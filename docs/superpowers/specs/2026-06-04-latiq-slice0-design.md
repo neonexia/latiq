@@ -223,8 +223,8 @@ De-risk-first, then bottom-up through the seams, integration last.
 - **M3 — Outbound seams.** `latiq-storage` (LocalFs + InMemory); `latiq-engine` (trait + DuckLake contract + BatchSink + abort layer); `latiq-engine-duckdb` (instance mgr, extension allowlist, txn writes + attribution, interrupt, `_latiq` views, explain). Cancellation test.
 - **M4 — Control plane.** DuckDB registry + migrations; Control gRPC + Admin gRPC; async audit ingestion.
 - **M5 — Inbound surface.** `latiq-agent-core` (neutral ops + abort registry + result/`_meta`/warnings/errors); `latiq-mcp` (rmcp server, 7 tools + descriptions + annotations, relaxed identity, SSE for queries, dual encoding, cancel→abort, minimal `latiq://` resources).
-- **M6 — Pond node + processes.** Wire everything; node registration/heartbeat; allocate consistency; graceful shutdown; `latiq` binary; `dev.sh`; YAML configs.
-- **M7 — Integration & success criteria.** Query-by-URI ingestion; integration harness; concurrent-multi-agent correctness + attribution test; cancellation E2E; demo walkthrough + quickstart docs.
+- **M6 — Pond node + processes.** Wire everything; node registration/heartbeat; allocate consistency; graceful shutdown; `latiq` binary; `dev.sh`; YAML configs. **First runnable end-to-end system** — provide a single "run everything" CLI/entry (`dev.sh` and/or a `latiq dev`-style convenience) so the operator can bring the whole stack up with one command and point an MCP client at the printed endpoint.
+- **M7 — Integration & success criteria.** Query-by-URI ingestion; integration harness; concurrent-multi-agent correctness + attribution test; cancellation E2E; demo walkthrough. **Write `docs/usage.md`** here — the getting-started + manual-test guide — once the run-everything CLI exists (per user direction: usage doc lands at M6/M7, not before). Plus quickstart.
 
 ---
 
