@@ -1,0 +1,27 @@
+syntax = "proto3";
+package latiq.v1;
+
+service Control {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc CreatePondAssignment(CreatePondAssignmentRequest) returns (CreatePondAssignmentResponse);
+  rpc GetPondLocation(GetPondLocationRequest) returns (GetPondLocationResponse);
+  rpc DropPondAssignment(DropPondAssignmentRequest) returns (DropPondAssignmentResponse);
+  rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
+}
+
+message RegisterNodeRequest { string node_id = 1; string mcp_endpoint = 2; string internal_endpoint = 3; uint32 capacity = 4; }
+message RegisterNodeResponse { }
+message HeartbeatRequest { string node_id = 1; uint32 pond_count = 2; }
+message HeartbeatResponse { }
+message CreatePondAssignmentRequest { string name = 1; string owner_identity = 2; string policy_json = 3; }
+message CreatePondAssignmentResponse { string pond_id = 1; string assigned_node_endpoint = 2; }
+message GetPondLocationRequest { string pond_ref = 1; }
+message GetPondLocationResponse { string pond_id = 1; string node_endpoint = 2; }
+message DropPondAssignmentRequest { string pond_id = 1; }
+message DropPondAssignmentResponse { }
+message RecordAuditRequest {
+  string agent_identity = 1; bool identity_verified = 2; string operation = 3;
+  string pond_id = 4; string request_summary_json = 5; string result_summary_json = 6; uint64 duration_ms = 7;
+}
+message RecordAuditResponse { }
