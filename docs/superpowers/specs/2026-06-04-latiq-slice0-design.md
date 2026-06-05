@@ -54,17 +54,19 @@ Three trait seams, each with one live adapter now and room for more:
 ### Crate layout (Cargo workspace)
 ```
 crates/
-  latiq                 # binary: clap dispatch (control-plane | pond-node) + admin CLI subcommands
+  latiq                 # binary: clap dispatch (control-plane | pond-node) + admin CLI + agent client CLI
   latiq-common          # Identity, ErrorEnvelope, Location, IDs (UUIDv4), config, neutral Result/_meta types
   latiq-proto           # tonic gRPC: Control service + Admin service (build.rs)
   latiq-agent-core      # protocol-neutral agent ops + in-flight/abort registry + result/_meta/warnings assembly
-  latiq-mcp             # MCP-over-HTTP surface adapter (rmcp) → agent-core
+  latiq-mcp             # MCP-over-HTTP surface adapter (rmcp server) → agent-core
+  latiq-client          # MCP client (rmcp client) → drives the agent surface from the CLI / tests
   latiq-engine          # QueryEngine trait + DuckLake-format contract + BatchSink + abort layer
   latiq-engine-duckdb   # DuckDB + ducklake adapter (per-pond instance manager)
   latiq-storage         # PondStorage trait; LocalFs + InMemory/Temp backends
   latiq-pond-node       # wires surfaces + agent-core + engine(duckdb) + storage(localfs) + Control-gRPC client
   latiq-control-plane   # registry/routing/audit (DuckDB) + Control gRPC + Admin gRPC + migrations
 ```
+(`latiq-client` is added beyond the original 10 crates to satisfy the agent client-CLI requirement — see §10a.)
 
 ### Tech stack
 `tokio`, `rmcp` (MCP Streamable-HTTP), `tonic` (gRPC), `duckdb-rs` (DuckDB + `ducklake` extension), `clap` (CLI). DuckLake spec **v1.0** (2026-04-13).
@@ -204,6 +206,24 @@ Tool descriptions are mini-tutorials (doc §4a principle 1): what / when-vs-alte
 
 ---
 
+## 10a. Agent client CLI (connect to a Latiq server and issue queries)
+
+A human/dev-facing **MCP client** built into the `latiq` binary so you can drive the agent surface from the terminal without writing an agent. This does **not** violate the MCP-vs-Admin separation (§2): it speaks the **agent MCP surface** (acting *as an agent*), exactly as a framework's MCP client would — it is not the Admin gRPC path. (Precedent: the original M1 design noted `latiq pond list # uses MCP under the hood`.)
+
+- **Crate:** `latiq-client` — a thin wrapper over the `rmcp` *client* that connects to a Streamable-HTTP endpoint, runs the MCP handshake, calls tools, and decodes the dual-encoded results (`structuredContent` + `_meta`) and structured errors for terminal display. Reused by the integration test harness.
+- **Subcommands** (all take `--endpoint <url>` default `http://127.0.0.1:8080/mcp`, and `--agent-id <id>` → sent as the `X-Latiq-Agent-Id` header; relaxed identity per §8):
+  - `latiq pond create [--name N] [--tag ...]` → `allocate_pond`
+  - `latiq pond list` / `latiq pond describe <ref>` / `latiq pond drop <ref> [--confirm]` → lifecycle tools
+  - `latiq query --pond <ref> "<SQL>"` → `read_query` (renders rows as a table + the `_meta` line)
+  - `latiq write --pond <ref> "<SQL>"` → `write_query`
+  - `latiq explain --pond <ref> "<SQL>"` → `explain_query`
+- **Output:** human-readable by default (table + `_meta` summary + warnings); `--json` prints the raw result object. Structured errors render as `kind`, `message`, `suggest`, and the `see` link.
+- **Distinct from the admin CLI** (`latiq node|policy|audit`, which uses Admin gRPC). The client CLI is the agent-surface client.
+
+Lands in **M5** (the `latiq-client` crate, once the MCP surface exists) and is wired into the binary + the run-everything flow in **M6**.
+
+---
+
 ## 11. Testing strategy
 
 - **Unit tests per crate**; the engine seam validated against both `LocalFs` and `InMemory` storage.
@@ -222,8 +242,8 @@ De-risk-first, then bottom-up through the seams, integration last.
 - **M2 — Workspace + kernel.** Workspace + 10 crates stubbed; `latiq-common`; `latiq-proto` (Control+Admin); binary clap skeleton; CI green.
 - **M3 — Outbound seams.** `latiq-storage` (LocalFs + InMemory); `latiq-engine` (trait + DuckLake contract + BatchSink + abort layer); `latiq-engine-duckdb` (instance mgr, extension allowlist, txn writes + attribution, interrupt, `_latiq` views, explain). Cancellation test.
 - **M4 — Control plane.** DuckDB registry + migrations; Control gRPC + Admin gRPC; async audit ingestion.
-- **M5 — Inbound surface.** `latiq-agent-core` (neutral ops + abort registry + result/`_meta`/warnings/errors); `latiq-mcp` (rmcp server, 7 tools + descriptions + annotations, relaxed identity, SSE for queries, dual encoding, cancel→abort, minimal `latiq://` resources).
-- **M6 — Pond node + processes.** Wire everything; node registration/heartbeat; allocate consistency; graceful shutdown; `latiq` binary; `dev.sh`; YAML configs. **First runnable end-to-end system** — provide a single "run everything" CLI/entry (`dev.sh` and/or a `latiq dev`-style convenience) so the operator can bring the whole stack up with one command and point an MCP client at the printed endpoint.
+- **M5 — Inbound surface + client.** `latiq-agent-core` (neutral ops + abort registry + result/`_meta`/warnings/errors); `latiq-mcp` (rmcp server, 7 tools + descriptions + annotations, relaxed identity, SSE for queries, dual encoding, cancel→abort, minimal `latiq://` resources); `latiq-client` (rmcp client wrapper — handshake, tool calls, dual-result/error decode — used by the CLI and the integration harness; see §10a).
+- **M6 — Pond node + processes.** Wire everything; node registration/heartbeat; allocate consistency; graceful shutdown; `latiq` binary; `dev.sh`; YAML configs. Wire the **agent client CLI** subcommands (`latiq pond …`, `latiq query|write|explain …`) over `latiq-client` (§10a). **First runnable end-to-end system** — provide a single "run everything" CLI/entry (`dev.sh` and/or a `latiq dev`-style convenience) so the operator can bring the whole stack up with one command and immediately drive it via `latiq query …` or any MCP client.
 - **M7 — Integration & success criteria.** Query-by-URI ingestion; integration harness; concurrent-multi-agent correctness + attribution test; cancellation E2E; demo walkthrough. **Write `docs/usage.md`** here — the getting-started + manual-test guide — once the run-everything CLI exists (per user direction: usage doc lands at M6/M7, not before). Plus quickstart.
 
 ---
