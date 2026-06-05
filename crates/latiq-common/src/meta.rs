@@ -3,7 +3,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WarningKind { Performance, Portability, SchemaHygiene, ResultHygiene }
+pub enum WarningKind {
+    Performance,
+    Portability,
+    SchemaHygiene,
+    ResultHygiene,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Warning {
@@ -33,7 +38,11 @@ mod tests {
 
     #[test]
     fn omits_empty_optional_fields() {
-        let m = QueryMeta { rows: 10, duration_ms: 5, ..Default::default() };
+        let m = QueryMeta {
+            rows: 10,
+            duration_ms: 5,
+            ..Default::default()
+        };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["rows"], 10);
         assert!(v.get("snapshot_id").is_none());
@@ -42,7 +51,10 @@ mod tests {
 
     #[test]
     fn serializes_warning_kind_snake_case() {
-        let w = Warning { kind: WarningKind::Performance, message: "full scan".into() };
+        let w = Warning {
+            kind: WarningKind::Performance,
+            message: "full scan".into(),
+        };
         assert_eq!(serde_json::to_value(&w).unwrap()["kind"], "performance");
     }
 }

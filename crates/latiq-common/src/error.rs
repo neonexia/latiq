@@ -48,7 +48,13 @@ impl ErrorEnvelope {
         suggest: impl Into<String>,
         see: impl Into<String>,
     ) -> Self {
-        Self { kind, message: message.into(), location: None, suggest: suggest.into(), see: see.into() }
+        Self {
+            kind,
+            message: message.into(),
+            location: None,
+            suggest: suggest.into(),
+            see: see.into(),
+        }
     }
 
     pub fn with_location(mut self, loc: Location) -> Self {
@@ -76,8 +82,17 @@ mod tests {
 
     #[test]
     fn includes_location_when_set() {
-        let e = ErrorEnvelope::new(ErrorKind::ParseError, "bad SQL", "fix it", "latiq://dialect")
-            .with_location(Location { line: 1, column: 8, byte: 7 });
+        let e = ErrorEnvelope::new(
+            ErrorKind::ParseError,
+            "bad SQL",
+            "fix it",
+            "latiq://dialect",
+        )
+        .with_location(Location {
+            line: 1,
+            column: 8,
+            byte: 7,
+        });
         let v = serde_json::to_value(&e).unwrap();
         assert_eq!(v["location"]["line"], 1);
     }

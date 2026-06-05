@@ -26,18 +26,28 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum NodeCmd { List, Describe { node_id: String } }
+enum NodeCmd {
+    List,
+    Describe { node_id: String },
+}
 #[derive(Subcommand)]
-enum PolicyCmd { Show, Set { key: String, value: String } }
+enum PolicyCmd {
+    Show,
+    Set { key: String, value: String },
+}
 #[derive(Subcommand)]
-enum AuditCmd { Tail, Search { identity: String } }
+enum AuditCmd {
+    Tail,
+    Search { identity: String },
+}
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Command::ControlPlane => println!("control-plane: not yet implemented (M4)"),
         Command::PondNode => println!("pond-node: not yet implemented (M6)"),
-        Command::Node(_) | Command::Policy(_) | Command::Audit(_) =>
-            println!("admin CLI: not yet implemented (M4/M6)"),
+        Command::Node(_) | Command::Policy(_) | Command::Audit(_) => {
+            println!("admin CLI: not yet implemented (M4/M6)")
+        }
     }
 }

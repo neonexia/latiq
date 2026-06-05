@@ -14,7 +14,10 @@ impl Identity {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => "anonymous".to_string(),
         };
-        Self { agent_id, verified: false }
+        Self {
+            agent_id,
+            verified: false,
+        }
     }
 }
 
