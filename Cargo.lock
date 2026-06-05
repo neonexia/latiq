@@ -606,6 +606,7 @@ version = "0.1.0"
 dependencies = [
  "latiq-common",
  "serde",
+ "tempfile",
  "thiserror",
 ]
 

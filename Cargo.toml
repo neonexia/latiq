@@ -28,3 +28,4 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tonic = "0.12"
 prost = "0.13"
 clap = { version = "4", features = ["derive"] }
+tempfile = "3"

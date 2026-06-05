@@ -7,3 +7,4 @@ edition.workspace = true
 latiq-common = { path = "../latiq-common" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true }
