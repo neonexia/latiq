@@ -123,9 +123,9 @@ A first-class, **engine-agnostic abort layer** in `latiq-agent-core`:
 
 - **In-flight registry** keyed by internal op-id (each surface maps its own request-id onto it) → holds an `AbortToken`.
 - `QueryEngine::execute(sql, abort_token) -> BatchStream`. **Contract:** after `abort` fires, engine-side memory/handles for that query are released within a **bounded window**.
-  - DuckDB adapter: `Connection::interrupt()` from the control thread → blocking exec returns abort error → drop statement/result → **discard the connection** (don't return to pool; re-create lazily). `memory_limit` bounds reclaimed budget.
+  - DuckDB adapter *(spike-confirmed API, M1)*: obtain `conn.interrupt_handle() -> Arc<InterruptHandle>` **before** moving the connection onto its query thread (`duckdb::Connection` is `!Send`, so it's pinned to one thread — this matches our one-connection-per-in-flight-query model). Store the handle in the in-flight registry; on abort call `handle.interrupt()` (effectively instant) → blocking exec returns `INTERRUPT Error: Interrupted!` → drop statement/result → **discard the connection** (don't return to pool; re-create lazily). `memory_limit` bounds reclaimed budget.
   - DataFusion adapter (future): drop the stream/task; `Drop` tears down operator + spill state deterministically.
-- **All cancel sources funnel into one `abort(op_id)`:** MCP `notifications/cancelled`, client disconnect (detected via SSE write failure), `drop_pond` (authoritative), query timeout (default 30s), SIGTERM.
+- **Cancel sources funnel into one `abort(op_id)`.** Slice 0+: MCP `notifications/cancelled`, `drop_pond` (authoritative), query timeout (default 30s), SIGTERM. **Client-disconnect detection is NOT a Slice 0+ cancel source** — the spike found `rmcp` 1.7.0 does not propagate client disconnect to handlers (writes to a closed SSE stream are silently buffered). The query timeout is the backstop for an abandoned query; explicit `notifications/cancelled` is the agent's cancel path. Disconnect→abort (via an axum tower-layer interceptor or a heartbeat probe) is deferred to a later slice.
 - **Graceful shutdown sequence:** stop accepting new MCP calls (503) → `abort` all in-flight + await within drain timeout → `CHECKPOINT`/close DuckLake instances → deregister node from control plane → exit.
 - **Cancellation test (engine-agnostic):** start a heavy query, abort, assert connection count returns to baseline and a fresh query on the same pond succeeds promptly.
 
@@ -133,9 +133,10 @@ A first-class, **engine-agnostic abort layer** in `latiq-agent-core`:
 
 ## 7. MCP transport
 
-- **SSE (`text/event-stream`) for `read_query` / `write_query`** — emits `notifications/progress` during execution (keepalive + progress + prompt disconnect→abort detection), then the single bounded `CallToolResult`.
+- **SSE (`text/event-stream`) for `read_query` / `write_query`** — emits `notifications/progress` during execution (keepalive + progress), then the single bounded `CallToolResult`. *(Note: SSE no longer buys prompt disconnect→abort detection in Slice 0+ — the spike found `rmcp` 1.7.0 doesn't surface client disconnect; see §6. SSE is still worth it for keepalive + progress UX and keeps the surface ready for disconnect interception in a later slice.)*
 - **Single-JSON (`application/json`) for `explain_query` + lifecycle + admin tools** — sub-millisecond, no value in SSE.
 - The query result is **bounded** by the inline cap (default 10k rows / 1MB). Streaming is internal/future-SDK; the agent boundary is one bounded MCP result. (This supersedes the M1 doc's "JSON-Lines over HTTP chunked transfer" wording.)
+- **Implementation note (spike-confirmed):** the `rmcp` Streamable-HTTP server is `StreamableHttpService` + `LocalSessionManager`, mounted via `axum::Router::nest_service("/mcp", …)` (features: `transport-streamable-http-server`; direct `axum` 0.8 dep). Tools use the `#[tool_router]` / `#[tool_handler]` macros; a `String` return fills `content[0].text` only — **`structuredContent` must be populated explicitly** by the handler (relevant to §8's dual-encoding). Progress is sent via the `Peer<RoleServer>` handle's `notify_progress(...)` when `meta.get_progress_token()` is `Some`.
 - **MCP cancel routing:** a `notifications/cancelled` POST (possibly on a different connection) is matched by request-id to the in-flight op and triggers `abort`.
 
 ---
@@ -231,5 +232,5 @@ De-risk-first, then bottom-up through the seams, integration last.
 
 - **DataFusion engine parity (future):** `datafusion-ducklake` is pre-1.0 — read + basic INSERT + snapshots only; **no UPDATE/DELETE, no time-travel, cannot *set* commit author.** The engine swap is real work and write-attribution parity is a known gap to design around later. The `QueryEngine` seam makes it *possible and bounded*, not small.
 - **Erasure bug to track:** DuckLake `cleanup_old_files` reportedly broken with a Postgres catalog (issue #586) — relevant only when catalog moves to Postgres (scaling slice).
-- **Spike-confirmed assumptions:** exact `rmcp` progress/notification API; `duckdb-rs` extension-load ergonomics; `set_commit_message` transactional behavior. M1 resolves these before the plan's foundation is committed.
+- **Spike (M1) — RESOLVED** (see `docs/superpowers/notes/m1-spike-findings.md`). All five probes confirmed: DuckLake round-trip via `duckdb-rs`, **native `set_commit_message` attribution works** (the load-bearing bet), `rmcp` Streamable-HTTP server pattern, SSE progress, and `interrupt_handle()`-based cancellation. Reconciled into §6/§7 above. Residual finding carried forward: **client-disconnect detection is unavailable in `rmcp` 1.7.0** → disconnect→abort deferred; timeout + explicit cancel cover Slice 0+.
 - **Inline cap / timeouts / pool sizing / progress cadence** are tunable defaults (doc §15) — start with doc values, adjust from observed behavior.
