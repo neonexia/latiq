@@ -4,12 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-This repository is **design-only**. There is no source code, no build system, no tests, and no git history yet. It contains two documents under `docs/`:
+Implementation has begun. The repo is a **Cargo workspace** (10 crates under `crates/`) — the M1 spike and M2 (workspace + kernel) of "Slice 0+" are done; M3–M7 are not yet built.
 
-- `docs/product_spec.md` — the product vision and M1 scope ("the agent-native data lake; sell to agents, not people").
-- `docs/m1_design.md` — the M1 architecture & design (v1.0). This is the authoritative technical spec; read it before implementing anything.
+**Read these first, in order:**
+- `docs/superpowers/specs/2026-06-04-latiq-slice0-design.md` — **the authoritative design** for the current build (Slice 0+). Supersedes `docs/m1_design.md` where they differ.
+- `docs/superpowers/plans/2026-06-04-latiq-slice0-m1-m2.md` — the executed M1+M2 plan.
+- `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs (rmcp `StreamableHttpService`, DuckLake `set_commit_message` attribution, `interrupt_handle()` cancellation, the rmcp client-disconnect gap).
+- `docs/product_spec.md`, `docs/m1_design.md` — original product vision + full M1 design (background).
 
-The intended implementation is a **single statically-linked Rust binary** (`latiq`) that serves multiple roles via subcommand. When scaffolding the project, that is the target — do not introduce a second language or a multi-binary layout without reconciling it against `m1_design.md` §5 and §12.
+**What exists now:** `latiq-common` (Identity, ErrorEnvelope/ErrorKind, QueryMeta, PondId — all tested), `latiq-proto` (Control + Admin gRPC, tonic codegen), the `latiq` binary (clap subcommand skeleton), CI, and a throwaway `spike/` crate (NOT a workspace member — exploratory only). The other crates are empty stubs awaiting M3+.
+
+**Build/test commands** (run from repo root):
+- `cargo build` / `cargo test --workspace` — workspace excludes `spike/`.
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — CI gates; keep both green.
+- `latiq-proto` codegen needs **`protoc`** on PATH (`brew install protobuf`).
+- The intended target is a **single binary** (`latiq`) serving roles via subcommand (`control-plane`, `pond-node`) — don't introduce a second language or multi-binary layout. M3+ continues per the spec's build order (§12).
 
 ## What Latiq is
 
