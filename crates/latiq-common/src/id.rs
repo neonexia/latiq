@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub struct PondId(Uuid);
 
 impl PondId {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self { Self(Uuid::new_v4()) }
     pub fn parse(s: &str) -> Result<Self, uuid::Error> { Ok(Self(Uuid::parse_str(s)?)) }
 }
