@@ -1,1 +1,5 @@
-//! latiq-storage — see docs/superpowers/specs/2026-06-04-latiq-slice0-design.md
+//! latiq-storage — pluggable pond storage (PondStorage trait + backends).
+pub mod location;
+pub mod storage;
+pub use location::PondLocation;
+pub use storage::{PondStorage, StorageError};
