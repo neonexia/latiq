@@ -1,0 +1,6 @@
+[package]
+name = "latiq-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

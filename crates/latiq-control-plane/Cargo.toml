@@ -1,0 +1,6 @@
+[package]
+name = "latiq-control-plane"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

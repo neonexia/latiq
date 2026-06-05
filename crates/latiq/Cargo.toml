@@ -1,0 +1,11 @@
+[package]
+name = "latiq"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "latiq"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
