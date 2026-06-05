@@ -1,0 +1,26 @@
+[workspace]
+
+[package]
+name = "spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+duckdb = { version = "1.10503.1", features = ["bundled"] }
+rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server"] }
+anyhow = "1"
+serde_json = "1"
+schemars = "0.8"
+serde = { version = "1", features = ["derive"] }
+axum = { version = "0.8", features = ["http1"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[[bin]]
+name = "probe_c"
+path = "src/bin/probe_c.rs"
+
+[[bin]]
+name = "probe_e"
+path = "src/bin/probe_e.rs"
