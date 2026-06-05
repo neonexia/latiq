@@ -1,1 +1,3 @@
-//! latiq-common — see docs/superpowers/specs/2026-06-04-latiq-slice0-design.md
+//! latiq-common — shared kernel (ids, identity, errors, results, config).
+pub mod id;
+pub use id::PondId;
