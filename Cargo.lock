@@ -1416,12 +1416,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "latiq-agent-core",
  "latiq-client",
+ "latiq-common",
  "latiq-control-plane",
+ "latiq-mcp",
  "latiq-pond-node",
  "latiq-proto",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
@@ -1530,10 +1536,12 @@ dependencies = [
  "async-trait",
  "latiq-agent-core",
  "latiq-common",
+ "latiq-engine",
  "latiq-engine-duckdb",
  "latiq-mcp",
  "latiq-proto",
  "latiq-storage",
+ "serde_json",
  "tokio",
  "tonic",
 ]

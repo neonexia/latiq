@@ -59,6 +59,9 @@ struct PondNodeArgs {
     node_id: String,
     #[arg(long, default_value = "127.0.0.1:8080")]
     mcp_addr: String,
+    /// Address to serve the Data/Query gRPC surface (CLI/SDK) on.
+    #[arg(long, default_value = "127.0.0.1:8081")]
+    data_addr: String,
     #[arg(long, default_value = "http://127.0.0.1:9090")]
     control: String,
     #[arg(long, default_value = "./latiq-data")]
@@ -157,9 +160,11 @@ async fn run_control_plane(a: ControlPlaneArgs) -> Result<()> {
 
 async fn run_pond(a: PondNodeArgs) -> Result<()> {
     let mcp_addr = a.mcp_addr.parse()?;
+    let data_addr = a.data_addr.parse()?;
     run_pond_node(PondNodeConfig {
         node_id: a.node_id,
         mcp_addr,
+        data_addr,
         internal_endpoint: format!("http://{}", a.mcp_addr),
         control_endpoint: a.control,
         data_dir: a.data_dir,

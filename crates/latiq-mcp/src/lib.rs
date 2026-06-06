@@ -2,4 +2,4 @@
 pub mod encode;
 pub mod server;
 
-pub use server::{serve_mcp, LatiqServer};
+pub use server::{serve_mcp, serve_mcp_with_listener, LatiqServer};

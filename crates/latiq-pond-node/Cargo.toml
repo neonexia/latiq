@@ -9,8 +9,10 @@ latiq-agent-core = { path = "../latiq-agent-core" }
 latiq-proto = { path = "../latiq-proto" }
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-storage = { path = "../latiq-storage" }
+latiq-engine = { path = "../latiq-engine" }
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 async-trait = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }

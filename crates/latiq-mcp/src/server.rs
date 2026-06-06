@@ -162,13 +162,22 @@ pub async fn serve_mcp(
     addr: SocketAddr,
     ops: Arc<AgentOps>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_mcp_with_listener(listener, ops).await
+}
+
+/// Serve the MCP surface on an already-bound listener (no port race; used by the
+/// integration harness).
+pub async fn serve_mcp_with_listener(
+    listener: tokio::net::TcpListener,
+    ops: Arc<AgentOps>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let service = StreamableHttpService::new(
         move || Ok(LatiqServer::new(ops.clone())),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );
     let router = axum::Router::new().nest_service("/mcp", service);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
     Ok(())
 }
