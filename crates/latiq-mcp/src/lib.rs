@@ -1,1 +1,5 @@
-//! latiq-mcp — see docs/superpowers/specs/2026-06-04-latiq-slice0-design.md
+//! latiq-mcp — MCP-over-HTTP surface adapter (rmcp) onto latiq-agent-core.
+pub mod encode;
+pub mod server;
+
+pub use server::{serve_mcp, LatiqServer};
