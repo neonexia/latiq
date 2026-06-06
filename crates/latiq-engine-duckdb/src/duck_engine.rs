@@ -1,9 +1,14 @@
 //! `DuckEngine` — the DuckDB + DuckLake implementation of `QueryEngine`.
 //!
-//! One DuckDB instance (connection) per query, per spec §5/§6. Cancellation
-//! uses the spike-confirmed `Connection::interrupt_handle()`: a watcher thread
-//! interrupts the running statement when the `AbortToken` is cancelled, and
-//! stops promptly when the query finishes (so it never lingers).
+//! **One DuckDB instance per pond** (spec §5, Decision 3): a single connection
+//! per pond, reused across queries and guarded by a mutex. This is what makes
+//! concurrent multi-agent writes correct — all commits to a pond's DuckLake
+//! catalog go through one DuckDB handle, so DuckLake's transactional model
+//! serializes them (instead of independent instances racing on the catalog file).
+//!
+//! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
+//! watcher thread interrupts the running statement when the `AbortToken` is
+//! cancelled, and exits when the operation completes.
 use crate::exec::{run_explain, run_read, run_write};
 use crate::instance::PondInstance;
 use crate::latiq_schema::create_latiq_schema;
@@ -12,20 +17,36 @@ use latiq_engine::{
     AbortToken, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary, TableInfo,
 };
 use latiq_storage::PondLocation;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub struct DuckEngine;
+#[derive(Default)]
+pub struct DuckEngine {
+    /// Per-pond DuckDB instances, keyed by catalog URI. Each is mutex-guarded so
+    /// queries on a pond serialize through its single connection.
+    instances: Mutex<HashMap<String, Arc<Mutex<PondInstance>>>>,
+}
 
 impl DuckEngine {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Get the pond's instance, opening (and caching) it on first use.
+    fn instance(&self, loc: &PondLocation) -> Result<Arc<Mutex<PondInstance>>, EngineError> {
+        let mut map = self.instances.lock().expect("instances mutex poisoned");
+        if let Some(inst) = map.get(&loc.catalog_uri) {
+            return Ok(inst.clone());
+        }
+        let inst = Arc::new(Mutex::new(PondInstance::open(loc)?));
+        map.insert(loc.catalog_uri.clone(), inst.clone());
+        Ok(inst)
     }
 
     /// Run a blocking engine operation with an interrupt watcher bound to `abort`.
-    /// The watcher interrupts the connection on cancellation and exits when the
-    /// operation completes. An `INTERRUPT` error is normalized to `Cancelled`.
+    /// An `INTERRUPT` error is normalized to `Cancelled`.
     fn run_with_abort<T>(
         inst: &PondInstance,
         abort: &AbortToken,
@@ -59,16 +80,11 @@ impl DuckEngine {
     }
 }
 
-impl Default for DuckEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl QueryEngine for DuckEngine {
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError> {
-        let inst = PondInstance::open(loc)?;
-        create_latiq_schema(&inst.conn)
+        let inst = self.instance(loc)?;
+        let guard = inst.lock().expect("pond instance poisoned");
+        create_latiq_schema(&guard.conn)
     }
 
     fn read_query(
@@ -77,8 +93,9 @@ impl QueryEngine for DuckEngine {
         sql: &str,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
-        let inst = PondInstance::open(loc)?;
-        Self::run_with_abort(&inst, &abort, |i| run_read(i, sql))
+        let inst = self.instance(loc)?;
+        let guard = inst.lock().expect("pond instance poisoned");
+        Self::run_with_abort(&guard, &abort, |i| run_read(i, sql))
     }
 
     fn write_query(
@@ -88,19 +105,22 @@ impl QueryEngine for DuckEngine {
         identity: &Identity,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
-        let inst = PondInstance::open(loc)?;
-        Self::run_with_abort(&inst, &abort, |i| run_write(i, sql, identity))
+        let inst = self.instance(loc)?;
+        let guard = inst.lock().expect("pond instance poisoned");
+        Self::run_with_abort(&guard, &abort, |i| run_write(i, sql, identity))
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
-        let inst = PondInstance::open(loc)?;
-        run_explain(&inst, sql)
+        let inst = self.instance(loc)?;
+        let guard = inst.lock().expect("pond instance poisoned");
+        run_explain(&guard, sql)
     }
 
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError> {
-        let inst = PondInstance::open(loc)?;
+        let inst = self.instance(loc)?;
+        let guard = inst.lock().expect("pond instance poisoned");
         let res = run_read(
-            &inst,
+            &guard,
             "SELECT name, row_count, comment FROM _latiq.tables_summary",
         )?;
         let tables = res
@@ -153,7 +173,6 @@ mod tests {
             t0.elapsed()
         );
 
-        // Pond remains usable afterwards (resources reclaimed).
         let ok = eng
             .read_query(&loc, "SELECT 1 AS x", AbortToken::new())
             .unwrap();
