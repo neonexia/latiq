@@ -1273,6 +1273,19 @@ dependencies = [
 [[package]]
 name = "latiq-agent-core"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "latiq-common",
+ "latiq-control-plane",
+ "latiq-engine",
+ "latiq-engine-duckdb",
+ "latiq-storage",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "latiq-common"

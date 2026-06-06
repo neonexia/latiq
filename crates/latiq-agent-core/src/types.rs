@@ -1,0 +1,35 @@
+//! Neutral, protocol-agnostic result/info types produced by AgentOps.
+use latiq_engine::SchemaSummary;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PondInfo {
+    pub pond_id: String,
+    pub name: String,
+    pub owner: String,
+    pub created_at: String,
+    pub policy_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllocateResult {
+    pub pond_id: String,
+    pub pond_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeResult {
+    pub pond: PondInfo,
+    pub schema: SchemaSummary,
+}
+
+/// What AgentOps hands the ControlPlane to record (already shape-summarized).
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub agent_identity: String,
+    pub verified: bool,
+    pub operation: String,
+    pub pond_id: Option<String>,
+    pub request_summary: Option<String>,
+    pub duration_ms: u64,
+}
