@@ -8,6 +8,27 @@ References: `docs/product_spec.md`, `docs/m1_design.md`. This spec **supersedes*
 
 ---
 
+## 0. Addendum — architecture reshaping (M8–M11)
+
+**This addendum supersedes §10a (the "agent client CLI") and the M5/M6 framing of the CLI as an MCP/agent client.** After M1–M7 shipped, a design review settled the surface model:
+
+**Three external surfaces, three audiences:**
+- **MCP-over-HTTP** — **agents only** (frontier LLMs). The CLI/SDK are *not* agents and never use MCP. `latiq-client` (MCP client) is demoted to agent-simulation + MCP integration tests.
+- **Data/Query gRPC** *(new — pulled forward from M2)* — **CLI + SDK**. On the pond node. `allocate / drop / read / write / explain`. Unary, bounded by the inline cap (Arrow Flight SQL streaming for large results stays M2).
+- **Admin gRPC** — **operators**. On the control plane. `node / policy / audit` **+ pond list/describe** (metadata reads, so they work even when pond nodes are down).
+
+**Why it's not a rewrite:** `latiq-agent-core` is protocol-neutral, so the Data/Query gRPC API is a *second inbound adapter onto `AgentOps`* (the same seam MCP uses). The control plane stays out of the query path; queries always run on the pond node.
+
+**Reshaped roadmap (supersedes the M-roadmap tail in §12):**
+- **M8** — Data/Query gRPC surface on the pond node (inbound adapter onto `AgentOps`) + identity via gRPC metadata + gRPC-native cancellation. Categorized integration tests interleaved.
+- **M9** — Rewire CLI/SDK to gRPC (data → Query gRPC; metadata + admin → Admin gRPC, add pond list/describe there); friendly connection errors; drop MCP from the CLI.
+- **M10** — Complete the MCP agent surface: tool annotations, `latiq://` resources, prompts (the 4 SOPs), mini-tutorial tool descriptions.
+- **M11** — Full-stack test harness + categorized integration tests exercising every surface + the feature-test suite; fix the open review findings (engine guards, etc.) test-first.
+
+The canonical, always-loaded statement of these invariants lives in `CLAUDE.md` (root) and per-crate `crates/*/CLAUDE.md`.
+
+---
+
 ## 1. What Slice 0+ is
 
 A two-process Latiq deployment where agents, over MCP-over-HTTP, allocate ponds, write and read SQL against DuckLake storage, ingest public external files directly into a pond, and see their writes attributed — with an admin CLI over a separate gRPC surface. No federation, no OIDC verification, no multi-node proxying.
