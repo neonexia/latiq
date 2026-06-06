@@ -1414,7 +1414,14 @@ dependencies = [
 name = "latiq"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
+ "latiq-client",
+ "latiq-control-plane",
+ "latiq-pond-node",
+ "latiq-proto",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1518,6 +1525,18 @@ dependencies = [
 [[package]]
 name = "latiq-pond-node"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "latiq-agent-core",
+ "latiq-common",
+ "latiq-engine-duckdb",
+ "latiq-mcp",
+ "latiq-proto",
+ "latiq-storage",
+ "tokio",
+ "tonic",
+]
 
 [[package]]
 name = "latiq-proto"

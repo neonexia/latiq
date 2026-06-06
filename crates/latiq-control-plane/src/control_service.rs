@@ -102,6 +102,45 @@ impl Control for ControlService {
         Ok(Response::new(DropPondAssignmentResponse {}))
     }
 
+    async fn list_ponds(
+        &self,
+        _req: Request<ListPondsRequest>,
+    ) -> Result<Response<ListPondsResponse>, Status> {
+        let rows = self.registry.list_ponds().map_err(to_status)?;
+        let mut ponds = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (row, created_at, policy_json) =
+                self.registry.pond_info(&row.pond_id).map_err(to_status)?;
+            ponds.push(PondInfoMsg {
+                pond_id: row.pond_id,
+                name: row.name,
+                owner: row.owner_identity,
+                created_at,
+                policy_json,
+            });
+        }
+        Ok(Response::new(ListPondsResponse { ponds }))
+    }
+
+    async fn get_pond_info(
+        &self,
+        req: Request<GetPondInfoRequest>,
+    ) -> Result<Response<GetPondInfoResponse>, Status> {
+        let (row, created_at, policy_json) = self
+            .registry
+            .pond_info(&req.into_inner().pond_ref)
+            .map_err(to_status)?;
+        Ok(Response::new(GetPondInfoResponse {
+            pond: Some(PondInfoMsg {
+                pond_id: row.pond_id,
+                name: row.name,
+                owner: row.owner_identity,
+                created_at,
+                policy_json,
+            }),
+        }))
+    }
+
     async fn record_audit(
         &self,
         req: Request<RecordAuditRequest>,

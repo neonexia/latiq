@@ -8,4 +8,11 @@ name = "latiq"
 path = "src/main.rs"
 
 [dependencies]
+latiq-control-plane = { path = "../latiq-control-plane" }
+latiq-pond-node = { path = "../latiq-pond-node" }
+latiq-proto = { path = "../latiq-proto" }
+latiq-client = { path = "../latiq-client" }
 clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
