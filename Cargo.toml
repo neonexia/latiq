@@ -29,3 +29,4 @@ tonic = "0.12"
 prost = "0.13"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+tokio-util = { version = "0.7", features = ["rt"] }

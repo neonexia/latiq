@@ -4,3 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+latiq-common = { path = "../latiq-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
