@@ -1286,6 +1286,18 @@ dependencies = [
 [[package]]
 name = "latiq-control-plane"
 version = "0.1.0"
+dependencies = [
+ "duckdb",
+ "latiq-common",
+ "latiq-proto",
+ "prost",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tonic",
+]
 
 [[package]]
 name = "latiq-engine"
