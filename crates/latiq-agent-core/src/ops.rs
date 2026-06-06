@@ -260,7 +260,7 @@ fn redact_sql(sql: &str) -> String {
         match c {
             '\'' => {
                 // consume to the closing quote
-                while let Some(n) = chars.next() {
+                for n in chars.by_ref() {
                     if n == '\'' {
                         break;
                     }
