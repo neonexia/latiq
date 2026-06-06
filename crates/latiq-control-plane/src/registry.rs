@@ -174,6 +174,48 @@ impl Registry {
         .map_err(|_| ControlPlaneError::PondNotFound(pond_ref.to_string()))
     }
 
+    pub fn list_ponds(&self) -> Result<Vec<PondRow>, ControlPlaneError> {
+        let c = self.lock();
+        let mut stmt = c.prepare(
+            "SELECT pond_id, name, owner_identity, node_id FROM ponds ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PondRow {
+                pond_id: r.get(0)?,
+                name: r.get(1)?,
+                owner_identity: r.get(2)?,
+                node_id: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Returns (PondRow, created_at, policy_json) resolved by id or name.
+    pub fn pond_info(
+        &self,
+        pond_ref: &str,
+    ) -> Result<(PondRow, String, String), ControlPlaneError> {
+        let c = self.lock();
+        c.query_row(
+            "SELECT pond_id, name, owner_identity, node_id, created_at::VARCHAR, policy_json
+             FROM ponds WHERE pond_id=? OR name=? LIMIT 1",
+            duckdb::params![pond_ref, pond_ref],
+            |r| {
+                Ok((
+                    PondRow {
+                        pond_id: r.get(0)?,
+                        name: r.get(1)?,
+                        owner_identity: r.get(2)?,
+                        node_id: r.get(3)?,
+                    },
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .map_err(|_| ControlPlaneError::PondNotFound(pond_ref.to_string()))
+    }
+
     pub fn drop_pond(&self, pond_id: &str) -> Result<(), ControlPlaneError> {
         let c = self.lock();
         let n = c.execute(
@@ -269,6 +311,28 @@ mod tests {
 
     fn reg() -> Registry {
         Registry::open(None).unwrap()
+    }
+
+    #[test]
+    fn list_ponds_and_pond_info() {
+        let r = reg();
+        r.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 100)
+            .unwrap();
+        r.create_pond(Some("p-one".into()), "agent-x", "{\"k\":1}")
+            .unwrap();
+        r.create_pond(Some("p-two".into()), "agent-y", "{}")
+            .unwrap();
+        let ponds = r.list_ponds().unwrap();
+        assert_eq!(ponds.len(), 2);
+        let (row, created_at, policy) = r.pond_info("p-one").unwrap();
+        assert_eq!(row.name, "p-one");
+        assert_eq!(row.owner_identity, "agent-x");
+        assert!(!created_at.is_empty());
+        assert_eq!(policy, "{\"k\":1}");
+        assert!(matches!(
+            r.pond_info("nope"),
+            Err(ControlPlaneError::PondNotFound(_))
+        ));
     }
 
     #[test]
