@@ -122,9 +122,17 @@ impl AgentOps {
 
     pub async fn drop_pond(&self, identity: &Identity, pond_ref: &str) -> Result<(), AgentError> {
         let pond_id = self.control.resolve_pond(pond_ref).await?;
-        self.inflight.cancel_for_pond(&pond_id);
-        self.control.drop_pond(&pond_id).await?;
         let pid = Self::parse_id(&pond_id)?;
+        // Tombstone the pond + cancel its in-flight ops. begin_drop also makes any
+        // query that registers from here on get a pre-cancelled token, so one that
+        // slipped past resolve_pond can't run against files we're about to delete.
+        self.inflight.begin_drop(&pond_id);
+        if let Err(e) = self.control.drop_pond(&pond_id).await {
+            // Registry drop failed: the pond still exists — clear the tombstone so
+            // it stays usable instead of permanently rejecting queries.
+            self.inflight.end_drop(&pond_id);
+            return Err(e);
+        }
         // Evict the cached engine instance (closing its connection to the catalog)
         // BEFORE deleting the files out from under it. Best-effort: a pond that was
         // never queried has no location/instance to forget.
@@ -132,6 +140,7 @@ impl AgentOps {
             self.engine.forget_pond(&loc);
         }
         let _ = self.storage.drop_pond(pid);
+        self.inflight.end_drop(&pond_id);
         self.audit(identity, "drop_pond", Some(&pond_id), None, 0)
             .await;
         Ok(())
