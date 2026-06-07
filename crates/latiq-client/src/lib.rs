@@ -61,7 +61,18 @@ impl LatiqClient {
     }
 
     pub async fn drop_pond(&self, pond: &str) -> Result<CallOutcome> {
-        self.call("drop_pond", pond_arg(pond)).await
+        // Agent-sim: confirm the destructive op by default (the gate is enforced
+        // server-side; tests that need the un-confirmed path call drop_pond_raw).
+        let mut a = pond_arg(pond);
+        a.insert("confirm".into(), Value::Bool(true));
+        self.call("drop_pond", a).await
+    }
+
+    /// Drive drop_pond with an explicit `confirm` value (to exercise the gate).
+    pub async fn drop_pond_raw(&self, pond: &str, confirm: bool) -> Result<CallOutcome> {
+        let mut a = pond_arg(pond);
+        a.insert("confirm".into(), Value::Bool(confirm));
+        self.call("drop_pond", a).await
     }
 
     pub async fn query(&self, pond: &str, sql: &str) -> Result<CallOutcome> {

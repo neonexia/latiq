@@ -155,7 +155,11 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
     )]
     async fn drop_pond(&self, Parameters(a): Parameters<DropArgs>) -> CallToolResult {
         let id = Identity::claimed(a.agent_id.as_deref());
-        match self.ops.drop_pond(&id, &a.pond).await {
+        match self
+            .ops
+            .drop_pond(&id, &a.pond, a.confirm.unwrap_or(false))
+            .await
+        {
             Ok(()) => ok_value(serde_json::json!({ "status": "dropped", "pond": a.pond })),
             Err(e) => err_envelope(e.envelope()),
         }

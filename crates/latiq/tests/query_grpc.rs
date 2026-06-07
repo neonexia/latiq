@@ -87,6 +87,42 @@ async fn pond_lifecycle_happy() {
 }
 
 #[tokio::test]
+async fn pond_lifecycle_drop_requires_confirm() {
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(req(alloc("keepme"), "alice"))
+        .await
+        .unwrap();
+
+    // confirm=false → the destructive drop is refused with a structured error.
+    let err = c
+        .drop_pond(req(
+            DropPondRequest {
+                pond: "keepme".into(),
+                confirm: false,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(
+        envelope(&err).kind,
+        latiq_common::ErrorKind::MissingArgument
+    );
+
+    // The pond survives the refused drop.
+    c.describe_pond(req(
+        DescribePondRequest {
+            pond: "keepme".into(),
+        },
+        "alice",
+    ))
+    .await
+    .expect("pond must still exist after an un-confirmed drop");
+}
+
+#[tokio::test]
 async fn pond_lifecycle_duplicate_name_conflicts() {
     let s = start_stack().await;
     let mut c = client(&s.data_endpoint).await;

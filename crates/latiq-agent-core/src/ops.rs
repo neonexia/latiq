@@ -5,6 +5,7 @@ use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::inflight::InFlightRegistry;
 use crate::types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
+use latiq_common::ErrorKind;
 use latiq_common::Identity;
 use latiq_common::PondId;
 use latiq_engine::{ExplainResult, QueryEngine, QueryResult};
@@ -120,7 +121,23 @@ impl AgentOps {
         Ok(ponds)
     }
 
-    pub async fn drop_pond(&self, identity: &Identity, pond_ref: &str) -> Result<(), AgentError> {
+    pub async fn drop_pond(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        confirm: bool,
+    ) -> Result<(), AgentError> {
+        // drop_pond deletes the pond and ALL its data — require explicit confirm.
+        // Every surface plumbs this flag; enforcing it here keeps the gate
+        // consistent across MCP and the Data gRPC.
+        if !confirm {
+            return Err(AgentError::new(
+                ErrorKind::MissingArgument,
+                format!("drop_pond deletes pond '{pond_ref}' and all its data; set confirm=true to proceed"),
+                "Re-issue drop_pond with confirm=true once you're certain.",
+                "latiq://guidance",
+            ));
+        }
         let pond_id = self.control.resolve_pond(pond_ref).await?;
         let pid = Self::parse_id(&pond_id)?;
         // Tombstone the pond + cancel its in-flight ops. begin_drop also makes any
@@ -392,10 +409,16 @@ mod tests {
     #[test]
     fn redaction_strips_block_comment() {
         let r = redact_sql("SELECT /* secret 'hunter2' */ id FROM t");
-        assert!(!r.contains("hunter2"), "literal leaked via block comment: {r}");
+        assert!(
+            !r.contains("hunter2"),
+            "literal leaked via block comment: {r}"
+        );
         assert!(!r.contains("secret"));
         // The block comment becomes whitespace; the statement shape survives.
-        assert_eq!(r.split_whitespace().collect::<Vec<_>>(), ["SELECT", "id", "FROM", "t"]);
+        assert_eq!(
+            r.split_whitespace().collect::<Vec<_>>(),
+            ["SELECT", "id", "FROM", "t"]
+        );
     }
 
     #[test]

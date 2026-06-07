@@ -86,7 +86,10 @@ impl Data for DataService {
     ) -> Result<Response<DropPondResponse>, Status> {
         let id = identity_of(&req);
         let r = req.into_inner();
-        self.ops.drop_pond(&id, &r.pond).await.map_err(to_status)?;
+        self.ops
+            .drop_pond(&id, &r.pond, r.confirm)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(DropPondResponse {}))
     }
 

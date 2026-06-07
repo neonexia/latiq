@@ -78,8 +78,34 @@ async fn full_agent_loop() {
     let ponds = ops.list_ponds(&id).await.unwrap();
     assert_eq!(ponds.len(), 1);
 
-    ops.drop_pond(&id, "incident-9").await.unwrap();
+    ops.drop_pond(&id, "incident-9", true).await.unwrap();
     assert!(ops.describe_pond(&id, "incident-9").await.is_err());
+}
+
+#[tokio::test]
+async fn pond_lifecycle_drop_requires_confirm() {
+    let ops = ops();
+    let id = Identity::claimed(Some("agent-loop"));
+    ops.allocate_pond(&id, Some("keepme".into()), "{}")
+        .await
+        .unwrap();
+
+    // Without confirm the destructive drop is refused with a structured error...
+    let err = ops
+        .drop_pond(&id, "keepme", false)
+        .await
+        .expect_err("drop without confirm must be refused");
+    assert_eq!(
+        err.envelope().kind,
+        latiq_common::ErrorKind::MissingArgument
+    );
+
+    // ...and the pond is untouched.
+    assert!(ops.describe_pond(&id, "keepme").await.is_ok());
+
+    // With confirm it actually drops.
+    ops.drop_pond(&id, "keepme", true).await.unwrap();
+    assert!(ops.describe_pond(&id, "keepme").await.is_err());
 }
 
 #[tokio::test]
