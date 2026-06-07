@@ -18,9 +18,11 @@ impl ControlService {
 fn to_status(e: ControlPlaneError) -> Status {
     match e {
         ControlPlaneError::NameConflict(m) => Status::already_exists(m),
-        ControlPlaneError::PondNotFound(m) | ControlPlaneError::NodeNotFound(m) => {
-            Status::not_found(m)
-        }
+        ControlPlaneError::PondNotFound(m) => Status::not_found(m),
+        // No node available to host the pond is an availability/precondition
+        // failure, NOT "pond not found" — collapsing them mislabels allocate-with-
+        // no-node as a missing pond (review #13).
+        ControlPlaneError::NodeNotFound(m) => Status::failed_precondition(m),
         ControlPlaneError::Storage(m) => Status::internal(m),
     }
 }

@@ -29,6 +29,11 @@ fn status_err(s: tonic::Status) -> AgentError {
     match s.code() {
         Code::NotFound => AgentError::pond_not_found(s.message()),
         Code::AlreadyExists => AgentError::name_conflict(s.message()),
+        // FailedPrecondition = no pond node available to host the request (an
+        // availability error, not a missing pond) — keep it distinct from NotFound.
+        Code::FailedPrecondition => {
+            AgentError::internal(format!("no pond node available: {}", s.message()))
+        }
         _ => AgentError::internal(s.message().to_string()),
     }
 }

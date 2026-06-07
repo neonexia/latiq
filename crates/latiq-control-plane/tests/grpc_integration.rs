@@ -119,3 +119,43 @@ async fn control_and_admin_surfaces_work() {
     assert_eq!(tail.entries.len(), 1);
     assert_eq!(tail.entries[0].operation, "read_query");
 }
+
+/// Allocating a pond when no node is registered must surface as a precondition
+/// failure (no host available), NOT NotFound — NotFound is reserved for a
+/// missing pond and the client maps it to `pond_not_found` (review #13).
+#[tokio::test]
+async fn error_contract_allocate_with_no_node_is_precondition_not_notfound() {
+    let registry = Registry::open(None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ControlServer::new(
+                latiq_control_plane::control_service::ControlService::new(registry),
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut control = ControlClient::connect(format!("http://127.0.0.1:{port}"))
+        .await
+        .unwrap();
+
+    // No register_node call: the registry has zero nodes.
+    let status = control
+        .create_pond_assignment(CreatePondAssignmentRequest {
+            name: "orphan".into(),
+            owner_identity: "agent-x".into(),
+            policy_json: "{}".into(),
+        })
+        .await
+        .expect_err("allocate with no node must fail");
+    assert_eq!(
+        status.code(),
+        tonic::Code::FailedPrecondition,
+        "no-node allocate must be FailedPrecondition, not {:?}",
+        status.code()
+    );
+}
