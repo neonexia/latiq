@@ -66,9 +66,14 @@ impl ControlPlane for RegistryControlPlane {
         let rows = self.registry.list_ponds().map_err(cp_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let (row, created_at, policy) =
-                self.registry.pond_info(&row.pond_id).map_err(cp_err)?;
-            out.push(to_info(row, created_at, policy));
+            // This is a list-then-detail (N+1) read: a pond dropped between the
+            // list and its pond_info lookup must be skipped, not fail the whole
+            // call (review #9). Other errors still propagate.
+            match self.registry.pond_info(&row.pond_id) {
+                Ok((row, created_at, policy)) => out.push(to_info(row, created_at, policy)),
+                Err(ControlPlaneError::PondNotFound(_)) => continue,
+                Err(e) => return Err(cp_err(e)),
+            }
         }
         Ok(out)
     }
@@ -92,5 +97,69 @@ impl ControlPlane for RegistryControlPlane {
             result_summary: None,
             duration_ms: rec.duration_ms,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn node_backed_registry() -> Registry {
+        let reg = Registry::open(None).unwrap();
+        reg.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 1000)
+            .unwrap();
+        reg
+    }
+
+    // list_ponds is a list-then-detail (N+1) read: a pond dropped between the
+    // list snapshot and its per-row pond_info lookup must be skipped, not blow up
+    // the whole call (review #9). Drops run concurrently with repeated lists; every
+    // list must return Ok regardless of which ponds raced away mid-iteration.
+    #[tokio::test]
+    async fn list_ponds_tolerates_concurrent_drop() {
+        let registry = node_backed_registry();
+        let cp = Arc::new(RegistryControlPlane::new(registry.clone()));
+
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            let info = cp
+                .create_pond(Some(format!("p{i}")), "agent-x", "{}")
+                .await
+                .unwrap();
+            ids.push(info.pond_id);
+        }
+
+        // Dropper: tear the ponds down one by one, concurrently with the lister.
+        let dropper = {
+            let cp = cp.clone();
+            tokio::spawn(async move {
+                for id in ids {
+                    let _ = cp.drop_pond(&id).await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        // Lister: hammer list_ponds while drops are in flight. Before the fix, a
+        // drop landing between list_ponds() and pond_info() returned PondNotFound
+        // and failed the whole call.
+        let lister = {
+            let cp = cp.clone();
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    cp.list_ponds()
+                        .await
+                        .expect("list_ponds must tolerate a concurrent drop");
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        dropper.await.unwrap();
+        lister.await.unwrap();
+
+        // All ponds dropped → an empty, still-successful list.
+        assert!(cp.list_ponds().await.unwrap().is_empty());
     }
 }
