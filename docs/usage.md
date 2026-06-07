@@ -50,9 +50,9 @@ Defaults: control-plane `--control-addr 127.0.0.1:9090 --admin-addr 127.0.0.1:90
 
 ---
 
-## Agent client CLI (connect to the server, issue queries)
+## CLI (connect to the server, issue queries)
 
-These speak the **agent MCP surface** at `http://127.0.0.1:8080/mcp` (acting as an agent). Use `--agent-id <name>` to set the identity your writes are attributed to (defaults to `anonymous`).
+The CLI is a **gRPC client — not an agent.** Data ops (allocate/drop/describe, query/write/explain) go to the pond node's **Data gRPC** (`127.0.0.1:8081`, override with `--endpoint`); `pond list` and the operator commands go to the control plane's **Admin gRPC** (`127.0.0.1:9091`, override with `--admin`). MCP (`:8080/mcp`) is reserved for AI agents. Use `--agent-id <name>` on data ops to set the identity your writes are attributed to (default `anonymous`).
 
 ```bash
 BIN="cargo run -q -p latiq --"

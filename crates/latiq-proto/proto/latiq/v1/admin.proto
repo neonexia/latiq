@@ -8,7 +8,14 @@ service Admin {
   rpc PolicySet(PolicySetRequest) returns (PolicySetResponse);
   rpc AuditTail(AuditTailRequest) returns (AuditTailResponse);
   rpc AuditSearch(AuditSearchRequest) returns (AuditSearchResponse);
+  // Operators inspect ponds from the control plane (registry) directly, so this
+  // works even when pond nodes are down (metadata read, not in the query path).
+  rpc PondList(PondListRequest) returns (PondListResponse);
 }
+
+message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; }
+message PondListRequest { }
+message PondListResponse { repeated PondSummary ponds = 1; }
 
 message NodeInfo { string node_id = 1; string mcp_endpoint = 2; string state = 3; uint32 pond_count = 4; }
 message ListNodesRequest { }

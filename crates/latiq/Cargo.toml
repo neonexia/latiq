@@ -11,16 +11,15 @@ path = "src/main.rs"
 latiq-control-plane = { path = "../latiq-control-plane" }
 latiq-pond-node = { path = "../latiq-pond-node" }
 latiq-proto = { path = "../latiq-proto" }
-latiq-client = { path = "../latiq-client" }
+latiq-common = { path = "../latiq-common" }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+tonic = { workspace = true }
 
 [dev-dependencies]
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-agent-core = { path = "../latiq-agent-core" }
-latiq-common = { path = "../latiq-common" }
-tonic = { workspace = true }
 tokio-stream = { workspace = true }
 tempfile = { workspace = true }

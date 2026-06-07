@@ -23,9 +23,10 @@ sleep 2
 cat <<EOF
 
 Latiq dev stack is up:
-  MCP (agents):   http://127.0.0.1:8080/mcp
-  Control gRPC:   127.0.0.1:9090
-  Admin gRPC:     127.0.0.1:9091
+  MCP (agents only):    http://127.0.0.1:8080/mcp
+  Data gRPC (CLI/SDK):  127.0.0.1:8081
+  Control gRPC:         127.0.0.1:9090
+  Admin gRPC (ops):     127.0.0.1:9091
 
 Try (agent client CLI):
   $BIN pond create --name demo

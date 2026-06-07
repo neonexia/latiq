@@ -100,6 +100,26 @@ impl Admin for AdminService {
         Ok(Response::new(AuditTailResponse { entries }))
     }
 
+    async fn pond_list(
+        &self,
+        _req: Request<PondListRequest>,
+    ) -> Result<Response<PondListResponse>, Status> {
+        let rows = self.registry.list_ponds().map_err(to_status)?;
+        let mut ponds = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (row, created_at, _policy) =
+                self.registry.pond_info(&row.pond_id).map_err(to_status)?;
+            ponds.push(PondSummary {
+                pond_id: row.pond_id,
+                name: row.name,
+                owner: row.owner_identity,
+                created_at,
+                node_id: row.node_id,
+            });
+        }
+        Ok(Response::new(PondListResponse { ponds }))
+    }
+
     async fn audit_search(
         &self,
         req: Request<AuditSearchRequest>,

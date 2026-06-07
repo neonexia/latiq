@@ -1417,7 +1417,6 @@ dependencies = [
  "anyhow",
  "clap",
  "latiq-agent-core",
- "latiq-client",
  "latiq-common",
  "latiq-control-plane",
  "latiq-mcp",
