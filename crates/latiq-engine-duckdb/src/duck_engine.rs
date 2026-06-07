@@ -29,6 +29,14 @@ pub struct DuckEngine {
     instances: Mutex<HashMap<String, Arc<Mutex<PondInstance>>>>,
 }
 
+/// Lock a mutex, recovering the guard if a prior holder panicked. A poisoned
+/// pond/instances mutex must not brick the pond — the DuckDB connection (or map)
+/// is still usable, and the next statement either succeeds or returns a normal
+/// engine error.
+fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl DuckEngine {
     pub fn new() -> Self {
         Self::default()
@@ -36,7 +44,7 @@ impl DuckEngine {
 
     /// Get the pond's instance, opening (and caching) it on first use.
     fn instance(&self, loc: &PondLocation) -> Result<Arc<Mutex<PondInstance>>, EngineError> {
-        let mut map = self.instances.lock().expect("instances mutex poisoned");
+        let mut map = lock_recover(&self.instances);
         if let Some(inst) = map.get(&loc.catalog_uri) {
             return Ok(inst.clone());
         }
@@ -83,7 +91,7 @@ impl DuckEngine {
 impl QueryEngine for DuckEngine {
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError> {
         let inst = self.instance(loc)?;
-        let guard = inst.lock().expect("pond instance poisoned");
+        let guard = lock_recover(&inst);
         create_latiq_schema(&guard.conn)
     }
 
@@ -94,7 +102,7 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
         let inst = self.instance(loc)?;
-        let guard = inst.lock().expect("pond instance poisoned");
+        let guard = lock_recover(&inst);
         Self::run_with_abort(&guard, &abort, |i| run_read(i, sql))
     }
 
@@ -106,13 +114,13 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
         let inst = self.instance(loc)?;
-        let guard = inst.lock().expect("pond instance poisoned");
+        let guard = lock_recover(&inst);
         Self::run_with_abort(&guard, &abort, |i| run_write(i, sql, identity))
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
         let inst = self.instance(loc)?;
-        let guard = inst.lock().expect("pond instance poisoned");
+        let guard = lock_recover(&inst);
         run_explain(&guard, sql)
     }
 
@@ -121,13 +129,13 @@ impl QueryEngine for DuckEngine {
         // the pond's catalog file) is closed before storage deletes those files.
         // No-op if the pond was never opened. The Arc is dropped when the last
         // in-flight query on it finishes, closing the connection then.
-        let mut map = self.instances.lock().expect("instances mutex poisoned");
+        let mut map = lock_recover(&self.instances);
         map.remove(&loc.catalog_uri);
     }
 
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError> {
         let inst = self.instance(loc)?;
-        let guard = inst.lock().expect("pond instance poisoned");
+        let guard = lock_recover(&inst);
         let res = run_read(
             &guard,
             "SELECT name, row_count, comment FROM _latiq.tables_summary",
@@ -190,6 +198,37 @@ mod tests {
 
     fn instance_count(eng: &DuckEngine) -> usize {
         eng.instances.lock().unwrap().len()
+    }
+
+    #[test]
+    fn recovers_from_poisoned_mutex() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap();
+
+        // Poison the instances map: panic while holding its guard.
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let _g = eng.instances.lock().unwrap();
+            panic!("boom while holding the instances lock");
+        }));
+        assert!(r.is_err());
+
+        // Poison the per-pond instance mutex too (the query-path lock).
+        let inst = eng.instance(&loc).unwrap();
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let _g = inst.lock().unwrap();
+            panic!("boom while holding the pond instance lock");
+        }));
+        assert!(r.is_err());
+
+        // Both mutexes are poisoned, yet the pond must still be queryable —
+        // lock_recover recovers the guard instead of bricking the engine.
+        let ok = eng
+            .read_query(&loc, "SELECT 1 AS x", AbortToken::new())
+            .unwrap();
+        assert_eq!(ok.rows[0][0], serde_json::json!(1));
     }
 
     #[test]

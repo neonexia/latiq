@@ -65,7 +65,10 @@ impl Registry {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().expect("registry mutex poisoned")
+        // Recover the guard if a prior holder panicked: a poisoned registry mutex
+        // must not brick the whole control plane. The DuckDB connection is still
+        // usable; the next statement either succeeds or returns a normal error.
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn register_node(
@@ -388,5 +391,24 @@ mod tests {
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].operation, "read_query");
         assert_eq!(r.audit_search("agent-x", "1970-01-01").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovers_from_poisoned_mutex() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        let r = reg();
+        let rc = r.clone();
+        // Poison the connection mutex: panic while holding its guard.
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            let _g = rc.conn.lock().unwrap();
+            panic!("boom while holding the registry conn lock");
+        }));
+        assert!(res.is_err());
+
+        // The control plane must still serve reads/writes after the poison.
+        r.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 10)
+            .unwrap();
+        assert_eq!(r.list_nodes().unwrap().len(), 1);
+        assert!(r.list_ponds().unwrap().is_empty());
     }
 }
