@@ -258,27 +258,92 @@ impl AgentOps {
     }
 }
 
-/// Minimal SQL-shape redaction for the audit log: collapse quoted string and
-/// numeric literals to `?`. (A full parser-based redactor is future work.)
+/// Minimal SQL-shape redaction for the audit log: drop comments (so literals
+/// hidden in them can't leak), then collapse quoted-string and numeric *literals*
+/// to `?`. Identifiers that merely contain digits (`t1`, `events2`) are preserved.
+/// (A full parser-based redactor is future work.)
 fn redact_sql(sql: &str) -> String {
+    let decommented = strip_sql_comments(sql);
+    let mut out = String::with_capacity(decommented.len());
+    let mut chars = decommented.chars().peekable();
+    // Whether the previously emitted char was part of an identifier — a digit
+    // right after one (e.g. the `1` in `t1`) is part of that identifier, not a
+    // numeric literal, so it must not be collapsed.
+    let mut prev_ident = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                // String literal: consume to the closing quote, treating `''` as
+                // an escaped quote (not the terminator).
+                while let Some(n) = chars.next() {
+                    if n == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                out.push('?');
+                prev_ident = false;
+            }
+            d if d.is_ascii_digit() && !prev_ident => {
+                // Numeric literal: collapse the digit/decimal run.
+                while matches!(chars.peek(), Some(n) if n.is_ascii_digit() || *n == '.') {
+                    chars.next();
+                }
+                out.push('?');
+                prev_ident = false;
+            }
+            other => {
+                prev_ident = other.is_ascii_alphanumeric() || other == '_';
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
+/// Strip SQL comments (`-- … EOL` and `/* … */`), leaving string literals — and
+/// any `--`/`/*` *inside* them — untouched.
+fn strip_sql_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
-                // consume to the closing quote
-                for n in chars.by_ref() {
+                // Copy the whole string literal verbatim (with `''` escapes).
+                out.push('\'');
+                while let Some(n) = chars.next() {
+                    out.push(n);
                     if n == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            out.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                // Line comment: drop to (and keep) the newline.
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
                         break;
                     }
                 }
-                out.push('?');
             }
-            d if d.is_ascii_digit() => {
-                while matches!(chars.peek(), Some(n) if n.is_ascii_digit() || *n == '.') {
-                    chars.next();
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next(); // consume '*'
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
                 }
-                out.push('?');
+                out.push(' '); // keep a token separator
             }
             other => out.push(other),
         }
@@ -295,6 +360,42 @@ mod tests {
         assert_eq!(
             redact_sql("SELECT * FROM events WHERE id = 47 AND sev = 'high'"),
             "SELECT * FROM events WHERE id = ? AND sev = ?"
+        );
+    }
+
+    #[test]
+    fn redaction_preserves_identifiers_with_digits() {
+        // t1/t2/events2 are identifiers, not literals — they must survive.
+        assert_eq!(
+            redact_sql("SELECT t1.x FROM events2 AS t1 JOIN t2 ON t1.id = 5"),
+            "SELECT t1.x FROM events2 AS t1 JOIN t2 ON t1.id = ?"
+        );
+    }
+
+    #[test]
+    fn redaction_strips_line_comment_so_literals_do_not_leak() {
+        let r = redact_sql("SELECT 1 -- pw is 'hunter2'\nFROM t");
+        assert!(!r.contains("hunter2"), "literal leaked via comment: {r}");
+        assert!(!r.contains("pw is"), "comment text leaked: {r}");
+        assert_eq!(r, "SELECT ? \nFROM t");
+    }
+
+    #[test]
+    fn redaction_strips_block_comment() {
+        let r = redact_sql("SELECT /* secret 'hunter2' */ id FROM t");
+        assert!(!r.contains("hunter2"), "literal leaked via block comment: {r}");
+        assert!(!r.contains("secret"));
+        // The block comment becomes whitespace; the statement shape survives.
+        assert_eq!(r.split_whitespace().collect::<Vec<_>>(), ["SELECT", "id", "FROM", "t"]);
+    }
+
+    #[test]
+    fn redaction_handles_escaped_quote_and_keeps_dashes_in_strings() {
+        // `''` escape inside a literal, and a `--` that lives inside a string must
+        // NOT be treated as a comment — the whole literal collapses to one `?`.
+        assert_eq!(
+            redact_sql("INSERT INTO t VALUES ('it''s -- not a comment')"),
+            "INSERT INTO t VALUES (?)"
         );
     }
 }
