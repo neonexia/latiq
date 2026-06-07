@@ -116,6 +116,15 @@ impl QueryEngine for DuckEngine {
         run_explain(&guard, sql)
     }
 
+    fn forget_pond(&self, loc: &PondLocation) {
+        // Drop the cached instance so its DuckDB connection (and the open handle to
+        // the pond's catalog file) is closed before storage deletes those files.
+        // No-op if the pond was never opened. The Arc is dropped when the last
+        // in-flight query on it finishes, closing the connection then.
+        let mut map = self.instances.lock().expect("instances mutex poisoned");
+        map.remove(&loc.catalog_uri);
+    }
+
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError> {
         let inst = self.instance(loc)?;
         let guard = inst.lock().expect("pond instance poisoned");
@@ -177,5 +186,36 @@ mod tests {
             .read_query(&loc, "SELECT 1 AS x", AbortToken::new())
             .unwrap();
         assert_eq!(ok.rows[0][0], serde_json::json!(1));
+    }
+
+    fn instance_count(eng: &DuckEngine) -> usize {
+        eng.instances.lock().unwrap().len()
+    }
+
+    #[test]
+    fn forget_pond_evicts_cached_instance() {
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap(); // opens + caches the instance
+        assert_eq!(instance_count(&eng), 1, "init_pond should cache an instance");
+
+        eng.forget_pond(&loc);
+        assert_eq!(
+            instance_count(&eng),
+            0,
+            "forget_pond must evict the cached instance (else it leaks the connection)"
+        );
+
+        // Idempotent: forgetting an unknown / already-forgotten pond is a no-op.
+        eng.forget_pond(&loc);
+        assert_eq!(instance_count(&eng), 0);
+
+        // The pond is still usable afterward — a new query re-opens it lazily.
+        let ok = eng
+            .read_query(&loc, "SELECT 1 AS x", AbortToken::new())
+            .unwrap();
+        assert_eq!(ok.rows[0][0], serde_json::json!(1));
+        assert_eq!(instance_count(&eng), 1, "query should re-open the instance");
     }
 }

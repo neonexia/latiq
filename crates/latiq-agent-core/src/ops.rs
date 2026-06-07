@@ -124,7 +124,14 @@ impl AgentOps {
         let pond_id = self.control.resolve_pond(pond_ref).await?;
         self.inflight.cancel_for_pond(&pond_id);
         self.control.drop_pond(&pond_id).await?;
-        let _ = self.storage.drop_pond(Self::parse_id(&pond_id)?);
+        let pid = Self::parse_id(&pond_id)?;
+        // Evict the cached engine instance (closing its connection to the catalog)
+        // BEFORE deleting the files out from under it. Best-effort: a pond that was
+        // never queried has no location/instance to forget.
+        if let Ok(loc) = self.storage.pond_location(pid) {
+            self.engine.forget_pond(&loc);
+        }
+        let _ = self.storage.drop_pond(pid);
         self.audit(identity, "drop_pond", Some(&pond_id), None, 0)
             .await;
         Ok(())

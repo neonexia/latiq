@@ -45,4 +45,9 @@ pub trait QueryEngine: Send + Sync {
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError>;
     /// Summarize the pond's user tables (for describe_pond).
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError>;
+    /// Evict any cached engine state for a pond (called on drop_pond). After this
+    /// the engine must hold no open handles to the pond's catalog/data files, so a
+    /// subsequent storage delete leaves nothing dangling. Idempotent: forgetting an
+    /// unknown pond is a no-op.
+    fn forget_pond(&self, loc: &PondLocation);
 }
