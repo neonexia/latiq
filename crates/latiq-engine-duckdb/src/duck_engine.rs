@@ -198,7 +198,11 @@ mod tests {
         let loc = fs.create_pond(PondId::new()).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap(); // opens + caches the instance
-        assert_eq!(instance_count(&eng), 1, "init_pond should cache an instance");
+        assert_eq!(
+            instance_count(&eng),
+            1,
+            "init_pond should cache an instance"
+        );
 
         eng.forget_pond(&loc);
         assert_eq!(
