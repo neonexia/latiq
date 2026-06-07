@@ -76,6 +76,70 @@ impl LatiqClient {
         self.call("explain_query", query_args(pond, sql)).await
     }
 
+    // --- agent-discovery surface (tools/resources/prompts) ---------------
+
+    /// All tools, with their MCP annotations (for inspecting read_only/destructive hints).
+    pub async fn list_tools(&self) -> Result<Vec<rmcp::model::Tool>> {
+        Ok(self.service.list_all_tools().await?)
+    }
+
+    /// Resource URIs advertised by the server.
+    pub async fn list_resource_uris(&self) -> Result<Vec<String>> {
+        Ok(self
+            .service
+            .list_all_resources()
+            .await?
+            .into_iter()
+            .map(|r| r.uri.clone())
+            .collect())
+    }
+
+    /// Read a resource's text body.
+    pub async fn read_resource_text(&self, uri: &str) -> Result<String> {
+        let res = self
+            .service
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(uri))
+            .await?;
+        let text = res
+            .contents
+            .into_iter()
+            .find_map(|c| match c {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default();
+        Ok(text)
+    }
+
+    /// Prompt names advertised by the server.
+    pub async fn list_prompt_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .service
+            .list_all_prompts()
+            .await?
+            .into_iter()
+            .map(|p| p.name)
+            .collect())
+    }
+
+    /// Render a prompt (returns the concatenated message text).
+    pub async fn get_prompt_text(&self, name: &str, args: Map<String, Value>) -> Result<String> {
+        let mut params = rmcp::model::GetPromptRequestParams::default();
+        params.name = name.to_string();
+        params.arguments = Some(args);
+        let res = self.service.get_prompt(params).await?;
+        let text = res
+            .messages
+            .into_iter()
+            .filter_map(|m| match m.content {
+                rmcp::model::PromptMessageContent::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(text)
+    }
+
     /// Cleanly close the client session.
     pub async fn close(self) -> Result<()> {
         let _ = self.service.cancel().await;

@@ -2,15 +2,21 @@
 //! Identity is relaxed (Slice 0+): taken from an optional `agent_id` argument,
 //! defaulting to anonymous. (M6 moves this to the `X-Latiq-Agent-Id` header.)
 use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
+use crate::resources;
 use latiq_agent_core::AgentOps;
 use latiq_common::Identity;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
+    ServerCapabilities, ServerInfo,
+};
 use rmcp::schemars::JsonSchema;
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -226,8 +232,57 @@ This makes you thrifty rather than greedy. Read-only and side-effect-free.",
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LatiqServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Latiq — the agent-native data pond. Allocate a pond, write/read SQL, attach nothing (federation is later). Errors carry suggest/see guidance.")
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_instructions(
+            "Latiq — the agent-native data pond. Allocate a pond, write/read SQL with native \
+attribution. Read latiq://guidance to start; tool errors carry suggest/see links to \
+latiq:// resources. Prompts provide SOPs for common multi-agent workflows.",
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(
+            resources::list_resources(),
+        ))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        resources::read_resource(&request.uri).ok_or_else(|| {
+            McpError::resource_not_found(format!("unknown resource: {}", request.uri), None)
+        })
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        Ok(ListPromptsResult::with_all_items(resources::list_prompts()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        let args = request.arguments.unwrap_or_default();
+        resources::get_prompt(&request.name, &args).ok_or_else(|| {
+            McpError::invalid_params(format!("unknown prompt: {}", request.name), None)
+        })
     }
 }
 

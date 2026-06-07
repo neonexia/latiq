@@ -21,5 +21,6 @@ tonic = { workspace = true }
 [dev-dependencies]
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-agent-core = { path = "../latiq-agent-core" }
+latiq-client = { path = "../latiq-client" }
 tokio-stream = { workspace = true }
 tempfile = { workspace = true }
