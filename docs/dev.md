@@ -111,13 +111,13 @@ The CLI is a **gRPC client.** Connection options come from two flag groups:
 
 > `pond list` reads the **control plane**, so it works even when the pond node is down. The other data ops need the pond node.
 
-The examples below call `latiq` directly. Get it on your PATH once:
+The examples below call `latiq` directly. For dev, just put the build output on your PATH — every `cargo build` refreshes the binary in place, so there's nothing to reinstall:
 
 ```bash
-cargo install --path crates/latiq    # installs `latiq` into ~/.cargo/bin
+export PATH="$PWD/target/debug:$PATH"     # or target/release after `cargo build --release`
 ```
 
-Or, without installing, use the built binary (`target/debug/latiq <cmd>`) or `cargo run -q -p latiq -- <cmd>` in place of `latiq` below.
+For a production/global install instead, `cargo install --path crates/latiq` drops `latiq` into `~/.cargo/bin` (re-run after each change to update it).
 
 ### Pond lifecycle
 
