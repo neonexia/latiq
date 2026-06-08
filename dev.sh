@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Start a Latiq dev stack: control-plane + one pond-node, print endpoints.
-# All addresses/paths are overridable via flags so you can run alongside other
-# services. See ./dev.sh --help.
+# Ports are overridable via flags so you can run alongside other services.
+# Everything binds to 127.0.0.1 (prod deployments like k8s bind loopback anyway).
+# See ./dev.sh --help.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CONTROL_ADDR=127.0.0.1:9090
-ADMIN_ADDR=127.0.0.1:9091
-MCP_ADDR=127.0.0.1:8080
-DATA_ADDR=127.0.0.1:8081
+HOST=127.0.0.1
+CONTROL_PORT=9090
+ADMIN_PORT=9091
+MCP_PORT=8080
+DATA_PORT=8081
 DB=./latiq-cp.duckdb
 DATA=./latiq-data
 
@@ -16,26 +18,27 @@ usage() {
   cat <<EOF
 Usage: ./dev.sh [options]
 
-  --control-addr <host:port>  Control gRPC bind   (default $CONTROL_ADDR)
-  --admin-addr   <host:port>  Admin gRPC bind     (default $ADMIN_ADDR)
-  --mcp-addr     <host:port>  MCP-over-HTTP bind  (default $MCP_ADDR)
-  --data-addr    <host:port>  Data/Query gRPC bind(default $DATA_ADDR)
-  --db           <path>       Registry DuckDB file(default $DB)
-  --data-dir     <path>       Pond storage root   (default $DATA)
-  -h, --help                  Show this help
+  --control-port <port>  Control gRPC port    (default $CONTROL_PORT)
+  --admin-port   <port>  Admin gRPC port      (default $ADMIN_PORT)
+  --mcp-port     <port>  MCP-over-HTTP port   (default $MCP_PORT)
+  --data-port    <port>  Data/Query gRPC port (default $DATA_PORT)
+  --db           <path>  Registry DuckDB file (default $DB)
+  --data-dir     <path>  Pond storage root    (default $DATA)
+  -h, --help             Show this help
+
+Everything binds to $HOST.
 
 Example (run alongside another stack):
-  ./dev.sh --control-addr 127.0.0.1:19090 --admin-addr 127.0.0.1:19091 \\
-           --mcp-addr 127.0.0.1:18080 --data-addr 127.0.0.1:18081
+  ./dev.sh --control-port 19090 --admin-port 19091 --mcp-port 18080 --data-port 18081
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --control-addr) CONTROL_ADDR=$2; shift 2 ;;
-    --admin-addr)   ADMIN_ADDR=$2;   shift 2 ;;
-    --mcp-addr)     MCP_ADDR=$2;     shift 2 ;;
-    --data-addr)    DATA_ADDR=$2;    shift 2 ;;
+    --control-port) CONTROL_PORT=$2; shift 2 ;;
+    --admin-port)   ADMIN_PORT=$2;   shift 2 ;;
+    --mcp-port)     MCP_PORT=$2;     shift 2 ;;
+    --data-port)    DATA_PORT=$2;    shift 2 ;;
     --db)           DB=$2;           shift 2 ;;
     --data-dir)     DATA=$2;         shift 2 ;;
     -h|--help)      usage; exit 0 ;;
@@ -43,21 +46,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+CONTROL_ADDR=$HOST:$CONTROL_PORT
+ADMIN_ADDR=$HOST:$ADMIN_PORT
+MCP_ADDR=$HOST:$MCP_PORT
+DATA_ADDR=$HOST:$DATA_PORT
+
 # Fail early (with the culprit) if a port is already taken — a stale stack or
 # another service squatting on it is the usual cause of confusing startup errors.
 check_port() {
-  local addr=$1 name=$2 port=${1##*:}
+  local port=$1 name=$2
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "ERROR: $name port $addr is already in use by:" >&2
+    echo "ERROR: $name port $port is already in use by:" >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
-    echo "Free it, or pick another port, e.g. ./dev.sh --control-addr 127.0.0.1:19090" >&2
+    echo "Free it, or pick another port, e.g. ./dev.sh --control-port 19090" >&2
     exit 1
   fi
 }
-check_port "$CONTROL_ADDR" "Control gRPC"
-check_port "$ADMIN_ADDR" "Admin gRPC"
-check_port "$MCP_ADDR" "MCP"
-check_port "$DATA_ADDR" "Data gRPC"
+check_port "$CONTROL_PORT" "Control gRPC"
+check_port "$ADMIN_PORT" "Admin gRPC"
+check_port "$MCP_PORT" "MCP"
+check_port "$DATA_PORT" "Data gRPC"
 
 echo "Building latiq..."
 cargo build -p latiq

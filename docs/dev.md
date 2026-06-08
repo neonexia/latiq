@@ -64,11 +64,10 @@ Admin gRPC (ops):     127.0.0.1:9091
 
 Runtime artifacts land in `./latiq-cp.duckdb` (registry) and `./latiq-data/` (pond storage) — both gitignored.
 
-`dev.sh` preflights all four ports and aborts (naming the culprit) if one is taken — so a stale stack or another service on `:9090` fails loudly instead of producing confusing gRPC errors. Everything is overridable via flags (`./dev.sh --help`):
+`dev.sh` preflights all four ports and aborts (naming the culprit) if one is taken — so a stale stack or another service on `:9090` fails loudly instead of producing confusing gRPC errors. Ports and paths are overridable via flags (`./dev.sh --help`); everything binds to `127.0.0.1`:
 
 ```bash
-./dev.sh --control-addr 127.0.0.1:19090 --admin-addr 127.0.0.1:19091 \
-         --mcp-addr 127.0.0.1:18080 --data-addr 127.0.0.1:18081 \
+./dev.sh --control-port 19090 --admin-port 19091 --mcp-port 18080 --data-port 18081 \
          --db /tmp/cp.duckdb --data-dir /tmp/ponds
 ```
 
