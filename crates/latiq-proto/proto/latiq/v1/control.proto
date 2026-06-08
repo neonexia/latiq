@@ -8,7 +8,18 @@ service Control {
   rpc GetPondLocation(GetPondLocationRequest) returns (GetPondLocationResponse);
   rpc DropPondAssignment(DropPondAssignmentRequest) returns (DropPondAssignmentResponse);
   rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
+  rpc ListPonds(ListPondsRequest) returns (ListPondsResponse);
+  rpc GetPondInfo(GetPondInfoRequest) returns (GetPondInfoResponse);
 }
+
+message PondInfoMsg {
+  string pond_id = 1; string name = 2; string owner = 3;
+  string created_at = 4; string policy_json = 5;
+}
+message ListPondsRequest { }
+message ListPondsResponse { repeated PondInfoMsg ponds = 1; }
+message GetPondInfoRequest { string pond_ref = 1; }
+message GetPondInfoResponse { PondInfoMsg pond = 1; }
 
 message RegisterNodeRequest { string node_id = 1; string mcp_endpoint = 2; string internal_endpoint = 3; uint32 capacity = 4; }
 message RegisterNodeResponse { }

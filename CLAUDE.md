@@ -4,79 +4,88 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current state
 
-Implementation has begun. The repo is a **Cargo workspace** (10 crates under `crates/`) — the M1 spike and M2 (workspace + kernel) of "Slice 0+" are done; M3–M7 are not yet built.
+**Slice 0+ M1–M7 are complete and runnable** (two-process stack: control-plane + pond-node, plus the `latiq` CLI). **M8–M11 are in progress** — a deliberate architecture reshaping (see "Surfaces" + "Design invariants" below): MCP becomes the *agent-only* layer, and CLI/SDK move to dedicated **gRPC** APIs.
 
-**Read these first, in order:**
-- `docs/superpowers/specs/2026-06-04-latiq-slice0-design.md` — **the authoritative design** for the current build (Slice 0+). Supersedes `docs/m1_design.md` where they differ.
-- `docs/superpowers/plans/2026-06-04-latiq-slice0-m1-m2.md` — the executed M1+M2 plan.
-- `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs (rmcp `StreamableHttpService`, DuckLake `set_commit_message` attribution, `interrupt_handle()` cancellation, the rmcp client-disconnect gap).
-- `docs/product_spec.md`, `docs/m1_design.md` — original product vision + full M1 design (background).
-
-**What exists now:** `latiq-common` (Identity, ErrorEnvelope/ErrorKind, QueryMeta, PondId — all tested), `latiq-proto` (Control + Admin gRPC, tonic codegen), the `latiq` binary (clap subcommand skeleton), CI, and a throwaway `spike/` crate (NOT a workspace member — exploratory only). The other crates are empty stubs awaiting M3+.
-
-**Build/test commands** (run from repo root):
-- `cargo build` / `cargo test --workspace` — workspace excludes `spike/`.
-- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — CI gates; keep both green.
-- `latiq-proto` codegen needs **`protoc`** on PATH (`brew install protobuf`).
-- The intended target is a **single binary** (`latiq`) serving roles via subcommand (`control-plane`, `pond-node`) — don't introduce a second language or multi-binary layout. M3+ continues per the spec's build order (§12).
+**Read first, in order:**
+- `docs/usage.md` — how to run and manually test the current system (`./dev.sh`).
+- `docs/superpowers/specs/2026-06-04-latiq-slice0-design.md` — authoritative design. Supersedes `docs/m1_design.md` where they differ.
+- This file's **Design invariants** — the rules that must not drift.
+- Per-crate `crates/*/CLAUDE.md` — local invariants for that crate.
+- `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs.
 
 ## What Latiq is
 
-A data system whose customer is an AI agent, not a human. Agents allocate ephemeral workspaces called **ponds**, write/query data with SQL, attach admin-curated external data sources ("catalogs"), and collaborate with other agents in a shared pond. Operators administer the deployment but never touch the agent surface.
+An agent-native data system. Agents allocate ephemeral **ponds** (DuckLake workspaces), write/read SQL, collaborate, and release them. Operators administer the deployment; humans/programs (CLI, SDK) drive it programmatically. DuckLake is the storage spec; DuckDB is the M1 engine.
 
-## Architecture (from `m1_design.md`)
+## Surfaces & audiences (the spine of the design)
 
-One binary, three roles via subcommand:
+**Three external surfaces, three distinct audiences. Do not blur them.**
 
-```
-latiq control-plane    # stateful registry (Postgres; SQLite in dev)
-latiq pond-node        # hosts ponds, terminates agent MCP calls, executes queries
-latiq dev              # both roles in one process, for development
-latiq <admin command>  # CLI client for operators (catalog/credential/node/audit ...)
-```
+| Surface | Audience | Lives on | Carries |
+|---|---|---|---|
+| **MCP-over-HTTP** | **Agents only** (frontier LLMs) | pond node | the agent tools + resources + prompts + guidance |
+| **Data/Query gRPC** | **CLI + SDK** (not agents) | pond node | allocate / drop / read / write / explain |
+| **Admin gRPC** | **Operators** | control plane | node / policy / audit + pond list/describe (metadata reads) |
 
-Three tiers:
+Plus one internal surface: **Control gRPC** (pond-node → control-plane; routing/registry/audit writes).
 
-- **Control plane** — routing table (pond → node), pond registry, catalog registry, audit log, OIDC verification config, node health. **Never in the data path.** Two gRPC surfaces: *Control gRPC* (pond nodes call it) and *Admin gRPC* (the CLI calls it). These are distinct surfaces with distinct auth.
-- **Pond nodes** — each is simultaneously *owner* (ponds on its local disk), *proxy* (forwards queries for ponds it doesn't own), and *MCP gateway* (terminates agent HTTP). Storage engine is **DuckDB + DuckLake**; pond data lives at `/var/lib/latiq/ponds/<pond-id>/` (`catalog.sqlite`, `data/` Parquet, `metadata.json`).
-- **Load balancer** — standard L7 (nginx/envoy). No Latiq-specific logic; pond nodes route internally.
+## Design invariants (DO NOT DRIFT)
 
-Three protocols:
+1. **MCP is the agent layer ONLY.** The CLI and SDK are **not agents** and must **never** use MCP. `latiq-client` (the MCP client) is for agent-simulation + MCP integration tests only.
+2. **CLI/SDK speak gRPC.** Data ops (allocate/drop/read/write/explain) → **Data/Query gRPC on the pond node**. Metadata reads (pond list/describe) + admin (node/policy/audit) → **Admin gRPC on the control plane**.
+3. **The control plane is NEVER in the query data path.** Queries execute on the **pond node** only. The control plane holds the registry/routing/policy/audit — metadata, never data.
+4. **Split by ownership.** The pond node owns storage + engine (so allocate/drop/queries go there). The control plane owns the registry (so pure metadata reads go there, and work even when pond nodes are down).
+5. **`latiq-agent-core` is PROTOCOL-NEUTRAL.** No MCP / gRPC / HTTP / transport types may appear in `latiq-agent-core`. Every surface (MCP, Data gRPC, future A2A) is an **inbound adapter** that maps its protocol onto `AgentOps`. **A new surface is a new adapter, never a change to the core.**
+6. **Pure DuckLake — nothing on top.** Attribution rides DuckLake's native `set_commit_message`; the `_latiq` schema is read-only **views** over DuckLake/DuckDB metadata. No Latiq-maintained shadow store of pond data/snapshots/attribution. (Governance/policy metadata in the control-plane registry is a *different plane* and is allowed.)
+7. **One DuckDB instance per pond** (mutex-guarded, reused across queries). Required for concurrent-write correctness — independent instances racing on one DuckLake catalog file lose writes. Never go back to instance-per-query.
+8. **Hard separation of surfaces.** Agents (MCP) cannot do admin; operators (Admin gRPC) are not agents; data clients (Data gRPC) are not agents. Different transports, different audiences, different audit attribution.
+9. **Identity is relaxed in M1** (claimed, default `anonymous`, `verified:false`), carried by a header (MCP) / gRPC metadata (gRPC). OIDC verification is M2.
+10. **Don't test DuckDB; test our integration with it.** DuckDB is a production engine. Test *our* code and *our* boundary: cell→JSON conversion, the read/write/explain guards, cancellation + prompt resource release, concurrency correctness, attribution plumbing, the `_latiq` views. Never assert DuckDB SQL semantics.
+11. **Single binary** (`latiq`) for all roles. `protoc` required to build (`brew install protobuf`).
+12. **Make it boring.** Predictable behavior, structured errors (`kind`/`message`/`suggest`/`see`), good defaults. Cleverness waits for later slices.
 
-- **MCP-over-HTTP (Streamable HTTP)** — the only agent-facing surface, versioned at `/mcp/v1/`. Targets the 2026-07-28 MCP spec. Requests carry `Mcp-Method` / `Mcp-Name` headers so the LB can route without parsing the body.
-- **Internal Flight SQL over gRPC** — pond-node-to-pond-node proxy hops only. **Not exposed externally in M1** (that ships with the Python SDK in M2). Arrow batches are converted to JSON Lines at the pond node edge before reaching the agent.
-- **Control/Admin gRPC** — internal + operator surfaces described above.
+## Crates (`crates/`)
 
-The load-bearing flow is the agent query (`m1_design.md` §3): LB → any pond node A → A validates identity → A asks control plane where the pond lives (no caching in M1) → A executes locally or proxies to owner B over Flight SQL → Arrow batches stream back → A converts to JSON Lines over HTTP chunked transfer → final `{"_meta": {...}}` frame → async audit write.
+- `latiq` — the single binary: server roles (`control-plane`, `pond-node`) + the CLI (gRPC client; **not** an MCP client).
+- `latiq-common` — kernel: `Identity`, `ErrorEnvelope`/`ErrorKind`, `QueryMeta`, `PondId`.
+- `latiq-proto` — gRPC contracts: Control, Admin, and **Data/Query** services (tonic codegen).
+- `latiq-agent-core` — **protocol-neutral** `AgentOps` + `ControlPlane` trait + in-flight/abort registry. No transport types (invariant 5).
+- `latiq-mcp` — **inbound adapter**: MCP-over-HTTP (rmcp) → `AgentOps`. Agent-only.
+- *(M8)* the Data/Query gRPC **inbound adapter** → `AgentOps` (in `latiq-pond-node` or its own crate).
+- `latiq-client` — MCP client. **Agent-sim / MCP tests only** (invariant 1).
+- `latiq-engine` (`QueryEngine` trait) + `latiq-engine-duckdb` (DuckDB/DuckLake adapter, instance-per-pond).
+- `latiq-storage` — `PondStorage`: LocalFs + TempFs.
+- `latiq-control-plane` — DuckDB registry + migrations + Control/Admin gRPC. Sole writer to its registry; never in the query path.
+- `latiq-pond-node` — wires surfaces + `AgentOps` + engine + storage + `GrpcControlPlane`; node registration/heartbeat.
 
-## The agent MCP surface (10 tools)
+## Test taxonomy (so we can run targeted tests per change)
 
-- Lifecycle: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`
-- Query: `read_query` (SELECT only), `write_query` (INSERT/UPDATE/DELETE/DDL/CTAS), `explain_query` (cost estimation, read-only planner)
-- Catalog: `list_catalogs`, `attach_catalog`, `detach_catalog`
+Tests are categorized by **layer** and **surface/feature** so a given change runs a known subset.
 
-`read_query`/`write_query` are split so MCP tool annotations are static and accurate (auto-approve reads, require confirmation for destructive writes). Plus MCP **Prompts** (parameterized SOPs) and **Resources** (`latiq://` recipes/troubleshooting/reference). Metadata is exposed not as tools but as SQL views in a reserved per-pond `_latiq` schema (`pond_info`, `snapshots`, `attribution`, `tables_summary`, `sources`) — writes to `_latiq.*` are blocked.
+**Layers:**
+- **Unit** (`#[test]` in `src/`) — pure logic, per crate. Run: `cargo test -p <crate> --lib`.
+- **Crate integration** (`crates/<crate>/tests/*.rs`) — that crate's public API over real deps (e.g. engine lifecycle, gRPC round-trip). Run: `cargo test -p <crate> --test '*'`.
+- **Full-stack e2e** (`crates/latiq/tests/<surface>.rs`) — the whole stack in-process via the harness, one file per surface. Run: `cargo test -p latiq --test <surface>`.
 
-## Non-negotiable constraints
+**Conventions (keep these so targeting works):**
+- One e2e file per **surface**: `tests/mcp.rs`, `tests/query_grpc.rs`, `tests/admin.rs`. (`tests/common/mod.rs` = the shared harness.)
+- Test fn names start with the **feature**: `pond_lifecycle_*`, `sql_read_write_*`, `attribution_*`, `result_encoding_*`, `inline_cap_*`, `cancellation_*`, `concurrency_*`, `ingestion_*`, `audit_*`, `policy_*`, `error_contract_*`. Both a `_happy` and the relevant `_edge`/error cases exist for every feature.
+- **Run a feature across surfaces:** `cargo test <feature_prefix>` (name filter), e.g. `cargo test attribution`.
+- **Run a surface:** `cargo test -p latiq --test query_grpc`.
+- Every feature add/change ships with its tests **in the same commit** (interleaved, not deferred).
 
-When implementing, these four principles (`m1_design.md` §16) override convenience. If a change is in tension, resolve in favor of the agent:
+**Common targets:**
+- Engine change → `cargo test -p latiq-engine-duckdb`
+- MCP surface change → `cargo test -p latiq-mcp && cargo test -p latiq --test mcp`
+- Data gRPC change → `cargo test -p latiq --test query_grpc`
+- Control plane change → `cargo test -p latiq-control-plane && cargo test -p latiq --test admin`
+- Everything → `cargo test --workspace`
 
-1. **The agent is the customer.** Agent-serving features go in the MCP surface; operator features go in the Admin API / CLI. Never blur them.
-2. **Hard separation between MCP and Admin surfaces.** Different transports, different auth, different audit trails. An agent cannot register catalogs, manage credentials, or configure nodes. An admin never appears as an agent.
-3. **One pond, one node.** Cross-catalog joins *inside* a pond are the feature. Cross-pond joins, distributed query, and multi-node ponds are explicitly out — don't add them.
-4. **Make it boring.** M1 is the predictable floor (clear errors, good defaults). Cleverness waits for M2/M3.
+## Build commands
 
-Additional invariants worth holding onto:
+- `cargo build` / `cargo test --workspace` (excludes `spike/`); first build compiles DuckDB from source (slow once).
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — keep green (run manually; no CI workflow, per direction).
 
-- **Agents never see credentials, URIs, or connection strings.** Admins register catalogs + credentials (Vault first) via CLI; agents pick from a curated menu by name. Credentials are fetched from the store at attach time and discarded, never persisted by Latiq.
-- **Identity is mandatory; verification is optional.** OIDC verification is admin-toggleable; when off, the `X-Latiq-Agent-Id` header is trusted and audited as `verified: false`. Every operation produces an audit entry.
-- **Audit records SQL shape, not content.** Literal values become `?` placeholders; parameters are counted not logged; query results never enter the audit log.
-- **MCP surface is versioned and stable within `/mcp/v1/`.** Additions allowed; renames/removals are not.
+## Scope / deferrals (later slices)
 
-## MCP UX is the product
-
-`m1_design.md` §4a is required reading for anything touching the agent surface. The prose in tool descriptions, errors, warnings, and resources is read by LLMs far more than by humans. Concretely: tool descriptions are mini-tutorials with concrete SQL examples and do/don't pairs; errors carry `what_failed` / `why` / `try` (and `did_you_mean` / `example` when relevant); suboptimal-but-successful operations return success with `warnings`; every query response carries a `_meta` block. Write directly and declaratively — no hedging, no apologetic errors, no aspirational docs for unbuilt features.
-
-## Scope discipline
-
-Out of M1 (don't build these without an explicit decision): Python SDK / externally-exposed Flight SQL, streaming ingestion (Kafka/CDC), Kubernetes/multi-host production deployment, cross-pond joins, per-pond ACLs / column-level security, disk quotas, live credential rotation, management UI, DataFusion engine. See `m1_design.md` §1 and §17 for the full deferred list and the milestone each maps to.
+External catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, multi-node + proxy hops, Arrow **Flight SQL streaming** for large result sets (M1 Data gRPC is unary + bounded by the inline cap), Kubernetes, DataFusion engine. Don't build these without an explicit decision.

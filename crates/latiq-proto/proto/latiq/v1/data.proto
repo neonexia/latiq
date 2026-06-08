@@ -1,0 +1,28 @@
+syntax = "proto3";
+package latiq.v1;
+
+// Data/Query surface — for the CLI and SDK (NOT agents; agents use MCP).
+// Served by the pond node (it owns the engine + storage). Unary + bounded by
+// the inline cap in M1; Arrow Flight SQL streaming for large results is M2.
+// Identity is carried in gRPC metadata key `latiq-agent-id` (relaxed; default
+// anonymous). Errors are returned as a tonic Status whose code maps from the
+// ErrorKind and whose `details` carry the JSON-encoded ErrorEnvelope.
+service Data {
+  rpc AllocatePond(AllocatePondRequest) returns (AllocatePondResponse);
+  rpc DropPond(DropPondRequest) returns (DropPondResponse);
+  rpc DescribePond(DescribePondRequest) returns (JsonResponse);
+  rpc ReadQuery(QueryRequest) returns (JsonResponse);
+  rpc WriteQuery(QueryRequest) returns (JsonResponse);
+  rpc ExplainQuery(QueryRequest) returns (JsonResponse);
+}
+
+message AllocatePondRequest { string name = 1; string policy_json = 2; }
+message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }
+message DropPondRequest { string pond = 1; bool confirm = 2; }
+message DropPondResponse { }
+message DescribePondRequest { string pond = 1; }
+message QueryRequest { string pond = 1; string sql = 2; }
+
+// Carries a serialized JSON object: for queries `{columns, rows, statement,
+// status, _meta}`; for describe `{pond, schema}`.
+message JsonResponse { string json = 1; }
