@@ -76,26 +76,40 @@ PN_PID=""
 cleanup() { kill "$CP_PID" "$PN_PID" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
 
-# A backgrounded server that's already gone died on startup — surface it.
-alive() {
-  if ! kill -0 "$1" 2>/dev/null; then
-    echo "ERROR: $2 exited during startup (see its error above)." >&2
-    exit 1
-  fi
+# Wait until a backgrounded server is accepting connections on all its ports,
+# failing fast if it dies first. Avoids the startup race where the pond-node
+# tries to register before the control plane is listening.
+wait_ready() {
+  local pid=$1 name=$2
+  shift 2
+  local ports=("$@")
+  local i p all_up
+  for ((i = 0; i < 150; i++)); do
+    kill -0 "$pid" 2>/dev/null || {
+      echo "ERROR: $name exited during startup (see its error above)." >&2
+      exit 1
+    }
+    all_up=1
+    for p in "${ports[@]}"; do
+      (exec 3<>"/dev/tcp/$HOST/$p") 2>/dev/null && exec 3>&- 3<&- || all_up=0
+    done
+    [[ $all_up -eq 1 ]] && return 0
+    sleep 0.2
+  done
+  echo "ERROR: $name did not start listening (ports: ${ports[*]}) in time." >&2
+  exit 1
 }
 
 echo "Starting control-plane (Control $CONTROL_ADDR, Admin $ADMIN_ADDR)..."
 "$BIN" control-plane --control-addr "$CONTROL_ADDR" --admin-addr "$ADMIN_ADDR" --db "$DB" &
 CP_PID=$!
-sleep 2
-alive "$CP_PID" "control-plane"
+wait_ready "$CP_PID" "control-plane" "$CONTROL_PORT" "$ADMIN_PORT"
 
 echo "Starting pond-node (MCP $MCP_ADDR, Data $DATA_ADDR)..."
 "$BIN" pond-node --node-id node-1 --mcp-addr "$MCP_ADDR" --data-addr "$DATA_ADDR" \
   --control "http://$CONTROL_ADDR" --data-dir "$DATA" &
 PN_PID=$!
-sleep 2
-alive "$PN_PID" "pond-node"
+wait_ready "$PN_PID" "pond-node" "$DATA_PORT" "$MCP_PORT"
 
 cat <<EOF
 
