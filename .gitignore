@@ -2,3 +2,8 @@
 /spike/target
 **/*.rs.bk
 .DS_Store
+
+# dev.sh runtime artifacts
+/latiq-data
+/latiq-cp.duckdb
+/latiq-cp.duckdb.wal

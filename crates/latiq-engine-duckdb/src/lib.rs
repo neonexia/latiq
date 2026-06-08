@@ -1,1 +1,6 @@
-//! latiq-engine-duckdb — see docs/superpowers/specs/2026-06-04-latiq-slice0-design.md
+//! latiq-engine-duckdb — DuckDB + DuckLake implementation of QueryEngine.
+pub mod duck_engine;
+pub mod exec;
+pub mod instance;
+pub mod latiq_schema;
+pub use duck_engine::DuckEngine;

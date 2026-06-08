@@ -1,0 +1,10 @@
+[package]
+name = "latiq-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rmcp = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

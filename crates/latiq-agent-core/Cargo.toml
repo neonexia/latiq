@@ -4,3 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+latiq-common = { path = "../latiq-common" }
+latiq-storage = { path = "../latiq-storage" }
+latiq-engine = { path = "../latiq-engine" }
+latiq-control-plane = { path = "../latiq-control-plane" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
+tempfile = { workspace = true }
