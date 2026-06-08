@@ -68,6 +68,15 @@ Runtime artifacts land in `./latiq-cp.duckdb` (registry) and `./latiq-data/` (po
 LATIQ_DB=/tmp/cp.duckdb LATIQ_DATA=/tmp/ponds ./dev.sh
 ```
 
+`dev.sh` preflights all four ports and aborts (naming the culprit) if one is taken — so a stale stack or another service on `:9090` fails loudly instead of producing confusing gRPC errors. Run on different ports with `LATIQ_CONTROL_ADDR` / `LATIQ_ADMIN_ADDR` / `LATIQ_MCP_ADDR` / `LATIQ_DATA_ADDR`:
+
+```bash
+LATIQ_CONTROL_ADDR=127.0.0.1:19090 LATIQ_ADMIN_ADDR=127.0.0.1:19091 \
+LATIQ_MCP_ADDR=127.0.0.1:18080 LATIQ_DATA_ADDR=127.0.0.1:18081 ./dev.sh
+```
+
+(Point the CLI at the matching ports with `--endpoint` / `--admin`.)
+
 ### Manual start (two terminals)
 
 Run the roles yourself to control their flags:
@@ -116,8 +125,6 @@ The examples below call `latiq` directly. For dev, just put the build output on 
 ```bash
 export PATH="$PWD/target/debug:$PATH"     # or target/release after `cargo build --release`
 ```
-
-For a production/global install instead, `cargo install --path crates/latiq` drops `latiq` into `~/.cargo/bin` (re-run after each change to update it).
 
 ### Pond lifecycle
 
