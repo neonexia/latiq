@@ -3,10 +3,5 @@
 **/*.rs.bk
 .DS_Store
 
-# dev.sh runtime artifacts
-/latiq-data
-/latiq-cp.duckdb
-/latiq-cp.duckdb.wal
-
-# dev.sh runtime root
-.latiq-dev/
+# Local override if you point --root at the repo (default is ~/.latiq, outside the tree).
+/.latiq
