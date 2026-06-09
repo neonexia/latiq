@@ -101,9 +101,11 @@ impl AgentOps {
     ) -> Result<DescribeResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
         let pid = Self::parse_id(&info.pond_id)?;
+        // ensure_pond materializes storage on first touch — a pond assigned by
+        // the control plane (no eager allocate) gets its catalog created here.
         let loc = self
             .storage
-            .pond_location(pid)
+            .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         let engine = self.engine.clone();
         let loc2 = loc.clone();
@@ -192,9 +194,11 @@ impl AgentOps {
     ) -> Result<QueryResult, AgentError> {
         let pond_id = self.control.resolve_pond(pond_ref).await?;
         let pid = Self::parse_id(&pond_id)?;
+        // ensure_pond materializes storage on first touch — a pond assigned by
+        // the control plane (no eager allocate) gets its catalog created here.
         let loc = self
             .storage
-            .pond_location(pid)
+            .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         let (op_id, token) = self.inflight.register(Some(pond_id.clone()));
 
@@ -242,9 +246,11 @@ impl AgentOps {
     ) -> Result<ExplainResult, AgentError> {
         let pond_id = self.control.resolve_pond(pond_ref).await?;
         let pid = Self::parse_id(&pond_id)?;
+        // ensure_pond materializes storage on first touch — a pond assigned by
+        // the control plane (no eager allocate) gets its catalog created here.
         let loc = self
             .storage
-            .pond_location(pid)
+            .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         let engine = self.engine.clone();
         let loc2 = loc.clone();

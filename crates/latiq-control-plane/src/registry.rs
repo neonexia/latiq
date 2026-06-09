@@ -139,9 +139,11 @@ impl Registry {
         let pond_id = PondId::new().to_string();
         let name = name.unwrap_or_else(|| pond_id.clone());
         let c = self.lock();
+        // Pick a random active node to balance ponds across nodes. Uniform random
+        // is the only strategy for now; a pluggable strategy can come later.
         let node_id: String = c
             .query_row(
-                "SELECT node_id FROM nodes WHERE state='active' ORDER BY node_id LIMIT 1",
+                "SELECT node_id FROM nodes WHERE state='active' ORDER BY random() LIMIT 1",
                 [],
                 |r| r.get(0),
             )
