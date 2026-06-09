@@ -6,57 +6,96 @@ use latiq_common::{Identity, QueryMeta};
 use latiq_engine::{EngineError, ExplainResult, QueryResult};
 use std::time::Instant;
 
-/// Convert a single DuckDB cell to a JSON value for the neutral result.
+/// Convert a single DuckDB cell to a JSON value for the neutral result. Owns the
+/// value first so complex types (LIST/STRUCT/MAP/ARRAY) materialize, then maps
+/// recursively to real nested JSON — never DuckDB's Arrow Debug repr.
 fn cell_to_json(v: ValueRef<'_>) -> serde_json::Value {
-    use serde_json::Value;
+    value_to_json(&v.to_owned())
+}
+
+fn value_to_json(v: &duckdb::types::Value) -> serde_json::Value {
+    use duckdb::types::Value as V;
+    use serde_json::Value as J;
     match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Boolean(b) => Value::Bool(b),
-        ValueRef::TinyInt(i) => Value::from(i),
-        ValueRef::SmallInt(i) => Value::from(i),
-        ValueRef::Int(i) => Value::from(i),
-        ValueRef::BigInt(i) => Value::from(i),
+        V::Null => J::Null,
+        V::Boolean(b) => J::Bool(*b),
+        V::TinyInt(i) => J::from(*i),
+        V::SmallInt(i) => J::from(*i),
+        V::Int(i) => J::from(*i),
+        V::BigInt(i) => J::from(*i),
+        V::UTinyInt(i) => J::from(*i),
+        V::USmallInt(i) => J::from(*i),
+        V::UInt(i) => J::from(*i),
+        V::UBigInt(i) => J::from(*i),
         // i128 doesn't fit serde_json::Number; keep full precision as a string
         // when it overflows i64 (never silently truncate via `as i64`).
-        ValueRef::HugeInt(i) => match i64::try_from(i) {
-            Ok(v) => Value::from(v),
-            Err(_) => Value::String(i.to_string()),
+        V::HugeInt(i) => match i64::try_from(*i) {
+            Ok(x) => J::from(x),
+            Err(_) => J::String(i.to_string()),
         },
-        ValueRef::UTinyInt(i) => Value::from(i),
-        ValueRef::USmallInt(i) => Value::from(i),
-        ValueRef::UInt(i) => Value::from(i),
-        ValueRef::UBigInt(i) => Value::from(i),
-        ValueRef::Float(f) => Value::from(f),
-        ValueRef::Double(f) => Value::from(f),
-        ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
-        // Temporal types: emit ISO strings, not DuckDB's Debug repr (which printed
-        // e.g. "Date32(18817)"). Days/units are since the Unix epoch.
-        ValueRef::Date32(days) => {
-            let (y, m, d) = civil_from_days(days as i64);
-            Value::String(format!("{y:04}-{m:02}-{d:02}"))
+        V::Float(f) => J::from(*f),
+        V::Double(f) => J::from(*f),
+        V::Decimal(d) => J::String(d.to_string()),
+        V::Text(s) => J::String(s.clone()),
+        V::Enum(s) => J::String(s.clone()),
+        // Temporal types: ISO strings, not Debug (which printed e.g. "Date32(18817)").
+        V::Date32(days) => {
+            let (y, m, d) = civil_from_days(*days as i64);
+            J::String(format!("{y:04}-{m:02}-{d:02}"))
         }
-        ValueRef::Timestamp(unit, v) => {
-            let (secs, frac_us) = split_unit_since_epoch(unit, v);
-            let days = secs.div_euclid(86_400);
+        V::Timestamp(unit, t) => {
+            let (secs, frac_us) = split_unit_since_epoch(*unit, *t);
+            let (y, mo, d) = civil_from_days(secs.div_euclid(86_400));
             let tod = secs.rem_euclid(86_400);
-            let (y, mo, d) = civil_from_days(days);
             let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-            Value::String(if frac_us > 0 {
+            J::String(if frac_us > 0 {
                 format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{frac_us:06}")
             } else {
                 format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
             })
         }
-        ValueRef::Time64(unit, v) => {
-            let (secs, frac_us) = split_unit_since_epoch(unit, v);
+        V::Time64(unit, t) => {
+            let (secs, frac_us) = split_unit_since_epoch(*unit, *t);
             let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-            Value::String(if frac_us > 0 {
+            J::String(if frac_us > 0 {
                 format!("{h:02}:{mi:02}:{s:02}.{frac_us:06}")
             } else {
                 format!("{h:02}:{mi:02}:{s:02}")
             })
         }
-        other => Value::String(format!("{other:?}")),
+        V::Interval {
+            months,
+            days,
+            nanos,
+        } => serde_json::json!({ "months": months, "days": days, "nanos": nanos }),
+        V::Blob(b) => J::String(
+            b.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        ),
+        V::List(items) | V::Array(items) => J::Array(items.iter().map(value_to_json).collect()),
+        V::Struct(fields) => J::Object(
+            fields
+                .iter()
+                .map(|(k, val)| (k.clone(), value_to_json(val)))
+                .collect(),
+        ),
+        V::Map(entries) => J::Object(
+            entries
+                .iter()
+                .map(|(k, val)| (map_key(k), value_to_json(val)))
+                .collect(),
+        ),
+        V::Union(inner) => value_to_json(inner),
+    }
+}
+
+/// Render a MAP key as a JSON object key (JSON keys must be strings).
+fn map_key(k: &duckdb::types::Value) -> String {
+    use duckdb::types::Value as V;
+    match k {
+        V::Text(s) | V::Enum(s) => s.clone(),
+        other => value_to_json(other).to_string(),
     }
 }
 
@@ -464,6 +503,19 @@ mod tests {
         assert_eq!(res.rows[0][0], serde_json::json!("2021-07-01"));
         assert_eq!(res.rows[0][1], serde_json::json!("2021-07-01 13:45:06"));
         assert_eq!(res.rows[0][2], serde_json::json!("13:45:06"));
+    }
+
+    #[test]
+    fn nested_types_render_as_json_not_arrow_debug() {
+        let (_fs, inst) = pond();
+        let res = run_read(
+            &inst,
+            "SELECT [1,2,3] AS l, {'x': 1, 'y': 'hi'} AS s, MAP {'k': [10,20]} AS m",
+        )
+        .unwrap();
+        assert_eq!(res.rows[0][0], serde_json::json!([1, 2, 3]));
+        assert_eq!(res.rows[0][1], serde_json::json!({"x": 1, "y": "hi"}));
+        assert_eq!(res.rows[0][2], serde_json::json!({"k": [10, 20]}));
     }
 
     #[test]
