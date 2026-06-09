@@ -22,6 +22,8 @@ impl LocalFs {
         PondLocation {
             catalog_uri: format!("ducklake:duckdb:{}", dir.join("catalog.duckdb").display()),
             data_path: dir.join("data").display().to_string(),
+            // Default alias; AgentOps overrides with the pond's registry name.
+            catalog_name: "pond".to_string(),
         }
     }
 }

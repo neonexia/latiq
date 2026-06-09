@@ -8,4 +8,8 @@ pub struct PondLocation {
     pub catalog_uri: String,
     /// DuckLake DATA_PATH for parquet files, e.g. "/var/lib/latiq/ponds/<id>/data".
     pub data_path: String,
+    /// The name the catalog is attached as — the pond's name, so callers query
+    /// `<pond>.snapshots()` / `<pond>.main.<table>`. Storage defaults this to
+    /// `pond`; the orchestrator (AgentOps) overrides it with the registry name.
+    pub catalog_name: String,
 }

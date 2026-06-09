@@ -22,7 +22,7 @@ const RESOURCES: &[Res] = &[
         body: "# Working in a Latiq pond\n\n\
 - **SQL dialect:** Latiq speaks ANSI SQL on DuckDB. DuckDB-specific functions work but reduce portability — prefer ANSI when other agents will read your code.\n\
 - **Self-describing schemas:** when you CREATE TABLE, add column and table COMMENTs. Other agents discovering your pond rely on them. See latiq://recipes/schema-design.\n\
-- **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message FROM pond.snapshots()`.\n\
+- **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message FROM ducklake_snapshots('<pond>')`.\n\
 - **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
 - **Plan first:** call explain_query before an expensive query to estimate cost, then refine.\n\
@@ -37,7 +37,7 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 - **read_query** accepts SELECT and read-only metadata (SHOW/DESCRIBE). Writes are rejected — use write_query.\n\
 - **write_query** accepts INSERT/UPDATE/DELETE and DDL (CREATE/DROP/ALTER, CREATE TABLE AS SELECT).\n\
 - Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
-- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message FROM pond.snapshots()`. List tables/columns with `SHOW TABLES` / `information_schema`.\n\
+- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message FROM ducklake_snapshots('<pond>')`. List tables/columns with `SHOW TABLES` / `information_schema`.\n\
 - Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.",
     },
     Res {
@@ -76,7 +76,7 @@ Only public/anonymous sources work in M1; credentialed databases come with admin
         name: "Recipe: attribution lookup",
         desc: "Who wrote what in a pond",
         body: "# Recipe — attribution lookup\n\n\
-Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT author, commit_message, snapshot_id FROM pond.snapshots() ORDER BY snapshot_id DESC;\n```\n\
+Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT author, commit_message, snapshot_id FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
 Use this to coordinate: see who created a table before extending it.",
     },
     Res {
@@ -119,7 +119,7 @@ The query exceeded the deployment's timeout. Call explain_query to find the heav
         name: "Troubleshooting: write conflicts",
         desc: "Concurrent writes that conflict",
         body: "# Write conflicts\n\n\
-Multiple agents write through DuckLake's transactional model. Conflicting writes auto-retry against the latest snapshot; expect occasional snapshot bumps. If you need strict ordering, coordinate at the application layer (e.g. read `pond.snapshots()` to see the latest writer before extending a table).",
+Multiple agents write through DuckLake's transactional model. Conflicting writes auto-retry against the latest snapshot; expect occasional snapshot bumps. If you need strict ordering, coordinate at the application layer (e.g. read `ducklake_snapshots('<pond>')` to see the latest writer before extending a table).",
     },
     Res {
         uri: "latiq://troubleshooting/read-only-violation",
@@ -190,7 +190,7 @@ pub fn get_prompt(name: &str, args: &Map<String, Value>) -> Option<GetPromptResu
             "Set up a pond named '{pond}' for {domain} where several agents will collaborate:\n\
 1. allocate_pond with name='{pond}'.\n\
 2. Design a self-describing schema (COMMENT every table and column) — see latiq://recipes/schema-design.\n\
-3. Establish an attribution-lookup habit: agents read `pond.snapshots()` to see who wrote what.\n\
+3. Establish an attribution-lookup habit: agents read `ducklake_snapshots('<pond>')` to see who wrote what.\n\
 4. Coordinate writes; conflicts auto-retry (latiq://troubleshooting/conflicts).",
             pond = arg(args, "pond_name", "shared"),
             domain = arg(args, "domain", "the task")
@@ -214,8 +214,8 @@ See latiq://recipes/schema-design.",
         ),
         "recover_from_conflict" => format!(
             "Recover from a write conflict in pond '{pond}':\n\
-1. Re-read the current state: `SELECT max(snapshot_id) FROM pond.snapshots()`.\n\
-2. Identify the conflicting writer via `pond.snapshots()`.\n\
+1. Re-read the current state: `SELECT max(snapshot_id) FROM ducklake_snapshots('<pond>')`.\n\
+2. Identify the conflicting writer via `ducklake_snapshots('<pond>')`.\n\
 3. Re-plan your write against the latest snapshot and retry (writes auto-retry, but re-check assumptions).\n\
 See latiq://troubleshooting/conflicts.",
             pond = arg(args, "pond_id", "the pond")

@@ -106,6 +106,9 @@ struct QueryArgs {
     /// Identity attributed to your writes (relaxed; defaults to anonymous).
     #[arg(long)]
     agent_id: Option<String>,
+    /// Emit raw JSON instead of a table (the default for read results).
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -228,7 +231,11 @@ async fn run_query(a: QueryArgs) -> Result<()> {
             &a.agent_id,
         ))
         .await;
-    print_json_result(res)
+    if a.json {
+        print_json_result(res)
+    } else {
+        print_table_result(res)
+    }
 }
 
 // ---- pond lifecycle -----------------------------------------------------
@@ -332,6 +339,94 @@ async fn node_describe(node_id: String) -> Result<()> {
 }
 
 // ---- rendering ----------------------------------------------------------
+
+/// Render a query result as a text table (the CLI default); falls back to JSON
+/// for non-row payloads, and prints a short status line for writes.
+fn print_table_result(res: Result<tonic::Response<JsonResponse>, Status>) -> Result<()> {
+    match res {
+        Ok(r) => {
+            let json = r.into_inner().json;
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+                println!("{json}");
+                return Ok(());
+            };
+            match (
+                v.get("columns").and_then(|c| c.as_array()),
+                v.get("rows").and_then(|r| r.as_array()),
+            ) {
+                (Some(cols), Some(rows)) if !cols.is_empty() => print_table(cols, rows),
+                (Some(_), Some(_)) => {
+                    // A write: no result set. Report the snapshot it produced.
+                    match v.pointer("/_meta/snapshot_id") {
+                        Some(s) if !s.is_null() => println!("ok (snapshot {s})"),
+                        _ => println!("ok"),
+                    }
+                }
+                _ => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(json)),
+            }
+            Ok(())
+        }
+        Err(st) => print_status(&st),
+    }
+}
+
+fn cell_str(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn print_table(columns: &[serde_json::Value], rows: &[serde_json::Value]) {
+    let headers: Vec<String> = columns
+        .iter()
+        .map(|c| c.as_str().unwrap_or("").to_string())
+        .collect();
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            r.as_array()
+                .map(|cells| cells.iter().map(cell_str).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in &body {
+        for (i, c) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(c.chars().count());
+            }
+        }
+    }
+    let line = |cells: &[String]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{:width$}", c, width = widths.get(i).copied().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    println!("{}", line(&headers));
+    println!(
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("-+-")
+    );
+    for row in &body {
+        println!("{}", line(row));
+    }
+    println!(
+        "({} row{})",
+        body.len(),
+        if body.len() == 1 { "" } else { "s" }
+    );
+}
 
 /// Print a Data gRPC `JsonResponse` (pretty) or render its structured error.
 fn print_json_result(res: Result<tonic::Response<JsonResponse>, Status>) -> Result<()> {

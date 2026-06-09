@@ -64,7 +64,7 @@ async fn full_agent_loop() {
         .read_query(
             &id,
             "incident-9",
-            "SELECT DISTINCT author FROM pond.snapshots()",
+            "SELECT DISTINCT author FROM ducklake_snapshots('incident-9')",
         )
         .await
         .unwrap();
