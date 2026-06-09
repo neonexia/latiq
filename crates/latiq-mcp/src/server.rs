@@ -192,7 +192,7 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     /// pond. Writes are attributed to your agent identity.
     #[tool(
         description = "Run a write or DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE TABLE AS SELECT) against a pond. \
-Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message FROM pond.snapshots()`). \
+Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message FROM ducklake_snapshots('<pond>')`). \
 Marked destructive because it CAN delete data; clients may require approval. \
 Load external public files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'` (public/anonymous only). \
 Do: add column COMMENTs so other agents understand your tables. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",

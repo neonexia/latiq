@@ -29,11 +29,64 @@ fn cell_to_json(v: ValueRef<'_>) -> serde_json::Value {
         ValueRef::Float(f) => Value::from(f),
         ValueRef::Double(f) => Value::from(f),
         ValueRef::Text(t) => Value::String(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Timestamp(_, _) | ValueRef::Date32(_) | ValueRef::Time64(_, _) => {
-            Value::String(format!("{v:?}"))
+        // Temporal types: emit ISO strings, not DuckDB's Debug repr (which printed
+        // e.g. "Date32(18817)"). Days/units are since the Unix epoch.
+        ValueRef::Date32(days) => {
+            let (y, m, d) = civil_from_days(days as i64);
+            Value::String(format!("{y:04}-{m:02}-{d:02}"))
+        }
+        ValueRef::Timestamp(unit, v) => {
+            let (secs, frac_us) = split_unit_since_epoch(unit, v);
+            let days = secs.div_euclid(86_400);
+            let tod = secs.rem_euclid(86_400);
+            let (y, mo, d) = civil_from_days(days);
+            let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+            Value::String(if frac_us > 0 {
+                format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}.{frac_us:06}")
+            } else {
+                format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+            })
+        }
+        ValueRef::Time64(unit, v) => {
+            let (secs, frac_us) = split_unit_since_epoch(unit, v);
+            let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+            Value::String(if frac_us > 0 {
+                format!("{h:02}:{mi:02}:{s:02}.{frac_us:06}")
+            } else {
+                format!("{h:02}:{mi:02}:{s:02}")
+            })
         }
         other => Value::String(format!("{other:?}")),
     }
+}
+
+/// Split a value expressed in `unit` into whole seconds + microsecond fraction.
+fn split_unit_since_epoch(unit: duckdb::types::TimeUnit, v: i64) -> (i64, u32) {
+    use duckdb::types::TimeUnit;
+    let (secs, frac_us) = match unit {
+        TimeUnit::Second => (v, 0),
+        TimeUnit::Millisecond => (v.div_euclid(1_000), (v.rem_euclid(1_000) * 1_000) as u32),
+        TimeUnit::Microsecond => (v.div_euclid(1_000_000), v.rem_euclid(1_000_000) as u32),
+        TimeUnit::Nanosecond => (
+            v.div_euclid(1_000_000_000),
+            (v.rem_euclid(1_000_000_000) / 1_000) as u32,
+        ),
+    };
+    (secs, frac_us)
+}
+
+/// Civil date (year, month, day) from days since 1970-01-01 (Hinnant's algorithm).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 /// Heuristic: is this SQL a read-only statement (safe for `read_query`)?
@@ -155,6 +208,7 @@ pub fn run_write(
     inst: &PondInstance,
     sql: &str,
     identity: &Identity,
+    catalog: &str,
 ) -> Result<QueryResult, EngineError> {
     // A read routed to write_query: run it without creating a snapshot or
     // attribution (no history pollution), returning its rows gracefully.
@@ -177,10 +231,13 @@ pub fn run_write(
         rollback();
         return Err(e);
     }
+    // Attribution is a DuckLake method on THIS pond's catalog (named after the
+    // pond), so qualify + quote the catalog name.
+    let cat = crate::instance::quote_ident(catalog);
     let agent = identity.agent_id.replace('\'', "''");
     let extra = format!("{{\"verified\":{}}}", identity.verified);
     let call =
-        format!("CALL pond.set_commit_message('{agent}', 'write_query', extra_info => '{extra}')");
+        format!("CALL {cat}.set_commit_message('{agent}', 'write_query', extra_info => '{extra}')");
     if let Err(e) = exec(&call) {
         rollback();
         return Err(e);
@@ -192,9 +249,11 @@ pub fn run_write(
 
     let snapshot_id: Option<i64> = inst
         .conn
-        .query_row("SELECT max(snapshot_id) FROM pond.snapshots()", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            &format!("SELECT max(snapshot_id) FROM {cat}.snapshots()"),
+            [],
+            |r| r.get(0),
+        )
         .ok();
     let meta = QueryMeta {
         snapshot_id,
@@ -268,8 +327,20 @@ mod tests {
     fn write_then_read_with_attribution() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE events(id INTEGER, sev VARCHAR)", &id).unwrap();
-        run_write(&inst, "INSERT INTO events VALUES (1,'high'),(2,'low')", &id).unwrap();
+        run_write(
+            &inst,
+            "CREATE TABLE events(id INTEGER, sev VARCHAR)",
+            &id,
+            "pond",
+        )
+        .unwrap();
+        run_write(
+            &inst,
+            "INSERT INTO events VALUES (1,'high'),(2,'low')",
+            &id,
+            "pond",
+        )
+        .unwrap();
         let res = run_read(&inst, "SELECT id, sev FROM events ORDER BY id").unwrap();
         assert_eq!(res.columns, vec!["id", "sev"]);
         assert_eq!(res.rows.len(), 2);
@@ -301,6 +372,7 @@ mod tests {
             &inst,
             "CREATE TABLE events(id INTEGER, sev VARCHAR)",
             &Identity::claimed(Some("a")),
+            "pond",
         )
         .unwrap();
         let res = run_read(&inst, "SELECT id FROM events WHERE 1=0").unwrap();
@@ -318,12 +390,12 @@ mod tests {
     fn write_with_trailing_comment_does_not_wedge_the_pond() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id).unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
         // A trailing line comment must NOT comment out our COMMIT/attribution or
         // leave a dangling transaction on the reused connection.
-        run_write(&inst, "INSERT INTO t VALUES (1) --trailing", &id).unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1) --trailing", &id, "pond").unwrap();
         // The pond is still usable (would error mid-transaction if wedged).
-        run_write(&inst, "INSERT INTO t VALUES (2)", &id).unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond").unwrap();
         let n = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
         assert_eq!(n.rows[0][0], serde_json::json!(2));
         // Attribution still recorded for the commented write's identity.
@@ -339,10 +411,10 @@ mod tests {
     fn write_query_with_a_select_creates_no_snapshot() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id).unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
         let before = snapshot_count(&inst);
         // A SELECT routed to write_query must not pollute snapshot history.
-        let res = run_write(&inst, "SELECT 1 AS x", &id).unwrap();
+        let res = run_write(&inst, "SELECT 1 AS x", &id, "pond").unwrap();
         assert_eq!(res.rows[0][0], serde_json::json!(1));
         assert_eq!(
             snapshot_count(&inst),
@@ -358,6 +430,7 @@ mod tests {
             &inst,
             "CREATE TABLE t(id INTEGER)",
             &Identity::claimed(None),
+            "pond",
         )
         .unwrap();
         assert!(matches!(
@@ -370,12 +443,27 @@ mod tests {
     fn explain_refuses_analyze_and_does_not_execute() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(None);
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id).unwrap();
-        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id).unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, "pond").unwrap();
         assert!(run_explain(&inst, "ANALYZE DELETE FROM t").is_err());
         // The rows must still be there — ANALYZE was refused, not executed.
         let n = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
         assert_eq!(n.rows[0][0], serde_json::json!(2));
+    }
+
+    #[test]
+    fn temporal_values_render_as_iso_strings_not_debug() {
+        let (_fs, inst) = pond();
+        let res = run_read(
+            &inst,
+            "SELECT DATE '2021-07-01' AS d, \
+             TIMESTAMP '2021-07-01 13:45:06' AS ts, \
+             TIME '13:45:06' AS t",
+        )
+        .unwrap();
+        assert_eq!(res.rows[0][0], serde_json::json!("2021-07-01"));
+        assert_eq!(res.rows[0][1], serde_json::json!("2021-07-01 13:45:06"));
+        assert_eq!(res.rows[0][2], serde_json::json!("13:45:06"));
     }
 
     #[test]

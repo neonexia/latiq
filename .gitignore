@@ -5,3 +5,6 @@
 
 # Local override if you point --root at the repo (default is ~/.latiq, outside the tree).
 /.latiq
+/latiq-data
+/latiq-cp.duckdb
+/latiq-cp.duckdb.wal

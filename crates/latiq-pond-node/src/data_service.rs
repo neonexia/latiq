@@ -118,7 +118,7 @@ impl Data for DataService {
             .read_query(&id, &r.pond, &r.sql)
             .await
             .map_err(to_status)?;
-        Ok(json_resp(query_value("read_query", qr)))
+        Ok(json_resp(query_value(qr)))
     }
 
     async fn write_query(
@@ -132,7 +132,7 @@ impl Data for DataService {
             .write_query(&id, &r.pond, &r.sql)
             .await
             .map_err(to_status)?;
-        Ok(json_resp(query_value("write_query", qr)))
+        Ok(json_resp(query_value(qr)))
     }
 
     async fn explain_query(
@@ -150,7 +150,14 @@ impl Data for DataService {
     }
 }
 
-fn query_value(statement: &str, qr: latiq_engine::QueryResult) -> serde_json::Value {
+fn query_value(qr: latiq_engine::QueryResult) -> serde_json::Value {
+    // The `query` CLI command routes everything through write_query, so label by
+    // what actually happened: a write creates a snapshot, a read does not.
+    let statement = if qr.meta.snapshot_id.is_some() {
+        "write_query"
+    } else {
+        "read_query"
+    };
     serde_json::json!({
         "columns": qr.columns,
         "rows": qr.rows,
