@@ -76,8 +76,8 @@ Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond st
 # Terminal 1 — control plane (Control + Admin gRPC on one port)
 cargo run -p latiq -- serve --port 9090 --root ~/.latiq
 
-# Terminal 2 — pond node (Data gRPC + MCP; registers with the control plane)
-cargo run -p latiq -- node add --port 8081 --root ~/.latiq --control http://127.0.0.1:9090
+# Terminal 2 — pond node (Data gRPC + MCP; registers at $LATIQ_CONTROL, default :9090)
+cargo run -p latiq -- node add --port 8081 --root ~/.latiq
 ```
 
 ### Server options
@@ -96,18 +96,20 @@ cargo run -p latiq -- node add --port 8081 --root ~/.latiq --control http://127.
 | `--node-id` | `node-1` | This node's id in the registry |
 | `--port` | `8081` | Data/Query gRPC port; MCP (agents) is served on `port + 1` |
 | `--root` | `~/.latiq` | Data root; pond storage under `<root>/ponds` |
-| `--control` | `http://127.0.0.1:9090` | Control plane to register with |
+
+(The node registers with the control plane at `$LATIQ_CONTROL`, default `http://127.0.0.1:9090`.)
 
 ---
 
 ## Drive it from the CLI
 
-The CLI is a **gRPC client whose one entry point is the control plane.** Every command takes `--control` (default `http://127.0.0.1:9090`) and `--agent-id <name>` (the identity your writes are attributed to; default `anonymous`). You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops.
+The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_CONTROL` env var (default `http://127.0.0.1:9090`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops.
 
-The examples below call `latiq` directly. For dev, put the build output on your PATH — every `cargo build` refreshes the binary in place, nothing to reinstall:
+For dev, put the build output on your PATH (every `cargo build` refreshes it in place) and export the control address only if it's not the default:
 
 ```bash
-export PATH="$PWD/target/debug:$PATH"     # or target/release after `cargo build --release`
+export PATH="$PWD/target/debug:$PATH"           # or target/release after `cargo build --release`
+export LATIQ_CONTROL=http://127.0.0.1:9090      # only if you changed --cp-port
 ```
 
 ### Pond lifecycle
@@ -158,15 +160,16 @@ latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parq
 ### Targeting a non-default control plane
 
 ```bash
-latiq pond create --name demo --control http://127.0.0.1:19090
-latiq query --pond demo --control http://127.0.0.1:19090 "SELECT 1"
+export LATIQ_CONTROL=http://127.0.0.1:19090
+latiq pond create --name demo
+latiq query --pond demo "SELECT 1"
 ```
 
 ---
 
 ## Operator CLI (node admin)
 
-Inspect registered pond nodes (control plane); `--control` default `http://127.0.0.1:9090`.
+Inspect registered pond nodes (control plane, at `$LATIQ_CONTROL`).
 
 ```bash
 latiq node list                # registered pond nodes (id, state, pond_count, mcp_endpoint)
