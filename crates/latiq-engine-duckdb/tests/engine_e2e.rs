@@ -1,6 +1,6 @@
 //! End-to-end pond lifecycle through the public seams only (PondStorage +
 //! QueryEngine). Proves storage + engine compose: create → init → attributed
-//! write → read → attribution + schema via `_latiq` → drop.
+//! write → read → attribution (native DuckLake pond.snapshots()) + schema → drop.
 use latiq_common::{Identity, PondId};
 use latiq_engine::{AbortToken, QueryEngine};
 use latiq_engine_duckdb::DuckEngine;
@@ -48,7 +48,7 @@ fn pond_lifecycle_end_to_end() {
     let attr = eng
         .read_query(
             &loc,
-            "SELECT DISTINCT author FROM _latiq.attribution",
+            "SELECT DISTINCT author FROM pond.snapshots()",
             AbortToken::new(),
         )
         .unwrap();

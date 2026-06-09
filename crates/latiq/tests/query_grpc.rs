@@ -190,7 +190,7 @@ async fn attribution_records_the_writer_identity() {
 
     let r = c
         .read_query(req(
-            q("p", "SELECT DISTINCT author FROM _latiq.attribution"),
+            q("p", "SELECT DISTINCT author FROM pond.snapshots()"),
             "viewer",
         ))
         .await
@@ -252,7 +252,7 @@ async fn identity_defaults_to_anonymous_when_metadata_absent() {
     let r = c
         .read_query(Request::new(q(
             "anon",
-            "SELECT DISTINCT author FROM _latiq.attribution",
+            "SELECT DISTINCT author FROM pond.snapshots()",
         )))
         .await
         .unwrap()

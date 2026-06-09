@@ -22,8 +22,8 @@ const RESOURCES: &[Res] = &[
         body: "# Working in a Latiq pond\n\n\
 - **SQL dialect:** Latiq speaks ANSI SQL on DuckDB. DuckDB-specific functions work but reduce portability — prefer ANSI when other agents will read your code.\n\
 - **Self-describing schemas:** when you CREATE TABLE, add column and table COMMENTs. Other agents discovering your pond rely on them. See latiq://recipes/schema-design.\n\
-- **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message FROM _latiq.attribution`.\n\
-- **Discover:** `SELECT name, comment FROM _latiq.tables_summary` lists tables; list_ponds + describe_pond find existing work to join.\n\
+- **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message FROM pond.snapshots()`.\n\
+- **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
 - **Plan first:** call explain_query before an expensive query to estimate cost, then refine.\n\
 - **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.",
@@ -36,8 +36,8 @@ const RESOURCES: &[Res] = &[
 Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 - **read_query** accepts SELECT and read-only metadata (SHOW/DESCRIBE). Writes are rejected — use write_query.\n\
 - **write_query** accepts INSERT/UPDATE/DELETE and DDL (CREATE/DROP/ALTER, CREATE TABLE AS SELECT).\n\
-- Three-part names are not needed in M1 (no attached catalogs yet); query your own tables directly.\n\
-- The reserved `_latiq` schema is read-only (snapshots, attribution, tables_summary, sources).\n\
+- Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
+- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message FROM pond.snapshots()`. List tables/columns with `SHOW TABLES` / `information_schema`.\n\
 - Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.",
     },
     Res {
@@ -47,7 +47,7 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
         body: "# Recipe — schema design for collaboration\n\n\
 **When:** you're the first agent creating tables in a pond.\n\n\
 **Pattern:**\n```sql\nCREATE TABLE events (\n  id INTEGER,           -- event primary key\n  severity VARCHAR,     -- one of: low, medium, high, critical\n  occurred_at TIMESTAMP -- event time in UTC\n);\n```\n\
-**Why it works:** comments are visible via `_latiq.tables_summary`, so the next agent understands your schema without asking.\n\
+**Why it works:** comments are visible via `SHOW TABLES` / `information_schema.columns`, so the next agent understands your schema without asking.\n\
 **Watch for:** vague table/column names; missing comments; types that don't match the domain.",
     },
     Res {
@@ -76,7 +76,7 @@ Only public/anonymous sources work in M1; credentialed databases come with admin
         name: "Recipe: attribution lookup",
         desc: "Who wrote what in a pond",
         body: "# Recipe — attribution lookup\n\n\
-Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT author, commit_message, snapshot_id FROM _latiq.attribution ORDER BY snapshot_id DESC;\n```\n\
+Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT author, commit_message, snapshot_id FROM pond.snapshots() ORDER BY snapshot_id DESC;\n```\n\
 Use this to coordinate: see who created a table before extending it.",
     },
     Res {
@@ -119,7 +119,7 @@ The query exceeded the deployment's timeout. Call explain_query to find the heav
         name: "Troubleshooting: write conflicts",
         desc: "Concurrent writes that conflict",
         body: "# Write conflicts\n\n\
-Multiple agents write through DuckLake's transactional model. Conflicting writes auto-retry against the latest snapshot; expect occasional snapshot bumps. If you need strict ordering, coordinate at the application layer (e.g. read `_latiq.attribution` to see the latest writer before extending a table).",
+Multiple agents write through DuckLake's transactional model. Conflicting writes auto-retry against the latest snapshot; expect occasional snapshot bumps. If you need strict ordering, coordinate at the application layer (e.g. read `pond.snapshots()` to see the latest writer before extending a table).",
     },
     Res {
         uri: "latiq://troubleshooting/read-only-violation",
@@ -190,7 +190,7 @@ pub fn get_prompt(name: &str, args: &Map<String, Value>) -> Option<GetPromptResu
             "Set up a pond named '{pond}' for {domain} where several agents will collaborate:\n\
 1. allocate_pond with name='{pond}'.\n\
 2. Design a self-describing schema (COMMENT every table and column) — see latiq://recipes/schema-design.\n\
-3. Establish an attribution-lookup habit: agents read `_latiq.attribution` to see who wrote what.\n\
+3. Establish an attribution-lookup habit: agents read `pond.snapshots()` to see who wrote what.\n\
 4. Coordinate writes; conflicts auto-retry (latiq://troubleshooting/conflicts).",
             pond = arg(args, "pond_name", "shared"),
             domain = arg(args, "domain", "the task")
@@ -199,7 +199,7 @@ pub fn get_prompt(name: &str, args: &Map<String, Value>) -> Option<GetPromptResu
             "Find an existing pond related to '{term}' (intent: {intent}):\n\
 1. list_ponds and scan names/owners.\n\
 2. describe_pond on candidates to inspect tables.\n\
-3. read_query `SELECT name, comment FROM _latiq.tables_summary` to understand the data.\n\
+3. read_query `SHOW TABLES` (and `information_schema.columns`) to understand the data.\n\
 4. For intent=extend: add new tables without colliding with existing ones; comment them.",
             term = arg(args, "search_term", ""),
             intent = arg(args, "intent", "read")
@@ -207,15 +207,15 @@ pub fn get_prompt(name: &str, args: &Map<String, Value>) -> Option<GetPromptResu
         "design_collaborative_schema" => format!(
             "Design a schema for {domain} that other agents can read and extend:\n\
 - Use clear, ANSI types; name tables/columns for cross-agent legibility.\n\
-- COMMENT every table and column (visible via _latiq.tables_summary).\n\
+- COMMENT every table and column (visible via `information_schema.columns`).\n\
 - Prefer additive evolution; don't rename columns others may depend on.\n\
 See latiq://recipes/schema-design.",
             domain = arg(args, "domain", "the domain")
         ),
         "recover_from_conflict" => format!(
             "Recover from a write conflict in pond '{pond}':\n\
-1. Re-read the current state: `SELECT max(snapshot_id) FROM _latiq.snapshots`.\n\
-2. Identify the conflicting writer via `_latiq.attribution`.\n\
+1. Re-read the current state: `SELECT max(snapshot_id) FROM pond.snapshots()`.\n\
+2. Identify the conflicting writer via `pond.snapshots()`.\n\
 3. Re-plan your write against the latest snapshot and retry (writes auto-retry, but re-check assumptions).\n\
 See latiq://troubleshooting/conflicts.",
             pond = arg(args, "pond_id", "the pond")
