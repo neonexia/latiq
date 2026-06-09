@@ -42,6 +42,13 @@ impl PondStorage for LocalFs {
             Err(StorageError::NotFound(pond_id))
         }
     }
+    fn ensure_pond(&self, pond_id: PondId) -> Result<PondLocation, StorageError> {
+        if self.pond_exists(pond_id) {
+            Ok(self.location_for(pond_id))
+        } else {
+            self.create_pond(pond_id)
+        }
+    }
     fn drop_pond(&self, pond_id: PondId) -> Result<(), StorageError> {
         let dir = self.pond_dir(pond_id);
         if !dir.exists() {

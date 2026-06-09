@@ -7,3 +7,6 @@
 /latiq-data
 /latiq-cp.duckdb
 /latiq-cp.duckdb.wal
+
+# dev.sh runtime root
+.latiq-dev/

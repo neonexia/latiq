@@ -1,21 +1,23 @@
-//! latiq — single binary. Server roles (control-plane, pond-node), plus the
-//! operator/dev CLI. The CLI is a gRPC client (NOT an agent): data ops go to
-//! the pond node's Data gRPC; metadata reads + admin go to the control plane's
-//! Admin gRPC. MCP is the agent-only surface and the CLI never uses it.
+//! latiq — single binary. `serve` runs the control plane; `node add` runs a pond
+//! node; the remaining commands are a gRPC client. The CLI talks to the control
+//! plane (its single entry point), resolves which node hosts a pond, then runs
+//! data ops **node-direct** (the control plane is never in the data path). MCP is
+//! the agent-only surface and the CLI never uses it.
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use latiq_common::ErrorEnvelope;
-use latiq_control_plane::{serve_admin, serve_control, Registry};
+use latiq_control_plane::{serve_control_plane, Registry};
 use latiq_pond_node::{run_pond_node, PondNodeConfig};
 use latiq_proto::v1::admin_client::AdminClient;
+use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::*;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
-const DATA_ENDPOINT: &str = "http://127.0.0.1:8081";
-const ADMIN_ENDPOINT: &str = "http://127.0.0.1:9091";
+const DEFAULT_CONTROL: &str = "http://127.0.0.1:9090";
 
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
@@ -26,128 +28,91 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the control-plane server (Control + Admin gRPC over a DuckDB registry).
-    ControlPlane(ControlPlaneArgs),
-    /// Run a pond-node server (MCP for agents + Data gRPC for CLI/SDK).
-    PondNode(PondNodeArgs),
-    /// Operator: node administration (Admin gRPC).
+    /// Run the control plane (registry + Control/Admin gRPC on one port).
+    Serve(ServeArgs),
+    /// Pond nodes: run one (`add`) or inspect registered ones (`list`/`describe`).
     #[command(subcommand)]
     Node(NodeCmd),
-    /// Operator: policy administration (Admin gRPC).
-    #[command(subcommand)]
-    Policy(PolicyCmd),
-    /// Operator: audit access (Admin gRPC).
-    #[command(subcommand)]
-    Audit(AuditCmd),
-    /// Pond lifecycle (Data gRPC; `list` reads the control plane).
+    /// Pond lifecycle (create/list/describe/drop) via the control plane.
     #[command(subcommand)]
     Pond(PondCmd),
-    /// Run a read-only SQL query (Data gRPC).
+    /// Run a SQL statement (read or write) against a pond.
     Query(QueryArgs),
-    /// Run a write/DDL SQL statement (Data gRPC).
-    Write(QueryArgs),
-    /// Plan a query without running it (Data gRPC).
-    Explain(QueryArgs),
 }
 
 #[derive(Args)]
-struct ControlPlaneArgs {
-    #[arg(long, default_value = "127.0.0.1:9090")]
-    control_addr: String,
-    #[arg(long, default_value = "127.0.0.1:9091")]
-    admin_addr: String,
+struct ServeArgs {
+    /// Port for the Control + Admin gRPC surfaces.
+    #[arg(long, default_value_t = 9090)]
+    port: u16,
+    /// Data root; the registry lives at <root>/registry.duckdb (default ~/.latiq).
     #[arg(long)]
-    db: Option<PathBuf>,
-}
-
-#[derive(Args)]
-struct PondNodeArgs {
-    #[arg(long, default_value = "node-1")]
-    node_id: String,
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    mcp_addr: String,
-    #[arg(long, default_value = "127.0.0.1:8081")]
-    data_addr: String,
-    #[arg(long, default_value = "http://127.0.0.1:9090")]
-    control: String,
-    #[arg(long, default_value = "./latiq-data")]
-    data_dir: PathBuf,
+    root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 enum NodeCmd {
-    List(AdminConn),
+    /// Start a pond node and register it with the control plane.
+    Add(NodeAddArgs),
+    /// List registered pond nodes.
+    List(CpConn),
+    /// Describe a registered pond node.
     Describe {
         node_id: String,
         #[command(flatten)]
-        conn: AdminConn,
+        conn: CpConn,
     },
 }
 
-#[derive(Subcommand)]
-enum PolicyCmd {
-    Show(AdminConn),
-    Set {
-        key: String,
-        value: String,
-        #[command(flatten)]
-        conn: AdminConn,
-    },
-}
-
-#[derive(Subcommand)]
-enum AuditCmd {
-    Tail {
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        #[command(flatten)]
-        conn: AdminConn,
-    },
-    Search {
-        identity: String,
-        #[command(flatten)]
-        conn: AdminConn,
-    },
+#[derive(Args)]
+struct NodeAddArgs {
+    #[arg(long, default_value = "node-1")]
+    node_id: String,
+    /// Data/Query gRPC port. MCP (agents) is served on port + 1.
+    #[arg(long, default_value_t = 8081)]
+    port: u16,
+    /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// Control plane to register with.
+    #[arg(long, default_value = DEFAULT_CONTROL)]
+    control: String,
 }
 
 #[derive(Subcommand)]
 enum PondCmd {
+    /// Allocate a pond. The control plane picks a node; you don't pass an address.
     Create {
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
-        conn: DataConn,
+        conn: CpConn,
     },
-    /// List ponds (reads the control-plane registry — works even if pond nodes are down).
-    List(AdminConn),
+    /// List ponds (control-plane registry; works even if nodes are down).
+    List(CpConn),
     Describe {
         pond: String,
         #[command(flatten)]
-        conn: DataConn,
+        conn: CpConn,
     },
     Drop {
         pond: String,
         #[arg(long)]
         confirm: bool,
         #[command(flatten)]
-        conn: DataConn,
+        conn: CpConn,
     },
 }
 
-/// Connection options for Data gRPC (pond node).
+/// Client connection to the control plane (the CLI's single entry point).
 #[derive(Args)]
-struct DataConn {
-    #[arg(long, default_value = DATA_ENDPOINT)]
-    endpoint: String,
+struct CpConn {
+    /// Control plane address.
+    #[arg(long, default_value = DEFAULT_CONTROL)]
+    control: String,
+    /// Identity attributed to your writes (relaxed; defaults to anonymous).
     #[arg(long)]
     agent_id: Option<String>,
-}
-
-/// Connection options for Admin gRPC (control plane).
-#[derive(Args)]
-struct AdminConn {
-    #[arg(long = "admin", default_value = ADMIN_ENDPOINT)]
-    endpoint: String,
 }
 
 #[derive(Args)]
@@ -156,69 +121,94 @@ struct QueryArgs {
     pond: String,
     sql: String,
     #[command(flatten)]
-    conn: DataConn,
+    conn: CpConn,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::ControlPlane(a) => run_control_plane(a).await,
-        Command::PondNode(a) => run_pond(a).await,
-        Command::Node(cmd) => run_node_admin(cmd).await,
-        Command::Policy(cmd) => run_policy_admin(cmd).await,
-        Command::Audit(cmd) => run_audit_admin(cmd).await,
+        Command::Serve(a) => run_serve(a).await,
+        Command::Node(NodeCmd::Add(a)) => run_node_add(a).await,
+        Command::Node(NodeCmd::List(c)) => node_list(c).await,
+        Command::Node(NodeCmd::Describe { node_id, conn }) => node_describe(node_id, conn).await,
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
-        Command::Query(a) => run_query(a, QueryKind::Read).await,
-        Command::Write(a) => run_query(a, QueryKind::Write).await,
-        Command::Explain(a) => run_query(a, QueryKind::Explain).await,
+        Command::Query(a) => run_query(a).await,
     }
+}
+
+fn default_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".latiq")
 }
 
 // ---- server roles -------------------------------------------------------
 
-async fn run_control_plane(a: ControlPlaneArgs) -> Result<()> {
-    let registry = Registry::open(a.db.as_deref())?;
-    let c_addr = a.control_addr.parse()?;
-    let admin_addr = a.admin_addr.parse()?;
+async fn run_serve(a: ServeArgs) -> Result<()> {
+    let root = a.root.unwrap_or_else(default_root);
+    std::fs::create_dir_all(&root)?;
+    let db = root.join("registry.duckdb");
+    let registry = Registry::open(Some(db.as_path()))?;
+    let addr: SocketAddr = format!("127.0.0.1:{}", a.port).parse()?;
     println!(
-        "control-plane: Control gRPC on {}, Admin gRPC on {} (db: {})",
-        a.control_addr,
-        a.admin_addr,
-        a.db.as_deref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "in-memory".into())
+        "control plane: Control + Admin gRPC on {addr} (registry: {})",
+        db.display()
     );
-    let r2 = registry.clone();
-    tokio::try_join!(serve_control(c_addr, registry), serve_admin(admin_addr, r2))
+    serve_control_plane(addr, registry)
+        .await
         .map_err(|e| anyhow!("server error: {e}"))?;
     Ok(())
 }
 
-async fn run_pond(a: PondNodeArgs) -> Result<()> {
+async fn run_node_add(a: NodeAddArgs) -> Result<()> {
+    let root = a.root.unwrap_or_else(default_root);
+    let data_addr = format!("127.0.0.1:{}", a.port);
+    let mcp_addr = format!("127.0.0.1:{}", a.port + 1);
     run_pond_node(PondNodeConfig {
         node_id: a.node_id,
-        mcp_addr: a.mcp_addr.parse()?,
-        data_addr: a.data_addr.parse()?,
-        internal_endpoint: format!("http://{}", a.data_addr),
+        mcp_addr: mcp_addr.parse()?,
+        data_addr: data_addr.parse()?,
+        internal_endpoint: format!("http://{data_addr}"),
         control_endpoint: a.control,
-        data_dir: a.data_dir,
+        data_dir: root.join("ponds"),
     })
     .await
 }
 
 // ---- gRPC clients (friendly connection errors) --------------------------
 
-async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
-    DataClient::connect(endpoint.to_string()).await.map_err(|_| {
-        anyhow!("could not reach the pond node Data API at {endpoint}. Is it running? Start the stack with ./dev.sh (or `latiq pond-node`).")
+async fn control_client(addr: &str) -> Result<ControlClient<Channel>> {
+    ControlClient::connect(addr.to_string()).await.map_err(|_| {
+        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve`.")
     })
 }
 
-async fn admin_client(endpoint: &str) -> Result<AdminClient<Channel>> {
-    AdminClient::connect(endpoint.to_string()).await.map_err(|_| {
-        anyhow!("could not reach the control plane Admin API at {endpoint}. Is it running? Start it with `latiq control-plane` (or ./dev.sh).")
+async fn admin_client(addr: &str) -> Result<AdminClient<Channel>> {
+    AdminClient::connect(addr.to_string()).await.map_err(|_| {
+        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve`.")
     })
+}
+
+async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
+    DataClient::connect(endpoint.to_string()).await.map_err(|_| {
+        anyhow!("could not reach the pond node at {endpoint}. Is it up? Start one with `latiq node add`.")
+    })
+}
+
+/// Ask the control plane which node's Data gRPC hosts `pond_ref`, so data ops go
+/// node-direct. The control plane is only consulted for routing, never the data.
+async fn resolve_node(control: &str, pond_ref: &str) -> Result<String> {
+    let mut c = control_client(control).await?;
+    let loc = c
+        .get_pond_location(GetPondLocationRequest {
+            pond_ref: pond_ref.to_string(),
+        })
+        .await
+        .map_err(|st| anyhow!("pond '{pond_ref}': {}", st.message()))?
+        .into_inner();
+    Ok(loc.node_endpoint)
 }
 
 fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
@@ -231,55 +221,76 @@ fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
     r
 }
 
-// ---- data CLI (pond node) ----------------------------------------------
+// ---- query (data; node-direct) ------------------------------------------
 
-enum QueryKind {
-    Read,
-    Write,
-    Explain,
-}
-
-async fn run_query(a: QueryArgs, kind: QueryKind) -> Result<()> {
-    let mut c = data_client(&a.conn.endpoint).await?;
-    let msg = || QueryRequest {
-        pond: a.pond.clone(),
-        sql: a.sql.clone(),
-    };
-    let res = match kind {
-        QueryKind::Read => c.read_query(with_id(msg(), &a.conn.agent_id)).await,
-        QueryKind::Write => c.write_query(with_id(msg(), &a.conn.agent_id)).await,
-        QueryKind::Explain => c.explain_query(with_id(msg(), &a.conn.agent_id)).await,
-    };
+async fn run_query(a: QueryArgs) -> Result<()> {
+    let node = resolve_node(&a.conn.control, &a.pond).await?;
+    let mut c = data_client(&node).await?;
+    // One `query` for everything: the write path runs DDL/DML and, for a plain
+    // SELECT, falls through to a read (no snapshot). Reads are still cap-bounded.
+    let res = c
+        .write_query(with_id(
+            QueryRequest {
+                pond: a.pond.clone(),
+                sql: a.sql.clone(),
+            },
+            &a.conn.agent_id,
+        ))
+        .await;
     print_json_result(res)
 }
+
+// ---- pond lifecycle -----------------------------------------------------
 
 async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
     match cmd {
         PondCmd::Create { name, conn } => {
-            let mut c = data_client(&conn.endpoint).await?;
-            let res = c
-                .allocate_pond(with_id(
-                    AllocatePondRequest {
-                        name: name.unwrap_or_default(),
-                        policy_json: String::new(),
-                    },
-                    &conn.agent_id,
-                ))
-                .await;
-            match res {
+            // Pure control-plane op: the registry assigns a (random) node; the
+            // node materializes storage lazily on first query.
+            let mut c = control_client(&conn.control).await?;
+            let owner = conn.agent_id.clone().unwrap_or_else(|| "anonymous".into());
+            match c
+                .create_pond_assignment(CreatePondAssignmentRequest {
+                    name: name.unwrap_or_default(),
+                    owner_identity: owner,
+                    policy_json: "{}".into(),
+                })
+                .await
+            {
                 Ok(r) => {
-                    let r = r.into_inner();
+                    let pond_id = r.into_inner().pond_id;
+                    let pond_name = c
+                        .get_pond_info(GetPondInfoRequest {
+                            pond_ref: pond_id.clone(),
+                        })
+                        .await
+                        .ok()
+                        .and_then(|x| x.into_inner().pond)
+                        .map(|p| p.name)
+                        .unwrap_or_default();
                     println!(
                         "{}",
-                        serde_json::json!({"pond_id": r.pond_id, "pond_name": r.pond_name})
+                        serde_json::json!({"pond_id": pond_id, "pond_name": pond_name})
                     );
                     Ok(())
                 }
                 Err(st) => print_status(&st),
             }
         }
+        PondCmd::List(conn) => {
+            let mut c = admin_client(&conn.control).await?;
+            let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
+            for p in ponds {
+                println!(
+                    "{}\t{}\towner={}\t{}",
+                    p.pond_id, p.name, p.owner, p.created_at
+                );
+            }
+            Ok(())
+        }
         PondCmd::Describe { pond, conn } => {
-            let mut c = data_client(&conn.endpoint).await?;
+            let node = resolve_node(&conn.control, &pond).await?;
+            let mut c = data_client(&node).await?;
             print_json_result(
                 c.describe_pond(with_id(DescribePondRequest { pond }, &conn.agent_id))
                     .await,
@@ -290,7 +301,8 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             confirm,
             conn,
         } => {
-            let mut c = data_client(&conn.endpoint).await?;
+            let node = resolve_node(&conn.control, &pond).await?;
+            let mut c = data_client(&node).await?;
             match c
                 .drop_pond(with_id(
                     DropPondRequest {
@@ -308,101 +320,30 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 Err(st) => print_status(&st),
             }
         }
-        PondCmd::List(conn) => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
-            for p in ponds {
-                println!(
-                    "{}\t{}\towner={}\t{}",
-                    p.pond_id, p.name, p.owner, p.created_at
-                );
-            }
-            Ok(())
-        }
     }
 }
 
-// ---- admin CLI (control plane) -----------------------------------------
+// ---- node admin (control plane) -----------------------------------------
 
-async fn run_node_admin(cmd: NodeCmd) -> Result<()> {
-    match cmd {
-        NodeCmd::List(conn) => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            for n in c.list_nodes(ListNodesRequest {}).await?.into_inner().nodes {
-                println!(
-                    "{}\t{}\tponds={}\t{}",
-                    n.node_id, n.state, n.pond_count, n.mcp_endpoint
-                );
-            }
-            Ok(())
-        }
-        NodeCmd::Describe { node_id, conn } => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            let n = c
-                .describe_node(DescribeNodeRequest { node_id })
-                .await?
-                .into_inner()
-                .node;
-            println!("{}", serde_json::to_string_pretty(&node_to_json(n))?);
-            Ok(())
-        }
-    }
-}
-
-async fn run_policy_admin(cmd: PolicyCmd) -> Result<()> {
-    match cmd {
-        PolicyCmd::Show(conn) => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            println!(
-                "{}",
-                c.policy_get(PolicyGetRequest {})
-                    .await?
-                    .into_inner()
-                    .policy_json
-            );
-            Ok(())
-        }
-        PolicyCmd::Set { key, value, conn } => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            c.policy_set(PolicySetRequest { key, value }).await?;
-            println!("ok");
-            Ok(())
-        }
-    }
-}
-
-async fn run_audit_admin(cmd: AuditCmd) -> Result<()> {
-    let (entries, _) = match cmd {
-        AuditCmd::Tail { limit, conn } => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            (
-                c.audit_tail(AuditTailRequest { limit })
-                    .await?
-                    .into_inner()
-                    .entries,
-                (),
-            )
-        }
-        AuditCmd::Search { identity, conn } => {
-            let mut c = admin_client(&conn.endpoint).await?;
-            (
-                c.audit_search(AuditSearchRequest {
-                    identity,
-                    since: String::new(),
-                })
-                .await?
-                .into_inner()
-                .entries,
-                (),
-            )
-        }
-    };
-    for e in entries {
+async fn node_list(conn: CpConn) -> Result<()> {
+    let mut c = admin_client(&conn.control).await?;
+    for n in c.list_nodes(ListNodesRequest {}).await?.into_inner().nodes {
         println!(
-            "{}\t{}\tverified={}\t{}\tpond={}\t{}ms",
-            e.ts, e.agent_identity, e.verified, e.operation, e.pond_id, e.duration_ms
+            "{}\t{}\tponds={}\t{}",
+            n.node_id, n.state, n.pond_count, n.mcp_endpoint
         );
     }
+    Ok(())
+}
+
+async fn node_describe(node_id: String, conn: CpConn) -> Result<()> {
+    let mut c = admin_client(&conn.control).await?;
+    let n = c
+        .describe_node(DescribeNodeRequest { node_id })
+        .await?
+        .into_inner()
+        .node;
+    println!("{}", serde_json::to_string_pretty(&node_to_json(n))?);
     Ok(())
 }
 
