@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 HOST=127.0.0.1
 CP_PORT=9090
 DATA_PORT=8081
-ROOT=./.latiq-dev
+ROOT="${HOME}/.latiq"
 
 usage() {
   cat <<EOF
@@ -18,7 +18,7 @@ Usage: ./dev.sh [options]
   --root      <path>  Data root (registry + pond storage)   (default $ROOT)
   -h, --help          Show this help
 
-Example (run alongside another stack):
+Example (run alongside another stack, or with throwaway state):
   ./dev.sh --cp-port 19090 --data-port 18081 --root /tmp/latiq-dev
 EOF
 }

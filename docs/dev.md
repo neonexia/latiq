@@ -59,10 +59,10 @@ Endpoints it brings up:
 Control plane (CLI):  127.0.0.1:9090   (Control + Admin gRPC, one port)
 Pond node Data gRPC:  127.0.0.1:8081
 MCP (agents only):    http://127.0.0.1:8082/mcp
-Root:                 ./.latiq-dev
+Root:                 ~/.latiq
 ```
 
-Runtime artifacts land under `./.latiq-dev/` (registry at `registry.duckdb`, pond storage under `ponds/`) — gitignored.
+Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond storage under `ponds/`) — the same default the CLI uses. Pass `--root /tmp/latiq-dev` for throwaway state.
 
 `dev.sh` preflights the ports and aborts (naming the culprit) if one is taken, so a stale stack fails loudly instead of producing confusing gRPC errors. Override via flags (`./dev.sh --help`); MCP is always the Data port + 1:
 
@@ -200,6 +200,6 @@ Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`
 ## Cleanup
 
 ```bash
-# stop dev.sh with Ctrl+C, then:
-rm -rf ./.latiq-dev
+# stop dev.sh with Ctrl+C, then (removes the registry + all pond storage):
+rm -rf ~/.latiq
 ```
