@@ -106,7 +106,7 @@ Then write_query to create tables and load data, and read_query to query. See la
     #[tool(
         description = "Describe a pond: its metadata (name, owner, created_at) plus a summary of its tables. \
 Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying. \
-To discover columns/comments in detail, read_query `SELECT * FROM _latiq.tables_summary`.",
+To discover tables/columns in detail, read_query `SHOW TABLES` or `SELECT * FROM information_schema.columns`.",
         annotations(
             title = "Describe pond",
             read_only_hint = true,
@@ -170,7 +170,7 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
     #[tool(
         description = "Run a read-only SQL query (SELECT, or read-only metadata like SHOW/DESCRIBE) against a pond. \
 For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here. \
-Latiq prefers ANSI SQL; DuckDB extensions are tolerated. Discover tables with `SELECT name, comment FROM _latiq.tables_summary` first. \
+Latiq prefers ANSI SQL; DuckDB extensions are tolerated. Discover tables with `SHOW TABLES` (or `information_schema.tables`/`information_schema.columns`) first. \
 Do: add WHERE/LIMIT on selective columns and call explain_query if unsure of cost. Don't: unbounded `SELECT *` on large tables — results are capped (~10k rows); narrow, aggregate, or materialize with CREATE TABLE AS SELECT. \
 Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correct. See latiq://recipes/large-results.",
         annotations(
@@ -192,7 +192,7 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     /// pond. Writes are attributed to your agent identity.
     #[tool(
         description = "Run a write or DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE TABLE AS SELECT) against a pond. \
-Your writes are attributed to your agent identity (queryable via `SELECT author FROM _latiq.attribution`). \
+Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message FROM pond.snapshots()`). \
 Marked destructive because it CAN delete data; clients may require approval. \
 Load external public files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'` (public/anonymous only). \
 Do: add column COMMENTs so other agents understand your tables. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",

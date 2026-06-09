@@ -143,8 +143,8 @@ latiq write --pond demo --agent-id alice "INSERT INTO events VALUES (1,'high'),(
 # Read it back (rows + a _meta envelope)
 latiq query --pond demo "SELECT id, sev FROM events ORDER BY id"
 
-# Native DuckLake attribution, exposed via the _latiq schema
-latiq query --pond demo "SELECT snapshot_id, author, commit_message FROM _latiq.attribution"
+# Native DuckLake attribution — the snapshot history (who wrote what)
+latiq query --pond demo "SELECT snapshot_id, author, commit_message FROM pond.snapshots()"
 
 # Plan a query without running it
 latiq explain --pond demo "SELECT * FROM events WHERE sev = 'critical'"
@@ -205,7 +205,7 @@ Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`
 
 ## What works now vs. later
 
-**Now (Slice 0+ / M1–M11):** pond lifecycle, SQL read/write with native attribution, `explain`, the `_latiq` schema (`snapshots`, `attribution`, `tables_summary`, `sources`), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, and an audit log.
+**Now (Slice 0+ / M1–M11):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, and an audit log.
 
 **Later slices:** external catalogs + credentials + federation, OIDC verification, Arrow Flight SQL streaming for large results, rate limiting, OpenTelemetry, multi-node, an SDK.
 

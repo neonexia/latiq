@@ -59,12 +59,12 @@ async fn full_agent_loop() {
     assert_eq!(r.rows.len(), 2);
     assert_eq!(r.rows[1][1], serde_json::json!("critical"));
 
-    // Attribution visible via _latiq.
+    // Attribution visible via native DuckLake snapshots.
     let attr = ops
         .read_query(
             &id,
             "incident-9",
-            "SELECT DISTINCT author FROM _latiq.attribution",
+            "SELECT DISTINCT author FROM pond.snapshots()",
         )
         .await
         .unwrap();

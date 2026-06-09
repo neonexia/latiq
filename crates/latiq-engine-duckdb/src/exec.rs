@@ -1,7 +1,6 @@
 //! Query execution against an attached pond instance: read (SELECT),
 //! write (txn-wrapped + native DuckLake attribution), and explain.
 use crate::instance::PondInstance;
-use crate::latiq_schema::writes_reserved_schema;
 use duckdb::types::ValueRef;
 use latiq_common::{Identity, QueryMeta};
 use latiq_engine::{EngineError, ExplainResult, QueryResult};
@@ -157,9 +156,6 @@ pub fn run_write(
     sql: &str,
     identity: &Identity,
 ) -> Result<QueryResult, EngineError> {
-    if writes_reserved_schema(sql) {
-        return Err(EngineError::ReservedSchemaWrite);
-    }
     // A read routed to write_query: run it without creating a snapshot or
     // attribution (no history pollution), returning its rows gracefully.
     if is_read_for_write(sql) {
@@ -258,7 +254,6 @@ pub fn run_explain(inst: &PondInstance, sql: &str) -> Result<ExplainResult, Engi
 mod tests {
     use super::*;
     use crate::instance::PondInstance;
-    use crate::latiq_schema::create_latiq_schema;
     use latiq_common::PondId;
     use latiq_storage::{PondStorage, TempFs};
 
@@ -266,7 +261,6 @@ mod tests {
         let fs = TempFs::new();
         let loc = fs.create_pond(PondId::new()).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
-        create_latiq_schema(&inst.conn).unwrap();
         (fs, inst)
     }
 
@@ -282,7 +276,7 @@ mod tests {
         assert_eq!(res.rows[0][0], serde_json::json!(1));
         let attr = run_read(
             &inst,
-            "SELECT author FROM _latiq.attribution WHERE author = 'agent-test'",
+            "SELECT author FROM pond.snapshots() WHERE author = 'agent-test'",
         )
         .unwrap();
         assert!(
@@ -297,19 +291,6 @@ mod tests {
         assert!(matches!(
             run_read(&inst, "INSERT INTO t VALUES (1)"),
             Err(EngineError::ReadOnlyViolation)
-        ));
-    }
-
-    #[test]
-    fn rejects_reserved_schema_write() {
-        let (_fs, inst) = pond();
-        assert!(matches!(
-            run_write(
-                &inst,
-                "INSERT INTO _latiq.attribution VALUES (1)",
-                &Identity::claimed(None)
-            ),
-            Err(EngineError::ReservedSchemaWrite)
         ));
     }
 
@@ -348,7 +329,7 @@ mod tests {
         // Attribution still recorded for the commented write's identity.
         let a = run_read(
             &inst,
-            "SELECT count(*) AS c FROM _latiq.attribution WHERE author='agent-test'",
+            "SELECT count(*) AS c FROM pond.snapshots() WHERE author='agent-test'",
         )
         .unwrap();
         assert!(a.rows[0][0].as_i64().unwrap() >= 2);

@@ -77,12 +77,6 @@ impl From<EngineError> for AgentError {
                 "Use write_query for INSERT/UPDATE/DELETE/DDL; read_query is for SELECT.",
                 "latiq://dialect",
             ),
-            EngineError::ReservedSchemaWrite => AgentError::new(
-                ErrorKind::WriteToReservedSchema,
-                "Writes to the reserved _latiq schema are not allowed.",
-                "Query _latiq.* read-only; write to your own tables.",
-                "latiq://guidance",
-            ),
             EngineError::Cancelled => AgentError::new(
                 ErrorKind::QueryCancelled,
                 "The query was cancelled.",
