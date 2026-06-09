@@ -1,8 +1,9 @@
 //! latiq — single binary. `serve` runs the control plane; `node add` runs a pond
 //! node; the remaining commands are a gRPC client. The CLI talks to the control
-//! plane (its single entry point), resolves which node hosts a pond, then runs
-//! data ops **node-direct** (the control plane is never in the data path). MCP is
-//! the agent-only surface and the CLI never uses it.
+//! plane (its single entry point, addressed by the `LATIQ_CONTROL` env var),
+//! resolves which node hosts a pond, then runs data ops **node-direct** (the
+//! control plane is never in the data path). MCP is the agent-only surface and
+//! the CLI never uses it.
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use latiq_common::ErrorEnvelope;
@@ -21,6 +22,9 @@ const DEFAULT_CONTROL: &str = "http://127.0.0.1:9090";
 
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
+#[command(
+    after_help = "The control plane address comes from $LATIQ_CONTROL (default http://127.0.0.1:9090)."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -55,13 +59,9 @@ enum NodeCmd {
     /// Start a pond node and register it with the control plane.
     Add(NodeAddArgs),
     /// List registered pond nodes.
-    List(CpConn),
+    List,
     /// Describe a registered pond node.
-    Describe {
-        node_id: String,
-        #[command(flatten)]
-        conn: CpConn,
-    },
+    Describe { node_id: String },
 }
 
 #[derive(Args)]
@@ -74,9 +74,6 @@ struct NodeAddArgs {
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
     #[arg(long)]
     root: Option<PathBuf>,
-    /// Control plane to register with.
-    #[arg(long, default_value = DEFAULT_CONTROL)]
-    control: String,
 }
 
 #[derive(Subcommand)]
@@ -85,34 +82,20 @@ enum PondCmd {
     Create {
         #[arg(long)]
         name: Option<String>,
-        #[command(flatten)]
-        conn: CpConn,
+        /// Owner identity recorded for the pond (relaxed; defaults to anonymous).
+        #[arg(long)]
+        agent_id: Option<String>,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
-    List(CpConn),
+    List,
     Describe {
         pond: String,
-        #[command(flatten)]
-        conn: CpConn,
     },
     Drop {
         pond: String,
         #[arg(long)]
         confirm: bool,
-        #[command(flatten)]
-        conn: CpConn,
     },
-}
-
-/// Client connection to the control plane (the CLI's single entry point).
-#[derive(Args)]
-struct CpConn {
-    /// Control plane address.
-    #[arg(long, default_value = DEFAULT_CONTROL)]
-    control: String,
-    /// Identity attributed to your writes (relaxed; defaults to anonymous).
-    #[arg(long)]
-    agent_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -120,8 +103,9 @@ struct QueryArgs {
     #[arg(long)]
     pond: String,
     sql: String,
-    #[command(flatten)]
-    conn: CpConn,
+    /// Identity attributed to your writes (relaxed; defaults to anonymous).
+    #[arg(long)]
+    agent_id: Option<String>,
 }
 
 #[tokio::main]
@@ -130,8 +114,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve(a) => run_serve(a).await,
         Command::Node(NodeCmd::Add(a)) => run_node_add(a).await,
-        Command::Node(NodeCmd::List(c)) => node_list(c).await,
-        Command::Node(NodeCmd::Describe { node_id, conn }) => node_describe(node_id, conn).await,
+        Command::Node(NodeCmd::List) => node_list().await,
+        Command::Node(NodeCmd::Describe { node_id }) => node_describe(node_id).await,
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
         Command::Query(a) => run_query(a).await,
     }
@@ -142,6 +126,11 @@ fn default_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".latiq")
+}
+
+/// Control plane address — from $LATIQ_CONTROL, else the loopback default.
+fn control_addr() -> String {
+    std::env::var("LATIQ_CONTROL").unwrap_or_else(|_| DEFAULT_CONTROL.to_string())
 }
 
 // ---- server roles -------------------------------------------------------
@@ -171,7 +160,7 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         mcp_addr: mcp_addr.parse()?,
         data_addr: data_addr.parse()?,
         internal_endpoint: format!("http://{data_addr}"),
-        control_endpoint: a.control,
+        control_endpoint: control_addr(),
         data_dir: root.join("ponds"),
     })
     .await
@@ -179,15 +168,17 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
 
 // ---- gRPC clients (friendly connection errors) --------------------------
 
-async fn control_client(addr: &str) -> Result<ControlClient<Channel>> {
-    ControlClient::connect(addr.to_string()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve`.")
+async fn control_client() -> Result<ControlClient<Channel>> {
+    let addr = control_addr();
+    ControlClient::connect(addr.clone()).await.map_err(|_| {
+        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve` (or set $LATIQ_CONTROL).")
     })
 }
 
-async fn admin_client(addr: &str) -> Result<AdminClient<Channel>> {
-    AdminClient::connect(addr.to_string()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve`.")
+async fn admin_client() -> Result<AdminClient<Channel>> {
+    let addr = control_addr();
+    AdminClient::connect(addr.clone()).await.map_err(|_| {
+        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve` (or set $LATIQ_CONTROL).")
     })
 }
 
@@ -199,8 +190,8 @@ async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
 
 /// Ask the control plane which node's Data gRPC hosts `pond_ref`, so data ops go
 /// node-direct. The control plane is only consulted for routing, never the data.
-async fn resolve_node(control: &str, pond_ref: &str) -> Result<String> {
-    let mut c = control_client(control).await?;
+async fn resolve_node(pond_ref: &str) -> Result<String> {
+    let mut c = control_client().await?;
     let loc = c
         .get_pond_location(GetPondLocationRequest {
             pond_ref: pond_ref.to_string(),
@@ -224,7 +215,7 @@ fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
 // ---- query (data; node-direct) ------------------------------------------
 
 async fn run_query(a: QueryArgs) -> Result<()> {
-    let node = resolve_node(&a.conn.control, &a.pond).await?;
+    let node = resolve_node(&a.pond).await?;
     let mut c = data_client(&node).await?;
     // One `query` for everything: the write path runs DDL/DML and, for a plain
     // SELECT, falls through to a read (no snapshot). Reads are still cap-bounded.
@@ -234,7 +225,7 @@ async fn run_query(a: QueryArgs) -> Result<()> {
                 pond: a.pond.clone(),
                 sql: a.sql.clone(),
             },
-            &a.conn.agent_id,
+            &a.agent_id,
         ))
         .await;
     print_json_result(res)
@@ -244,11 +235,11 @@ async fn run_query(a: QueryArgs) -> Result<()> {
 
 async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
     match cmd {
-        PondCmd::Create { name, conn } => {
+        PondCmd::Create { name, agent_id } => {
             // Pure control-plane op: the registry assigns a (random) node; the
             // node materializes storage lazily on first query.
-            let mut c = control_client(&conn.control).await?;
-            let owner = conn.agent_id.clone().unwrap_or_else(|| "anonymous".into());
+            let mut c = control_client().await?;
+            let owner = agent_id.unwrap_or_else(|| "anonymous".into());
             match c
                 .create_pond_assignment(CreatePondAssignmentRequest {
                     name: name.unwrap_or_default(),
@@ -277,8 +268,8 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 Err(st) => print_status(&st),
             }
         }
-        PondCmd::List(conn) => {
-            let mut c = admin_client(&conn.control).await?;
+        PondCmd::List => {
+            let mut c = admin_client().await?;
             let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
             for p in ponds {
                 println!(
@@ -288,29 +279,22 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             }
             Ok(())
         }
-        PondCmd::Describe { pond, conn } => {
-            let node = resolve_node(&conn.control, &pond).await?;
+        PondCmd::Describe { pond } => {
+            let node = resolve_node(&pond).await?;
             let mut c = data_client(&node).await?;
             print_json_result(
-                c.describe_pond(with_id(DescribePondRequest { pond }, &conn.agent_id))
+                c.describe_pond(Request::new(DescribePondRequest { pond }))
                     .await,
             )
         }
-        PondCmd::Drop {
-            pond,
-            confirm,
-            conn,
-        } => {
-            let node = resolve_node(&conn.control, &pond).await?;
+        PondCmd::Drop { pond, confirm } => {
+            let node = resolve_node(&pond).await?;
             let mut c = data_client(&node).await?;
             match c
-                .drop_pond(with_id(
-                    DropPondRequest {
-                        pond: pond.clone(),
-                        confirm,
-                    },
-                    &conn.agent_id,
-                ))
+                .drop_pond(Request::new(DropPondRequest {
+                    pond: pond.clone(),
+                    confirm,
+                }))
                 .await
             {
                 Ok(_) => {
@@ -325,8 +309,8 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
 
 // ---- node admin (control plane) -----------------------------------------
 
-async fn node_list(conn: CpConn) -> Result<()> {
-    let mut c = admin_client(&conn.control).await?;
+async fn node_list() -> Result<()> {
+    let mut c = admin_client().await?;
     for n in c.list_nodes(ListNodesRequest {}).await?.into_inner().nodes {
         println!(
             "{}\t{}\tponds={}\t{}",
@@ -336,8 +320,8 @@ async fn node_list(conn: CpConn) -> Result<()> {
     Ok(())
 }
 
-async fn node_describe(node_id: String, conn: CpConn) -> Result<()> {
-    let mut c = admin_client(&conn.control).await?;
+async fn node_describe(node_id: String) -> Result<()> {
+    let mut c = admin_client().await?;
     let n = c
         .describe_node(DescribeNodeRequest { node_id })
         .await?

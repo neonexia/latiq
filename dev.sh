@@ -89,11 +89,10 @@ CP_PID=$!
 wait_ready "$CP_PID" "control plane" "$CP_PORT"
 
 echo "Starting pond node (Data $DATA_PORT, MCP $MCP_PORT)..."
-"$BIN" node add --port "$DATA_PORT" --root "$ROOT" --control "http://$HOST:$CP_PORT" &
+LATIQ_CONTROL="http://$HOST:$CP_PORT" "$BIN" node add --port "$DATA_PORT" --root "$ROOT" &
 PN_PID=$!
 wait_ready "$PN_PID" "pond node" "$DATA_PORT" "$MCP_PORT"
 
-CTL="--control http://$HOST:$CP_PORT"
 cat <<EOF
 
 Latiq dev stack is up:
@@ -110,11 +109,10 @@ Try (the CLI talks only to the control plane; it routes to the node for you):
   $BIN pond list
   $BIN node list
 
-(Defaults match, so the commands above need no --control flag.)
+The CLI reads \$LATIQ_CONTROL (default http://127.0.0.1:9090). If you changed
+--cp-port, export it in your CLI shell:
+  export LATIQ_CONTROL=http://$HOST:$CP_PORT
 Press Ctrl+C to stop.
 EOF
-
-# Keep CTL referenced so shellcheck/readers know how to target a non-default port.
-: "$CTL"
 
 wait
