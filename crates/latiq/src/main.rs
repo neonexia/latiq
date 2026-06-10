@@ -23,7 +23,8 @@ const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
 #[command(
-    after_help = "The control plane address comes from $LATIQ_CONTROL (default http://127.0.0.1:51400)."
+    after_help = "Env: $LATIQ_CONTROL = control plane address (default http://127.0.0.1:51400); \
+$LATIQ_ROOT = data root for serve/node add (default ~/.latiq)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -141,7 +142,13 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Data root: $LATIQ_ROOT if set, else ~/.latiq. The registry lives at
+/// `<root>/registry.duckdb` and pond storage under `<root>/ponds`. The `--root`
+/// flag overrides both.
 fn default_root() -> PathBuf {
+    if let Some(r) = std::env::var_os("LATIQ_ROOT") {
+        return PathBuf::from(r);
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
