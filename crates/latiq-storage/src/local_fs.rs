@@ -22,6 +22,8 @@ impl LocalFs {
         PondLocation {
             catalog_uri: format!("ducklake:duckdb:{}", dir.join("catalog.duckdb").display()),
             data_path: dir.join("data").display().to_string(),
+            // Default alias; AgentOps overrides with the pond's registry name.
+            catalog_name: "pond".to_string(),
         }
     }
 }
@@ -40,6 +42,13 @@ impl PondStorage for LocalFs {
             Ok(self.location_for(pond_id))
         } else {
             Err(StorageError::NotFound(pond_id))
+        }
+    }
+    fn ensure_pond(&self, pond_id: PondId) -> Result<PondLocation, StorageError> {
+        if self.pond_exists(pond_id) {
+            Ok(self.location_for(pond_id))
+        } else {
+            self.create_pond(pond_id)
         }
     }
     fn drop_pond(&self, pond_id: PondId) -> Result<(), StorageError> {

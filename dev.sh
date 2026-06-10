@@ -1,123 +1,129 @@
 #!/usr/bin/env bash
-# Start a Latiq dev stack: control-plane + one pond-node, print endpoints.
-# Ports are overridable via flags so you can run alongside other services.
-# Everything binds to 127.0.0.1 (prod deployments like k8s bind loopback anyway).
-# See ./dev.sh --help.
+# Start a Latiq dev stack: control plane (`serve`) + one pond node (`node add`).
+# Binds 127.0.0.1; ports/root overridable via flags. See ./dev.sh --help.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST=127.0.0.1
-CONTROL_PORT=9090
-ADMIN_PORT=9091
-MCP_PORT=8080
-DATA_PORT=8081
-DB=./latiq-cp.duckdb
-DATA=./latiq-data
+CP_PORT=51400
+DATA_PORT=51401
+ROOT="${HOME}/.latiq"
 
 usage() {
   cat <<EOF
 Usage: ./dev.sh [options]
 
-  --control-port <port>  Control gRPC port    (default $CONTROL_PORT)
-  --admin-port   <port>  Admin gRPC port      (default $ADMIN_PORT)
-  --mcp-port     <port>  MCP-over-HTTP port   (default $MCP_PORT)
-  --data-port    <port>  Data/Query gRPC port (default $DATA_PORT)
-  --db           <path>  Registry DuckDB file (default $DB)
-  --data-dir     <path>  Pond storage root    (default $DATA)
-  -h, --help             Show this help
+  --cp-port   <port>  Control plane (Control + Admin gRPC)  (default $CP_PORT)
+  --data-port <port>  Pond node Data gRPC; MCP on port + 1  (default $DATA_PORT)
+  --root      <path>  Data root (registry + pond storage)   (default $ROOT)
+  -h, --help          Show this help
 
-Everything binds to $HOST.
-
-Example (run alongside another stack):
-  ./dev.sh --control-port 19090 --admin-port 19091 --mcp-port 18080 --data-port 18081
+Example (run alongside another stack, or with throwaway state):
+  ./dev.sh --cp-port 41400 --data-port 41401 --root /tmp/latiq-dev
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --control-port) CONTROL_PORT=$2; shift 2 ;;
-    --admin-port)   ADMIN_PORT=$2;   shift 2 ;;
-    --mcp-port)     MCP_PORT=$2;     shift 2 ;;
-    --data-port)    DATA_PORT=$2;    shift 2 ;;
-    --db)           DB=$2;           shift 2 ;;
-    --data-dir)     DATA=$2;         shift 2 ;;
-    -h|--help)      usage; exit 0 ;;
+    --cp-port)   CP_PORT=$2;   shift 2 ;;
+    --data-port) DATA_PORT=$2; shift 2 ;;
+    --root)      ROOT=$2;      shift 2 ;;
+    -h|--help)   usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-CONTROL_ADDR=$HOST:$CONTROL_PORT
-ADMIN_ADDR=$HOST:$ADMIN_PORT
-MCP_ADDR=$HOST:$MCP_PORT
-DATA_ADDR=$HOST:$DATA_PORT
+MCP_PORT=$((DATA_PORT + 1))
+mkdir -p "$ROOT"
+ROOT=$(cd "$ROOT" && pwd)        # resolve to an absolute path for the banner
+LOG_DIR="$ROOT/logs"
 
-# Fail early (with the culprit) if a port is already taken — a stale stack or
-# another service squatting on it is the usual cause of confusing startup errors.
+# Colors — only when stdout is a terminal (so piping/redirecting stays clean).
+if [ -t 1 ]; then
+  HDR=$'\033[1m'      # banner: bold white
+  LBL=$'\033[2m'      # labels: dim
+  VAL=$'\033[0m'      # values: normal white
+  DIM=$'\033[2m'
+  ERRC=$'\033[1;31m'  # errors: red (kept visible)
+  RST=$'\033[0m'
+else
+  HDR='' LBL='' VAL='' DIM='' ERRC='' RST=''
+fi
+
+# Fail early (with the culprit) if a port is already taken.
 check_port() {
   local port=$1 name=$2
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "ERROR: $name port $port is already in use by:" >&2
+    printf '%sERROR%s: %s port %s is already in use by:\n' "$ERRC" "$RST" "$name" "$port" >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
-    echo "Free it, or pick another port, e.g. ./dev.sh --control-port 19090" >&2
+    printf 'Free it, or pick another port, e.g. ./dev.sh --cp-port 41400\n' >&2
     exit 1
   fi
 }
-check_port "$CONTROL_PORT" "Control gRPC"
-check_port "$ADMIN_PORT" "Admin gRPC"
-check_port "$MCP_PORT" "MCP"
+check_port "$CP_PORT" "Control plane"
 check_port "$DATA_PORT" "Data gRPC"
+check_port "$MCP_PORT" "MCP"
 
-echo "Building latiq..."
-cargo build -p latiq
+printf '%sbuilding latiq…%s\n' "$DIM" "$RST"
+cargo build -q -p latiq
 BIN=target/debug/latiq
+VERSION=$("$BIN" --version 2>/dev/null | awk '{print $2}')
+mkdir -p "$LOG_DIR"
+CP_LOG="$LOG_DIR/control-plane.log"
+PN_LOG="$LOG_DIR/node-1.log"
 
 CP_PID=""
 PN_PID=""
 cleanup() { kill "$CP_PID" "$PN_PID" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
 
-# A backgrounded server that's already gone died on startup — surface it.
-alive() {
-  if ! kill -0 "$1" 2>/dev/null; then
-    echo "ERROR: $2 exited during startup (see its error above)." >&2
-    exit 1
-  fi
+# Wait until a backgrounded server accepts connections on all its ports, failing
+# fast (and showing its log) if it dies first.
+wait_ready() {
+  local pid=$1 name=$2 log=$3
+  shift 3
+  local ports=("$@")
+  local i p all_up
+  for ((i = 0; i < 150; i++)); do
+    kill -0 "$pid" 2>/dev/null || {
+      printf '%sERROR%s: %s exited during startup — last lines of %s:\n' "$ERRC" "$RST" "$name" "$log" >&2
+      tail -n 15 "$log" >&2
+      exit 1
+    }
+    all_up=1
+    for p in "${ports[@]}"; do
+      (exec 3<>"/dev/tcp/$HOST/$p") 2>/dev/null && exec 3>&- 3<&- || all_up=0
+    done
+    [[ $all_up -eq 1 ]] && return 0
+    sleep 0.2
+  done
+  printf '%sERROR%s: %s did not start listening in time (see %s).\n' "$ERRC" "$RST" "$name" "$log" >&2
+  exit 1
 }
 
-echo "Starting control-plane (Control $CONTROL_ADDR, Admin $ADMIN_ADDR)..."
-"$BIN" control-plane --control-addr "$CONTROL_ADDR" --admin-addr "$ADMIN_ADDR" --db "$DB" &
+"$BIN" serve --port "$CP_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
 CP_PID=$!
-sleep 2
-alive "$CP_PID" "control-plane"
+wait_ready "$CP_PID" "control plane" "$CP_LOG" "$CP_PORT"
 
-echo "Starting pond-node (MCP $MCP_ADDR, Data $DATA_ADDR)..."
-"$BIN" pond-node --node-id node-1 --mcp-addr "$MCP_ADDR" --data-addr "$DATA_ADDR" \
-  --control "http://$CONTROL_ADDR" --data-dir "$DATA" &
+LATIQ_CONTROL="http://$HOST:$CP_PORT" "$BIN" node add --port "$DATA_PORT" --root "$ROOT" >"$PN_LOG" 2>&1 &
 PN_PID=$!
-sleep 2
-alive "$PN_PID" "pond-node"
+wait_ready "$PN_PID" "pond node" "$PN_LOG" "$DATA_PORT" "$MCP_PORT"
 
-cat <<EOF
-
-Latiq dev stack is up:
-  MCP (agents only):    http://$MCP_ADDR/mcp
-  Data gRPC (CLI/SDK):  $DATA_ADDR
-  Control gRPC:         $CONTROL_ADDR
-  Admin gRPC (ops):     $ADMIN_ADDR
-
-Try (data CLI — pond node):
-  $BIN pond create --name demo
-  $BIN write --pond demo "CREATE TABLE t(id INTEGER, note VARCHAR)"
-  $BIN write --pond demo "INSERT INTO t VALUES (1,'hello')"
-  $BIN query --pond demo "SELECT * FROM t"
-  $BIN pond list
-
-Operator CLI (control plane):
-  $BIN node list
-  $BIN policy show
-  $BIN audit tail
-
-Press Ctrl+C to stop.
-EOF
+# --- banner -------------------------------------------------------------
+row() { printf '   %s%-12s%s %s%s%s\n' "$LBL" "$1" "$RST" "$VAL" "$2" "$RST"; }
+echo
+printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
+printf '%s  latiq%s %sagent-native data pond%s %s· v%s%s\n' "$HDR" "$RST" "$DIM" "$RST" "$DIM" "${VERSION:-?}" "$RST"
+printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
+echo
+row "control"   "$HOST:$CP_PORT   (Control + Admin gRPC)"
+row "data gRPC" "$HOST:$DATA_PORT"
+row "mcp"       "http://$HOST:$MCP_PORT/mcp"
+row "node"      "node-1"
+row "registry"  "$ROOT/registry.duckdb"
+row "ponds"     "$ROOT/ponds"
+row "logs"      "$LOG_DIR/{control-plane,node-1}.log"
+echo
+printf '   %sCtrl+C to stop.%s\n' "$DIM" "$RST"
 
 wait

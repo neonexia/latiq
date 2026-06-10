@@ -11,6 +11,12 @@ pub struct PondInstance {
     pub conn: Connection,
 }
 
+/// Quote a SQL identifier (the catalog alias), doubling embedded `"` so any pond
+/// name — dashes, spaces, reserved words — is a valid catalog name.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 impl PondInstance {
     /// Open a DuckDB instance with the pond's DuckLake catalog attached as `pond`.
     pub fn open(loc: &PondLocation) -> Result<Self, EngineError> {
@@ -20,17 +26,19 @@ impl PondInstance {
             conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
                 .map_err(|e| EngineError::Engine(format!("load {ext}: {e}")))?;
         }
-        // ATTACH the pond's DuckLake catalog.
-        // Exact syntax confirmed in spike findings (m1-spike-findings.md, Probe A):
-        //   ATTACH 'ducklake:duckdb:<catalog_path>' AS pond (DATA_PATH '<data_path>');
-        // The catalog_uri already contains the full 'ducklake:duckdb:<path>' prefix.
+        // ATTACH the pond's DuckLake catalog under the pond's name, so callers
+        // query `<pond>.snapshots()` / `<pond>.main.<table>`. The alias is quoted
+        // (and embedded quotes doubled) so any pond name is a valid identifier.
+        // Syntax per spike findings (m1-spike-findings.md, Probe A); catalog_uri
+        // already carries the full 'ducklake:duckdb:<path>' prefix.
+        let alias = quote_ident(&loc.catalog_name);
         conn.execute_batch(&format!(
-            "ATTACH '{}' AS pond (DATA_PATH '{}');",
+            "ATTACH '{}' AS {alias} (DATA_PATH '{}');",
             loc.catalog_uri, loc.data_path
         ))
         .map_err(|e| EngineError::Engine(format!("attach: {e}")))?;
-        // Make `pond` the default catalog so unqualified table names resolve there.
-        conn.execute_batch("USE pond;").ok();
+        // Make it the default catalog so unqualified table names resolve there.
+        conn.execute_batch(&format!("USE {alias};")).ok();
         Ok(Self { conn })
     }
 }

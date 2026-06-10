@@ -11,7 +11,6 @@
 //! cancelled, and exits when the operation completes.
 use crate::exec::{run_explain, run_read, run_write};
 use crate::instance::PondInstance;
-use crate::latiq_schema::create_latiq_schema;
 use latiq_common::Identity;
 use latiq_engine::{
     AbortToken, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary, TableInfo,
@@ -90,9 +89,11 @@ impl DuckEngine {
 
 impl QueryEngine for DuckEngine {
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
-        create_latiq_schema(&guard.conn)
+        // Opening the instance attaches the pond's DuckLake catalog (creating the
+        // catalog file on first open) and validates it's usable. No Latiq objects
+        // are created on top — the pond is pure DuckLake.
+        let _ = self.instance(loc)?;
+        Ok(())
     }
 
     fn read_query(
@@ -115,7 +116,9 @@ impl QueryEngine for DuckEngine {
     ) -> Result<QueryResult, EngineError> {
         let inst = self.instance(loc)?;
         let guard = lock_recover(&inst);
-        Self::run_with_abort(&guard, &abort, |i| run_write(i, sql, identity))
+        Self::run_with_abort(&guard, &abort, |i| {
+            run_write(i, sql, identity, &loc.catalog_name)
+        })
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
@@ -136,9 +139,17 @@ impl QueryEngine for DuckEngine {
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError> {
         let inst = self.instance(loc)?;
         let guard = lock_recover(&inst);
+        // Native DuckDB catalog introspection on the attached pond catalog — no
+        // Latiq view in between. (This lives in the DuckDB adapter, so using
+        // duckdb_tables() here is fine; a DataFusion adapter would use its own.)
+        // Scope to this pond's catalog (its name); escape `'` for the literal.
+        let cat = loc.catalog_name.replace('\'', "''");
         let res = run_read(
             &guard,
-            "SELECT name, row_count, comment FROM _latiq.tables_summary",
+            &format!(
+                "SELECT table_name AS name, estimated_size AS row_count, comment \
+                 FROM duckdb_tables() WHERE database_name = '{cat}'"
+            ),
         )?;
         let tables = res
             .rows

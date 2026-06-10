@@ -7,8 +7,6 @@ use latiq_storage::PondLocation;
 pub enum EngineError {
     #[error("query parse error: {0}")]
     Parse(String),
-    #[error("write to reserved schema _latiq is not allowed")]
-    ReservedSchemaWrite,
     #[error("read_query received a non-read statement; use write_query")]
     ReadOnlyViolation,
     #[error("query was cancelled")]
@@ -24,7 +22,7 @@ pub enum EngineError {
 /// blocking thread. `abort` MUST interrupt execution and release engine resources
 /// within a bounded window (see spec §6).
 pub trait QueryEngine: Send + Sync {
-    /// Initialize a freshly-created pond (create the `_latiq` views, load extensions).
+    /// Initialize a freshly-created pond (attach its DuckLake catalog, load extensions).
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError>;
     /// Run a read-only query (SELECT / read-only metadata). Rejects writes.
     fn read_query(

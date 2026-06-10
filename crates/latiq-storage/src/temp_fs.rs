@@ -31,6 +31,9 @@ impl PondStorage for TempFs {
     fn pond_location(&self, id: PondId) -> Result<PondLocation, StorageError> {
         self.inner.pond_location(id)
     }
+    fn ensure_pond(&self, id: PondId) -> Result<PondLocation, StorageError> {
+        self.inner.ensure_pond(id)
+    }
     fn drop_pond(&self, id: PondId) -> Result<(), StorageError> {
         self.inner.drop_pond(id)
     }

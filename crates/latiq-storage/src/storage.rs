@@ -19,6 +19,10 @@ pub trait PondStorage: Send + Sync {
     fn create_pond(&self, pond_id: PondId) -> Result<PondLocation, StorageError>;
     /// Resolve an existing pond's location.
     fn pond_location(&self, pond_id: PondId) -> Result<PondLocation, StorageError>;
+    /// Resolve a pond's location, provisioning storage if it doesn't exist yet.
+    /// Lazy materialization: a pond assigned by the registry gets its physical
+    /// storage on first use, so allocation can be a pure control-plane op.
+    fn ensure_pond(&self, pond_id: PondId) -> Result<PondLocation, StorageError>;
     /// Remove a pond's storage entirely.
     fn drop_pond(&self, pond_id: PondId) -> Result<(), StorageError>;
     /// Whether the pond's storage exists.

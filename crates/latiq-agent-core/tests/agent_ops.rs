@@ -59,12 +59,12 @@ async fn full_agent_loop() {
     assert_eq!(r.rows.len(), 2);
     assert_eq!(r.rows[1][1], serde_json::json!("critical"));
 
-    // Attribution visible via _latiq.
+    // Attribution visible via native DuckLake snapshots.
     let attr = ops
         .read_query(
             &id,
             "incident-9",
-            "SELECT DISTINCT author FROM _latiq.attribution",
+            "SELECT DISTINCT author FROM ducklake_snapshots('incident-9')",
         )
         .await
         .unwrap();
@@ -106,6 +106,44 @@ async fn pond_lifecycle_drop_requires_confirm() {
     // With confirm it actually drops.
     ops.drop_pond(&id, "keepme", true).await.unwrap();
     assert!(ops.describe_pond(&id, "keepme").await.is_err());
+}
+
+#[tokio::test]
+async fn lazy_materialize_pond_assigned_without_eager_storage() {
+    // Mirrors the CLI `pond create` path: the control plane assigns a node in the
+    // registry, but NO storage is provisioned up front. The first query must
+    // materialize the pond's storage on touch and succeed.
+    let registry = Registry::open(None).unwrap();
+    registry
+        .register_node(
+            "node-a",
+            "http://127.0.0.1:8080/mcp",
+            "http://127.0.0.1:9092",
+            100,
+        )
+        .unwrap();
+    // Registry-only allocation — deliberately NOT ops.allocate_pond (no storage).
+    registry
+        .create_pond(Some("lazy".into()), "agent-x", "{}")
+        .unwrap();
+
+    let control = Arc::new(RegistryControlPlane::new(registry));
+    let storage = Arc::new(TempFs::new());
+    let engine = Arc::new(DuckEngine::new());
+    let ops = AgentOps::new(control, storage, engine, AgentConfig::default());
+    let id = Identity::claimed(Some("agent-x"));
+
+    ops.write_query(&id, "lazy", "CREATE TABLE t(x INTEGER)")
+        .await
+        .unwrap();
+    ops.write_query(&id, "lazy", "INSERT INTO t VALUES (1),(2)")
+        .await
+        .unwrap();
+    let r = ops
+        .read_query(&id, "lazy", "SELECT count(*) AS n FROM t")
+        .await
+        .unwrap();
+    assert_eq!(r.rows[0][0], serde_json::json!(2));
 }
 
 #[tokio::test]

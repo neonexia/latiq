@@ -70,10 +70,11 @@ impl AgentOps {
             .create_pond(name, &identity.agent_id, policy_json)
             .await?;
         let pid = Self::parse_id(&info.pond_id)?;
-        let loc = self
+        let mut loc = self
             .storage
             .create_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
 
         let engine = self.engine.clone();
         let loc2 = loc.clone();
@@ -101,10 +102,13 @@ impl AgentOps {
     ) -> Result<DescribeResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
         let pid = Self::parse_id(&info.pond_id)?;
-        let loc = self
+        // ensure_pond materializes storage on first touch; attach under the
+        // pond's registry name so introspection is scoped to this catalog.
+        let mut loc = self
             .storage
-            .pond_location(pid)
+            .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let schema = tokio::task::spawn_blocking(move || engine.describe_schema(&loc2))
@@ -190,12 +194,16 @@ impl AgentOps {
         identity: &Identity,
         write: bool,
     ) -> Result<QueryResult, AgentError> {
-        let pond_id = self.control.resolve_pond(pond_ref).await?;
+        let info = self.control.pond_info(pond_ref).await?;
+        let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
-        let loc = self
+        // ensure_pond materializes storage on first touch; attach the catalog
+        // under the pond's registry name so callers query `<pond>.snapshots()`.
+        let mut loc = self
             .storage
-            .pond_location(pid)
+            .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
         let (op_id, token) = self.inflight.register(Some(pond_id.clone()));
 
         let engine = self.engine.clone();
@@ -240,12 +248,15 @@ impl AgentOps {
         pond_ref: &str,
         sql: &str,
     ) -> Result<ExplainResult, AgentError> {
-        let pond_id = self.control.resolve_pond(pond_ref).await?;
-        let pid = Self::parse_id(&pond_id)?;
-        let loc = self
+        let info = self.control.pond_info(pond_ref).await?;
+        let pid = Self::parse_id(&info.pond_id)?;
+        // ensure_pond materializes storage on first touch; attach under the
+        // pond's registry name so the plan resolves names in this catalog.
+        let mut loc = self
             .storage
-            .pond_location(pid)
+            .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let sql2 = sql.to_string();
@@ -255,7 +266,7 @@ impl AgentOps {
         self.audit(
             identity,
             "explain_query",
-            Some(&pond_id),
+            Some(info.pond_id.as_str()),
             Some(redact_sql(sql)),
             0,
         )
