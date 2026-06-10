@@ -126,6 +126,7 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         "pond-node '{}' serving MCP at {mcp_endpoint} and Data gRPC at http://{}",
         cfg.node_id, cfg.data_addr
     );
+    println!("  pond storage: {}", cfg.data_dir.display());
     serve_mcp(cfg.mcp_addr, ops)
         .await
         .map_err(|e| anyhow::anyhow!("mcp server error: {e}"))?;

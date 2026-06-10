@@ -165,13 +165,12 @@ fn control_addr() -> String {
 async fn run_serve(a: ServeArgs) -> Result<()> {
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
     let db = root.join("registry.duckdb");
     let registry = Registry::open(Some(db.as_path()))?;
     let addr: SocketAddr = format!("127.0.0.1:{}", a.port).parse()?;
-    println!(
-        "control plane: Control + Admin gRPC on {addr} (registry: {})",
-        db.display()
-    );
+    println!("control plane: Control + Admin gRPC on {addr}");
+    println!("  registry: {}", db.display());
     serve_control_plane(addr, registry)
         .await
         .map_err(|e| anyhow!("server error: {e}"))?;
@@ -180,6 +179,8 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
 
 async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     let root = a.root.unwrap_or_else(default_root);
+    std::fs::create_dir_all(&root)?;
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
     let data_addr = format!("127.0.0.1:{}", a.port);
     let mcp_addr = format!("127.0.0.1:{}", a.port + 1);
     run_pond_node(PondNodeConfig {
