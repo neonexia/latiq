@@ -109,7 +109,7 @@ async fn concurrent_multi_agent_writes_are_consistent_and_attributed() {
         .read_query(
             &setup,
             "shared",
-            "SELECT count(DISTINCT author) AS a FROM _latiq.attribution WHERE author LIKE 'agent-%'",
+            "SELECT count(DISTINCT author) AS a FROM ducklake_snapshots('shared') WHERE author LIKE 'agent-%'",
         )
         .await
         .unwrap();

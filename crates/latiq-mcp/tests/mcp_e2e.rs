@@ -78,7 +78,10 @@ async fn server_client_agent_loop() {
 
     // Attribution visible.
     let attr = client
-        .query("demo", "SELECT DISTINCT author FROM _latiq.attribution")
+        .query(
+            "demo",
+            "SELECT DISTINCT author FROM ducklake_snapshots('demo')",
+        )
         .await
         .unwrap();
     let authors: Vec<_> = attr.value["rows"]
