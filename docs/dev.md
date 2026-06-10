@@ -157,6 +157,19 @@ latiq query --pond demo "CREATE TABLE t AS SELECT * FROM read_csv('https://examp
 latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parquet'"
 ```
 
+### Sample datasets
+
+`latiq dataset` loads curated **public** datasets (DuckLake/standard data — nothing is stored in the repo) into a pond, one `CREATE TABLE` per table:
+
+```bash
+latiq dataset list                       # startrek, holdings, tpch (8 tables), taxi (~127 MB)
+latiq dataset load tpch     -p demo       # loads lineitem, orders, customer, … into `demo`
+latiq dataset load startrek -p demo       # a tiny CSV, good for a quick smoke
+latiq dataset load --all    -p demo       # everything (taxi is large — downloads ~127 MB)
+```
+
+Each table is created via the normal write path, so it's attributed to `--agent-id` and snapshotted like any other write. Needs network (the data is fetched from the public URLs).
+
 ### Targeting a non-default control plane
 
 ```bash

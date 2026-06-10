@@ -43,6 +43,27 @@ enum Command {
     Pond(PondCmd),
     /// Run a SQL statement (read or write) against a pond.
     Query(QueryArgs),
+    /// Load curated sample datasets (public DuckLake/standard data) into a pond.
+    #[command(subcommand)]
+    Dataset(DatasetCmd),
+}
+
+#[derive(Subcommand)]
+enum DatasetCmd {
+    /// List the available sample datasets.
+    List,
+    /// Load a dataset (or --all) into a pond — one CREATE TABLE per table.
+    Load {
+        /// Dataset name (omit and pass --all to load every dataset).
+        name: Option<String>,
+        /// Load every dataset.
+        #[arg(long)]
+        all: bool,
+        #[arg(short, long)]
+        pond: String,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -139,6 +160,155 @@ async fn main() -> Result<()> {
         Command::Node(NodeCmd::Describe { node_id }) => node_describe(node_id).await,
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
         Command::Query(a) => run_query(a).await,
+        Command::Dataset(cmd) => run_dataset_cmd(cmd).await,
+    }
+}
+
+// ---- sample datasets ----------------------------------------------------
+
+/// A curated sample dataset: one or more tables, each loaded from a public URL.
+/// Data is NOT stored in the repo — these are standard public datasets.
+struct SampleDataset {
+    name: &'static str,
+    description: &'static str,
+    tables: &'static [(&'static str, &'static str)], // (table name, source URL)
+}
+
+const DATASETS: &[SampleDataset] = &[
+    SampleDataset {
+        name: "startrek",
+        description: "Star Trek Season 1 scripts — CSV, ~2 KB",
+        tables: &[(
+            "startrek",
+            "https://blobs.duckdb.org/data/Star_Trek-Season_1.csv",
+        )],
+    },
+    SampleDataset {
+        name: "holdings",
+        description: "Example stock holdings — CSV, ~300 B",
+        tables: &[("holdings", "https://duckdb.org/data/holdings.csv")],
+    },
+    SampleDataset {
+        name: "tpch",
+        description: "TPC-H scale 0.01 — 8 tables, Parquet, a few MB",
+        tables: &[
+            (
+                "lineitem",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet",
+            ),
+            (
+                "orders",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/orders.parquet",
+            ),
+            (
+                "customer",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet",
+            ),
+            (
+                "part",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/part.parquet",
+            ),
+            (
+                "supplier",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/supplier.parquet",
+            ),
+            (
+                "partsupp",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/partsupp.parquet",
+            ),
+            (
+                "nation",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet",
+            ),
+            (
+                "region",
+                "https://shell.duckdb.org/data/tpch/0_01/parquet/region.parquet",
+            ),
+        ],
+    },
+    SampleDataset {
+        name: "taxi",
+        description: "NYC yellow-taxi, Apr 2019 — Parquet, ~127 MB (large)",
+        tables: &[("taxi", "https://blobs.duckdb.org/data/taxi_2019_04.parquet")],
+    },
+];
+
+/// The DuckDB reader for a URL, picked by extension.
+fn read_fn(url: &str) -> String {
+    let u = url.to_lowercase();
+    if u.ends_with(".csv") {
+        format!("read_csv_auto('{url}')")
+    } else if u.ends_with(".json") || u.ends_with(".ndjson") {
+        format!("read_json_auto('{url}')")
+    } else {
+        format!("read_parquet('{url}')")
+    }
+}
+
+async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
+    match cmd {
+        DatasetCmd::List => {
+            for d in DATASETS {
+                let tn = d.tables.len();
+                println!(
+                    "{:<10} {} table{}  {}",
+                    d.name,
+                    tn,
+                    if tn == 1 { " " } else { "s" },
+                    d.description
+                );
+            }
+            Ok(())
+        }
+        DatasetCmd::Load {
+            name,
+            all,
+            pond,
+            agent_id,
+        } => {
+            let selected: Vec<&SampleDataset> = if all {
+                DATASETS.iter().collect()
+            } else {
+                let n = name.ok_or_else(|| {
+                    anyhow!("pass a dataset name or --all (see `latiq dataset list`)")
+                })?;
+                vec![DATASETS
+                    .iter()
+                    .find(|d| d.name == n)
+                    .ok_or_else(|| anyhow!("unknown dataset '{n}'; see `latiq dataset list`"))?]
+            };
+            // Resolve the pond's node once; load each table node-direct.
+            let node = resolve_node(&pond).await?;
+            let mut c = data_client(&node).await?;
+            for d in selected {
+                for (table, url) in d.tables {
+                    let sql = format!(
+                        "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM {}",
+                        read_fn(url)
+                    );
+                    print!("  {} → {table} … ", d.name);
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                    match c
+                        .write_query(with_id(
+                            QueryRequest {
+                                pond: pond.clone(),
+                                sql,
+                            },
+                            &agent_id,
+                        ))
+                        .await
+                    {
+                        Ok(_) => println!("ok"),
+                        Err(st) => {
+                            println!("FAILED");
+                            return print_status(&st);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -496,5 +666,36 @@ fn node_to_json(n: Option<NodeInfo>) -> serde_json::Value {
             "pond_count": n.pond_count,
         }),
         None => serde_json::Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_fn_picks_reader_by_extension() {
+        assert!(read_fn("https://x/a.parquet").starts_with("read_parquet("));
+        assert!(read_fn("https://x/a.csv").starts_with("read_csv_auto("));
+        assert!(read_fn("https://x/a.json").starts_with("read_json_auto("));
+        // unknown extension defaults to parquet
+        assert!(read_fn("https://x/a").starts_with("read_parquet("));
+    }
+
+    #[test]
+    fn dataset_catalog_is_well_formed() {
+        let mut names = std::collections::HashSet::new();
+        for d in DATASETS {
+            assert!(names.insert(d.name), "duplicate dataset name '{}'", d.name);
+            assert!(!d.tables.is_empty(), "dataset '{}' has no tables", d.name);
+            for (table, url) in d.tables {
+                assert!(!table.is_empty(), "{} has an empty table name", d.name);
+                assert!(
+                    url.starts_with("https://"),
+                    "{}.{table} url must be https (public): {url}",
+                    d.name
+                );
+            }
+        }
     }
 }
