@@ -35,7 +35,7 @@ Plus one internal surface: **Control gRPC** (pond-node → control-plane; routin
 7. **One DuckDB instance per pond** (mutex-guarded, reused across queries) — the unit of **resource isolation** (per-pond memory/CPU caps live on the instance; DuckDB's `memory_limit`/`threads` are instance-global) and of concurrency ownership (one process owns each catalog file; independent instances racing on one catalog lose writes). Never go back to instance-per-query.
 8. **Hard separation of surfaces.** Agents (MCP) cannot do admin; operators (Admin gRPC) are not agents; data clients (Data gRPC) are not agents. Different transports, different audiences, different audit attribution.
 9. **Identity is relaxed in M1** (claimed, default `anonymous`, `verified:false`), carried by a header (MCP) / gRPC metadata (gRPC). OIDC verification is M2.
-10. **Don't test DuckDB; test our integration with it.** DuckDB is a production engine. Test *our* code and *our* boundary: cell→JSON conversion, the read/write/explain guards, cancellation + prompt resource release, concurrency correctness, attribution plumbing, the `_latiq` views. Never assert DuckDB SQL semantics.
+10. **Don't test DuckDB; test our integration with it.** DuckDB is a production engine. Test *our* code and *our* boundary: cell→JSON conversion (incl. nested/temporal types), the read/write/explain guards, cancellation + prompt resource release, concurrency correctness, attribution plumbing (native `pond.snapshots()`). Never assert DuckDB SQL semantics.
 11. **Single binary** (`latiq`) for all roles. `protoc` required to build (`brew install protobuf`).
 12. **Make it boring.** Predictable behavior, structured errors (`kind`/`message`/`suggest`/`see`), good defaults. Cleverness waits for later slices.
 
