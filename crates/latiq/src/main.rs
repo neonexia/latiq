@@ -47,10 +47,10 @@ enum Command {
 #[derive(Args)]
 struct ServeArgs {
     /// Port for the Control + Admin gRPC surfaces.
-    #[arg(long, default_value_t = 51400)]
+    #[arg(short, long, default_value_t = 51400)]
     port: u16,
     /// Data root; the registry lives at <root>/registry.duckdb (default ~/.latiq).
-    #[arg(long)]
+    #[arg(short, long)]
     root: Option<PathBuf>,
 }
 
@@ -69,10 +69,10 @@ struct NodeAddArgs {
     #[arg(long, default_value = "node-1")]
     node_id: String,
     /// Data/Query gRPC port. MCP (agents) is served on port + 1.
-    #[arg(long, default_value_t = 51401)]
+    #[arg(short, long, default_value_t = 51401)]
     port: u16,
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
-    #[arg(long)]
+    #[arg(short, long)]
     root: Option<PathBuf>,
 }
 
@@ -80,10 +80,10 @@ struct NodeAddArgs {
 enum PondCmd {
     /// Allocate a pond. The control plane picks a node; you don't pass an address.
     Create {
-        #[arg(long)]
+        #[arg(short, long)]
         name: Option<String>,
         /// Owner identity recorded for the pond (relaxed; defaults to anonymous).
-        #[arg(long)]
+        #[arg(short, long)]
         agent_id: Option<String>,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
@@ -98,17 +98,34 @@ enum PondCmd {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Format {
+    /// Aligned text table (default).
+    Tabular,
+    /// Raw JSON ({columns, rows, statement, status, _meta}).
+    Json,
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Format::Tabular => "tabular",
+            Format::Json => "json",
+        })
+    }
+}
+
 #[derive(Args)]
 struct QueryArgs {
-    #[arg(long)]
+    #[arg(short, long)]
     pond: String,
     sql: String,
     /// Identity attributed to your writes (relaxed; defaults to anonymous).
-    #[arg(long)]
+    #[arg(short, long)]
     agent_id: Option<String>,
-    /// Emit raw JSON instead of a table (the default for read results).
-    #[arg(long)]
-    json: bool,
+    /// Output format for read results.
+    #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
+    format: Format,
 }
 
 #[tokio::main]
@@ -231,10 +248,9 @@ async fn run_query(a: QueryArgs) -> Result<()> {
             &a.agent_id,
         ))
         .await;
-    if a.json {
-        print_json_result(res)
-    } else {
-        print_table_result(res)
+    match a.format {
+        Format::Json => print_json_result(res),
+        Format::Tabular => print_table_result(res),
     }
 }
 

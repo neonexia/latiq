@@ -140,7 +140,7 @@ latiq query --pond demo "SHOW TABLES"
 latiq query --pond demo "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='events'"
 ```
 
-The SQL is a positional argument; `--pond` is required. Read results print as a **table** by default (`--json` for raw `{columns, rows, statement, status, _meta}`); writes print `ok (snapshot N)`. Errors print the structured envelope:
+The SQL is a positional argument; `--pond` (`-p`) is required. Read results print as a **table** by default (`--format json` / `-f json` for raw `{columns, rows, statement, status, _meta}`); writes print `ok (snapshot N)`. Most flags have short forms — `-p` pond, `-n` name, `-a` agent-id, `-f` format. Errors print the structured envelope:
 
 ```
 error [pond_not_found]: Pond 'ghost' does not exist.
