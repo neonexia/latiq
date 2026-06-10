@@ -143,7 +143,13 @@ fn is_read_only(sql: &str) -> bool {
         || s.starts_with("describe")
         || s.starts_with("show")
         || s.starts_with("explain")
-        || s.starts_with("pragma");
+        || s.starts_with("pragma")
+        // DuckDB read-first shorthands: `FROM t`, `TABLE t`, `VALUES (...)` are all
+        // SELECTs. No write statement starts with these (DELETE/UPDATE start with
+        // their own keyword), so treating them as reads is safe.
+        || s.starts_with("from")
+        || s.starts_with("table")
+        || s.starts_with("values");
     if !starts_read {
         return false;
     }
@@ -459,6 +465,28 @@ mod tests {
             snapshot_count(&inst),
             before,
             "SELECT must not add a snapshot"
+        );
+    }
+
+    #[test]
+    fn from_first_shorthand_is_a_read_not_a_write() {
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, "pond").unwrap();
+        let before = snapshot_count(&inst);
+        // DuckDB's `FROM t` shorthand is `SELECT * FROM t` — must read, and routed
+        // through write_query must NOT create a snapshot (the reported bug: it ran
+        // as a write, returning no rows and polluting history).
+        let r = run_read(&inst, "FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], serde_json::json!(1));
+        let w = run_write(&inst, "FROM t", &id, "pond").unwrap();
+        assert_eq!(w.rows.len(), 2, "FROM via write path must return rows");
+        assert_eq!(
+            snapshot_count(&inst),
+            before,
+            "a FROM-first read must not add a snapshot"
         );
     }
 
