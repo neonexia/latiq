@@ -34,18 +34,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 MCP_PORT=$((DATA_PORT + 1))
+mkdir -p "$ROOT"
+ROOT=$(cd "$ROOT" && pwd)        # resolve to an absolute path for the banner
 LOG_DIR="$ROOT/logs"
 
 # Colors — only when stdout is a terminal (so piping/redirecting stays clean).
 if [ -t 1 ]; then
-  NAVY=$'\033[1;38;2;0;0;128m'   # navy blue, bold
-  LBL=$'\033[36m'                # labels: cyan
-  VAL=$'\033[1;37m'              # values: bright white
+  HDR=$'\033[1m'      # banner: bold white
+  LBL=$'\033[2m'      # labels: dim
+  VAL=$'\033[0m'      # values: normal white
   DIM=$'\033[2m'
-  ERRC=$'\033[1;31m'
+  ERRC=$'\033[1;31m'  # errors: red (kept visible)
   RST=$'\033[0m'
 else
-  NAVY='' LBL='' VAL='' DIM='' ERRC='' RST=''
+  HDR='' LBL='' VAL='' DIM='' ERRC='' RST=''
 fi
 
 # Fail early (with the culprit) if a port is already taken.
@@ -110,9 +112,9 @@ wait_ready "$PN_PID" "pond node" "$PN_LOG" "$DATA_PORT" "$MCP_PORT"
 # --- banner -------------------------------------------------------------
 row() { printf '   %s%-12s%s %s%s%s\n' "$LBL" "$1" "$RST" "$VAL" "$2" "$RST"; }
 echo
-printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$NAVY" "$RST"
-printf '%s  latiq%s %sagent-native data pond%s %s· v%s%s\n' "$NAVY" "$RST" "$DIM" "$RST" "$DIM" "${VERSION:-?}" "$RST"
-printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$NAVY" "$RST"
+printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
+printf '%s  latiq%s %sagent-native data pond%s %s· v%s%s\n' "$HDR" "$RST" "$DIM" "$RST" "$DIM" "${VERSION:-?}" "$RST"
+printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
 echo
 row "control"   "$HOST:$CP_PORT   (Control + Admin gRPC)"
 row "data gRPC" "$HOST:$DATA_PORT"
