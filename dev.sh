@@ -5,8 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST=127.0.0.1
-CP_PORT=9090
-DATA_PORT=8081
+CP_PORT=51400
+DATA_PORT=51401
 ROOT="${HOME}/.latiq"
 
 usage() {
@@ -19,7 +19,7 @@ Usage: ./dev.sh [options]
   -h, --help          Show this help
 
 Example (run alongside another stack, or with throwaway state):
-  ./dev.sh --cp-port 19090 --data-port 18081 --root /tmp/latiq-dev
+  ./dev.sh --cp-port 41400 --data-port 41401 --root /tmp/latiq-dev
 EOF
 }
 
@@ -42,7 +42,7 @@ check_port() {
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "ERROR: $name port $port is already in use by:" >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
-    echo "Free it, or pick another port, e.g. ./dev.sh --cp-port 19090" >&2
+    echo "Free it, or pick another port, e.g. ./dev.sh --cp-port 41400" >&2
     exit 1
   fi
 }
@@ -109,7 +109,7 @@ Try (the CLI talks only to the control plane; it routes to the node for you):
   $BIN pond list
   $BIN node list
 
-The CLI reads \$LATIQ_CONTROL (default http://127.0.0.1:9090). If you changed
+The CLI reads \$LATIQ_CONTROL (default http://127.0.0.1:51400). If you changed
 --cp-port, export it in your CLI shell:
   export LATIQ_CONTROL=http://$HOST:$CP_PORT
 Press Ctrl+C to stop.

@@ -56,9 +56,9 @@ Builds `latiq`, starts the control plane (`serve`) and one pond node (`node add`
 Endpoints it brings up:
 
 ```
-Control plane (CLI):  127.0.0.1:9090   (Control + Admin gRPC, one port)
-Pond node Data gRPC:  127.0.0.1:8081
-MCP (agents only):    http://127.0.0.1:8082/mcp
+Control plane (CLI):  127.0.0.1:51400   (Control + Admin gRPC, one port)
+Pond node Data gRPC:  127.0.0.1:51401
+MCP (agents only):    http://127.0.0.1:51402/mcp
 Root:                 ~/.latiq
 ```
 
@@ -67,17 +67,17 @@ Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond st
 `dev.sh` preflights the ports and aborts (naming the culprit) if one is taken, so a stale stack fails loudly instead of producing confusing gRPC errors. Override via flags (`./dev.sh --help`); MCP is always the Data port + 1:
 
 ```bash
-./dev.sh --cp-port 19090 --data-port 18081 --root /tmp/latiq-dev
+./dev.sh --cp-port 41400 --data-port 41401 --root /tmp/latiq-dev
 ```
 
 ### Manual start (two terminals)
 
 ```bash
 # Terminal 1 — control plane (Control + Admin gRPC on one port)
-cargo run -p latiq -- serve --port 9090 --root ~/.latiq
+cargo run -p latiq -- serve --port 51400 --root ~/.latiq
 
-# Terminal 2 — pond node (Data gRPC + MCP; registers at $LATIQ_CONTROL, default :9090)
-cargo run -p latiq -- node add --port 8081 --root ~/.latiq
+# Terminal 2 — pond node (Data gRPC + MCP; registers at $LATIQ_CONTROL, default :51400)
+cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 ```
 
 ### Server options
@@ -86,7 +86,7 @@ cargo run -p latiq -- node add --port 8081 --root ~/.latiq
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--port` | `9090` | Control + Admin gRPC port (one port, both services) |
+| `--port` | `51400` | Control + Admin gRPC port (one port, both services) |
 | `--root` | `~/.latiq` | Data root; registry at `<root>/registry.duckdb` |
 
 **`latiq node add`** (pond node)
@@ -94,22 +94,22 @@ cargo run -p latiq -- node add --port 8081 --root ~/.latiq
 | Flag | Default | Meaning |
 |---|---|---|
 | `--node-id` | `node-1` | This node's id in the registry |
-| `--port` | `8081` | Data/Query gRPC port; MCP (agents) is served on `port + 1` |
+| `--port` | `51401` | Data/Query gRPC port; MCP (agents) is served on `port + 1` |
 | `--root` | `~/.latiq` | Data root; pond storage under `<root>/ponds` |
 
-(The node registers with the control plane at `$LATIQ_CONTROL`, default `http://127.0.0.1:9090`.)
+(The node registers with the control plane at `$LATIQ_CONTROL`, default `http://127.0.0.1:51400`.)
 
 ---
 
 ## Drive it from the CLI
 
-The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_CONTROL` env var (default `http://127.0.0.1:9090`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops.
+The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_CONTROL` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops.
 
 For dev, put the build output on your PATH (every `cargo build` refreshes it in place) and export the control address only if it's not the default:
 
 ```bash
 export PATH="$PWD/target/debug:$PATH"           # or target/release after `cargo build --release`
-export LATIQ_CONTROL=http://127.0.0.1:9090      # only if you changed --cp-port
+export LATIQ_CONTROL=http://127.0.0.1:51400      # only if you changed --cp-port
 ```
 
 ### Pond lifecycle
@@ -132,15 +132,15 @@ latiq query --pond demo --agent-id alice "CREATE TABLE events(id INTEGER, sev VA
 latiq query --pond demo --agent-id alice "INSERT INTO events VALUES (1,'high'),(2,'critical')"
 latiq query --pond demo "SELECT id, sev FROM events ORDER BY id"
 
-# Native DuckLake — history/attribution (who wrote what); nothing layered on top
-latiq query --pond demo "SELECT snapshot_id, author, commit_message FROM pond.snapshots()"
+# Native DuckLake — history/attribution (the catalog is named after the pond)
+latiq query --pond demo "SELECT snapshot_id, author, commit_message FROM demo.snapshots()"
 
 # Catalog introspection is standard SQL (engine-portable)
 latiq query --pond demo "SHOW TABLES"
 latiq query --pond demo "SELECT column_name, data_type FROM information_schema.columns WHERE table_name='events'"
 ```
 
-The SQL is a positional argument; `--pond` is required. Successful results print as pretty JSON (`columns`, `rows`, `statement`, `status`, `_meta`). Errors print the structured envelope:
+The SQL is a positional argument; `--pond` is required. Read results print as a **table** by default (`--json` for raw `{columns, rows, statement, status, _meta}`); writes print `ok (snapshot N)`. Errors print the structured envelope:
 
 ```
 error [pond_not_found]: Pond 'ghost' does not exist.
@@ -160,7 +160,7 @@ latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parq
 ### Targeting a non-default control plane
 
 ```bash
-export LATIQ_CONTROL=http://127.0.0.1:19090
+export LATIQ_CONTROL=http://127.0.0.1:41400
 latiq pond create --name demo
 latiq query --pond demo "SELECT 1"
 ```
@@ -185,7 +185,7 @@ latiq node describe node-1     # one node, pretty JSON
 Agents (frontier LLMs), not the CLI, point an MCP client at the node's MCP endpoint (the Data port + 1):
 
 ```
-http://127.0.0.1:8082/mcp     (Streamable HTTP transport)
+http://127.0.0.1:51402/mcp     (Streamable HTTP transport)
 ```
 
 Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`, `write_query`, `explain_query` — plus `latiq://` resources and prompt SOPs for guidance. Results carry both a text block and `structuredContent`; errors set `isError` with the structured envelope. Identity is relaxed (Slice 0+): pass an optional `agent_id` argument; header-based/OIDC identity is a later slice. To exercise this surface programmatically in tests, use `latiq-client` (the agent-sim MCP client) — never from the CLI.
