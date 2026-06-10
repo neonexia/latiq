@@ -8,3 +8,4 @@
 /latiq-data
 /latiq-cp.duckdb
 /latiq-cp.duckdb.wal
+/.latiq-dev
