@@ -2,20 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Current state
-
-**Slice 0+ M1–M7 are complete and runnable** (two-process stack: control-plane + pond-node, plus the `latiq` CLI). **M8–M11 are in progress** — a deliberate architecture reshaping (see "Surfaces" + "Design invariants" below): MCP becomes the *agent-only* layer, and CLI/SDK move to dedicated **gRPC** APIs.
-
 **Read first, in order:**
-- `docs/usage.md` — how to run and manually test the current system (`./dev.sh`).
-- `docs/superpowers/specs/2026-06-04-latiq-slice0-design.md` — authoritative design. Supersedes `docs/m1_design.md` where they differ.
-- This file's **Design invariants** — the rules that must not drift.
+- `docs/product.md` - Product Spec for latiq
+- `docs/dev.md` — how to build, run, and manually test the current system (`./dev.sh` + CLI).
 - Per-crate `crates/*/CLAUDE.md` — local invariants for that crate.
 - `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs.
 
 ## What Latiq is
 
-An agent-native data system. Agents allocate ephemeral **ponds** (DuckLake workspaces), write/read SQL, collaborate, and release them. Operators administer the deployment; humans/programs (CLI, SDK) drive it programmatically. DuckLake is the storage spec; DuckDB is the M1 engine.
+An agent-native data system. Agents allocate ephemeral **ponds** (DuckLake workspaces- https://ducklake.select/docs/stable/), write/read SQL, collaborate, and release them. Operators administer the deployment; humans/programs (CLI, SDK) drive it programmatically. DuckLake is the storage spec; DuckDB is the M1 engine.
 
 ## Surfaces & audiences (the spine of the design)
 
