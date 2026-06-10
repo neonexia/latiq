@@ -18,12 +18,12 @@ use std::path::PathBuf;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
-const DEFAULT_CONTROL: &str = "http://127.0.0.1:9090";
+const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
 #[command(
-    after_help = "The control plane address comes from $LATIQ_CONTROL (default http://127.0.0.1:9090)."
+    after_help = "The control plane address comes from $LATIQ_CONTROL (default http://127.0.0.1:51400)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -47,7 +47,7 @@ enum Command {
 #[derive(Args)]
 struct ServeArgs {
     /// Port for the Control + Admin gRPC surfaces.
-    #[arg(long, default_value_t = 9090)]
+    #[arg(long, default_value_t = 51400)]
     port: u16,
     /// Data root; the registry lives at <root>/registry.duckdb (default ~/.latiq).
     #[arg(long)]
@@ -69,7 +69,7 @@ struct NodeAddArgs {
     #[arg(long, default_value = "node-1")]
     node_id: String,
     /// Data/Query gRPC port. MCP (agents) is served on port + 1.
-    #[arg(long, default_value_t = 8081)]
+    #[arg(long, default_value_t = 51401)]
     port: u16,
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
     #[arg(long)]
