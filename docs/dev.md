@@ -97,7 +97,7 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 | `--port` | `51401` | Data/Query gRPC port; MCP (agents) is served on `port + 1` |
 | `--root` | `~/.latiq` | Data root; pond storage under `<root>/ponds` |
 
-(The node registers with the control plane at `$LATIQ_CONTROL`, default `http://127.0.0.1:51400`.)
+`--root` defaults from `$LATIQ_ROOT` (else `~/.latiq`); the node registers with the control plane at `$LATIQ_CONTROL` (default `http://127.0.0.1:51400`). So `LATIQ_ROOT=/data LATIQ_CONTROL=… latiq serve` needs no flags.
 
 ---
 
