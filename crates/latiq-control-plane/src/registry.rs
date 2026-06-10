@@ -89,6 +89,10 @@ impl Registry {
                last_heartbeat=now()",
             duckdb::params![node_id, mcp, internal, capacity],
         )?;
+        // Flush the WAL into registry.duckdb so a lost/deleted .wal can't drop it
+        // (serve is often killed without a clean close, which is the only other
+        // time DuckDB would checkpoint).
+        let _ = c.execute_batch("CHECKPOINT");
         Ok(())
     }
 
@@ -160,6 +164,8 @@ impl Registry {
             "INSERT INTO ponds(pond_id, name, owner_identity, node_id, policy_json) VALUES (?,?,?,?,?)",
             duckdb::params![pond_id, name, owner_identity, node_id, policy_json],
         )?;
+        // Persist immediately so the pond survives a lost .wal (see register_node).
+        let _ = c.execute_batch("CHECKPOINT");
         Ok(PondRow {
             pond_id,
             name,
@@ -230,6 +236,7 @@ impl Registry {
         if n == 0 {
             return Err(ControlPlaneError::PondNotFound(pond_id.to_string()));
         }
+        let _ = c.execute_batch("CHECKPOINT");
         Ok(())
     }
 
@@ -372,6 +379,32 @@ mod tests {
             r.create_pond(None, "x", "{}"),
             Err(ControlPlaneError::NodeNotFound(_))
         ));
+    }
+
+    #[test]
+    fn create_pond_checkpoints_so_main_file_survives_wal_loss() {
+        // create_pond/register_node CHECKPOINT, so the data is in registry.duckdb
+        // (not only the .wal). Copying ONLY the main file (no .wal) and reopening
+        // must still show the pond — i.e. a deleted .wal can't empty the registry,
+        // even though serve is usually killed without a clean (checkpointing) close.
+        let dir = std::env::temp_dir().join(format!("latiq-ckpt-{}", PondId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.duckdb");
+        let r = Registry::open(Some(&path)).unwrap();
+        r.register_node("node-a", "http://n/mcp", "http://n:9092", 10)
+            .unwrap();
+        r.create_pond(Some("durable".into()), "agent-x", "{}")
+            .unwrap();
+
+        let copy = dir.join("copy.duckdb");
+        std::fs::copy(&path, &copy).unwrap();
+        let reopened = Registry::open(Some(&copy)).unwrap();
+        assert_eq!(
+            reopened.list_ponds().unwrap().len(),
+            1,
+            "pond must persist in the main file (WAL was checkpointed)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
