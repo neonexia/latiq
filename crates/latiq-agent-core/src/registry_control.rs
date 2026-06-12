@@ -31,13 +31,19 @@ fn cp_err(e: ControlPlaneError) -> AgentError {
     }
 }
 
-fn to_info(row: PondRow, created_at: String, policy_json: String) -> PondInfo {
+fn to_info(
+    row: PondRow,
+    created_at: String,
+    policy_json: String,
+    node_endpoint: Option<String>,
+) -> PondInfo {
     PondInfo {
         pond_id: row.pond_id,
         name: row.name,
         owner: row.owner_identity,
         created_at,
         policy_json,
+        node_endpoint,
     }
 }
 
@@ -53,12 +59,13 @@ impl ControlPlane for RegistryControlPlane {
             .registry
             .create_pond(name, owner, policy_json)
             .map_err(cp_err)?;
-        let (row, created_at, policy) = self.registry.pond_info(&row.pond_id).map_err(cp_err)?;
-        Ok(to_info(row, created_at, policy))
+        let (row, created_at, policy, endpoint) =
+            self.registry.pond_info(&row.pond_id).map_err(cp_err)?;
+        Ok(to_info(row, created_at, policy, endpoint))
     }
 
     async fn resolve_pond(&self, pond_ref: &str) -> Result<String, AgentError> {
-        let (row, _, _) = self.registry.pond_info(pond_ref).map_err(cp_err)?;
+        let (row, _, _, _) = self.registry.pond_info(pond_ref).map_err(cp_err)?;
         Ok(row.pond_id)
     }
 
@@ -70,7 +77,9 @@ impl ControlPlane for RegistryControlPlane {
             // list and its pond_info lookup must be skipped, not fail the whole
             // call (review #9). Other errors still propagate.
             match self.registry.pond_info(&row.pond_id) {
-                Ok((row, created_at, policy)) => out.push(to_info(row, created_at, policy)),
+                Ok((row, created_at, policy, endpoint)) => {
+                    out.push(to_info(row, created_at, policy, endpoint))
+                }
                 Err(ControlPlaneError::PondNotFound(_)) => continue,
                 Err(e) => return Err(cp_err(e)),
             }
@@ -79,8 +88,9 @@ impl ControlPlane for RegistryControlPlane {
     }
 
     async fn pond_info(&self, pond_ref: &str) -> Result<PondInfo, AgentError> {
-        let (row, created_at, policy) = self.registry.pond_info(pond_ref).map_err(cp_err)?;
-        Ok(to_info(row, created_at, policy))
+        let (row, created_at, policy, endpoint) =
+            self.registry.pond_info(pond_ref).map_err(cp_err)?;
+        Ok(to_info(row, created_at, policy, endpoint))
     }
 
     async fn drop_pond(&self, pond_id: &str) -> Result<(), AgentError> {
