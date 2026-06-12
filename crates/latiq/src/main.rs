@@ -603,15 +603,15 @@ fn print_table(columns: &[serde_json::Value], rows: &[serde_json::Value]) {
             .collect::<Vec<_>>()
             .join(" | ")
     };
+    let rule = widths
+        .iter()
+        .map(|w| "-".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("-+-");
+    println!();
+    println!("{rule}");
     println!("{}", line(&headers));
-    println!(
-        "{}",
-        widths
-            .iter()
-            .map(|w| "-".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("-+-")
-    );
+    println!("{rule}");
     for row in &body {
         println!("{}", line(row));
     }
