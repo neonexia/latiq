@@ -1,18 +1,26 @@
 //! AgentOps — the protocol-neutral agent operations. Composes ControlPlane +
 //! PondStorage + QueryEngine. Engine calls (blocking DuckDB) run on the blocking
 //! pool; cancellation flows through the in-flight registry's AbortToken.
+use crate::arrow::ArrowReadStream;
 use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
 use crate::types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use latiq_common::ErrorKind;
 use latiq_common::Identity;
 use latiq_common::PondId;
-use latiq_engine::{ExplainResult, QueryEngine, QueryResult};
+use latiq_common::QueryMeta;
+use latiq_engine::{ArrowSink, ExplainResult, QueryEngine, QueryResult};
 use latiq_storage::PondStorage;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -256,6 +264,112 @@ impl AgentOps {
         Ok(res)
     }
 
+    /// Stream a read as Arrow batches. Local: drive the engine's `read_arrow` on
+    /// the blocking pool, delivering the schema then batches over channels
+    /// (bounded mpsc → backpressure). Remote: forward to the owning node. The
+    /// schema is resolved before returning, so an empty result still carries
+    /// columns and a pre-stream error (parse / pond-not-found) surfaces here
+    /// rather than mid-stream.
+    pub async fn read_arrow(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+    ) -> Result<ArrowReadStream, AgentError> {
+        let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "read_arrow",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            return fwd.read_arrow(owner, identity, pond_ref, sql).await;
+        }
+        info!(op = "read_arrow", pond = pond_ref, "processing locally");
+        let pond_id = info.pond_id.clone();
+        let pid = Self::parse_id(&pond_id)?;
+        let mut loc = self
+            .storage
+            .ensure_pond(pid)
+            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
+        let (op_id, token) = self.inflight.register(Some(pond_id));
+
+        let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
+        let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
+
+        let engine = self.engine.clone();
+        let inflight = self.inflight.clone();
+        let sql2 = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut sink = ChannelSink {
+                schema_tx: Some(schema_tx),
+                batch_tx,
+            };
+            let res = engine.read_arrow(&loc, &sql2, token, &mut sink);
+            if let Err(e) = res {
+                let ae = AgentError::from(e);
+                // Deliver the error on whichever channel is still open: the schema
+                // oneshot (no batches produced yet) or the batch stream.
+                if let Some(stx) = sink.schema_tx.take() {
+                    let _ = stx.send(Err(ae));
+                } else {
+                    let _ = sink.batch_tx.blocking_send(Err(ae));
+                }
+            }
+            inflight.complete(&op_id);
+        });
+
+        let schema = schema_rx
+            .await
+            .map_err(|_| AgentError::internal("arrow read produced no schema"))??;
+        Ok(ArrowReadStream {
+            schema,
+            batches: Box::pin(ReceiverStream::new(batch_rx)),
+        })
+    }
+
+    /// Read via the Arrow hop, then collect the batches into the neutral
+    /// `{columns, rows}` `QueryResult` the JSON edges (Data gRPC, MCP) return —
+    /// bounded by the inline cap. So MCP/CLI reads ride the same Arrow internal
+    /// transport (no double-materialize on a forward) and only convert to JSON
+    /// once here, at the edge.
+    pub async fn read_collected(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+    ) -> Result<QueryResult, AgentError> {
+        let stream = self.read_arrow(identity, pond_ref, sql).await?;
+        let columns: Vec<String> = stream
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut batches = stream.batches;
+        while let Some(b) = batches.next().await {
+            append_batch_rows(&b?, &columns, &mut rows)?;
+            if rows.len() > self.config.inline_row_cap {
+                return Err(AgentError::result_cap_exceeded(
+                    rows.len(),
+                    self.config.inline_row_cap,
+                ));
+            }
+        }
+        let n = rows.len() as u64;
+        Ok(QueryResult {
+            columns,
+            rows,
+            meta: QueryMeta {
+                rows: n,
+                ..Default::default()
+            },
+        })
+    }
+
     async fn run_query(
         &self,
         pond_ref: &str,
@@ -390,6 +504,57 @@ impl AgentOps {
                 duration_ms,
             })
             .await;
+    }
+}
+
+/// Convert one Arrow `RecordBatch` to positional JSON rows aligned to `columns`.
+/// Uses Arrow's JSON writer (column-keyed objects), then reshapes to arrays in
+/// column order — a missing key (a null cell) becomes JSON null.
+fn append_batch_rows(
+    batch: &RecordBatch,
+    columns: &[String],
+    out: &mut Vec<Vec<serde_json::Value>>,
+) -> Result<(), AgentError> {
+    let mut buf = Vec::new();
+    let mut w = arrow::json::ArrayWriter::new(&mut buf);
+    w.write(batch)
+        .map_err(|e| AgentError::internal(format!("arrow->json: {e}")))?;
+    w.finish()
+        .map_err(|e| AgentError::internal(format!("arrow->json: {e}")))?;
+    let objs: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(&buf)
+        .map_err(|e| AgentError::internal(format!("arrow->json parse: {e}")))?;
+    for mut obj in objs {
+        let mut row = Vec::with_capacity(columns.len());
+        for c in columns {
+            row.push(obj.remove(c).unwrap_or(serde_json::Value::Null));
+        }
+        out.push(row);
+    }
+    Ok(())
+}
+
+/// Bridges the engine's blocking Arrow output to async channels: the schema once
+/// (oneshot), then batches (bounded mpsc → backpressure). A closed channel
+/// (consumer dropped) returns `Break`, which stops the engine promptly.
+struct ChannelSink {
+    schema_tx: Option<oneshot::Sender<Result<SchemaRef, AgentError>>>,
+    batch_tx: mpsc::Sender<Result<RecordBatch, AgentError>>,
+}
+
+impl ArrowSink for ChannelSink {
+    fn schema(&mut self, schema: SchemaRef) -> ControlFlow<()> {
+        if let Some(tx) = self.schema_tx.take() {
+            if tx.send(Ok(schema)).is_err() {
+                return ControlFlow::Break(()); // receiver gone
+            }
+        }
+        ControlFlow::Continue(())
+    }
+    fn batch(&mut self, batch: RecordBatch) -> ControlFlow<()> {
+        match self.batch_tx.blocking_send(Ok(batch)) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
+        }
     }
 }
 

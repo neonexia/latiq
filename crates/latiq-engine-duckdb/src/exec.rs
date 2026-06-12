@@ -3,7 +3,7 @@
 use crate::instance::PondInstance;
 use duckdb::types::ValueRef;
 use latiq_common::{Identity, QueryMeta};
-use latiq_engine::{EngineError, ExplainResult, QueryResult};
+use latiq_engine::{is_read_only, AbortToken, ArrowSink, EngineError, ExplainResult, QueryResult};
 use std::time::Instant;
 
 /// Convert a single DuckDB cell to a JSON value for the neutral result. Owns the
@@ -128,59 +128,46 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
-/// Heuristic: is this SQL a read-only statement (safe for `read_query`)?
-///
-/// DuckDB exposes no statement-type introspection, so this is a careful
-/// heuristic: the statement must start with a read keyword AND not contain any
-/// data-modifying keyword (which catches `WITH … INSERT`, `EXPLAIN ANALYZE …`,
-/// side-effecting `PRAGMA`/`CALL`, etc.). It errs toward rejecting ambiguous
-/// statements — a wrongly-rejected read is recoverable; a write slipping through
-/// the read path is not.
-fn is_read_only(sql: &str) -> bool {
-    let s = sql.trim_start().to_lowercase();
-    let starts_read = s.starts_with("select")
-        || s.starts_with("with")
-        || s.starts_with("describe")
-        || s.starts_with("show")
-        || s.starts_with("explain")
-        || s.starts_with("pragma")
-        // DuckDB read-first shorthands: `FROM t`, `TABLE t`, `VALUES (...)` are all
-        // SELECTs. No write statement starts with these (DELETE/UPDATE start with
-        // their own keyword), so treating them as reads is safe.
-        || s.starts_with("from")
-        || s.starts_with("table")
-        || s.starts_with("values");
-    if !starts_read {
-        return false;
-    }
-    // Word-boundary scan for data-modifying / side-effecting keywords.
-    let normalized = format!(" {} ", s.replace(['\n', '\t', '(', ')', ','], " "));
-    const WRITE_KEYWORDS: &[&str] = &[
-        " insert ",
-        " update ",
-        " delete ",
-        " create ",
-        " drop ",
-        " alter ",
-        " truncate ",
-        " attach ",
-        " detach ",
-        " copy ",
-        " call ",
-        " install ",
-        " load ",
-        " replace ",
-        " analyze ",
-        " vacuum ",
-        " checkpoint ",
-    ];
-    !WRITE_KEYWORDS.iter().any(|w| normalized.contains(w))
-}
-
 /// Whether a statement is a no-op for the write path (a read routed to
 /// write_query): run it without creating a snapshot/attribution.
 fn is_read_for_write(sql: &str) -> bool {
     is_read_only(sql)
+}
+
+/// Stream a read-only query's results as Arrow batches into `sink` (schema first,
+/// then batches), using DuckDB's native Arrow output — no per-cell JSON
+/// conversion, nothing buffered here. `abort` stops the stream between batches
+/// (the interrupt handle covers cancellation inside a fetch).
+pub fn run_read_arrow(
+    inst: &PondInstance,
+    sql: &str,
+    abort: &AbortToken,
+    sink: &mut dyn ArrowSink,
+) -> Result<(), EngineError> {
+    if !is_read_only(sql) {
+        return Err(EngineError::ReadOnlyViolation);
+    }
+    let mut stmt = inst
+        .conn
+        .prepare(sql)
+        .map_err(|e| EngineError::Parse(e.to_string()))?;
+    let arrow = stmt
+        .query_arrow([])
+        .map_err(|e| EngineError::Engine(e.to_string()))?;
+    // Schema is available even for an empty result, so downstream IPC/JSON always
+    // has columns.
+    if sink.schema(arrow.get_schema()).is_break() {
+        return Ok(());
+    }
+    for batch in arrow {
+        if abort.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        if sink.batch(batch).is_break() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Run a read-only query, materializing rows aligned to column names.

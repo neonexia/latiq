@@ -4,6 +4,59 @@
 
 ---
 
+## 0. Implementation status & deltas (2026-06)
+
+> **This is the original M1 design vision.** The shipped slice realizes its spine
+> — agent-native ponds, DuckLake+DuckDB, control-plane discovery, smart-proxy
+> forwarding, MCP for agents / gRPC for operators, single binary — but several
+> concrete choices below have changed. **Where this document and the deltas here
+> disagree, the deltas win.** `docs/dev.md` is the hands-on runbook for what's
+> actually built; `CLAUDE.md` holds the binding invariants.
+
+**Built and runnable:** pond lifecycle (create/describe/list/drop); SQL read/write
+with native attribution; `explain_query`; the MCP agent surface (tools, resources,
+prompt SOPs); Data + Admin gRPC; query-by-URI for public files; sample datasets;
+audit log; **multi-node request forwarding behind a front door**; **Arrow streaming
+reads**; cancellation + prompt-resource release.
+
+**Architectural deltas from the body of this doc:**
+
+- **No Flight SQL — anywhere.** The node-to-node proxy hop *and* the SDK read path
+  stream **Arrow IPC over our own server-streaming gRPC** (`latiq.v1.Stream/ReadArrow`),
+  sharing the Data gRPC port. We skipped Flight because `arrow-flight` at the Arrow
+  version DuckDB pulls forces a second `tonic` major into the build for a protocol
+  we don't need internally. The *data* is still standard Arrow (any `pyarrow`/arrow
+  client decodes it); only the framing is ours. (§2, §3, §6.2 below describe Flight
+  — read "Arrow IPC over gRPC" instead.)
+- **No `_latiq` schema (§8).** Ponds are **pure DuckLake** — history/attribution via
+  native `pond.snapshots()`, tables/columns via `SHOW TABLES` / `information_schema`.
+  Attribution rides DuckLake's native `set_commit_message`; there are no Latiq
+  objects in the pond catalog and no shadow store.
+- **Forwarding model is real and uniform.** Any node can greet a request (behind an
+  nginx front door in dev; a k8s Service in prod). It resolves the pond's owner from
+  the registry and forwards over gRPC if it isn't local — so clients hit one
+  endpoint and never address a node directly. Reads forward as the Arrow stream;
+  writes/describe/drop forward unary. The control plane is consulted only to
+  *resolve* the owner, never for data.
+- **Control plane is DuckDB-backed** in this slice (not Postgres). Same gRPC
+  contract; Postgres remains the scale path.
+- **Subcommands:** `latiq serve` (control plane), `latiq node add` (pond node),
+  plus `pond` / `query` / `dataset` / `node` CLI verbs — not `control-plane` /
+  `pond-node` / `dev` as written in §2/§12.
+- **Identity is relaxed:** a claimed `agent_id` (MCP arg / `latiq-agent-id` gRPC
+  metadata), default `anonymous`, `verified:false`. OIDC verification (§7) is
+  deferred. Cross-hop identity propagation carries the claim; no signing yet.
+- **Result handling:** the unary JSON path (MCP/CLI) is bounded by the inline cap
+  (default 10k rows); the **Arrow stream path is uncapped** (the streaming answer to
+  large results, ahead of a packaged SDK).
+
+**Designed here but not yet built:** admin-curated catalogs + credentials/Vault
+(§5, §11), OIDC (§7), per-identity rate limiting (§13a), OpenTelemetry (§13), the
+Docker Compose harness (§12), and per-pond resource limits. These remain the
+roadmap, not the current surface.
+
+---
+
 ## 1. M1 scope
 
 A complete, deployable system that lets agents allocate ponds, write data, query with SQL, share state with other agents, attach admin-curated external catalogs, and release ponds — over MCP, with optional federated identity, with attribution and audit. Operators administer the system through a CLI; agents never see admin operations.

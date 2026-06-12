@@ -83,6 +83,39 @@ async fn full_agent_loop() {
 }
 
 #[tokio::test]
+async fn read_arrow_streams_rows_locally() {
+    use tokio_stream::StreamExt;
+    let ops = ops();
+    let id = Identity::claimed(Some("a"));
+    ops.allocate_pond(&id, Some("ar".into()), "{}")
+        .await
+        .unwrap();
+    ops.write_query(
+        &id,
+        "ar",
+        "CREATE TABLE t AS SELECT * FROM range(3000) r(i)",
+    )
+    .await
+    .unwrap();
+
+    let stream = ops.read_arrow(&id, "ar", "SELECT i FROM t").await.unwrap();
+    // Schema is known up front, even before the first batch.
+    assert_eq!(stream.schema.field(0).name(), "i");
+    let mut rows = 0;
+    let mut batches = stream.batches;
+    while let Some(b) = batches.next().await {
+        rows += b.unwrap().num_rows();
+    }
+    assert_eq!(rows, 3000, "all rows streamed across batches");
+
+    // read_arrow rejects writes too (the error surfaces before the schema).
+    assert!(ops
+        .read_arrow(&id, "ar", "INSERT INTO t VALUES (1)")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn pond_lifecycle_drop_requires_confirm() {
     let ops = ops();
     let id = Identity::claimed(Some("agent-loop"));

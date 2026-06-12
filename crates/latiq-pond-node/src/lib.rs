@@ -4,17 +4,20 @@
 pub mod data_service;
 pub mod forward_client;
 pub mod grpc_control;
+pub mod stream_service;
 pub mod wire;
 
 pub use data_service::DataService;
 pub use forward_client::GrpcForwarder;
 pub use grpc_control::GrpcControlPlane;
+pub use stream_service::StreamService;
 
 use latiq_agent_core::{AgentConfig, AgentOps};
 use latiq_engine_duckdb::DuckEngine;
 use latiq_mcp::serve_mcp;
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_server::DataServer;
+use latiq_proto::v1::stream_server::StreamServer;
 use latiq_proto::v1::{HeartbeatRequest, RegisterNodeRequest};
 use latiq_storage::LocalFs;
 use std::net::SocketAddr;
@@ -73,8 +76,11 @@ pub async fn serve_data(
     addr: SocketAddr,
     ops: Arc<AgentOps>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Data (unary JSON, CLI/SDK) + Stream (server-streaming Arrow, SDK + the
+    // node-to-node read forward) share one port — both plain tonic.
     Server::builder()
-        .add_service(DataServer::new(DataService::new(ops)))
+        .add_service(DataServer::new(DataService::new(ops.clone())))
+        .add_service(StreamServer::new(StreamService::new(ops)))
         .serve(addr)
         .await?;
     Ok(())
