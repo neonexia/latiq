@@ -7,22 +7,30 @@
 //! This keeps the transport out of agent-core (invariant 5): the core knows only
 //! the owner's endpoint string; the gRPC client lives here in the adapter layer.
 use crate::wire::query_result_from_json;
-use latiq_agent_core::{AgentError, DescribeResult, Forwarder};
+use arrow::buffer::Buffer;
+use arrow::datatypes::SchemaRef;
+use arrow::ipc::reader::StreamDecoder;
+use arrow::record_batch::RecordBatch;
+use latiq_agent_core::{AgentError, ArrowReadStream, DescribeResult, Forwarder};
 use latiq_common::{ErrorEnvelope, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
 use latiq_proto::v1::data_client::DataClient;
+use latiq_proto::v1::stream_client::StreamClient;
 use latiq_proto::v1::*;
 use std::collections::HashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Request, Status, Streaming};
 
 #[derive(Default)]
 pub struct GrpcForwarder {
     /// One channel per peer endpoint. tonic channels multiplex concurrent RPCs,
     /// so caching + cloning is the cheap, correct reuse pattern.
     clients: Mutex<HashMap<String, DataClient<Channel>>>,
+    /// Same, for the streaming-Arrow read RPC (shares the peer's Data port).
+    stream_clients: Mutex<HashMap<String, StreamClient<Channel>>>,
 }
 
 impl GrpcForwarder {
@@ -36,6 +44,18 @@ impl GrpcForwarder {
             return Ok(c.clone());
         }
         let c = DataClient::connect(endpoint.to_string())
+            .await
+            .map_err(|e| AgentError::internal(format!("forward connect {endpoint}: {e}")))?;
+        map.insert(endpoint.to_string(), c.clone());
+        Ok(c)
+    }
+
+    async fn stream_client(&self, endpoint: &str) -> Result<StreamClient<Channel>, AgentError> {
+        let mut map = self.stream_clients.lock().await;
+        if let Some(c) = map.get(endpoint) {
+            return Ok(c.clone());
+        }
+        let c = StreamClient::connect(endpoint.to_string())
             .await
             .map_err(|e| AgentError::internal(format!("forward connect {endpoint}: {e}")))?;
         map.insert(endpoint.to_string(), c.clone());
@@ -74,6 +94,99 @@ fn parse_json(json: &str) -> Result<serde_json::Value, AgentError> {
         .map_err(|e| AgentError::internal(format!("forward decode json: {e}")))
 }
 
+/// Deliver the schema on the oneshot the first time the decoder knows it.
+fn deliver_schema(
+    schema_tx: &mut Option<oneshot::Sender<Result<SchemaRef, AgentError>>>,
+    decoder: &StreamDecoder,
+) {
+    if schema_tx.is_some() {
+        if let Some(sc) = decoder.schema() {
+            let _ = schema_tx.take().unwrap().send(Ok(sc));
+        }
+    }
+}
+
+/// Decode a peer's `ArrowChunk` IPC stream back into an `ArrowReadStream`: a
+/// background task pushes chunk bytes through a `StreamDecoder`, delivering the
+/// schema (once known) on a oneshot and batches on a bounded channel. Per-batch,
+/// nothing is fully buffered.
+fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamParts {
+    let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
+    let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
+
+    tokio::spawn(async move {
+        let mut decoder = StreamDecoder::new();
+        let mut schema_tx = Some(schema_tx);
+        loop {
+            match streaming.message().await {
+                Ok(Some(chunk)) => {
+                    let mut buf = Buffer::from_vec(chunk.ipc);
+                    loop {
+                        match decoder.decode(&mut buf) {
+                            Ok(Some(batch)) => {
+                                deliver_schema(&mut schema_tx, &decoder);
+                                if batch_tx.send(Ok(batch)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                let ae = AgentError::internal(format!("forward arrow decode: {e}"));
+                                match schema_tx.take() {
+                                    Some(s) => {
+                                        let _ = s.send(Err(ae));
+                                    }
+                                    None => {
+                                        let _ = batch_tx.send(Err(ae)).await;
+                                    }
+                                }
+                                return;
+                            }
+                        }
+                        if buf.is_empty() {
+                            break;
+                        }
+                    }
+                    // Schema-only chunk / empty result: surface the schema now.
+                    deliver_schema(&mut schema_tx, &decoder);
+                }
+                Ok(None) => {
+                    // Stream ended; ensure the schema (or an error) was delivered.
+                    if let Some(s) = schema_tx.take() {
+                        let _ = match decoder.schema() {
+                            Some(sc) => s.send(Ok(sc)),
+                            None => s.send(Err(AgentError::internal("forward arrow: no schema"))),
+                        };
+                    }
+                    return;
+                }
+                Err(status) => {
+                    let ae = status_to_error(status);
+                    match schema_tx.take() {
+                        Some(s) => {
+                            let _ = s.send(Err(ae));
+                        }
+                        None => {
+                            let _ = batch_tx.send(Err(ae)).await;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    });
+
+    ArrowReadStreamParts {
+        schema_rx,
+        batch_rx,
+    }
+}
+
+struct ArrowReadStreamParts {
+    schema_rx: oneshot::Receiver<Result<SchemaRef, AgentError>>,
+    batch_rx: mpsc::Receiver<Result<RecordBatch, AgentError>>,
+}
+
 #[async_trait::async_trait]
 impl Forwarder for GrpcForwarder {
     async fn read(
@@ -97,6 +210,39 @@ impl Forwarder for GrpcForwarder {
             .map_err(status_to_error)?
             .into_inner();
         query_result_from_json(&parse_json(&resp.json)?)
+    }
+
+    async fn read_arrow(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        sql: &str,
+    ) -> Result<ArrowReadStream, AgentError> {
+        let mut c = self.stream_client(endpoint).await?;
+        let req = with_identity(
+            QueryRequest {
+                pond: pond.to_string(),
+                sql: sql.to_string(),
+            },
+            identity,
+        );
+        let streaming = c
+            .read_arrow(req)
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+        let parts = decode_arrow_stream(streaming);
+        // The schema (and any pre-stream error) resolves before we hand back the
+        // stream, mirroring the local path.
+        let schema = parts
+            .schema_rx
+            .await
+            .map_err(|_| AgentError::internal("forward arrow: stream closed before schema"))??;
+        Ok(ArrowReadStream {
+            schema,
+            batches: Box::pin(ReceiverStream::new(parts.batch_rx)),
+        })
     }
 
     async fn write(
