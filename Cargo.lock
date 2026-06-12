@@ -1509,6 +1509,7 @@ dependencies = [
  "latiq-client",
  "latiq-common",
  "latiq-control-plane",
+ "latiq-engine",
  "latiq-mcp",
  "latiq-pond-node",
  "latiq-proto",

@@ -198,6 +198,33 @@ latiq query --pond demo "SELECT 1"
 
 ---
 
+## Arrow streaming (for the SDK / large reads)
+
+Reads stream end-to-end as **Arrow batches** — DuckDB → owning node → (greeter, if
+forwarded) → client — so large results aren't buffered. Internally every read
+rides this Arrow hop (the CLI's `query` routes `SELECT`s to it); the MCP/CLI
+surfaces just collect it back to JSON at the edge (bounded by the 10k inline cap),
+while an SDK can pull the **raw Arrow stream, uncapped**.
+
+The transport is a server-streaming gRPC RPC — `latiq.v1.Stream/ReadArrow` — that
+carries **Arrow IPC** chunks. It is **not** the Flight protocol, but the payload is
+standard Arrow, so any Arrow library decodes it. It **shares the Data gRPC port**
+(and the multi-node front door), so there's no extra endpoint: point a client at
+the same address the CLI uses.
+
+A Python client is just gRPC + `pyarrow` (no Latiq SDK package needed yet):
+
+```python
+# ReadArrow(QueryRequest{pond, sql}) → stream of ArrowChunk{ipc: bytes}
+import pyarrow as pa
+buf = b"".join(chunk.ipc for chunk in stub.ReadArrow(QueryRequest(pond="demo", sql="SELECT * FROM t")))
+table = pa.ipc.open_stream(buf).read_all()   # → pa.Table
+df = table.to_pandas()
+```
+
+(Concatenating then decoding is the simple form; a streaming client feeds each
+`chunk.ipc` to an incremental `pa.ipc` reader to avoid buffering.)
+
 ## Operator CLI (node admin)
 
 Inspect registered pond nodes (control plane, at `$LATIQ_CONTROL`).
