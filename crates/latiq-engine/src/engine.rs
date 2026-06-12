@@ -1,4 +1,5 @@
 use crate::abort::AbortToken;
+use crate::arrow_stream::ArrowSink;
 use crate::result::{ExplainResult, QueryResult, SchemaSummary};
 use latiq_common::Identity;
 use latiq_storage::PondLocation;
@@ -31,6 +32,16 @@ pub trait QueryEngine: Send + Sync {
         sql: &str,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError>;
+    /// Run a read-only query, streaming results as Arrow `RecordBatch`es into
+    /// `sink` (schema first, then batches) instead of materializing them. Rejects
+    /// writes, like `read_query`. `abort` must stop the stream promptly.
+    fn read_arrow(
+        &self,
+        loc: &PondLocation,
+        sql: &str,
+        abort: AbortToken,
+        sink: &mut dyn ArrowSink,
+    ) -> Result<(), EngineError>;
     /// Run a write/DDL query, transaction-wrapped with native attribution.
     fn write_query(
         &self,
