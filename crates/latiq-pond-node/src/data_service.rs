@@ -52,6 +52,31 @@ fn json_resp(value: serde_json::Value) -> Response<JsonResponse> {
     })
 }
 
+/// The request's trace id (`latiq-trace-id` metadata), or a fresh one. Propagated
+/// node-to-node by the forwarder so a request's spans correlate across nodes.
+pub(crate) fn trace_id_of<T>(req: &Request<T>) -> String {
+    req.metadata()
+        .get("latiq-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(latiq_agent_core::new_trace_id)
+}
+
+/// Run a handler body under the request's trace id + a span, so AgentOps logs
+/// carry the id and the forwarder can read it for the node-to-node hop.
+pub(crate) async fn traced<T>(
+    name: &'static str,
+    tid: String,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    use tracing::Instrument;
+    latiq_agent_core::with_trace_id(
+        tid.clone(),
+        fut.instrument(tracing::info_span!("rpc", name, trace_id = %tid)),
+    )
+    .await
+}
+
 #[tonic::async_trait]
 impl Data for DataService {
     async fn allocate_pond(
@@ -91,12 +116,16 @@ impl Data for DataService {
         req: Request<DropPondRequest>,
     ) -> Result<Response<DropPondResponse>, Status> {
         let id = identity_of(&req);
+        let tid = trace_id_of(&req);
         let r = req.into_inner();
-        self.ops
-            .drop_pond(&id, &r.pond, r.confirm)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(DropPondResponse {}))
+        let ops = self.ops.clone();
+        traced("drop_pond", tid, async move {
+            ops.drop_pond(&id, &r.pond, r.confirm)
+                .await
+                .map_err(to_status)?;
+            Ok(Response::new(DropPondResponse {}))
+        })
+        .await
     }
 
     async fn describe_pond(
@@ -104,13 +133,14 @@ impl Data for DataService {
         req: Request<DescribePondRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let id = identity_of(&req);
+        let tid = trace_id_of(&req);
         let r = req.into_inner();
-        let d = self
-            .ops
-            .describe_pond(&id, &r.pond)
-            .await
-            .map_err(to_status)?;
-        Ok(json_resp(serde_json::to_value(d).unwrap_or_default()))
+        let ops = self.ops.clone();
+        traced("describe_pond", tid, async move {
+            let d = ops.describe_pond(&id, &r.pond).await.map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(d).unwrap_or_default()))
+        })
+        .await
     }
 
     async fn read_query(
@@ -118,14 +148,18 @@ impl Data for DataService {
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let id = identity_of(&req);
+        let tid = trace_id_of(&req);
         let r = req.into_inner();
+        let ops = self.ops.clone();
         // Reads ride the Arrow internal hop, collected to JSON here at the edge.
-        let qr = self
-            .ops
-            .read_collected(&id, &r.pond, &r.sql)
-            .await
-            .map_err(to_status)?;
-        Ok(json_resp(query_value(qr)))
+        traced("read_query", tid, async move {
+            let qr = ops
+                .read_collected(&id, &r.pond, &r.sql)
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(query_value(qr)))
+        })
+        .await
     }
 
     async fn write_query(
@@ -133,13 +167,17 @@ impl Data for DataService {
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let id = identity_of(&req);
+        let tid = trace_id_of(&req);
         let r = req.into_inner();
-        let qr = self
-            .ops
-            .write_query(&id, &r.pond, &r.sql)
-            .await
-            .map_err(to_status)?;
-        Ok(json_resp(query_value(qr)))
+        let ops = self.ops.clone();
+        traced("write_query", tid, async move {
+            let qr = ops
+                .write_query(&id, &r.pond, &r.sql)
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(query_value(qr)))
+        })
+        .await
     }
 
     async fn explain_query(
@@ -147,12 +185,16 @@ impl Data for DataService {
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let id = identity_of(&req);
+        let tid = trace_id_of(&req);
         let r = req.into_inner();
-        let er = self
-            .ops
-            .explain_query(&id, &r.pond, &r.sql)
-            .await
-            .map_err(to_status)?;
-        Ok(json_resp(serde_json::to_value(er).unwrap_or_default()))
+        let ops = self.ops.clone();
+        traced("explain_query", tid, async move {
+            let er = ops
+                .explain_query(&id, &r.pond, &r.sql)
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(er).unwrap_or_default()))
+        })
+        .await
     }
 }
