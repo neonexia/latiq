@@ -1,0 +1,44 @@
+# Prometheus scrape config for a Latiq deployment.
+#
+# Each Latiq process serves /metrics on its main gRPC port + 1000:
+#   control plane   gRPC 51400  ->  metrics 52400
+#   pond node       data 51401  ->  metrics 52401   (and +2 per node: 52403, 52405, …)
+# Override per process with `--metrics-port`.
+#
+# Run:  prometheus --config.file=prometheus.example.yml \
+#                  --storage.tsdb.retention.time=15d
+# (retention >= your longest dashboard window; the metrics are per-minute at a 60s
+#  scrape, which covers "1 day aggregated every minute" and well beyond.)
+#
+# For Kubernetes, prefer the Prometheus Operator + a ServiceMonitor that selects
+# the metrics port, instead of these static targets.
+
+global:
+  scrape_interval: 60s        # per-minute resolution (matches the metric design)
+  evaluation_interval: 60s
+
+scrape_configs:
+  - job_name: latiq-control-plane
+    static_configs:
+      - targets: ["control-plane.internal:52400"]
+        labels:
+          role: control-plane
+
+  - job_name: latiq-pond-nodes
+    static_configs:
+      - targets:
+          - "node-0.internal:52401"
+          - "node-1.internal:52403"
+          - "node-2.internal:52405"
+        labels:
+          role: pond-node
+
+# Local dev (single host) equivalent — what dev.sh generates under <root>:
+#
+# scrape_configs:
+#   - job_name: latiq
+#     static_configs:
+#       - targets:
+#           - "127.0.0.1:52400"   # control plane
+#           - "127.0.0.1:52401"   # node-0
+#           - "127.0.0.1:52403"   # node-1

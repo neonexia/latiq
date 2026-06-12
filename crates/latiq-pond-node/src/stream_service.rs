@@ -39,14 +39,18 @@ impl StreamSvc for StreamService {
         req: Request<QueryRequest>,
     ) -> Result<Response<Self::ReadArrowStream>, Status> {
         let id = identity_of(&req);
+        let tid = crate::data_service::trace_id_of(&req);
         let r = req.into_inner();
+        let ops = self.ops.clone();
         // Resolving the read (incl. pond-not-found / parse errors and the schema)
-        // happens before we return, so those surface as a normal Status.
-        let read = self
-            .ops
-            .read_arrow(&id, &r.pond, &r.sql)
-            .await
-            .map_err(to_status)?;
+        // happens before we return — and so does any forward — so the trace id
+        // must be ambient here; the batch encoding runs after, untraced.
+        let read = crate::data_service::traced("read_arrow", tid, async move {
+            ops.read_arrow(&id, &r.pond, &r.sql)
+                .await
+                .map_err(to_status)
+        })
+        .await?;
         let (tx, rx) = mpsc::channel::<Result<ArrowChunk, Status>>(4);
         tokio::spawn(encode_to_chunks(read, tx));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
