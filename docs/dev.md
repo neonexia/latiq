@@ -1,6 +1,6 @@
 # Latiq — Developer Guide
 
-> **Status:** Slice 0+ (M1–M11) complete and runnable, plus **multi-node request forwarding** (a front door over N nodes) and **Arrow streaming reads** (the SDK path). This is the hands-on guide for building Latiq, starting the dev stack, and driving it manually through the **CLI** (the gRPC surfaces). Agents drive the separate **MCP** surface; a packaged SDK is still a later slice (the Arrow stream is standard `pyarrow`-decodable today). Federation/catalogs, OIDC, rate-limiting, OpenTelemetry, and per-pond resource limits are deferred.
+> **Status:** Slice 0+ (M1–M11) complete and runnable, plus **multi-node request forwarding** (a front door over N nodes), **Arrow streaming reads** (the SDK path), and **per-pond resource tiers**. This is the hands-on guide for building Latiq, starting the dev stack, and driving it manually through the **CLI** (the gRPC surfaces). Agents drive the separate **MCP** surface; a packaged SDK is still a later slice (the Arrow stream is standard `pyarrow`-decodable today). Federation/catalogs, OIDC, rate-limiting, OpenTelemetry, node-liveness reaping, and disk quotas are deferred.
 
 ## What you're running
 
@@ -263,9 +263,9 @@ Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`
 
 ## What works now vs. later
 
-**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, an audit log, **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), and **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge).
+**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, an audit log, **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), and **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads).
 
-**Later slices:** external catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, per-pond resource limits, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
+**Later slices:** external catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, node-liveness reaping (a crashed node currently stays `active`), disk quotas, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
 
 ---
 
