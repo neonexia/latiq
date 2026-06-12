@@ -29,6 +29,7 @@ async fn seed_and_locate(stack: &MultiStack, pond: &str, rows: usize) -> String 
         AllocatePondRequest {
             name: pond.into(),
             policy_json: String::new(),
+            tier: String::new(),
         },
         "a",
     ))

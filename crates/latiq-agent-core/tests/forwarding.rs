@@ -27,6 +27,7 @@ impl ControlPlane for FixedOwner {
         _: Option<String>,
         _: &str,
         _: &str,
+        _: &str,
     ) -> Result<PondInfo, AgentError> {
         unreachable!("not exercised")
     }
@@ -44,6 +45,7 @@ impl ControlPlane for FixedOwner {
             created_at: String::new(),
             policy_json: "{}".to_string(),
             node_endpoint: self.endpoint.clone(),
+            tier: "medium".to_string(),
         })
     }
     async fn drop_pond(&self, _: &str) -> Result<(), AgentError> {
@@ -143,6 +145,7 @@ impl Forwarder for RecordingForwarder {
                 created_at: String::new(),
                 policy_json: "{}".to_string(),
                 node_endpoint: Some(e.to_string()),
+                tier: "medium".to_string(),
             },
             schema: SchemaSummary::default(),
         })

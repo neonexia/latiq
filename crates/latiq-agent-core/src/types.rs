@@ -13,6 +13,10 @@ pub struct PondInfo {
     /// node is gone). A node uses this to decide local-vs-forward.
     #[serde(default)]
     pub node_endpoint: Option<String>,
+    /// Resource tier name (small/medium/large/x-large); the engine maps it to
+    /// the pond instance's memory/thread caps. Empty → medium.
+    #[serde(default)]
+    pub tier: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -133,11 +133,22 @@ export LATIQ_CONTROL=http://127.0.0.1:51400      # only if you changed --cp-port
 ### Pond lifecycle
 
 ```bash
-latiq pond create --name demo          # control plane picks a node; --name optional (auto-named)
-latiq pond list                        # discover ponds (control-plane registry)
-latiq pond describe demo               # metadata + table summary
-latiq pond drop demo --confirm         # DESTRUCTIVE — requires --confirm
+latiq pond create --name demo                 # control plane picks a node; --name optional (auto-named)
+latiq pond create --name big --tier large     # resource tier (default medium); caps the pond's memory + CPU
+latiq pond list                               # discover ponds (control-plane registry)
+latiq pond describe demo                       # metadata (incl. tier) + table summary
+latiq pond drop demo --confirm                 # DESTRUCTIVE — requires --confirm
 ```
+
+**Resource tiers** cap a pond's DuckDB instance (memory + threads) — caps, not reservations:
+
+| Tier | memory_limit | threads |
+|---|---|---|
+| x-small | 512 MB | 1 |
+| small | 1 GB | 2 |
+| **medium** (default) | 4 GB | 4 |
+| large | 16 GB | 8 |
+| x-large | 32 GB | 8 |
 
 `pond drop` without `--confirm` is refused with a structured error and leaves the pond intact.
 
