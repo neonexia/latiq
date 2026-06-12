@@ -11,6 +11,8 @@ latiq-mcp = { path = "../latiq-mcp" }
 latiq-storage = { path = "../latiq-storage" }
 latiq-engine = { path = "../latiq-engine" }
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
+latiq-metrics = { path = "../latiq-metrics" }
+metrics = { workspace = true }
 async-trait = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }

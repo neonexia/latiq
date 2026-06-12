@@ -1,0 +1,12 @@
+[package]
+name = "latiq-metrics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+sysinfo = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

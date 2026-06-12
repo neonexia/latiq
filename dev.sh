@@ -51,13 +51,15 @@ LOG_DIR="$ROOT/logs"
 MULTI=0; [[ "$NODES" -gt 1 ]] && MULTI=1
 
 # Per-node ports, and (multi-node) the nginx front-door ports just past them.
-NODE_DATA=(); NODE_MCP=()
+NODE_DATA=(); NODE_MCP=(); NODE_METRICS=()
 for ((i = 0; i < NODES; i++)); do
   NODE_DATA+=($((DATA_PORT + 2 * i)))
   NODE_MCP+=($((DATA_PORT + 2 * i + 1)))
+  NODE_METRICS+=($((DATA_PORT + 2 * i + 1000)))   # binary default: data port + 1000
 done
 GW_DATA=$((DATA_PORT + 2 * NODES))
 GW_MCP=$((GW_DATA + 1))
+CP_METRICS=$((CP_PORT + 1000))                     # control-plane /metrics
 
 # Colors — only when stdout is a terminal (so piping/redirecting stays clean).
 if [ -t 1 ]; then
@@ -200,6 +202,16 @@ EOF
   wait_ready "$NGINX_PID" "nginx front door" "$LOG_DIR/nginx.log" "$GW_DATA" "$GW_MCP"
 fi
 
+# --- prometheus scrape config -------------------------------------------
+# Each process serves /metrics on its port + 1000. Write a ready-to-use config
+# (60s scrape = per-minute) so the operator can `prometheus --config.file=...`.
+PROM_CFG="$ROOT/prometheus.yml"
+{
+  printf 'global:\n  scrape_interval: 60s\nscrape_configs:\n  - job_name: latiq\n    static_configs:\n      - targets:\n'
+  printf '          - "%s:%s"\n' "$HOST" "$CP_METRICS"
+  for ((i = 0; i < NODES; i++)); do printf '          - "%s:%s"\n' "$HOST" "${NODE_METRICS[$i]}"; done
+} >"$PROM_CFG"
+
 # --- banner -------------------------------------------------------------
 row() { printf '   %s%-12s%s %s%s%s\n' "$LBL" "$1" "$RST" "$VAL" "$2" "$RST"; }
 echo
@@ -221,6 +233,14 @@ fi
 row "registry"  "$ROOT/registry.duckdb"
 row "ponds"     "$ROOT/ponds"
 row "logs"      "$LOG_DIR/"
+if [[ $MULTI -eq 1 ]]; then
+  metrics_list="cp $HOST:$CP_METRICS"
+  for ((i = 0; i < NODES; i++)); do metrics_list+=" · n$i $HOST:${NODE_METRICS[$i]}"; done
+  row "metrics" "$metrics_list"
+else
+  row "metrics" "cp http://$HOST:$CP_METRICS/metrics · node http://$HOST:${NODE_METRICS[0]}/metrics"
+fi
+row "prometheus" "$PROM_CFG  (prometheus --config.file=$PROM_CFG)"
 echo
 if [[ $MULTI -eq 1 ]]; then
   printf '   %sDrive the CLI through the front door:%s\n' "$DIM" "$RST"
