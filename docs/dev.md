@@ -70,6 +70,24 @@ Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond st
 ./dev.sh --cp-port 41400 --data-port 41401 --root /tmp/latiq-dev
 ```
 
+### Multiple nodes behind a front door
+
+`--nodes N` starts the control plane plus N pond nodes and puts an **nginx front door** in front of them (needs `nginx` — `brew install nginx`):
+
+```bash
+./dev.sh --nodes 3
+```
+
+Node *i* binds Data port `data-port + 2*i` and MCP `+1`; the front door listens just past them and load-balances both surfaces. The banner prints the gateway and an `export LATIQ_GATEWAY=…` line. With it set, the CLI sends data ops to the gateway instead of resolving the owning node — whichever node nginx picks resolves the pond's owner and **forwards** the request there, relaying the result back. This is the same single-front-door model agents use over MCP, and it mirrors production (k8s): outside clients reach a Service/LB, never an individual pod; node-to-node hops are internal.
+
+```bash
+export LATIQ_GATEWAY=http://127.0.0.1:51405      # printed by dev.sh
+latiq pond create --name demo                    # control plane picks a node
+latiq query -p demo "SELECT 1"                   # via the gateway → forwarded to the owner
+```
+
+The MCP upstream is sticky (`ip_hash`) so a streamable-HTTP session stays on its greeter; the Data gRPC upstream is spread, since forwarding makes node choice irrelevant to correctness. `--nodes 1` (the default) keeps the single-node path with **no nginx dependency**.
+
 ### Manual start (two terminals)
 
 ```bash
@@ -103,7 +121,7 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 
 ## Drive it from the CLI
 
-The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_CONTROL` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops.
+The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_CONTROL` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops. Set `$LATIQ_GATEWAY` (a multi-node front door, see above) to send data ops there instead and let the greeter node forward.
 
 For dev, put the build output on your PATH (every `cargo build` refreshes it in place) and export the control address only if it's not the default:
 
