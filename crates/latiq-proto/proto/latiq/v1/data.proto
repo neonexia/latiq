@@ -26,3 +26,12 @@ message QueryRequest { string pond = 1; string sql = 2; }
 // Carries a serialized JSON object: for queries `{columns, rows, statement,
 // status, _meta}`; for describe `{pond, schema}`.
 message JsonResponse { string json = 1; }
+
+// Streaming Arrow read — for the SDK (Arrow → pandas) and the internal node-to-
+// node read forward. Shares the Data port (plain tonic, no Flight). Each chunk
+// carries a slice of a single Arrow IPC stream (schema message first, then record
+// batches); the client concatenates and decodes them. Reads only; uncapped.
+service Stream {
+  rpc ReadArrow(QueryRequest) returns (stream ArrowChunk);
+}
+message ArrowChunk { bytes ipc = 1; }

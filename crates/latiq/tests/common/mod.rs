@@ -7,10 +7,11 @@ use latiq_control_plane::admin_service::AdminService;
 use latiq_control_plane::control_service::ControlService;
 use latiq_control_plane::Registry;
 use latiq_mcp::serve_mcp_with_listener;
-use latiq_pond_node::{build_ops, DataService};
+use latiq_pond_node::{build_ops, DataService, StreamService};
 use latiq_proto::v1::admin_server::AdminServer;
 use latiq_proto::v1::control_server::ControlServer;
 use latiq_proto::v1::data_server::DataServer;
+use latiq_proto::v1::stream_server::StreamServer;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -119,7 +120,8 @@ async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     let data_ops = ops.clone();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(DataServer::new(DataService::new(data_ops)))
+            .add_service(DataServer::new(DataService::new(data_ops.clone())))
+            .add_service(StreamServer::new(StreamService::new(data_ops)))
             .serve_with_incoming(TcpListenerStream::new(data_l))
             .await
             .unwrap();

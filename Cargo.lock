@@ -1524,6 +1524,7 @@ dependencies = [
 name = "latiq-agent-core"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "latiq-common",
  "latiq-control-plane",
@@ -1535,6 +1536,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -1626,6 +1628,7 @@ name = "latiq-pond-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "async-trait",
  "latiq-agent-core",
  "latiq-common",
@@ -1636,6 +1639,7 @@ dependencies = [
  "latiq-storage",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 

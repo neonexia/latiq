@@ -3,8 +3,8 @@
 //! owner) runs locally. Uses a fake ControlPlane (to pin the owner endpoint) and
 //! a recording Forwarder (to observe delegation) — no real cluster needed.
 use latiq_agent_core::{
-    AgentConfig, AgentError, AgentOps, AuditRecord, ControlPlane, DescribeResult, Forwarder,
-    PondInfo,
+    AgentConfig, AgentError, AgentOps, ArrowReadStream, AuditRecord, ControlPlane, DescribeResult,
+    Forwarder, PondInfo,
 };
 use latiq_common::{Identity, QueryMeta};
 use latiq_engine::{ExplainResult, QueryResult, SchemaSummary};
@@ -100,6 +100,20 @@ impl Forwarder for RecordingForwarder {
         self.writes.fetch_add(1, Ordering::SeqCst);
         self.note(e, p, s);
         Ok(sentinel("forwarded_write"))
+    }
+    async fn read_arrow(
+        &self,
+        e: &str,
+        _: &Identity,
+        p: &str,
+        s: &str,
+    ) -> Result<ArrowReadStream, AgentError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.note(e, p, s);
+        Ok(ArrowReadStream {
+            schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+            batches: Box::pin(tokio_stream::iter(Vec::new())),
+        })
     }
     async fn explain(
         &self,

@@ -5,6 +5,7 @@
 //! client) lives in the pond-node adapter that implements this. It mirrors the
 //! `ControlPlane` trait: the core abstracts "a remote node" the same way it
 //! already abstracts "the registry".
+use crate::arrow::ArrowReadStream;
 use crate::error::AgentError;
 use crate::types::DescribeResult;
 use latiq_common::Identity;
@@ -19,6 +20,16 @@ pub trait Forwarder: Send + Sync {
         pond: &str,
         sql: &str,
     ) -> Result<QueryResult, AgentError>;
+
+    /// Stream a read from the owning node as Arrow batches (the Arrow internal
+    /// hop). Used by `read_arrow` when the pond is remote.
+    async fn read_arrow(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        sql: &str,
+    ) -> Result<ArrowReadStream, AgentError>;
 
     async fn write(
         &self,
