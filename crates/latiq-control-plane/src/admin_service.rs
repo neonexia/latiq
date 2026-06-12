@@ -109,7 +109,8 @@ impl Admin for AdminService {
         for row in rows {
             // N+1 list-then-detail read: skip a pond dropped between the list and
             // its pond_info lookup instead of failing the whole call (review #9).
-            let (row, created_at, _policy) = match self.registry.pond_info(&row.pond_id) {
+            let (row, created_at, _policy, _endpoint) = match self.registry.pond_info(&row.pond_id)
+            {
                 Ok(info) => info,
                 Err(ControlPlaneError::PondNotFound(_)) => continue,
                 Err(e) => return Err(to_status(e)),

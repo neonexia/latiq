@@ -201,15 +201,19 @@ impl Registry {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Returns (PondRow, created_at, policy_json) resolved by id or name.
+    /// Returns (PondRow, created_at, policy_json, owning node's internal_endpoint)
+    /// resolved by id or name. The endpoint is `None` if the owning node has gone
+    /// (LEFT JOIN) — the pond row still exists, it just has no live host.
     pub fn pond_info(
         &self,
         pond_ref: &str,
-    ) -> Result<(PondRow, String, String), ControlPlaneError> {
+    ) -> Result<(PondRow, String, String, Option<String>), ControlPlaneError> {
         let c = self.lock();
         c.query_row(
-            "SELECT pond_id, name, owner_identity, node_id, created_at::VARCHAR, policy_json
-             FROM ponds WHERE pond_id=? OR name=? LIMIT 1",
+            "SELECT p.pond_id, p.name, p.owner_identity, p.node_id,
+                    p.created_at::VARCHAR, p.policy_json, n.internal_endpoint
+             FROM ponds p LEFT JOIN nodes n ON n.node_id = p.node_id
+             WHERE p.pond_id=? OR p.name=? LIMIT 1",
             duckdb::params![pond_ref, pond_ref],
             |r| {
                 Ok((
@@ -221,6 +225,7 @@ impl Registry {
                     },
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, Option<String>>(6)?,
                 ))
             },
         )
@@ -336,11 +341,13 @@ mod tests {
             .unwrap();
         let ponds = r.list_ponds().unwrap();
         assert_eq!(ponds.len(), 2);
-        let (row, created_at, policy) = r.pond_info("p-one").unwrap();
+        let (row, created_at, policy, endpoint) = r.pond_info("p-one").unwrap();
         assert_eq!(row.name, "p-one");
         assert_eq!(row.owner_identity, "agent-x");
         assert!(!created_at.is_empty());
         assert_eq!(policy, "{\"k\":1}");
+        // pond_info joins the owning node so a greeter can resolve where to forward.
+        assert_eq!(endpoint.as_deref(), Some("http://n:9092"));
         assert!(matches!(
             r.pond_info("nope"),
             Err(ControlPlaneError::PondNotFound(_))

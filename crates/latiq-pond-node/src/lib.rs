@@ -2,9 +2,12 @@
 //! `AgentOps` (engine + storage + gRPC ControlPlane client); registers with the
 //! control plane and heartbeats.
 pub mod data_service;
+pub mod forward_client;
 pub mod grpc_control;
+pub mod wire;
 
 pub use data_service::DataService;
+pub use forward_client::GrpcForwarder;
 pub use grpc_control::GrpcControlPlane;
 
 use latiq_agent_core::{AgentConfig, AgentOps};
@@ -55,12 +58,14 @@ pub async fn build_ops(
     let control = Arc::new(GrpcControlPlane::connect(control_endpoint.to_string()).await?);
     let storage = Arc::new(LocalFs::new(data_dir));
     let engine = Arc::new(DuckEngine::new());
-    Ok(Arc::new(AgentOps::new(
-        control,
-        storage,
-        engine,
-        AgentConfig::default(),
-    )))
+    // Forward requests for ponds this node doesn't own to the owning node. The
+    // node's own `internal_endpoint` is the identity it compares against, so a
+    // pond whose registry endpoint matches runs locally; everything else forwards.
+    let ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
+        internal_endpoint.to_string(),
+        Arc::new(GrpcForwarder::new()),
+    );
+    Ok(Arc::new(ops))
 }
 
 /// Serve the Data/Query gRPC surface on `addr`.
