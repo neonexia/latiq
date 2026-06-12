@@ -132,6 +132,7 @@ impl Registry {
         )?;
         if n > 0 {
             let _ = c.execute_batch("CHECKPOINT");
+            metrics::counter!("latiq_nodes_reaped_total").increment(n as u64);
         }
         Ok(n)
     }
@@ -202,6 +203,7 @@ impl Registry {
         )?;
         // Persist immediately so the pond survives a lost .wal (see register_node).
         let _ = c.execute_batch("CHECKPOINT");
+        metrics::counter!("latiq_pond_allocations_total").increment(1);
         Ok(PondRow {
             pond_id,
             name,

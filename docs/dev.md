@@ -280,6 +280,44 @@ latiq stats -f json      # raw snapshot for scripts
 
 ---
 
+## Observability (logging + metrics)
+
+**Logging.** Both server roles use `tracing`. Level is `$RUST_LOG` (default `info`,
+e.g. `RUST_LOG=latiq_agent_core=debug`). Format is human-readable by default, or
+structured JSON for log aggregators:
+
+```bash
+LATIQ_LOG_FORMAT=json latiq serve …      # JSON lines for Loki/ELK/Datadog
+```
+
+**Metrics (Prometheus).** Each process serves `GET /metrics` on **its port + 1000**
+(control plane `51400→52400`, a node `51401→52401`), overridable with
+`--metrics-port`. `dev.sh` writes a ready-to-use scrape config (60s = per-minute)
+and prints the endpoints:
+
+```bash
+./dev.sh --nodes 3
+prometheus --config.file=~/.latiq/prometheus.yml     # path printed by dev.sh
+curl -s http://127.0.0.1:52401/metrics | grep latiq_
+```
+
+Counters give **over time** (`rate(latiq_pond_queries_total[1m])`,
+`increase(latiq_pond_errors_total[1m])` — per minute over any range); gauges give
+the **latest** snapshot. The set:
+
+| Metric | Type | Labels | Where |
+|---|---|---|---|
+| `latiq_nodes` / `latiq_ponds` / `latiq_ponds_total` | gauge | `state` / `tier` / — | control plane |
+| `latiq_pond_allocations_total` / `latiq_nodes_reaped_total` | counter | — | control plane |
+| `latiq_process_cpu_percent` / `latiq_process_memory_bytes` | gauge | — | both |
+| `latiq_node_open_ponds` / `latiq_inflight_queries` | gauge | — | node |
+| `latiq_pond_inflight_queries` | gauge | `pond` | node — live per-pond load |
+| `latiq_pond_queries_total` | counter | `pond`, `op` | node — load over time |
+| `latiq_pond_errors_total` | counter | `pond`, `kind` | node — errors over time |
+
+The operator runs Prometheus (scrape + 1-day retention) and Grafana; Latiq stores
+no history. (Distributed-trace spans + OTLP export are a later add-on.)
+
 ## The agent surface (MCP) — for reference
 
 Agents (frontier LLMs), not the CLI, point an MCP client at the node's MCP endpoint (the Data port + 1):

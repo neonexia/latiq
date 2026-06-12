@@ -16,6 +16,34 @@ use tonic::transport::Server;
 const NODE_TTL_SECS: u32 = 30;
 const REAP_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Periodically refresh the control-plane gauges from the registry + this
+/// process's CPU/memory. Counters (allocations, reaped) are incremented inline.
+pub fn spawn_system_collector(registry: Registry) {
+    tokio::spawn(async move {
+        let mut sampler = latiq_metrics::ProcessSampler::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            latiq_metrics::record_process_gauges(&mut sampler);
+            if let Ok(nodes) = registry.list_nodes() {
+                let active = nodes.iter().filter(|n| n.state == "active").count();
+                metrics::gauge!("latiq_nodes", "state" => "active").set(active as f64);
+                metrics::gauge!("latiq_nodes", "state" => "down")
+                    .set((nodes.len() - active) as f64);
+            }
+            if let Ok(ponds) = registry.list_ponds() {
+                metrics::gauge!("latiq_ponds_total").set(ponds.len() as f64);
+                let mut by_tier: std::collections::HashMap<String, usize> = Default::default();
+                for p in &ponds {
+                    *by_tier.entry(p.tier.clone()).or_default() += 1;
+                }
+                for (tier, n) in by_tier {
+                    metrics::gauge!("latiq_ponds", "tier" => tier).set(n as f64);
+                }
+            }
+        }
+    });
+}
+
 /// Periodically mark nodes whose heartbeat went stale as `down` (so placement
 /// stops picking them). A node's next heartbeat/register revives it.
 pub fn spawn_node_reaper(registry: Registry) {
