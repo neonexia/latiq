@@ -63,12 +63,18 @@ impl GrpcForwarder {
     }
 }
 
-/// Tag the forwarded request with the caller's identity so the owning node
-/// attributes the op to the original agent, not to this node.
+/// Tag the forwarded request with the caller's identity (so the owner attributes
+/// the op to the original agent) and the ambient trace id (so the request's spans
+/// correlate across the node hop).
 fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
     let mut req = Request::new(msg);
     if let Ok(v) = MetadataValue::try_from(id.agent_id.as_str()) {
         req.metadata_mut().insert("latiq-agent-id", v);
+    }
+    if let Some(tid) = latiq_agent_core::current_trace_id() {
+        if let Ok(v) = MetadataValue::try_from(tid.as_str()) {
+            req.metadata_mut().insert("latiq-trace-id", v);
+        }
     }
     req
 }

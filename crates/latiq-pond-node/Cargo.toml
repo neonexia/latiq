@@ -13,6 +13,7 @@ latiq-engine = { path = "../latiq-engine" }
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 latiq-metrics = { path = "../latiq-metrics" }
 metrics = { workspace = true }
+tracing = { workspace = true }
 async-trait = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
