@@ -6,6 +6,7 @@ pub mod forward;
 pub mod inflight;
 pub mod ops;
 pub mod registry_control;
+pub mod trace;
 pub mod types;
 
 pub use arrow::{ArrowReadStream, BatchStream};
@@ -15,4 +16,5 @@ pub use forward::Forwarder;
 pub use inflight::InFlightRegistry;
 pub use ops::{AgentConfig, AgentOps};
 pub use registry_control::RegistryControlPlane;
+pub use trace::{current_trace_id, new_trace_id, with_trace_id};
 pub use types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
