@@ -48,6 +48,15 @@ enum Command {
     /// Load curated sample datasets (public DuckLake/standard data) into a pond.
     #[command(subcommand)]
     Dataset(DatasetCmd),
+    /// System snapshot: nodes (state + heartbeat age), ponds, tiers.
+    Stats(StatsArgs),
+}
+
+#[derive(Args)]
+struct StatsArgs {
+    /// Output format (tabular dashboard or raw json).
+    #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
+    format: Format,
 }
 
 #[derive(Subcommand)]
@@ -167,6 +176,7 @@ async fn main() -> Result<()> {
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
         Command::Query(a) => run_query(a).await,
         Command::Dataset(cmd) => run_dataset_cmd(cmd).await,
+        Command::Stats(a) => run_stats(a).await,
     }
 }
 
@@ -551,8 +561,8 @@ async fn node_list() -> Result<()> {
     let mut c = admin_client().await?;
     for n in c.list_nodes(ListNodesRequest {}).await?.into_inner().nodes {
         println!(
-            "{}\t{}\tponds={}\t{}",
-            n.node_id, n.state, n.pond_count, n.mcp_endpoint
+            "{}\t{}\tponds={}\tbeat={}s ago\t{}",
+            n.node_id, n.state, n.pond_count, n.heartbeat_age_seconds, n.mcp_endpoint
         );
     }
     Ok(())
@@ -701,9 +711,92 @@ fn node_to_json(n: Option<NodeInfo>) -> serde_json::Value {
             "mcp_endpoint": n.mcp_endpoint,
             "state": n.state,
             "pond_count": n.pond_count,
+            "last_heartbeat": n.last_heartbeat,
+            "heartbeat_age_seconds": n.heartbeat_age_seconds,
         }),
         None => serde_json::Value::Null,
     }
+}
+
+// ---- stats (system snapshot) --------------------------------------------
+
+async fn run_stats(a: StatsArgs) -> Result<()> {
+    let mut c = admin_client().await?;
+    let nodes = c.list_nodes(ListNodesRequest {}).await?.into_inner().nodes;
+    let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
+
+    let active = nodes.iter().filter(|n| n.state == "active").count();
+    let down = nodes.len() - active;
+    let mut by_tier: std::collections::BTreeMap<String, usize> = Default::default();
+    for p in &ponds {
+        let t = if p.tier.is_empty() { "medium" } else { &p.tier };
+        *by_tier.entry(t.to_string()).or_default() += 1;
+    }
+
+    match a.format {
+        Format::Json => {
+            let v = serde_json::json!({
+                "nodes": { "total": nodes.len(), "active": active, "down": down },
+                "ponds": { "total": ponds.len(), "by_tier": by_tier },
+                "node_detail": nodes.iter().map(|n| serde_json::json!({
+                    "node_id": n.node_id, "state": n.state, "pond_count": n.pond_count,
+                    "heartbeat_age_seconds": n.heartbeat_age_seconds, "mcp_endpoint": n.mcp_endpoint,
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        Format::Tabular => print_stats_dashboard(&nodes, &ponds, active, down, &by_tier),
+    }
+    Ok(())
+}
+
+fn print_stats_dashboard(
+    nodes: &[NodeInfo],
+    ponds: &[PondSummary],
+    active: usize,
+    down: usize,
+    by_tier: &std::collections::BTreeMap<String, usize>,
+) {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    let (bold, dim, green, red, rst) = if tty {
+        ("\x1b[1m", "\x1b[2m", "\x1b[32m", "\x1b[1;31m", "\x1b[0m")
+    } else {
+        ("", "", "", "", "")
+    };
+    let bar = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
+    let tiers = by_tier
+        .iter()
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let down_c = if down > 0 { red } else { dim };
+
+    println!();
+    println!("{bold} {bar}{rst}");
+    println!("{bold}  latiq{rst} {dim}· system snapshot{rst}");
+    println!("{bold} {bar}{rst}");
+    println!();
+    println!(
+        "   {dim}nodes{rst}  {} total · {green}{active} active{rst} · {down_c}{down} down{rst}",
+        nodes.len()
+    );
+    let tier_suffix = if tiers.is_empty() {
+        String::new()
+    } else {
+        format!("  ·  {tiers}")
+    };
+    println!("   {dim}ponds{rst}  {}{tier_suffix}", ponds.len());
+    println!();
+    println!("   {dim}NODE        STATE   PONDS  LAST BEAT    ENDPOINT{rst}");
+    for n in nodes {
+        let sc = if n.state == "active" { green } else { red };
+        println!(
+            "   {:<11} {sc}{:<6}{rst} {:>5}  {:>7}s ago  {}",
+            n.node_id, n.state, n.pond_count, n.heartbeat_age_seconds, n.mcp_endpoint
+        );
+    }
+    println!();
 }
 
 #[cfg(test)]
