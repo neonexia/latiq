@@ -9,6 +9,10 @@ pub struct PondInfo {
     pub owner: String,
     pub created_at: String,
     pub policy_json: String,
+    /// Internal endpoint of the node that owns this pond (`None` if the owning
+    /// node is gone). A node uses this to decide local-vs-forward.
+    #[serde(default)]
+    pub node_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

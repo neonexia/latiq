@@ -3,6 +3,7 @@
 //! metadata key (relaxed, default anonymous). Errors map to a tonic `Status`
 //! whose code derives from the ErrorKind and whose `details` carry the
 //! JSON-encoded `ErrorEnvelope` (so the client can render kind/suggest/see).
+use crate::wire::query_value;
 use latiq_agent_core::{AgentError, AgentOps};
 use latiq_common::{ErrorKind, Identity};
 use latiq_proto::v1::data_server::Data;
@@ -148,21 +149,4 @@ impl Data for DataService {
             .map_err(to_status)?;
         Ok(json_resp(serde_json::to_value(er).unwrap_or_default()))
     }
-}
-
-fn query_value(qr: latiq_engine::QueryResult) -> serde_json::Value {
-    // The `query` CLI command routes everything through write_query, so label by
-    // what actually happened: a write creates a snapshot, a read does not.
-    let statement = if qr.meta.snapshot_id.is_some() {
-        "write_query"
-    } else {
-        "read_query"
-    };
-    serde_json::json!({
-        "columns": qr.columns,
-        "rows": qr.rows,
-        "statement": statement,
-        "status": "ok",
-        "_meta": qr.meta,
-    })
 }

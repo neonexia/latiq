@@ -3,6 +3,7 @@
 //! pool; cancellation flows through the in-flight registry's AbortToken.
 use crate::control::ControlPlane;
 use crate::error::AgentError;
+use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
 use crate::types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
 use latiq_common::ErrorKind;
@@ -33,6 +34,12 @@ pub struct AgentOps {
     engine: Arc<dyn QueryEngine>,
     inflight: InFlightRegistry,
     config: AgentConfig,
+    /// This node's own internal endpoint (registered with the control plane).
+    /// `None` in single-node/in-process setups, where forwarding never applies.
+    self_endpoint: Option<String>,
+    /// Delegate for ponds owned by a different node. `None` = single-node: every
+    /// pond is local, so the behavior is exactly as before forwarding existed.
+    forwarder: Option<Arc<dyn Forwarder>>,
 }
 
 impl AgentOps {
@@ -48,11 +55,36 @@ impl AgentOps {
             engine,
             inflight: InFlightRegistry::new(),
             config,
+            self_endpoint: None,
+            forwarder: None,
         }
+    }
+
+    /// Enable node-to-node forwarding: requests for ponds owned by a node other
+    /// than `self_endpoint` are delegated to `forwarder`. Without this, all ponds
+    /// are treated as local (single-node behavior).
+    pub fn with_forwarding(mut self, self_endpoint: String, forwarder: Arc<dyn Forwarder>) -> Self {
+        self.self_endpoint = Some(self_endpoint);
+        self.forwarder = Some(forwarder);
+        self
     }
 
     pub fn inflight(&self) -> &InFlightRegistry {
         &self.inflight
+    }
+
+    /// If this node isn't the pond's owner (and forwarding is configured), return
+    /// the delegate + owner endpoint to forward to. `None` → handle locally. A
+    /// pond with no live owner (`node_endpoint == None`) also runs locally, so the
+    /// local error path (e.g. storage/availability) surfaces normally.
+    fn forward_target<'a>(&'a self, info: &'a PondInfo) -> Option<(&'a dyn Forwarder, &'a str)> {
+        let fwd = self.forwarder.as_ref()?;
+        let me = self.self_endpoint.as_deref()?;
+        let owner = info.node_endpoint.as_deref()?;
+        if owner == me {
+            return None;
+        }
+        Some((fwd.as_ref(), owner))
     }
 
     fn parse_id(pond_id: &str) -> Result<PondId, AgentError> {
@@ -69,6 +101,19 @@ impl AgentOps {
             .control
             .create_pond(name, &identity.agent_id, policy_json)
             .await?;
+        // The control plane may place the pond on a different node than the one
+        // that received this call. In that case, don't eagerly create storage here
+        // (it would orphan files on the wrong node) — the owning node materializes
+        // it lazily on first use (ensure_pond). Single-node: owner == self, so this
+        // is skipped and the eager init below runs as before.
+        if self.forward_target(&info).is_some() {
+            self.audit(identity, "allocate_pond", Some(&info.pond_id), None, 0)
+                .await;
+            return Ok(AllocateResult {
+                pond_id: info.pond_id,
+                pond_name: info.name,
+            });
+        }
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
             .storage
@@ -101,6 +146,9 @@ impl AgentOps {
         pond_ref: &str,
     ) -> Result<DescribeResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            return fwd.describe(owner, identity, pond_ref).await;
+        }
         let pid = Self::parse_id(&info.pond_id)?;
         // ensure_pond materializes storage on first touch; attach under the
         // pond's registry name so introspection is scoped to this catalog.
@@ -142,7 +190,13 @@ impl AgentOps {
                 "latiq://guidance",
             ));
         }
-        let pond_id = self.control.resolve_pond(pond_ref).await?;
+        let info = self.control.pond_info(pond_ref).await?;
+        // Owned by another node → forward the drop so the owner evicts its engine
+        // instance and deletes the files it actually holds.
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            return fwd.drop_pond(owner, identity, pond_ref, confirm).await;
+        }
+        let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         // Tombstone the pond + cancel its in-flight ops. begin_drop also makes any
         // query that registers from here on get a pre-cancelled token, so one that
@@ -195,6 +249,15 @@ impl AgentOps {
         write: bool,
     ) -> Result<QueryResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
+        // Owned by another node → forward and relay. The owner audits + snapshots;
+        // we just return its result, so attribution stays on the node that ran it.
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            return if write {
+                fwd.write(owner, identity, pond_ref, sql).await
+            } else {
+                fwd.read(owner, identity, pond_ref, sql).await
+            };
+        }
         let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         // ensure_pond materializes storage on first touch; attach the catalog
@@ -249,6 +312,9 @@ impl AgentOps {
         sql: &str,
     ) -> Result<ExplainResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            return fwd.explain(owner, identity, pond_ref, sql).await;
+        }
         let pid = Self::parse_id(&info.pond_id)?;
         // ensure_pond materializes storage on first touch; attach under the
         // pond's registry name so the plan resolves names in this catalog.
