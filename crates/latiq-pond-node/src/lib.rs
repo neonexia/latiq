@@ -38,6 +38,23 @@ pub struct PondNodeConfig {
     pub control_endpoint: String,
     /// Local-FS root for pond storage.
     pub data_dir: PathBuf,
+    /// Address to serve Prometheus `/metrics` on (None = metrics off).
+    pub metrics_addr: Option<SocketAddr>,
+}
+
+/// Periodically refresh this node's resource + load gauges. The per-pond
+/// in-flight gauge is maintained inline in AgentOps; this samples the node-level
+/// gauges + process CPU/memory.
+pub fn spawn_node_collector(ops: Arc<AgentOps>) {
+    tokio::spawn(async move {
+        let mut sampler = latiq_metrics::ProcessSampler::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            latiq_metrics::record_process_gauges(&mut sampler);
+            metrics::gauge!("latiq_inflight_queries").set(ops.inflight().len() as f64);
+            metrics::gauge!("latiq_node_open_ponds").set(ops.open_pond_count() as f64);
+        }
+    });
 }
 
 /// Build the pond node's `AgentOps` (gRPC control + local storage + DuckDB
@@ -98,6 +115,18 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         &cfg.data_dir,
     )
     .await?;
+
+    // Prometheus /metrics + the gauge collector (if a metrics port is configured).
+    if let Some(metrics_addr) = cfg.metrics_addr {
+        let handle = latiq_metrics::init_recorder();
+        metrics::gauge!("latiq_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+        spawn_node_collector(ops.clone());
+        tokio::spawn(async move {
+            if let Err(e) = latiq_metrics::serve_metrics(metrics_addr, handle).await {
+                eprintln!("metrics server error: {e}");
+            }
+        });
+    }
 
     // Heartbeat loop (reconnects on failure so a control-plane blip doesn't
     // silently drop the node from the cluster).

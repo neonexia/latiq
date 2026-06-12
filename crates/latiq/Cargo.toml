@@ -13,6 +13,8 @@ latiq-pond-node = { path = "../latiq-pond-node" }
 latiq-proto = { path = "../latiq-proto" }
 latiq-common = { path = "../latiq-common" }
 latiq-engine = { path = "../latiq-engine" }
+latiq-metrics = { path = "../latiq-metrics" }
+metrics = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

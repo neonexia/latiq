@@ -22,12 +22,7 @@ const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
-#[command(
-    after_help = "Env: $LATIQ_CONTROL = control plane address (default http://127.0.0.1:51400); \
-$LATIQ_ROOT = data root for serve/node add (default ~/.latiq); \
-$LATIQ_GATEWAY = send data ops to this front door (e.g. nginx over several nodes) \
-instead of resolving the owning node — the greeter forwards."
-)]
+#[command(after_help = "")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -85,6 +80,9 @@ struct ServeArgs {
     /// Data root; the registry lives at <root>/registry.duckdb (default ~/.latiq).
     #[arg(short, long)]
     root: Option<PathBuf>,
+    /// Prometheus /metrics port (default: control port + 1000).
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +105,9 @@ struct NodeAddArgs {
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
     #[arg(short, long)]
     root: Option<PathBuf>,
+    /// Prometheus /metrics port (default: data port + 1000).
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 #[derive(Subcommand)]
@@ -355,7 +356,34 @@ fn control_addr() -> String {
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+    // LATIQ_LOG_FORMAT=json → structured JSON logs (for Loki/ELK/Datadog); else
+    // the human-readable format. RUST_LOG still controls level.
+    let json = std::env::var("LATIQ_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json"));
+    if json {
+        let _ = fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_target(true)
+            .try_init();
+    } else {
+        let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+    }
+}
+
+/// Resolve the metrics address (`--metrics-port`, default main port + 1000) and
+/// start the Prometheus recorder + `/metrics` server. Returns the address logged
+/// in the banner.
+fn start_metrics(main_port: u16, metrics_port: Option<u16>) -> Result<SocketAddr> {
+    let addr: SocketAddr =
+        format!("127.0.0.1:{}", metrics_port.unwrap_or(main_port + 1000)).parse()?;
+    let handle = latiq_metrics::init_recorder();
+    metrics::gauge!("latiq_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+    tokio::spawn(async move {
+        if let Err(e) = latiq_metrics::serve_metrics(addr, handle).await {
+            eprintln!("metrics server error: {e}");
+        }
+    });
+    Ok(addr)
 }
 
 async fn run_serve(a: ServeArgs) -> Result<()> {
@@ -366,8 +394,11 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     let db = root.join("registry.duckdb");
     let registry = Registry::open(Some(db.as_path()))?;
     let addr: SocketAddr = format!("127.0.0.1:{}", a.port).parse()?;
+    let metrics_addr = start_metrics(a.port, a.metrics_port)?;
+    latiq_control_plane::spawn_system_collector(registry.clone());
     println!("control plane: Control + Admin gRPC on {addr}");
     println!("  registry: {}", db.display());
+    println!("  metrics:  http://{metrics_addr}/metrics");
     serve_control_plane(addr, registry)
         .await
         .map_err(|e| anyhow!("server error: {e}"))?;
@@ -381,6 +412,8 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let data_addr = format!("127.0.0.1:{}", a.port);
     let mcp_addr = format!("127.0.0.1:{}", a.port + 1);
+    let metrics_addr: SocketAddr =
+        format!("127.0.0.1:{}", a.metrics_port.unwrap_or(a.port + 1000)).parse()?;
     run_pond_node(PondNodeConfig {
         node_id: a.node_id,
         mcp_addr: mcp_addr.parse()?,
@@ -388,6 +421,7 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         internal_endpoint: format!("http://{data_addr}"),
         control_endpoint: control_addr(),
         data_dir: root.join("ponds"),
+        metrics_addr: Some(metrics_addr),
     })
     .await
 }

@@ -140,6 +140,10 @@ impl QueryEngine for DuckEngine {
         run_explain(&guard, sql)
     }
 
+    fn open_pond_count(&self) -> usize {
+        lock_recover(&self.instances).len()
+    }
+
     fn forget_pond(&self, loc: &PondLocation) {
         // Drop the cached instance so its DuckDB connection (and the open handle to
         // the pond's catalog file) is closed before storage deletes those files.
