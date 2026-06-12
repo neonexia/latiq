@@ -38,6 +38,33 @@ async fn client(ep: &str) -> DataClient<tonic::transport::Channel> {
 }
 
 #[tokio::test]
+async fn result_encoding_arrow_edge_renders_date_and_nested() {
+    // The Data read path now collects from the Arrow hop and renders to JSON at
+    // the edge. Confirm common types still produce sane JSON (a date string, a
+    // nested array) rather than garbage.
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(req(alloc("enc"), "a")).await.unwrap();
+    let resp = c
+        .read_query(req(
+            q("enc", "SELECT DATE '2021-03-04' AS d, [10,20,30] AS arr"),
+            "a",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let v: serde_json::Value = serde_json::from_str(&resp.json).unwrap();
+    let row0 = &v["rows"][0];
+    assert_eq!(v["columns"], serde_json::json!(["d", "arr"]));
+    assert!(
+        row0[0].as_str().is_some_and(|s| s.contains("2021")),
+        "date should render as a readable string, got {}",
+        row0[0]
+    );
+    assert_eq!(row0[1], serde_json::json!([10, 20, 30]), "nested array");
+}
+
+#[tokio::test]
 async fn pond_lifecycle_happy() {
     let s = start_stack().await;
     let mut c = client(&s.data_endpoint).await;
