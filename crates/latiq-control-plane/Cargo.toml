@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 latiq-common = { path = "../latiq-common" }
 latiq-proto = { path = "../latiq-proto" }
+latiq-metrics = { path = "../latiq-metrics" }
+metrics = { workspace = true }
 duckdb = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

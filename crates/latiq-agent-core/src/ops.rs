@@ -83,6 +83,11 @@ impl AgentOps {
         &self.inflight
     }
 
+    /// Pond instances open on this node (for the `latiq_node_open_ponds` gauge).
+    pub fn open_pond_count(&self) -> usize {
+        self.engine.open_pond_count()
+    }
+
     /// If this node isn't the pond's owner (and forwarding is configured), return
     /// the delegate + owner endpoint to forward to. `None` → handle locally. A
     /// pond with no live owner (`node_endpoint == None`) also runs locally, so the
@@ -291,6 +296,8 @@ impl AgentOps {
             return fwd.read_arrow(owner, identity, pond_ref, sql).await;
         }
         info!(op = "read_arrow", pond = pond_ref, "processing locally");
+        record_query(&info.name, "read");
+        metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
         let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         let mut loc = self
@@ -307,6 +314,7 @@ impl AgentOps {
         let engine = self.engine.clone();
         let inflight = self.inflight.clone();
         let sql2 = sql.to_string();
+        let pond_name = info.name.clone();
         tokio::task::spawn_blocking(move || {
             let mut sink = ChannelSink {
                 schema_tx: Some(schema_tx),
@@ -324,11 +332,14 @@ impl AgentOps {
                 }
             }
             inflight.complete(&op_id);
+            // Streaming done (or the consumer dropped) → release the live-load gauge.
+            metrics::gauge!("latiq_pond_inflight_queries", "pond" => pond_name).decrement(1.0);
         });
 
         let schema = schema_rx
             .await
-            .map_err(|_| AgentError::internal("arrow read produced no schema"))??;
+            .map_err(|_| AgentError::internal("arrow read produced no schema"))?
+            .inspect_err(|e| record_error(&info.name, e))?;
         Ok(ArrowReadStream {
             schema,
             batches: Box::pin(ReceiverStream::new(batch_rx)),
@@ -402,6 +413,8 @@ impl AgentOps {
             };
         }
         info!(op = "query", pond = pond_ref, "processing locally");
+        record_query(&info.name, if write { "write" } else { "read" });
+        metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
         let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         // ensure_pond materializes storage on first touch; attach the catalog
@@ -429,14 +442,21 @@ impl AgentOps {
         .await
         .map_err(|e| AgentError::internal(format!("join: {e}")));
         self.inflight.complete(&op_id);
+        metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).decrement(1.0);
 
         let result = out?;
-        let qr = result?;
+        let qr = match result {
+            Ok(qr) => qr,
+            Err(e) => {
+                let ae = AgentError::from(e);
+                record_error(&info.name, &ae);
+                return Err(ae);
+            }
+        };
         if !write && qr.rows.len() > self.config.inline_row_cap {
-            return Err(AgentError::result_cap_exceeded(
-                qr.rows.len(),
-                self.config.inline_row_cap,
-            ));
+            let ae = AgentError::result_cap_exceeded(qr.rows.len(), self.config.inline_row_cap);
+            record_error(&info.name, &ae);
+            return Err(ae);
         }
         let op = if write { "write_query" } else { "read_query" };
         self.audit(
@@ -517,6 +537,18 @@ impl AgentOps {
 /// Map a pond's tier name to its resource caps (unknown/empty → medium).
 fn tier_limits(tier: &str) -> Option<ResourceLimits> {
     Some(PondTier::parse(tier).unwrap_or_default().limits())
+}
+
+/// Per-pond query/error counters — recorded on the node that actually runs the
+/// query (the local path, after the forward decision), labeled by pond name.
+/// Counters give over-time load (`rate`/`increase` in Prometheus).
+fn record_query(pond: &str, op: &'static str) {
+    metrics::counter!("latiq_pond_queries_total", "pond" => pond.to_string(), "op" => op)
+        .increment(1);
+}
+fn record_error(pond: &str, e: &AgentError) {
+    metrics::counter!("latiq_pond_errors_total", "pond" => pond.to_string(), "kind" => format!("{:?}", e.envelope().kind))
+        .increment(1);
 }
 
 /// Convert one Arrow `RecordBatch` to positional JSON rows aligned to `columns`.
