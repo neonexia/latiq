@@ -1,4 +1,5 @@
 //! Where a pond's bytes live — the descriptor handed to the query engine.
+use latiq_common::ResourceLimits;
 use serde::{Deserialize, Serialize};
 
 /// Resolved physical location of a pond. The engine consumes this to ATTACH.
@@ -12,4 +13,9 @@ pub struct PondLocation {
     /// `<pond>.snapshots()` / `<pond>.main.<table>`. Storage defaults this to
     /// `pond`; the orchestrator (AgentOps) overrides it with the registry name.
     pub catalog_name: String,
+    /// Per-pond resource caps (from its tier), applied to the DuckDB instance on
+    /// open. `None` → engine defaults. Storage leaves this `None`; AgentOps sets
+    /// it from the pond's tier.
+    #[serde(default)]
+    pub limits: Option<ResourceLimits>,
 }

@@ -63,6 +63,7 @@ async fn control_and_admin_surfaces_work() {
             name: "incident-1".into(),
             owner_identity: "agent-x".into(),
             policy_json: "{}".into(),
+            tier: "medium".into(),
         })
         .await
         .unwrap()
@@ -149,6 +150,7 @@ async fn error_contract_allocate_with_no_node_is_precondition_not_notfound() {
             name: "orphan".into(),
             owner_identity: "agent-x".into(),
             policy_json: "{}".into(),
+            tier: "medium".into(),
         })
         .await
         .expect_err("allocate with no node must fail");

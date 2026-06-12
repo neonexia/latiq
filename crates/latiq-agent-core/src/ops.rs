@@ -13,6 +13,7 @@ use latiq_common::ErrorKind;
 use latiq_common::Identity;
 use latiq_common::PondId;
 use latiq_common::QueryMeta;
+use latiq_common::{PondTier, ResourceLimits};
 use latiq_engine::{ArrowSink, ExplainResult, QueryEngine, QueryResult};
 use latiq_storage::PondStorage;
 use std::ops::ControlFlow;
@@ -105,10 +106,11 @@ impl AgentOps {
         identity: &Identity,
         name: Option<String>,
         policy_json: &str,
+        tier: &str,
     ) -> Result<AllocateResult, AgentError> {
         let info = self
             .control
-            .create_pond(name, &identity.agent_id, policy_json)
+            .create_pond(name, &identity.agent_id, policy_json, tier)
             .await?;
         // The control plane may place the pond on a different node than the one
         // that received this call. In that case, don't eagerly create storage here
@@ -129,6 +131,7 @@ impl AgentOps {
             .create_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
 
         let engine = self.engine.clone();
         let loc2 = loc.clone();
@@ -173,6 +176,7 @@ impl AgentOps {
             .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let schema = tokio::task::spawn_blocking(move || engine.describe_schema(&loc2))
@@ -294,6 +298,7 @@ impl AgentOps {
             .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
         let (op_id, token) = self.inflight.register(Some(pond_id));
 
         let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
@@ -406,6 +411,7 @@ impl AgentOps {
             .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
         let (op_id, token) = self.inflight.register(Some(pond_id.clone()));
 
         let engine = self.engine.clone();
@@ -469,6 +475,7 @@ impl AgentOps {
             .ensure_pond(pid)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let sql2 = sql.to_string();
@@ -505,6 +512,11 @@ impl AgentOps {
             })
             .await;
     }
+}
+
+/// Map a pond's tier name to its resource caps (unknown/empty → medium).
+fn tier_limits(tier: &str) -> Option<ResourceLimits> {
+    Some(PondTier::parse(tier).unwrap_or_default().limits())
 }
 
 /// Convert one Arrow `RecordBatch` to positional JSON rows aligned to `columns`.

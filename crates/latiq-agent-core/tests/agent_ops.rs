@@ -30,7 +30,7 @@ async fn full_agent_loop() {
     let id = Identity::claimed(Some("agent-loop"));
 
     let alloc = ops
-        .allocate_pond(&id, Some("incident-9".into()), "{}")
+        .allocate_pond(&id, Some("incident-9".into()), "{}", "medium")
         .await
         .unwrap();
     assert_eq!(alloc.pond_name, "incident-9");
@@ -87,7 +87,7 @@ async fn read_arrow_streams_rows_locally() {
     use tokio_stream::StreamExt;
     let ops = ops();
     let id = Identity::claimed(Some("a"));
-    ops.allocate_pond(&id, Some("ar".into()), "{}")
+    ops.allocate_pond(&id, Some("ar".into()), "{}", "medium")
         .await
         .unwrap();
     ops.write_query(
@@ -119,7 +119,7 @@ async fn read_arrow_streams_rows_locally() {
 async fn pond_lifecycle_drop_requires_confirm() {
     let ops = ops();
     let id = Identity::claimed(Some("agent-loop"));
-    ops.allocate_pond(&id, Some("keepme".into()), "{}")
+    ops.allocate_pond(&id, Some("keepme".into()), "{}", "medium")
         .await
         .unwrap();
 
@@ -157,7 +157,7 @@ async fn lazy_materialize_pond_assigned_without_eager_storage() {
         .unwrap();
     // Registry-only allocation — deliberately NOT ops.allocate_pond (no storage).
     registry
-        .create_pond(Some("lazy".into()), "agent-x", "{}")
+        .create_pond(Some("lazy".into()), "agent-x", "{}", "medium")
         .unwrap();
 
     let control = Arc::new(RegistryControlPlane::new(registry));
@@ -183,7 +183,7 @@ async fn lazy_materialize_pond_assigned_without_eager_storage() {
 async fn read_query_rejects_writes_with_structured_error() {
     let ops = ops();
     let id = Identity::claimed(None);
-    ops.allocate_pond(&id, Some("p".into()), "{}")
+    ops.allocate_pond(&id, Some("p".into()), "{}", "medium")
         .await
         .unwrap();
     let err = ops

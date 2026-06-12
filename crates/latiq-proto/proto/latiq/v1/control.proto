@@ -18,6 +18,8 @@ message PondInfoMsg {
   // Internal endpoint of the node that owns this pond (empty if the node is
   // gone). Lets a node that receives a request resolve the owner and forward.
   string node_endpoint = 6;
+  // Resource tier (small/medium/large/x-large); empty → medium.
+  string tier = 7;
 }
 message ListPondsRequest { }
 message ListPondsResponse { repeated PondInfoMsg ponds = 1; }
@@ -28,7 +30,7 @@ message RegisterNodeRequest { string node_id = 1; string mcp_endpoint = 2; strin
 message RegisterNodeResponse { }
 message HeartbeatRequest { string node_id = 1; uint32 pond_count = 2; }
 message HeartbeatResponse { }
-message CreatePondAssignmentRequest { string name = 1; string owner_identity = 2; string policy_json = 3; }
+message CreatePondAssignmentRequest { string name = 1; string owner_identity = 2; string policy_json = 3; string tier = 4; }
 message CreatePondAssignmentResponse { string pond_id = 1; string assigned_node_endpoint = 2; }
 message GetPondLocationRequest { string pond_ref = 1; }
 message GetPondLocationResponse { string pond_id = 1; string node_endpoint = 2; }

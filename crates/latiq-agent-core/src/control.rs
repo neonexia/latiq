@@ -10,6 +10,7 @@ pub trait ControlPlane: Send + Sync {
         name: Option<String>,
         owner: &str,
         policy_json: &str,
+        tier: &str,
     ) -> Result<PondInfo, AgentError>;
 
     /// Resolve a pond ref (id or name) to its pond_id, erroring if absent.

@@ -20,6 +20,7 @@ fn alloc(name: &str) -> AllocatePondRequest {
     AllocatePondRequest {
         name: name.into(),
         policy_json: String::new(),
+        tier: String::new(),
     }
 }
 fn q(pond: &str, sql: &str) -> QueryRequest {
@@ -35,6 +36,29 @@ fn envelope(status: &tonic::Status) -> ErrorEnvelope {
 
 async fn client(ep: &str) -> DataClient<tonic::transport::Channel> {
     DataClient::connect(ep.to_string()).await.unwrap()
+}
+
+#[tokio::test]
+async fn pond_lifecycle_tier_recorded_and_described() {
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(req(
+        AllocatePondRequest {
+            name: "big".into(),
+            policy_json: String::new(),
+            tier: "large".into(),
+        },
+        "a",
+    ))
+    .await
+    .unwrap();
+    let d = c
+        .describe_pond(req(DescribePondRequest { pond: "big".into() }, "a"))
+        .await
+        .unwrap()
+        .into_inner();
+    let v: serde_json::Value = serde_json::from_str(&d.json).unwrap();
+    assert_eq!(v["pond"]["tier"], "large", "tier recorded + described");
 }
 
 #[tokio::test]

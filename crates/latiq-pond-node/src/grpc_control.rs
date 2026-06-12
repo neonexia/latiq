@@ -47,6 +47,7 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         policy_json: m.policy_json,
         // Empty wire string means "no live owning node" → None.
         node_endpoint: Some(m.node_endpoint).filter(|s| !s.is_empty()),
+        tier: m.tier,
     }
 }
 
@@ -57,6 +58,7 @@ impl ControlPlane for GrpcControlPlane {
         name: Option<String>,
         owner: &str,
         policy_json: &str,
+        tier: &str,
     ) -> Result<PondInfo, AgentError> {
         let mut c = self.client.clone();
         let created = c
@@ -64,6 +66,7 @@ impl ControlPlane for GrpcControlPlane {
                 name: name.unwrap_or_default(),
                 owner_identity: owner.to_string(),
                 policy_json: policy_json.to_string(),
+                tier: tier.to_string(),
             })
             .await
             .map_err(status_err)?
