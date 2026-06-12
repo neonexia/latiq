@@ -1,6 +1,6 @@
 # Latiq — Developer Guide
 
-> **Status:** Slice 0+ (M1–M11) complete and runnable. This is the hands-on guide for building Latiq, starting the dev stack, and driving it manually through the **CLI** (the gRPC surfaces). Agents drive the separate **MCP** surface; an SDK is a later slice. Federation/catalogs, OIDC, rate-limiting, and OpenTelemetry are deferred.
+> **Status:** Slice 0+ (M1–M11) complete and runnable, plus **multi-node request forwarding** (a front door over N nodes) and **Arrow streaming reads** (the SDK path). This is the hands-on guide for building Latiq, starting the dev stack, and driving it manually through the **CLI** (the gRPC surfaces). Agents drive the separate **MCP** surface; a packaged SDK is still a later slice (the Arrow stream is standard `pyarrow`-decodable today). Federation/catalogs, OIDC, rate-limiting, OpenTelemetry, and per-pond resource limits are deferred.
 
 ## What you're running
 
@@ -198,6 +198,33 @@ latiq query --pond demo "SELECT 1"
 
 ---
 
+## Arrow streaming (for the SDK / large reads)
+
+Reads stream end-to-end as **Arrow batches** — DuckDB → owning node → (greeter, if
+forwarded) → client — so large results aren't buffered. Internally every read
+rides this Arrow hop (the CLI's `query` routes `SELECT`s to it); the MCP/CLI
+surfaces just collect it back to JSON at the edge (bounded by the 10k inline cap),
+while an SDK can pull the **raw Arrow stream, uncapped**.
+
+The transport is a server-streaming gRPC RPC — `latiq.v1.Stream/ReadArrow` — that
+carries **Arrow IPC** chunks. It is **not** the Flight protocol, but the payload is
+standard Arrow, so any Arrow library decodes it. It **shares the Data gRPC port**
+(and the multi-node front door), so there's no extra endpoint: point a client at
+the same address the CLI uses.
+
+A Python client is just gRPC + `pyarrow` (no Latiq SDK package needed yet):
+
+```python
+# ReadArrow(QueryRequest{pond, sql}) → stream of ArrowChunk{ipc: bytes}
+import pyarrow as pa
+buf = b"".join(chunk.ipc for chunk in stub.ReadArrow(QueryRequest(pond="demo", sql="SELECT * FROM t")))
+table = pa.ipc.open_stream(buf).read_all()   # → pa.Table
+df = table.to_pandas()
+```
+
+(Concatenating then decoding is the simple form; a streaming client feeds each
+`chunk.ipc` to an incremental `pa.ipc` reader to avoid buffering.)
+
 ## Operator CLI (node admin)
 
 Inspect registered pond nodes (control plane, at `$LATIQ_CONTROL`).
@@ -225,9 +252,9 @@ Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`
 
 ## What works now vs. later
 
-**Now (Slice 0+ / M1–M11):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, and an audit log.
+**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, an audit log, **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), and **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge).
 
-**Later slices:** external catalogs + credentials + federation, OIDC verification, Arrow Flight SQL streaming for large results, rate limiting, OpenTelemetry, multi-node, an SDK.
+**Later slices:** external catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, per-pond resource limits, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
 
 ---
 

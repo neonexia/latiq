@@ -440,17 +440,20 @@ fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
 async fn run_query(a: QueryArgs) -> Result<()> {
     let node = data_target(&a.pond).await?;
     let mut c = data_client(&node).await?;
-    // One `query` for everything: the write path runs DDL/DML and, for a plain
-    // SELECT, falls through to a read (no snapshot). Reads are still cap-bounded.
-    let res = c
-        .write_query(with_id(
-            QueryRequest {
-                pond: a.pond.clone(),
-                sql: a.sql.clone(),
-            },
-            &a.agent_id,
-        ))
-        .await;
+    let msg = with_id(
+        QueryRequest {
+            pond: a.pond.clone(),
+            sql: a.sql.clone(),
+        },
+        &a.agent_id,
+    );
+    // Still one `query` command — but route by statement so reads ride the Arrow
+    // streaming hop (ReadQuery) and writes are attributed/snapshotted (WriteQuery).
+    let res = if latiq_engine::is_read_only(&a.sql) {
+        c.read_query(msg).await
+    } else {
+        c.write_query(msg).await
+    };
     match a.format {
         Format::Json => print_json_result(res),
         Format::Tabular => print_table_result(res),

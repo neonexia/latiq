@@ -9,11 +9,12 @@
 //! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
 //! watcher thread interrupts the running statement when the `AbortToken` is
 //! cancelled, and exits when the operation completes.
-use crate::exec::{run_explain, run_read, run_write};
+use crate::exec::{run_explain, run_read, run_read_arrow, run_write};
 use crate::instance::PondInstance;
 use latiq_common::Identity;
 use latiq_engine::{
-    AbortToken, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary, TableInfo,
+    AbortToken, ArrowSink, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary,
+    TableInfo,
 };
 use latiq_storage::PondLocation;
 use std::collections::HashMap;
@@ -105,6 +106,18 @@ impl QueryEngine for DuckEngine {
         let inst = self.instance(loc)?;
         let guard = lock_recover(&inst);
         Self::run_with_abort(&guard, &abort, |i| run_read(i, sql))
+    }
+
+    fn read_arrow(
+        &self,
+        loc: &PondLocation,
+        sql: &str,
+        abort: AbortToken,
+        sink: &mut dyn ArrowSink,
+    ) -> Result<(), EngineError> {
+        let inst = self.instance(loc)?;
+        let guard = lock_recover(&inst);
+        Self::run_with_abort(&guard, &abort, |i| run_read_arrow(i, sql, &abort, sink))
     }
 
     fn write_query(
@@ -240,6 +253,62 @@ mod tests {
             .read_query(&loc, "SELECT 1 AS x", AbortToken::new())
             .unwrap();
         assert_eq!(ok.rows[0][0], serde_json::json!(1));
+    }
+
+    #[test]
+    fn read_arrow_streams_batches_and_rejects_writes() {
+        use arrow::datatypes::SchemaRef;
+        use arrow::record_batch::RecordBatch;
+        use std::ops::ControlFlow;
+
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap();
+        eng.write_query(
+            &loc,
+            "CREATE TABLE t AS SELECT * FROM range(2500) r(i)",
+            &Identity::claimed(Some("a")),
+            AbortToken::new(),
+        )
+        .unwrap();
+
+        #[derive(Default)]
+        struct Collector {
+            first_col: Option<String>,
+            rows: usize,
+            batches: usize,
+        }
+        impl ArrowSink for Collector {
+            fn schema(&mut self, s: SchemaRef) -> ControlFlow<()> {
+                self.first_col = Some(s.field(0).name().clone());
+                ControlFlow::Continue(())
+            }
+            fn batch(&mut self, b: RecordBatch) -> ControlFlow<()> {
+                self.rows += b.num_rows();
+                self.batches += 1;
+                ControlFlow::Continue(())
+            }
+        }
+
+        let mut c = Collector::default();
+        eng.read_arrow(
+            &loc,
+            "SELECT i FROM t ORDER BY i",
+            AbortToken::new(),
+            &mut c,
+        )
+        .unwrap();
+        assert_eq!(c.rows, 2500, "all rows streamed");
+        assert!(c.batches >= 1, "schema + at least one batch");
+        assert_eq!(c.first_col.as_deref(), Some("i"));
+
+        // read_arrow rejects writes, like read_query.
+        let mut c2 = Collector::default();
+        assert!(matches!(
+            eng.read_arrow(&loc, "INSERT INTO t VALUES (1)", AbortToken::new(), &mut c2),
+            Err(EngineError::ReadOnlyViolation)
+        ));
     }
 
     #[test]

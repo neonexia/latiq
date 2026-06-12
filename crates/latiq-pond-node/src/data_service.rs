@@ -22,7 +22,7 @@ impl DataService {
 }
 
 /// Relaxed identity from gRPC metadata (`latiq-agent-id`); default anonymous.
-fn identity_of<T>(req: &Request<T>) -> Identity {
+pub(crate) fn identity_of<T>(req: &Request<T>) -> Identity {
     let claimed = req
         .metadata()
         .get("latiq-agent-id")
@@ -30,7 +30,7 @@ fn identity_of<T>(req: &Request<T>) -> Identity {
     Identity::claimed(claimed)
 }
 
-fn to_status(e: AgentError) -> Status {
+pub(crate) fn to_status(e: AgentError) -> Status {
     let env = e.into_envelope();
     let code = match env.kind {
         ErrorKind::PondNotFound => Code::NotFound,
@@ -114,9 +114,10 @@ impl Data for DataService {
     ) -> Result<Response<JsonResponse>, Status> {
         let id = identity_of(&req);
         let r = req.into_inner();
+        // Reads ride the Arrow internal hop, collected to JSON here at the edge.
         let qr = self
             .ops
-            .read_query(&id, &r.pond, &r.sql)
+            .read_collected(&id, &r.pond, &r.sql)
             .await
             .map_err(to_status)?;
         Ok(json_resp(query_value(qr)))
