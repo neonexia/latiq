@@ -282,6 +282,8 @@ latiq stats -f json      # raw snapshot for scripts
 
 ## Observability (logging + metrics)
 
+> Full posture, metric reference, PromQL, and Prometheus/Grafana setup: **[`docs/obs.md`](obs.md)**.
+
 **Logging.** Both server roles use `tracing`. Level is `$RUST_LOG` (default `info`,
 e.g. `RUST_LOG=latiq_agent_core=debug`). Format is human-readable by default, or
 structured JSON for log aggregators:
