@@ -17,7 +17,7 @@ pub struct ResourceLimits {
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum PondTier {
     XSmall,
     Small,
