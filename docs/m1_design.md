@@ -17,7 +17,7 @@
 with native attribution; `explain_query`; the MCP agent surface (tools, resources,
 prompt SOPs); Data + Admin gRPC; query-by-URI for public files; sample datasets;
 audit log; **multi-node request forwarding behind a front door**; **Arrow streaming
-reads**; cancellation + prompt-resource release.
+reads**; **per-pond resource tiers**; cancellation + prompt-resource release.
 
 **Architectural deltas from the body of this doc:**
 
@@ -49,11 +49,17 @@ reads**; cancellation + prompt-resource release.
 - **Result handling:** the unary JSON path (MCP/CLI) is bounded by the inline cap
   (default 10k rows); the **Arrow stream path is uncapped** (the streaming answer to
   large results, ahead of a packaged SDK).
+- **Per-pond resource tiers.** A pond is created at a tier (x-small / small /
+  medium / large / x-large, default medium) that caps its DuckDB instance —
+  `memory_limit` + `threads`, instance-global per invariant 7. Caps, not
+  reservations. Set via `pond create --tier` (CLI) or the `tier` arg on the MCP
+  `allocate_pond`; surfaced in `describe`. (This is the M1 "disk-quota / capacity"
+  story landing as compute caps; disk quotas themselves remain deferred.)
 
 **Designed here but not yet built:** admin-curated catalogs + credentials/Vault
 (§5, §11), OIDC (§7), per-identity rate limiting (§13a), OpenTelemetry (§13), the
-Docker Compose harness (§12), and per-pond resource limits. These remain the
-roadmap, not the current surface.
+Docker Compose harness (§12), node-liveness reaping (a crashed node stays
+`active`), and disk quotas. These remain the roadmap, not the current surface.
 
 ---
 
