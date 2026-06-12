@@ -114,9 +114,10 @@ impl Data for DataService {
     ) -> Result<Response<JsonResponse>, Status> {
         let id = identity_of(&req);
         let r = req.into_inner();
+        // Reads ride the Arrow internal hop, collected to JSON here at the edge.
         let qr = self
             .ops
-            .read_query(&id, &r.pond, &r.sql)
+            .read_collected(&id, &r.pond, &r.sql)
             .await
             .map_err(to_status)?;
         Ok(json_resp(query_value(qr)))

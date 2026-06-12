@@ -12,6 +12,7 @@ use arrow::record_batch::RecordBatch;
 use latiq_common::ErrorKind;
 use latiq_common::Identity;
 use latiq_common::PondId;
+use latiq_common::QueryMeta;
 use latiq_engine::{ArrowSink, ExplainResult, QueryEngine, QueryResult};
 use latiq_storage::PondStorage;
 use std::ops::ControlFlow;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -328,6 +330,46 @@ impl AgentOps {
         })
     }
 
+    /// Read via the Arrow hop, then collect the batches into the neutral
+    /// `{columns, rows}` `QueryResult` the JSON edges (Data gRPC, MCP) return —
+    /// bounded by the inline cap. So MCP/CLI reads ride the same Arrow internal
+    /// transport (no double-materialize on a forward) and only convert to JSON
+    /// once here, at the edge.
+    pub async fn read_collected(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+    ) -> Result<QueryResult, AgentError> {
+        let stream = self.read_arrow(identity, pond_ref, sql).await?;
+        let columns: Vec<String> = stream
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+        let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut batches = stream.batches;
+        while let Some(b) = batches.next().await {
+            append_batch_rows(&b?, &columns, &mut rows)?;
+            if rows.len() > self.config.inline_row_cap {
+                return Err(AgentError::result_cap_exceeded(
+                    rows.len(),
+                    self.config.inline_row_cap,
+                ));
+            }
+        }
+        let n = rows.len() as u64;
+        Ok(QueryResult {
+            columns,
+            rows,
+            meta: QueryMeta {
+                rows: n,
+                ..Default::default()
+            },
+        })
+    }
+
     async fn run_query(
         &self,
         pond_ref: &str,
@@ -463,6 +505,32 @@ impl AgentOps {
             })
             .await;
     }
+}
+
+/// Convert one Arrow `RecordBatch` to positional JSON rows aligned to `columns`.
+/// Uses Arrow's JSON writer (column-keyed objects), then reshapes to arrays in
+/// column order — a missing key (a null cell) becomes JSON null.
+fn append_batch_rows(
+    batch: &RecordBatch,
+    columns: &[String],
+    out: &mut Vec<Vec<serde_json::Value>>,
+) -> Result<(), AgentError> {
+    let mut buf = Vec::new();
+    let mut w = arrow::json::ArrayWriter::new(&mut buf);
+    w.write(batch)
+        .map_err(|e| AgentError::internal(format!("arrow->json: {e}")))?;
+    w.finish()
+        .map_err(|e| AgentError::internal(format!("arrow->json: {e}")))?;
+    let objs: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(&buf)
+        .map_err(|e| AgentError::internal(format!("arrow->json parse: {e}")))?;
+    for mut obj in objs {
+        let mut row = Vec::with_capacity(columns.len());
+        for c in columns {
+            row.push(obj.remove(c).unwrap_or(serde_json::Value::Null));
+        }
+        out.push(row);
+    }
+    Ok(())
 }
 
 /// Bridges the engine's blocking Arrow output to async channels: the schema once

@@ -182,7 +182,8 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     )]
     async fn read_query(&self, Parameters(a): Parameters<QueryArgs>) -> CallToolResult {
         let id = Identity::claimed(a.agent_id.as_deref());
-        match self.ops.read_query(&id, &a.pond, &a.sql).await {
+        // Reads ride the Arrow internal hop, collected to the neutral result here.
+        match self.ops.read_collected(&id, &a.pond, &a.sql).await {
             Ok(qr) => ok_query("read_query", qr),
             Err(e) => err_envelope(e.envelope()),
         }
