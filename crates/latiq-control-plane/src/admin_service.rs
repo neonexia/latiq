@@ -36,12 +36,7 @@ impl Admin for AdminService {
             .list_nodes()
             .map_err(to_status)?
             .into_iter()
-            .map(|n| NodeInfo {
-                node_id: n.node_id,
-                mcp_endpoint: n.mcp_endpoint,
-                state: n.state,
-                pond_count: n.pond_count,
-            })
+            .map(node_info)
             .collect();
         Ok(Response::new(ListNodesResponse { nodes }))
     }
@@ -55,12 +50,7 @@ impl Admin for AdminService {
             .describe_node(&req.into_inner().node_id)
             .map_err(to_status)?;
         Ok(Response::new(DescribeNodeResponse {
-            node: Some(NodeInfo {
-                node_id: n.node_id,
-                mcp_endpoint: n.mcp_endpoint,
-                state: n.state,
-                pond_count: n.pond_count,
-            }),
+            node: Some(node_info(n)),
         }))
     }
 
@@ -121,6 +111,7 @@ impl Admin for AdminService {
                 owner: row.owner_identity,
                 created_at,
                 node_id: row.node_id,
+                tier: row.tier,
             });
         }
         Ok(Response::new(PondListResponse { ponds }))
@@ -144,6 +135,17 @@ impl Admin for AdminService {
             .map(audit_entry)
             .collect();
         Ok(Response::new(AuditSearchResponse { entries }))
+    }
+}
+
+fn node_info(n: crate::registry::NodeRow) -> NodeInfo {
+    NodeInfo {
+        node_id: n.node_id,
+        mcp_endpoint: n.mcp_endpoint,
+        state: n.state,
+        pond_count: n.pond_count,
+        last_heartbeat: n.last_heartbeat,
+        heartbeat_age_seconds: n.heartbeat_age_seconds.max(0) as u64,
     }
 }
 

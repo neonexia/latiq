@@ -13,11 +13,14 @@ service Admin {
   rpc PondList(PondListRequest) returns (PondListResponse);
 }
 
-message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; }
+message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; }
 message PondListRequest { }
 message PondListResponse { repeated PondSummary ponds = 1; }
 
-message NodeInfo { string node_id = 1; string mcp_endpoint = 2; string state = 3; uint32 pond_count = 4; }
+message NodeInfo {
+  string node_id = 1; string mcp_endpoint = 2; string state = 3; uint32 pond_count = 4;
+  string last_heartbeat = 5; uint64 heartbeat_age_seconds = 6;
+}
 message ListNodesRequest { }
 message ListNodesResponse { repeated NodeInfo nodes = 1; }
 message DescribeNodeRequest { string node_id = 1; }
