@@ -44,6 +44,9 @@ pub const MIGRATIONS: &[&str] = &[
         ('default_pond_lifetime_seconds', '3600'),
         ('query_timeout_seconds', '30');
     "#,
+    // v2: per-pond resource tier (small/medium/large/x-large). Nullable with a
+    // default so existing rows read as 'medium'; the engine maps it to caps.
+    "ALTER TABLE ponds ADD COLUMN tier VARCHAR DEFAULT 'medium';",
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {

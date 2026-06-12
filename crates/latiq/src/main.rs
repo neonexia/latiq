@@ -106,6 +106,10 @@ enum PondCmd {
     Create {
         #[arg(short, long)]
         name: Option<String>,
+        /// Resource tier: x-small | small | medium | large | x-large (caps the
+        /// pond's memory + CPU). Defaults to medium.
+        #[arg(short, long, default_value = "medium")]
+        tier: String,
         /// Owner identity recorded for the pond (relaxed; defaults to anonymous).
         #[arg(short, long)]
         agent_id: Option<String>,
@@ -464,7 +468,11 @@ async fn run_query(a: QueryArgs) -> Result<()> {
 
 async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
     match cmd {
-        PondCmd::Create { name, agent_id } => {
+        PondCmd::Create {
+            name,
+            tier,
+            agent_id,
+        } => {
             // Pure control-plane op: the registry assigns a (random) node; the
             // node materializes storage lazily on first query.
             let mut c = control_client().await?;
@@ -474,6 +482,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                     name: name.unwrap_or_default(),
                     owner_identity: owner,
                     policy_json: "{}".into(),
+                    tier,
                 })
                 .await
             {
