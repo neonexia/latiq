@@ -24,7 +24,9 @@ const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 #[command(name = "latiq", version, about = "Agent-native data pond")]
 #[command(
     after_help = "Env: $LATIQ_CONTROL = control plane address (default http://127.0.0.1:51400); \
-$LATIQ_ROOT = data root for serve/node add (default ~/.latiq)."
+$LATIQ_ROOT = data root for serve/node add (default ~/.latiq); \
+$LATIQ_GATEWAY = send data ops to this front door (e.g. nginx over several nodes) \
+instead of resolving the owning node — the greeter forwards."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -278,7 +280,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                     .ok_or_else(|| anyhow!("unknown dataset '{n}'; see `latiq dataset list`"))?]
             };
             // Resolve the pond's node once; load each table node-direct.
-            let node = resolve_node(&pond).await?;
+            let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
             for d in selected {
                 for (table, url) in d.tables {
@@ -386,6 +388,17 @@ async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
     })
 }
 
+/// Where the CLI sends data ops for `pond_ref`. Default: resolve the owning node
+/// via the control plane and hit it directly. If `$LATIQ_GATEWAY` is set (e.g. an
+/// nginx front door over several nodes), send everything there and let the greeter
+/// node forward — the same single-front-door model agents use over MCP.
+async fn data_target(pond_ref: &str) -> Result<String> {
+    match std::env::var("LATIQ_GATEWAY") {
+        Ok(gw) if !gw.is_empty() => Ok(gw),
+        _ => resolve_node(pond_ref).await,
+    }
+}
+
 /// Ask the control plane which node's Data gRPC hosts `pond_ref`, so data ops go
 /// node-direct. The control plane is only consulted for routing, never the data.
 async fn resolve_node(pond_ref: &str) -> Result<String> {
@@ -413,7 +426,7 @@ fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
 // ---- query (data; node-direct) ------------------------------------------
 
 async fn run_query(a: QueryArgs) -> Result<()> {
-    let node = resolve_node(&a.pond).await?;
+    let node = data_target(&a.pond).await?;
     let mut c = data_client(&node).await?;
     // One `query` for everything: the write path runs DDL/DML and, for a plain
     // SELECT, falls through to a read (no snapshot). Reads are still cap-bounded.
@@ -481,7 +494,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             Ok(())
         }
         PondCmd::Describe { pond } => {
-            let node = resolve_node(&pond).await?;
+            let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
             print_json_result(
                 c.describe_pond(Request::new(DescribePondRequest { pond }))
@@ -489,7 +502,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             )
         }
         PondCmd::Drop { pond, confirm } => {
-            let node = resolve_node(&pond).await?;
+            let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
             match c
                 .drop_pond(Request::new(DropPondRequest {
