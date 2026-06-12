@@ -241,9 +241,40 @@ df = table.to_pandas()
 Inspect registered pond nodes (control plane, at `$LATIQ_CONTROL`).
 
 ```bash
-latiq node list                # registered pond nodes (id, state, pond_count, mcp_endpoint)
-latiq node describe node-1     # one node, pretty JSON
+latiq node list                # id, state, pond_count, heartbeat age, mcp_endpoint
+latiq node describe node-1     # one node, pretty JSON (incl. last_heartbeat)
 ```
+
+**Node liveness.** Pond nodes heartbeat the control plane every 10s. A **reaper**
+on the control plane flips a node to `down` after **30s** without a heartbeat
+(3 missed beats); the node's next heartbeat/restart revives it to `active`.
+Placement (`pond create`) only picks `active` nodes, so a dead node stops
+receiving ponds automatically. `pond_count` is computed live from assignments.
+
+### `latiq stats` — system snapshot
+
+A one-shot health view: node states + heartbeat age, pond totals, ponds by tier.
+
+```bash
+latiq stats              # rendered dashboard (color on a TTY)
+latiq stats -f json      # raw snapshot for scripts
+```
+
+```
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  latiq · system snapshot
+ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   nodes  2 total · 1 active · 1 down
+   ponds  5  ·  large 1 · medium 4
+
+   NODE        STATE   PONDS  LAST BEAT    ENDPOINT
+   node-0      active     3        0s ago  http://127.0.0.1:51402/mcp
+   node-1      down       2       39s ago  http://127.0.0.1:51404/mcp
+```
+
+(Per-node CPU/memory and per-pond query metrics are the next pass — a Prometheus
+`/metrics` endpoint. This snapshot is registry state only.)
 
 (Policy and audit commands were trimmed from the CLI for now — the Admin gRPC still serves them; commands return when needed.)
 

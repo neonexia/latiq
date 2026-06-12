@@ -14,8 +14,14 @@ pub struct NodeRow {
     pub mcp_endpoint: String,
     pub internal_endpoint: String,
     pub capacity: u32,
+    /// Live count of ponds assigned to this node (computed from the ponds table,
+    /// the source of truth — not the heartbeat's vestigial field).
     pub pond_count: u32,
+    /// `active` | `down` (the reaper flips active→down on a stale heartbeat).
     pub state: String,
+    /// Last heartbeat timestamp (string) and its age in seconds (now − beat).
+    pub last_heartbeat: String,
+    pub heartbeat_age_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,7 +94,8 @@ impl Registry {
                mcp_endpoint=excluded.mcp_endpoint,
                internal_endpoint=excluded.internal_endpoint,
                capacity=excluded.capacity,
-               last_heartbeat=now()",
+               last_heartbeat=now(),
+               state='active'",
             duckdb::params![node_id, mcp, internal, capacity],
         )?;
         // Flush the WAL into registry.duckdb so a lost/deleted .wal can't drop it
@@ -98,11 +105,14 @@ impl Registry {
         Ok(())
     }
 
-    pub fn heartbeat(&self, node_id: &str, pond_count: u32) -> Result<(), ControlPlaneError> {
+    /// Record a heartbeat: refresh `last_heartbeat` and revive the node to
+    /// `active` (so a node the reaper downed comes back as soon as it beats).
+    /// The `pond_count` field is vestigial — the real count is computed on read.
+    pub fn heartbeat(&self, node_id: &str, _pond_count: u32) -> Result<(), ControlPlaneError> {
         let c = self.lock();
         let n = c.execute(
-            "UPDATE nodes SET pond_count=?, last_heartbeat=now() WHERE node_id=?",
-            duckdb::params![pond_count, node_id],
+            "UPDATE nodes SET last_heartbeat=now(), state='active' WHERE node_id=?",
+            duckdb::params![node_id],
         )?;
         if n == 0 {
             return Err(ControlPlaneError::NodeNotFound(node_id.to_string()));
@@ -110,11 +120,32 @@ impl Registry {
         Ok(())
     }
 
+    /// Mark `active` nodes whose last heartbeat is older than `ttl_secs` as
+    /// `down`. Returns the number newly downed. A subsequent heartbeat/register
+    /// revives them. Placement (`create_pond`) only picks `active` nodes.
+    pub fn reap_stale_nodes(&self, ttl_secs: u32) -> Result<usize, ControlPlaneError> {
+        let c = self.lock();
+        let n = c.execute(
+            "UPDATE nodes SET state='down'
+             WHERE state='active' AND last_heartbeat < now()::TIMESTAMP - to_seconds(?)",
+            duckdb::params![ttl_secs],
+        )?;
+        if n > 0 {
+            let _ = c.execute_batch("CHECKPOINT");
+        }
+        Ok(n)
+    }
+
     pub fn list_nodes(&self) -> Result<Vec<NodeRow>, ControlPlaneError> {
         let c = self.lock();
+        // pond_count is computed live from the ponds table (source of truth for
+        // placement), not the heartbeat's stored value. age is in seconds.
         let mut stmt = c.prepare(
-            "SELECT node_id, mcp_endpoint, internal_endpoint, capacity, pond_count, state
-             FROM nodes ORDER BY node_id",
+            "SELECT n.node_id, n.mcp_endpoint, n.internal_endpoint, n.capacity,
+                    (SELECT count(*) FROM ponds p WHERE p.node_id = n.node_id),
+                    n.state, n.last_heartbeat::VARCHAR,
+                    date_diff('second', n.last_heartbeat, now()::TIMESTAMP)
+             FROM nodes n ORDER BY n.node_id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(NodeRow {
@@ -122,8 +153,10 @@ impl Registry {
                 mcp_endpoint: r.get(1)?,
                 internal_endpoint: r.get(2)?,
                 capacity: r.get(3)?,
-                pond_count: r.get(4)?,
+                pond_count: r.get::<_, i64>(4)? as u32,
                 state: r.get(5)?,
+                last_heartbeat: r.get(6)?,
+                heartbeat_age_seconds: r.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -384,6 +417,53 @@ mod tests {
             r.get_pond_location("incident-1"),
             Err(ControlPlaneError::PondNotFound(_))
         ));
+    }
+
+    #[test]
+    fn reaper_downs_stale_node_and_heartbeat_revives() {
+        let r = reg();
+        r.register_node("node-a", "http://n/mcp", "http://n:9092", 10)
+            .unwrap();
+        // Fresh registration → not reaped.
+        assert_eq!(r.reap_stale_nodes(60).unwrap(), 0);
+        assert_eq!(r.describe_node("node-a").unwrap().state, "active");
+
+        // Age past a 1s TTL, then reap → downed.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(r.reap_stale_nodes(1).unwrap(), 1);
+        let n = r.describe_node("node-a").unwrap();
+        assert_eq!(n.state, "down");
+        assert!(n.heartbeat_age_seconds >= 1, "age tracked: {n:?}");
+
+        // A heartbeat revives it; reaping again is a no-op (beat is fresh).
+        r.heartbeat("node-a", 0).unwrap();
+        assert_eq!(r.describe_node("node-a").unwrap().state, "active");
+        assert_eq!(r.reap_stale_nodes(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn placement_skips_down_nodes_and_pond_count_is_live() {
+        let r = reg();
+        r.register_node("node-a", "http://a/mcp", "http://a:9092", 10)
+            .unwrap();
+        r.register_node("node-b", "http://b/mcp", "http://b:9092", 10)
+            .unwrap();
+        // Down both, then revive only node-b.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(r.reap_stale_nodes(1).unwrap(), 2);
+        r.heartbeat("node-b", 0).unwrap();
+
+        // create_pond must pick the only active node (node-b), repeatedly.
+        for i in 0..5 {
+            let p = r
+                .create_pond(Some(format!("p{i}")), "x", "{}", "medium")
+                .unwrap();
+            assert_eq!(p.node_id, "node-b", "placement skipped down node-a");
+        }
+        // pond_count is computed live from assignments, not the heartbeat.
+        let b = r.describe_node("node-b").unwrap();
+        assert_eq!(b.pond_count, 5);
+        assert_eq!(r.describe_node("node-a").unwrap().pond_count, 0);
     }
 
     #[test]
