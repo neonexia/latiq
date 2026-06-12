@@ -6,6 +6,7 @@
 //! the CLI never uses it.
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
+use latiq_common::tier::{PondTier, ResourceLimits};
 use latiq_common::ErrorEnvelope;
 use latiq_control_plane::{serve_control_plane, Registry};
 use latiq_pond_node::{run_pond_node, PondNodeConfig};
@@ -761,17 +762,37 @@ async fn run_stats(a: StatsArgs) -> Result<()> {
 
     let active = nodes.iter().filter(|n| n.state == "active").count();
     let down = nodes.len() - active;
-    let mut by_tier: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut counts: std::collections::HashMap<PondTier, usize> = Default::default();
     for p in &ponds {
-        let t = if p.tier.is_empty() { "medium" } else { &p.tier };
-        *by_tier.entry(t.to_string()).or_default() += 1;
+        let t = PondTier::parse(&p.tier).unwrap_or_default();
+        *counts.entry(t).or_default() += 1;
     }
+    // Tier rows in canonical size order (smallest → largest), only tiers in use,
+    // each carrying its resource caps.
+    let tier_rows: Vec<(PondTier, usize, ResourceLimits)> = [
+        PondTier::XSmall,
+        PondTier::Small,
+        PondTier::Medium,
+        PondTier::Large,
+        PondTier::XLarge,
+    ]
+    .into_iter()
+    .filter_map(|t| counts.get(&t).map(|&n| (t, n, t.limits())))
+    .collect();
 
     match a.format {
         Format::Json => {
             let v = serde_json::json!({
                 "nodes": { "total": nodes.len(), "active": active, "down": down },
-                "ponds": { "total": ponds.len(), "by_tier": by_tier },
+                "ponds": {
+                    "total": ponds.len(),
+                    "by_tier": tier_rows.iter().map(|(t, n, l)| serde_json::json!({
+                        "tier": t.as_str(),
+                        "count": n,
+                        "memory_bytes": l.memory_bytes,
+                        "threads": l.threads,
+                    })).collect::<Vec<_>>(),
+                },
                 "node_detail": nodes.iter().map(|n| serde_json::json!({
                     "node_id": n.node_id, "state": n.state, "pond_count": n.pond_count,
                     "heartbeat_age_seconds": n.heartbeat_age_seconds, "mcp_endpoint": n.mcp_endpoint,
@@ -779,9 +800,22 @@ async fn run_stats(a: StatsArgs) -> Result<()> {
             });
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
-        Format::Tabular => print_stats_dashboard(&nodes, &ponds, active, down, &by_tier),
+        Format::Tabular => print_stats_dashboard(&nodes, &ponds, active, down, &tier_rows),
     }
     Ok(())
+}
+
+/// Humanize a byte cap for the dashboard (e.g. `512 MB`, `4 GB`).
+fn fmt_bytes(bytes: u64) -> String {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB && bytes.is_multiple_of(GB) {
+        format!("{} GB", bytes / GB)
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn print_stats_dashboard(
@@ -789,7 +823,7 @@ fn print_stats_dashboard(
     ponds: &[PondSummary],
     active: usize,
     down: usize,
-    by_tier: &std::collections::BTreeMap<String, usize>,
+    tier_rows: &[(PondTier, usize, ResourceLimits)],
 ) {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
@@ -799,11 +833,6 @@ fn print_stats_dashboard(
         ("", "", "", "", "")
     };
     let bar = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
-    let tiers = by_tier
-        .iter()
-        .map(|(t, n)| format!("{t} {n}"))
-        .collect::<Vec<_>>()
-        .join(" · ");
     let down_c = if down > 0 { red } else { dim };
 
     println!();
@@ -815,12 +844,20 @@ fn print_stats_dashboard(
         "   {dim}nodes{rst}  {} total · {green}{active} active{rst} · {down_c}{down} down{rst}",
         nodes.len()
     );
-    let tier_suffix = if tiers.is_empty() {
-        String::new()
-    } else {
-        format!("  ·  {tiers}")
-    };
-    println!("   {dim}ponds{rst}  {}{tier_suffix}", ponds.len());
+    println!("   {dim}ponds{rst}  {} total", ponds.len());
+    if !tier_rows.is_empty() {
+        println!();
+        println!("   {dim}TIER       PONDS   MEMORY   THREADS{rst}");
+        for (tier, n, limits) in tier_rows {
+            println!(
+                "   {:<10} {:>5}  {:>7}  {:>7}",
+                tier.as_str(),
+                n,
+                fmt_bytes(limits.memory_bytes),
+                limits.threads
+            );
+        }
+    }
     println!();
     println!("   {dim}NODE        STATE   PONDS  LAST BEAT    ENDPOINT{rst}");
     for n in nodes {
