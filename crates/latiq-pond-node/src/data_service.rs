@@ -70,9 +70,14 @@ impl Data for DataService {
         } else {
             r.policy_json
         };
+        let tier = if r.tier.is_empty() {
+            "medium".to_string()
+        } else {
+            r.tier
+        };
         let res = self
             .ops
-            .allocate_pond(&id, name, &policy)
+            .allocate_pond(&id, name, &policy, &tier)
             .await
             .map_err(to_status)?;
         Ok(Response::new(AllocatePondResponse {

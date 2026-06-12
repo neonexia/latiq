@@ -21,6 +21,16 @@ impl PondInstance {
     /// Open a DuckDB instance with the pond's DuckLake catalog attached as `pond`.
     pub fn open(loc: &PondLocation) -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory().map_err(|e| EngineError::Engine(e.to_string()))?;
+        // Per-pond resource caps from its tier (instance-global in DuckDB, and we
+        // run one instance per pond — invariant 7). Caps, not reservations.
+        if let Some(lim) = &loc.limits {
+            conn.execute_batch(&format!(
+                "SET memory_limit='{}MiB'; SET threads={};",
+                lim.memory_bytes / (1024 * 1024),
+                lim.threads.max(1),
+            ))
+            .map_err(|e| EngineError::Engine(format!("set resource limits: {e}")))?;
+        }
         // Load extensions (INSTALL may need network the first time; LOAD is local once installed).
         for ext in EXTENSIONS {
             conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
@@ -48,6 +58,34 @@ mod tests {
     use super::*;
     use latiq_common::PondId;
     use latiq_storage::{PondStorage, TempFs};
+
+    #[test]
+    fn applies_resource_limits_to_the_instance() {
+        use latiq_common::ResourceLimits;
+        let fs = TempFs::new();
+        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        loc.limits = Some(ResourceLimits {
+            memory_bytes: 512 * 1024 * 1024,
+            threads: 1,
+        });
+        let inst = PondInstance::open(&loc).unwrap();
+        // Our SET plumbing landed on the instance (DuckDB enforces from here —
+        // invariant 10: test our integration, not DuckDB's enforcement).
+        let threads: String = inst
+            .conn
+            .query_row("SELECT current_setting('threads')::VARCHAR", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(threads, "1");
+        let mem: String = inst
+            .conn
+            .query_row("SELECT current_setting('memory_limit')::VARCHAR", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(mem.contains("512"), "memory_limit not applied: {mem}");
+    }
 
     #[test]
     fn opens_attaches_and_round_trips() {

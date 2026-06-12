@@ -16,7 +16,7 @@ service Data {
   rpc ExplainQuery(QueryRequest) returns (JsonResponse);
 }
 
-message AllocatePondRequest { string name = 1; string policy_json = 2; }
+message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; }
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }
 message DropPondRequest { string pond = 1; bool confirm = 2; }
 message DropPondResponse { }

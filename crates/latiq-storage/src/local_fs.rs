@@ -24,6 +24,8 @@ impl LocalFs {
             data_path: dir.join("data").display().to_string(),
             // Default alias; AgentOps overrides with the pond's registry name.
             catalog_name: "pond".to_string(),
+            // AgentOps sets caps from the pond's tier; default to engine defaults.
+            limits: None,
         }
     }
 }

@@ -35,6 +35,7 @@ async fn allocate_and_locate(stack: &MultiStack, name: &str) -> String {
         AllocatePondRequest {
             name: name.into(),
             policy_json: String::new(),
+            tier: String::new(),
         },
         "alice",
     ))

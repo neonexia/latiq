@@ -11,6 +11,7 @@ mod tests {
             name: "incident-001".into(),
             owner_identity: "agent".into(),
             policy_json: "{}".into(),
+            tier: "medium".into(),
         };
     }
 }

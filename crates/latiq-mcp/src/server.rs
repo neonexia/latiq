@@ -26,6 +26,10 @@ use std::sync::Arc;
 pub struct AllocateArgs {
     #[schemars(description = "Optional pond name; Latiq generates one if omitted")]
     pub name: Option<String>,
+    #[schemars(
+        description = "Resource tier: x-small | small | medium | large | x-large (default medium). Caps the pond's memory + CPU."
+    )]
+    pub tier: Option<String>,
     #[schemars(description = "Calling agent identity (relaxed; defaults to anonymous)")]
     pub agent_id: Option<String>,
 }
@@ -96,7 +100,8 @@ Then write_query to create tables and load data, and read_query to query. See la
     )]
     async fn allocate_pond(&self, Parameters(a): Parameters<AllocateArgs>) -> CallToolResult {
         let id = Identity::claimed(a.agent_id.as_deref());
-        match self.ops.allocate_pond(&id, a.name, "{}").await {
+        let tier = a.tier.as_deref().unwrap_or("medium");
+        match self.ops.allocate_pond(&id, a.name, "{}", tier).await {
             Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
             Err(e) => err_envelope(e.envelope()),
         }

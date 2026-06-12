@@ -7,3 +7,5 @@ pub mod error;
 pub use error::{ErrorEnvelope, ErrorKind, Location};
 pub mod meta;
 pub use meta::{QueryMeta, Warning, WarningKind};
+pub mod tier;
+pub use tier::{PondTier, ResourceLimits};

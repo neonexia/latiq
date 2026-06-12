@@ -23,6 +23,7 @@ async fn audit_tail_records_operations_with_identity() {
         AllocatePondRequest {
             name: "p".into(),
             policy_json: String::new(),
+            tier: String::new(),
         },
         "alice",
     ))
@@ -61,6 +62,7 @@ async fn pond_list_reads_from_control_plane() {
         AllocatePondRequest {
             name: "alpha".into(),
             policy_json: String::new(),
+            tier: String::new(),
         },
         "alice",
     ))
