@@ -264,18 +264,25 @@ impl AgentOps {
         write: bool,
     ) -> Result<QueryResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
-        let op = if write { "write_query" } else { "read_query" };
+        // The CLI sends every statement through write_query (it doesn't parse SQL;
+        // the engine classifies it), and forwarding happens *before* execution — so
+        // at this point we can't honestly say read vs write. Log a neutral "query".
         // Owned by another node → forward and relay. The owner audits + snapshots;
         // we just return its result, so attribution stays on the node that ran it.
         if let Some((fwd, owner)) = self.forward_target(&info) {
-            info!(op, pond = pond_ref, owner, "forwarding to owner node");
+            info!(
+                op = "query",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
             return if write {
                 fwd.write(owner, identity, pond_ref, sql).await
             } else {
                 fwd.read(owner, identity, pond_ref, sql).await
             };
         }
-        info!(op, pond = pond_ref, "processing locally");
+        info!(op = "query", pond = pond_ref, "processing locally");
         let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         // ensure_pond materializes storage on first touch; attach the catalog
