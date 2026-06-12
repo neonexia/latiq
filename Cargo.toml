@@ -28,6 +28,8 @@ thiserror = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tonic = "0.12"
 prost = "0.13"
 clap = { version = "4", features = ["derive"] }

@@ -113,17 +113,19 @@ impl Control for ControlService {
         for row in rows {
             // N+1 list-then-detail read: skip a pond dropped between the list and
             // its pond_info lookup instead of failing the whole call (review #9).
-            let (row, created_at, policy_json) = match self.registry.pond_info(&row.pond_id) {
-                Ok(info) => info,
-                Err(ControlPlaneError::PondNotFound(_)) => continue,
-                Err(e) => return Err(to_status(e)),
-            };
+            let (row, created_at, policy_json, endpoint) =
+                match self.registry.pond_info(&row.pond_id) {
+                    Ok(info) => info,
+                    Err(ControlPlaneError::PondNotFound(_)) => continue,
+                    Err(e) => return Err(to_status(e)),
+                };
             ponds.push(PondInfoMsg {
                 pond_id: row.pond_id,
                 name: row.name,
                 owner: row.owner_identity,
                 created_at,
                 policy_json,
+                node_endpoint: endpoint.unwrap_or_default(),
             });
         }
         Ok(Response::new(ListPondsResponse { ponds }))
@@ -133,7 +135,7 @@ impl Control for ControlService {
         &self,
         req: Request<GetPondInfoRequest>,
     ) -> Result<Response<GetPondInfoResponse>, Status> {
-        let (row, created_at, policy_json) = self
+        let (row, created_at, policy_json, endpoint) = self
             .registry
             .pond_info(&req.into_inner().pond_ref)
             .map_err(to_status)?;
@@ -144,6 +146,7 @@ impl Control for ControlService {
                 owner: row.owner_identity,
                 created_at,
                 policy_json,
+                node_endpoint: endpoint.unwrap_or_default(),
             }),
         }))
     }

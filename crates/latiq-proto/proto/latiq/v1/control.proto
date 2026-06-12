@@ -15,6 +15,9 @@ service Control {
 message PondInfoMsg {
   string pond_id = 1; string name = 2; string owner = 3;
   string created_at = 4; string policy_json = 5;
+  // Internal endpoint of the node that owns this pond (empty if the node is
+  // gone). Lets a node that receives a request resolve the owner and forward.
+  string node_endpoint = 6;
 }
 message ListPondsRequest { }
 message ListPondsResponse { repeated PondInfoMsg ponds = 1; }

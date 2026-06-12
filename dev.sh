@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Start a Latiq dev stack: control plane (`serve`) + one pond node (`node add`).
-# Binds 127.0.0.1; ports/root overridable via flags. See ./dev.sh --help.
+# Start a Latiq dev stack: control plane (`serve`) + one or more pond nodes
+# (`node add`). With --nodes >1, an nginx front door fans the agent (MCP) and
+# data (gRPC) surfaces across the nodes, and node-to-node forwarding routes each
+# request to the pond's owning node. Binds 127.0.0.1. See ./dev.sh --help.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST=127.0.0.1
 CP_PORT=51400
 DATA_PORT=51401
+NODES=1
 ROOT="${HOME}/.latiq"
 
 usage() {
@@ -14,12 +17,18 @@ usage() {
 Usage: ./dev.sh [options]
 
   --cp-port   <port>  Control plane (Control + Admin gRPC)  (default $CP_PORT)
-  --data-port <port>  Pond node Data gRPC; MCP on port + 1  (default $DATA_PORT)
-  --root      <path>  Data root (registry + pond storage)   (default $ROOT)
+  --data-port <port>  First pond node's Data gRPC; MCP = +1  (default $DATA_PORT)
+  --nodes     <n>     Number of pond nodes to start          (default $NODES)
+  --root      <path>  Data root (registry + pond storage)    (default $ROOT)
   -h, --help          Show this help
 
-Example (run alongside another stack, or with throwaway state):
-  ./dev.sh --cp-port 41400 --data-port 41401 --root /tmp/latiq-dev
+Node i binds data port (data-port + 2*i) and MCP (data + 1). With --nodes > 1 an
+nginx front door is started (requires nginx) and \$LATIQ_GATEWAY is printed.
+
+Examples:
+  ./dev.sh                                  # single node, no front door
+  ./dev.sh --nodes 3                        # 3 nodes behind nginx
+  ./dev.sh --nodes 2 --root /tmp/latiq-dev  # throwaway state
 EOF
 }
 
@@ -27,16 +36,28 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --cp-port)   CP_PORT=$2;   shift 2 ;;
     --data-port) DATA_PORT=$2; shift 2 ;;
+    --nodes)     NODES=$2;     shift 2 ;;
     --root)      ROOT=$2;      shift 2 ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-MCP_PORT=$((DATA_PORT + 1))
+[[ "$NODES" =~ ^[0-9]+$ && "$NODES" -ge 1 ]] || { echo "--nodes must be a positive integer" >&2; exit 2; }
+
 mkdir -p "$ROOT"
 ROOT=$(cd "$ROOT" && pwd)        # resolve to an absolute path for the banner
 LOG_DIR="$ROOT/logs"
+MULTI=0; [[ "$NODES" -gt 1 ]] && MULTI=1
+
+# Per-node ports, and (multi-node) the nginx front-door ports just past them.
+NODE_DATA=(); NODE_MCP=()
+for ((i = 0; i < NODES; i++)); do
+  NODE_DATA+=($((DATA_PORT + 2 * i)))
+  NODE_MCP+=($((DATA_PORT + 2 * i + 1)))
+done
+GW_DATA=$((DATA_PORT + 2 * NODES))
+GW_MCP=$((GW_DATA + 1))
 
 # Colors — only when stdout is a terminal (so piping/redirecting stays clean).
 if [ -t 1 ]; then
@@ -61,8 +82,18 @@ check_port() {
   fi
 }
 check_port "$CP_PORT" "Control plane"
-check_port "$DATA_PORT" "Data gRPC"
-check_port "$MCP_PORT" "MCP"
+for ((i = 0; i < NODES; i++)); do
+  check_port "${NODE_DATA[$i]}" "node-$i Data gRPC"
+  check_port "${NODE_MCP[$i]}" "node-$i MCP"
+done
+if [[ $MULTI -eq 1 ]]; then
+  command -v nginx >/dev/null 2>&1 || {
+    printf '%sERROR%s: --nodes > 1 needs nginx for the front door. Install it: brew install nginx\n' "$ERRC" "$RST" >&2
+    exit 1
+  }
+  check_port "$GW_DATA" "gateway Data gRPC"
+  check_port "$GW_MCP" "gateway MCP"
+fi
 
 printf '%sbuilding latiq…%s\n' "$DIM" "$RST"
 cargo build -q -p latiq
@@ -70,11 +101,13 @@ BIN=target/debug/latiq
 VERSION=$("$BIN" --version 2>/dev/null | awk '{print $2}')
 mkdir -p "$LOG_DIR"
 CP_LOG="$LOG_DIR/control-plane.log"
-PN_LOG="$LOG_DIR/node-1.log"
 
-CP_PID=""
-PN_PID=""
-cleanup() { kill "$CP_PID" "$PN_PID" 2>/dev/null || true; }
+PIDS=()
+NGINX_PID=""
+cleanup() {
+  [[ -n "$NGINX_PID" ]] && kill "$NGINX_PID" 2>/dev/null || true
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+}
 trap cleanup INT TERM EXIT
 
 # Wait until a backgrounded server accepts connections on all its ports, failing
@@ -101,13 +134,71 @@ wait_ready() {
   exit 1
 }
 
+# --- control plane ------------------------------------------------------
 "$BIN" serve --port "$CP_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
-CP_PID=$!
+CP_PID=$!; PIDS+=("$CP_PID")
 wait_ready "$CP_PID" "control plane" "$CP_LOG" "$CP_PORT"
 
-LATIQ_CONTROL="http://$HOST:$CP_PORT" "$BIN" node add --port "$DATA_PORT" --root "$ROOT" >"$PN_LOG" 2>&1 &
-PN_PID=$!
-wait_ready "$PN_PID" "pond node" "$PN_LOG" "$DATA_PORT" "$MCP_PORT"
+# --- pond nodes ---------------------------------------------------------
+for ((i = 0; i < NODES; i++)); do
+  log="$LOG_DIR/node-$i.log"
+  LATIQ_CONTROL="http://$HOST:$CP_PORT" "$BIN" node add \
+    --node-id "node-$i" --port "${NODE_DATA[$i]}" --root "$ROOT" >"$log" 2>&1 &
+  pid=$!; PIDS+=("$pid")
+  wait_ready "$pid" "node-$i" "$log" "${NODE_DATA[$i]}" "${NODE_MCP[$i]}"
+done
+
+# --- nginx front door (multi-node only) ---------------------------------
+if [[ $MULTI -eq 1 ]]; then
+  NGINX_CONF="$ROOT/nginx.conf"
+  TMP="$ROOT/nginx-tmp"
+  mkdir -p "$TMP"
+  mcp_servers=""; data_servers=""
+  for ((i = 0; i < NODES; i++)); do
+    mcp_servers+="        server $HOST:${NODE_MCP[$i]};"$'\n'
+    data_servers+="        server $HOST:${NODE_DATA[$i]};"$'\n'
+  done
+  cat >"$NGINX_CONF" <<EOF
+worker_processes 1;
+error_log $LOG_DIR/nginx-error.log warn;
+pid $ROOT/nginx.pid;
+events { worker_connections 256; }
+http {
+    access_log $LOG_DIR/nginx-access.log;
+    client_body_temp_path $TMP/body;
+    proxy_temp_path $TMP/proxy;
+    fastcgi_temp_path $TMP/fastcgi;
+    uwsgi_temp_path $TMP/uwsgi;
+    scgi_temp_path $TMP/scgi;
+
+    # Agents (MCP) — sticky so a streamable-HTTP session stays on its greeter.
+    upstream latiq_mcp {
+        ip_hash;
+$mcp_servers    }
+    # CLI/SDK (Data gRPC) — spread; node-to-node forwarding handles ownership.
+    upstream latiq_data {
+$data_servers    }
+
+    server {
+        listen $GW_MCP;
+        location /mcp {
+            proxy_pass http://latiq_mcp;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host \$host;
+            proxy_buffering off;
+        }
+    }
+    server {
+        listen $GW_DATA http2;
+        location / { grpc_pass grpc://latiq_data; }
+    }
+}
+EOF
+  nginx -c "$NGINX_CONF" -p "$ROOT" -g 'daemon off;' >"$LOG_DIR/nginx.log" 2>&1 &
+  NGINX_PID=$!
+  wait_ready "$NGINX_PID" "nginx front door" "$LOG_DIR/nginx.log" "$GW_DATA" "$GW_MCP"
+fi
 
 # --- banner -------------------------------------------------------------
 row() { printf '   %s%-12s%s %s%s%s\n' "$LBL" "$1" "$RST" "$VAL" "$2" "$RST"; }
@@ -117,13 +208,25 @@ printf '%s  latiq%s %sagent-native data pond%s %s· v%s%s\n' "$HDR" "$RST" "$DIM
 printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
 echo
 row "control"   "$HOST:$CP_PORT   (Control + Admin gRPC)"
-row "data gRPC" "$HOST:$DATA_PORT"
-row "mcp"       "http://$HOST:$MCP_PORT/mcp"
-row "node"      "node-1"
+if [[ $MULTI -eq 1 ]]; then
+  row "gateway"   "data gRPC $HOST:$GW_DATA · mcp http://$HOST:$GW_MCP/mcp"
+  for ((i = 0; i < NODES; i++)); do
+    row "node-$i" "data $HOST:${NODE_DATA[$i]} · mcp $HOST:${NODE_MCP[$i]}"
+  done
+else
+  row "data gRPC" "$HOST:${NODE_DATA[0]}"
+  row "mcp"       "http://$HOST:${NODE_MCP[0]}/mcp"
+  row "node"      "node-0"
+fi
 row "registry"  "$ROOT/registry.duckdb"
 row "ponds"     "$ROOT/ponds"
-row "logs"      "$LOG_DIR/{control-plane,node-1}.log"
+row "logs"      "$LOG_DIR/"
 echo
+if [[ $MULTI -eq 1 ]]; then
+  printf '   %sDrive the CLI through the front door:%s\n' "$DIM" "$RST"
+  printf '   %sexport LATIQ_GATEWAY=http://%s:%s%s\n' "$VAL" "$HOST" "$GW_DATA" "$RST"
+  echo
+fi
 printf '   %sCtrl+C to stop.%s\n' "$DIM" "$RST"
 
 wait

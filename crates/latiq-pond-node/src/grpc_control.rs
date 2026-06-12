@@ -45,6 +45,8 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         owner: m.owner,
         created_at: m.created_at,
         policy_json: m.policy_json,
+        // Empty wire string means "no live owning node" → None.
+        node_endpoint: Some(m.node_endpoint).filter(|s| !s.is_empty()),
     }
 }
 
