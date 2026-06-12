@@ -13,6 +13,7 @@ use latiq_engine::{ExplainResult, QueryEngine, QueryResult};
 use latiq_storage::PondStorage;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -147,8 +148,15 @@ impl AgentOps {
     ) -> Result<DescribeResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "describe_pond",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
             return fwd.describe(owner, identity, pond_ref).await;
         }
+        info!(op = "describe_pond", pond = pond_ref, "processing locally");
         let pid = Self::parse_id(&info.pond_id)?;
         // ensure_pond materializes storage on first touch; attach under the
         // pond's registry name so introspection is scoped to this catalog.
@@ -194,8 +202,15 @@ impl AgentOps {
         // Owned by another node → forward the drop so the owner evicts its engine
         // instance and deletes the files it actually holds.
         if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "drop_pond",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
             return fwd.drop_pond(owner, identity, pond_ref, confirm).await;
         }
+        info!(op = "drop_pond", pond = pond_ref, "processing locally");
         let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         // Tombstone the pond + cancel its in-flight ops. begin_drop also makes any
@@ -249,15 +264,18 @@ impl AgentOps {
         write: bool,
     ) -> Result<QueryResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
+        let op = if write { "write_query" } else { "read_query" };
         // Owned by another node → forward and relay. The owner audits + snapshots;
         // we just return its result, so attribution stays on the node that ran it.
         if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(op, pond = pond_ref, owner, "forwarding to owner node");
             return if write {
                 fwd.write(owner, identity, pond_ref, sql).await
             } else {
                 fwd.read(owner, identity, pond_ref, sql).await
             };
         }
+        info!(op, pond = pond_ref, "processing locally");
         let pond_id = info.pond_id.clone();
         let pid = Self::parse_id(&pond_id)?;
         // ensure_pond materializes storage on first touch; attach the catalog
@@ -313,8 +331,15 @@ impl AgentOps {
     ) -> Result<ExplainResult, AgentError> {
         let info = self.control.pond_info(pond_ref).await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "explain_query",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
             return fwd.explain(owner, identity, pond_ref, sql).await;
         }
+        info!(op = "explain_query", pond = pond_ref, "processing locally");
         let pid = Self::parse_id(&info.pond_id)?;
         // ensure_pond materializes storage on first touch; attach under the
         // pond's registry name so the plan resolves names in this catalog.

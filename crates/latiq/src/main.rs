@@ -334,7 +334,18 @@ fn control_addr() -> String {
 
 // ---- server roles -------------------------------------------------------
 
+/// Initialize structured logging for the long-running server roles (serve /
+/// node add). Honors `$RUST_LOG` (e.g. `RUST_LOG=latiq_agent_core=debug`),
+/// defaulting to `info`. Idempotent and only for servers — CLI client commands
+/// stay quiet. dev.sh redirects each node's output to `<root>/logs/node-N.log`.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+}
+
 async fn run_serve(a: ServeArgs) -> Result<()> {
+    init_tracing();
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -350,6 +361,7 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
 }
 
 async fn run_node_add(a: NodeAddArgs) -> Result<()> {
+    init_tracing();
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
