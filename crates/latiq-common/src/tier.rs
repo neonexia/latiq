@@ -3,6 +3,13 @@
 //! DuckDB instance (`memory_limit` + `threads` — instance-global, one instance
 //! per pond). These are caps, not reservations: a small pond's queries simply
 //! can't exceed its budget; nothing is pre-allocated.
+//!
+//! NOTE (non-k8s only): in-process caps are the isolation model when one node
+//! process hosts many ponds on a shared host. Under Kubernetes the boundary is
+//! the pod's cgroup — there the tier should map to pod sizing (requests/limits)
+//! and DuckDB should use the full pod, NOT be capped again in-process below the
+//! cgroup (double-capping strands pod resources). Gate these `SET` caps to the
+//! non-k8s path when the k8s slice lands.
 use serde::{Deserialize, Serialize};
 
 /// Engine-neutral resource caps for one pond's instance.
