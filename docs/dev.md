@@ -64,7 +64,13 @@ Root:                 ~/.latiq
 
 Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond storage under `ponds/`) — the same default the CLI uses. Pass `--root /tmp/latiq-dev` for throwaway state.
 
-`dev.sh` preflights the ports and aborts (naming the culprit) if one is taken, so a stale stack fails loudly instead of producing confusing gRPC errors. Override via flags (`./dev.sh --help`); MCP is always the Data port + 1:
+`dev.sh` tracks its child PIDs under `<root>/dev.pids` and **self-cleans**: a normal start first sweeps any survivors from a prior run before the port preflight, so a stack that died hard (SIGKILL / closed terminal, which the `Ctrl+C` trap can't catch) no longer leaves orphaned nodes/nginx that block the next run. To tear a stale stack down without starting a new one:
+
+```bash
+./dev.sh --down                          # or: ./dev.sh --down --root /tmp/latiq-dev
+```
+
+After the sweep it preflights the ports and aborts (naming the culprit) if one is *still* taken — e.g. a process it doesn't manage — so conflicts fail loudly instead of producing confusing gRPC errors. Override ports via flags (`./dev.sh --help`); MCP is always the Data port + 1:
 
 ```bash
 ./dev.sh --server-port 41400 --data-port 41401 --root /tmp/latiq-dev
