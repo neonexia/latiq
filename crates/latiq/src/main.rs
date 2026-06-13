@@ -1,6 +1,6 @@
 //! latiq — single binary. `serve` runs the control plane; `node add` runs a pond
 //! node; the remaining commands are a gRPC client. The CLI talks to the control
-//! plane (its single entry point, addressed by the `LATIQ_CONTROL` env var),
+//! plane (its single entry point, addressed by the `LATIQ_SERVER` env var),
 //! resolves which node hosts a pond, then runs data ops **node-direct** (the
 //! control plane is never in the data path). MCP is the agent-only surface and
 //! the CLI never uses it.
@@ -21,9 +21,28 @@ use tonic::{Request, Status};
 
 const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 
+/// Shown in `--help` for every client command that talks to the control plane.
+/// The control-plane address has no flag — it is set via `$LATIQ_SERVER`.
+const SERVER_HELP: &str = "\
+ENVIRONMENT:
+  LATIQ_SERVER  Control-plane address the CLI connects to. Set this first, e.g.
+                `export LATIQ_SERVER=http://host:51400` (default http://127.0.0.1:51400).";
+
+/// As `SERVER_HELP`, plus the optional query front door — used by `query` and
+/// `pond describe`, which run against a pond node.
+const QUERY_HELP: &str = "\
+ENVIRONMENT:
+  LATIQ_SERVER         Control-plane address the CLI connects to. Set this first,
+                       e.g. `export LATIQ_SERVER=http://host:51400` (default
+                       http://127.0.0.1:51400).
+  LATIQ_QUERY_GATEWAY  Optional data front door (e.g. an nginx LB over several
+                       nodes). If set, the query is sent there and the greeter node
+                       forwards to the pond's owner; otherwise the CLI connects to
+                       the owning node directly.";
+
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
-#[command(after_help = "")]
+#[command(after_help = QUERY_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -49,6 +68,7 @@ enum Command {
 }
 
 #[derive(Args)]
+#[command(after_help = SERVER_HELP)]
 struct StatsArgs {
     /// Output format (tabular dashboard or raw json).
     #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
@@ -56,6 +76,7 @@ struct StatsArgs {
 }
 
 #[derive(Subcommand)]
+#[command(after_help = SERVER_HELP)]
 enum DatasetCmd {
     /// List the available sample datasets.
     List,
@@ -87,6 +108,7 @@ struct ServeArgs {
 }
 
 #[derive(Subcommand)]
+#[command(after_help = SERVER_HELP)]
 enum NodeCmd {
     /// Start a pond node and register it with the control plane.
     Add(NodeAddArgs),
@@ -97,6 +119,7 @@ enum NodeCmd {
 }
 
 #[derive(Args)]
+#[command(after_help = SERVER_HELP)]
 struct NodeAddArgs {
     #[arg(long, default_value = "node-1")]
     node_id: String,
@@ -112,6 +135,7 @@ struct NodeAddArgs {
 }
 
 #[derive(Subcommand)]
+#[command(after_help = SERVER_HELP)]
 enum PondCmd {
     /// Allocate a pond. The control plane picks a node; you don't pass an address.
     Create {
@@ -155,6 +179,7 @@ impl std::fmt::Display for Format {
 }
 
 #[derive(Args)]
+#[command(after_help = QUERY_HELP)]
 struct QueryArgs {
     #[arg(short, long)]
     pond: String,
@@ -330,22 +355,21 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
     }
 }
 
-/// Data root: $LATIQ_ROOT if set, else ~/.latiq. The registry lives at
-/// `<root>/registry.duckdb` and pond storage under `<root>/ponds`. The `--root`
-/// flag overrides both.
+/// Default data root when `--root` is not given: ~/.latiq. The registry lives at
+/// `<root>/registry.duckdb` and pond storage under `<root>/ponds`. Pass `--root`
+/// to override.
 fn default_root() -> PathBuf {
-    if let Some(r) = std::env::var_os("LATIQ_ROOT") {
-        return PathBuf::from(r);
-    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".latiq")
 }
 
-/// Control plane address — from $LATIQ_CONTROL, else the loopback default.
+/// Control-plane address the CLI connects to — from `$LATIQ_SERVER`, else the
+/// loopback default. Set `LATIQ_SERVER` before running any client command (it has
+/// no flag; the CLI's single entry point is the control plane).
 fn control_addr() -> String {
-    std::env::var("LATIQ_CONTROL").unwrap_or_else(|_| DEFAULT_CONTROL.to_string())
+    std::env::var("LATIQ_SERVER").unwrap_or_else(|_| DEFAULT_CONTROL.to_string())
 }
 
 // ---- server roles -------------------------------------------------------
@@ -432,14 +456,14 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
 async fn control_client() -> Result<ControlClient<Channel>> {
     let addr = control_addr();
     ControlClient::connect(addr.clone()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve` (or set $LATIQ_CONTROL).")
+        anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
     })
 }
 
 async fn admin_client() -> Result<AdminClient<Channel>> {
     let addr = control_addr();
     AdminClient::connect(addr.clone()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running? Start it with `latiq serve` (or set $LATIQ_CONTROL).")
+        anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
     })
 }
 
@@ -450,11 +474,11 @@ async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
 }
 
 /// Where the CLI sends data ops for `pond_ref`. Default: resolve the owning node
-/// via the control plane and hit it directly. If `$LATIQ_GATEWAY` is set (e.g. an
-/// nginx front door over several nodes), send everything there and let the greeter
-/// node forward — the same single-front-door model agents use over MCP.
+/// via the control plane and hit it directly. If `$LATIQ_QUERY_GATEWAY` is set
+/// (e.g. an nginx front door over several nodes), send everything there and let the
+/// greeter node forward — the same single-front-door model agents use over MCP.
 async fn data_target(pond_ref: &str) -> Result<String> {
-    match std::env::var("LATIQ_GATEWAY") {
+    match std::env::var("LATIQ_QUERY_GATEWAY") {
         Ok(gw) if !gw.is_empty() => Ok(gw),
         _ => resolve_node(pond_ref).await,
     }

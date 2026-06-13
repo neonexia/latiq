@@ -78,10 +78,10 @@ Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond st
 ./dev.sh --nodes 3
 ```
 
-Node *i* binds Data port `data-port + 2*i` and MCP `+1`; the front door listens just past them and load-balances both surfaces. The banner prints the gateway and an `export LATIQ_GATEWAY=…` line. With it set, the CLI sends data ops to the gateway instead of resolving the owning node — whichever node nginx picks resolves the pond's owner and **forwards** the request there, relaying the result back. This is the same single-front-door model agents use over MCP, and it mirrors production (k8s): outside clients reach a Service/LB, never an individual pod; node-to-node hops are internal.
+Node *i* binds Data port `data-port + 2*i` and MCP `+1`; the front door listens just past them and load-balances both surfaces. The banner prints the gateway and an `export LATIQ_QUERY_GATEWAY=…` line. With it set, the CLI sends data ops to the gateway instead of resolving the owning node — whichever node nginx picks resolves the pond's owner and **forwards** the request there, relaying the result back. This is the same single-front-door model agents use over MCP, and it mirrors production (k8s): outside clients reach a Service/LB, never an individual pod; node-to-node hops are internal.
 
 ```bash
-export LATIQ_GATEWAY=http://127.0.0.1:51405      # printed by dev.sh
+export LATIQ_QUERY_GATEWAY=http://127.0.0.1:51405      # printed by dev.sh
 latiq pond create --name demo                    # control plane picks a node
 latiq query -p demo "SELECT 1"                   # via the gateway → forwarded to the owner
 ```
@@ -94,7 +94,7 @@ The MCP upstream is sticky (`ip_hash`) so a streamable-HTTP session stays on its
 # Terminal 1 — control plane (Control + Admin gRPC on one port)
 cargo run -p latiq -- serve --port 51400 --root ~/.latiq
 
-# Terminal 2 — pond node (Data gRPC + MCP; registers at $LATIQ_CONTROL, default :51400)
+# Terminal 2 — pond node (Data gRPC + MCP; registers at $LATIQ_SERVER, default :51400)
 cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 ```
 
@@ -115,19 +115,19 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 | `--port` | `51401` | Data/Query gRPC port; MCP (agents) is served on `port + 1` |
 | `--root` | `~/.latiq` | Data root; pond storage under `<root>/ponds` |
 
-`--root` defaults from `$LATIQ_ROOT` (else `~/.latiq`); the node registers with the control plane at `$LATIQ_CONTROL` (default `http://127.0.0.1:51400`). So `LATIQ_ROOT=/data LATIQ_CONTROL=… latiq serve` needs no flags.
+`--root` defaults to `~/.latiq` (pass `--root /data` to override); the node registers with the control plane at `$LATIQ_SERVER` (default `http://127.0.0.1:51400`). So `LATIQ_SERVER=… latiq serve --root /data` needs nothing more.
 
 ---
 
 ## Drive it from the CLI
 
-The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_CONTROL` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops. Set `$LATIQ_GATEWAY` (a multi-node front door, see above) to send data ops there instead and let the greeter node forward.
+The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_SERVER` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops. Set `$LATIQ_QUERY_GATEWAY` (a multi-node front door, see above) to send data ops there instead and let the greeter node forward.
 
 For dev, put the build output on your PATH (every `cargo build` refreshes it in place) and export the control address only if it's not the default:
 
 ```bash
 export PATH="$PWD/target/debug:$PATH"           # or target/release after `cargo build --release`
-export LATIQ_CONTROL=http://127.0.0.1:51400      # only if you changed --cp-port
+export LATIQ_SERVER=http://127.0.0.1:51400      # only if you changed --cp-port
 ```
 
 ### Pond lifecycle
@@ -202,7 +202,7 @@ Each table is created via the normal write path, so it's attributed to `--agent-
 ### Targeting a non-default control plane
 
 ```bash
-export LATIQ_CONTROL=http://127.0.0.1:41400
+export LATIQ_SERVER=http://127.0.0.1:41400
 latiq pond create --name demo
 latiq query --pond demo "SELECT 1"
 ```
@@ -238,7 +238,7 @@ df = table.to_pandas()
 
 ## Operator CLI (node admin)
 
-Inspect registered pond nodes (control plane, at `$LATIQ_CONTROL`).
+Inspect registered pond nodes (control plane, at `$LATIQ_SERVER`).
 
 ```bash
 latiq node list                # id, state, pond_count, heartbeat age, mcp_endpoint
