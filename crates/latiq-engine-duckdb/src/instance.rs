@@ -25,9 +25,10 @@ impl PondInstance {
         // run one instance per pond — invariant 7). Caps, not reservations.
         if let Some(lim) = &loc.limits {
             conn.execute_batch(&format!(
+                // The core budget maps to DuckDB's instance-global `threads`.
                 "SET memory_limit='{}MiB'; SET threads={};",
                 lim.memory_bytes / (1024 * 1024),
-                lim.threads.max(1),
+                lim.cores.max(1),
             ))
             .map_err(|e| EngineError::Engine(format!("set resource limits: {e}")))?;
         }
@@ -66,7 +67,7 @@ mod tests {
         let mut loc = fs.create_pond(PondId::new()).unwrap();
         loc.limits = Some(ResourceLimits {
             memory_bytes: 512 * 1024 * 1024,
-            threads: 1,
+            cores: 1,
         });
         let inst = PondInstance::open(&loc).unwrap();
         // Our SET plumbing landed on the instance (DuckDB enforces from here —
