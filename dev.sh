@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST=127.0.0.1
-CP_PORT=51400
+SERVER_PORT=51400
 DATA_PORT=51401
 NODES=1
 ROOT="${HOME}/.latiq"
@@ -16,11 +16,11 @@ usage() {
   cat <<EOF
 Usage: ./dev.sh [options]
 
-  --cp-port   <port>  Control plane (Control + Admin gRPC)  (default $CP_PORT)
-  --data-port <port>  First pond node's Data gRPC; MCP = +1  (default $DATA_PORT)
-  --nodes     <n>     Number of pond nodes to start          (default $NODES)
-  --root      <path>  Data root (registry + pond storage)    (default $ROOT)
-  -h, --help          Show this help
+  --server-port <port>  Control plane (Control + Admin gRPC)  (default $SERVER_PORT)
+  --data-port   <port>  First pond node's Data gRPC; MCP = +1  (default $DATA_PORT)
+  --nodes       <n>     Number of pond nodes to start          (default $NODES)
+  --root        <path>  Data root (registry + pond storage)    (default $ROOT)
+  -h, --help            Show this help
 
 Node i binds data port (data-port + 2*i) and MCP (data + 1). With --nodes > 1 an
 nginx front door is started (requires nginx) and \$LATIQ_QUERY_GATEWAY is printed.
@@ -34,7 +34,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --cp-port)   CP_PORT=$2;   shift 2 ;;
+    --server-port) SERVER_PORT=$2; shift 2 ;;
     --data-port) DATA_PORT=$2; shift 2 ;;
     --nodes)     NODES=$2;     shift 2 ;;
     --root)      ROOT=$2;      shift 2 ;;
@@ -59,7 +59,7 @@ for ((i = 0; i < NODES; i++)); do
 done
 GW_DATA=$((DATA_PORT + 2 * NODES))
 GW_MCP=$((GW_DATA + 1))
-CP_METRICS=$((CP_PORT + 1000))                     # control-plane /metrics
+CP_METRICS=$((SERVER_PORT + 1000))                     # control-plane /metrics
 
 # Colors — only when stdout is a terminal (so piping/redirecting stays clean).
 if [ -t 1 ]; then
@@ -73,28 +73,31 @@ else
   HDR='' LBL='' VAL='' DIM='' ERRC='' RST=''
 fi
 
-# Fail early (with the culprit) if a port is already taken.
+# Fail early (with the culprit) if a port is already taken. `$3` is the
+# remedy hint: the flag that actually moves THIS port (control-plane ports
+# shift with --server-port; every node/gateway port derives from the
+# --data-port base), so the suggestion is always actionable.
 check_port() {
-  local port=$1 name=$2
+  local port=$1 name=$2 hint=$3
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     printf '%sERROR%s: %s port %s is already in use by:\n' "$ERRC" "$RST" "$name" "$port" >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
-    printf 'Free it, or pick another port, e.g. ./dev.sh --cp-port 41400\n' >&2
+    printf 'Free it, or pick another port, e.g. ./dev.sh %s\n' "$hint" >&2
     exit 1
   fi
 }
-check_port "$CP_PORT" "Control plane"
+check_port "$SERVER_PORT" "Control plane" "--server-port 41400"
 for ((i = 0; i < NODES; i++)); do
-  check_port "${NODE_DATA[$i]}" "node-$i Data gRPC"
-  check_port "${NODE_MCP[$i]}" "node-$i MCP"
+  check_port "${NODE_DATA[$i]}" "node-$i Data gRPC" "--data-port 41401"
+  check_port "${NODE_MCP[$i]}" "node-$i MCP" "--data-port 41401"
 done
 if [[ $MULTI -eq 1 ]]; then
   command -v nginx >/dev/null 2>&1 || {
     printf '%sERROR%s: --nodes > 1 needs nginx for the front door. Install it: brew install nginx\n' "$ERRC" "$RST" >&2
     exit 1
   }
-  check_port "$GW_DATA" "gateway Data gRPC"
-  check_port "$GW_MCP" "gateway MCP"
+  check_port "$GW_DATA" "gateway Data gRPC" "--data-port 41401"
+  check_port "$GW_MCP" "gateway MCP" "--data-port 41401"
 fi
 
 printf '%sbuilding latiq…%s\n' "$DIM" "$RST"
@@ -137,14 +140,14 @@ wait_ready() {
 }
 
 # --- control plane ------------------------------------------------------
-"$BIN" serve --port "$CP_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
+"$BIN" serve --port "$SERVER_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
 CP_PID=$!; PIDS+=("$CP_PID")
-wait_ready "$CP_PID" "control plane" "$CP_LOG" "$CP_PORT"
+wait_ready "$CP_PID" "control plane" "$CP_LOG" "$SERVER_PORT"
 
 # --- pond nodes ---------------------------------------------------------
 for ((i = 0; i < NODES; i++)); do
   log="$LOG_DIR/node-$i.log"
-  LATIQ_SERVER="http://$HOST:$CP_PORT" "$BIN" node add \
+  LATIQ_SERVER="http://$HOST:$SERVER_PORT" "$BIN" node add \
     --node-id "node-$i" --port "${NODE_DATA[$i]}" --root "$ROOT" >"$log" 2>&1 &
   pid=$!; PIDS+=("$pid")
   wait_ready "$pid" "node-$i" "$log" "${NODE_DATA[$i]}" "${NODE_MCP[$i]}"
@@ -219,7 +222,7 @@ printf '%s ━━━━━━━━━━━━━━━━━━━━━━━
 printf '%s  latiq%s %sagent-native data pond%s %s· v%s%s\n' "$HDR" "$RST" "$DIM" "$RST" "$DIM" "${VERSION:-?}" "$RST"
 printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
 echo
-row "control"   "$HOST:$CP_PORT   (Control + Admin gRPC)"
+row "control"   "$HOST:$SERVER_PORT   (Control + Admin gRPC)"
 if [[ $MULTI -eq 1 ]]; then
   row "gateway"   "data gRPC $HOST:$GW_DATA · mcp http://$HOST:$GW_MCP/mcp"
   for ((i = 0; i < NODES; i++)); do
