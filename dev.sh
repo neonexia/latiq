@@ -23,7 +23,7 @@ Usage: ./dev.sh [options]
   -h, --help          Show this help
 
 Node i binds data port (data-port + 2*i) and MCP (data + 1). With --nodes > 1 an
-nginx front door is started (requires nginx) and \$LATIQ_GATEWAY is printed.
+nginx front door is started (requires nginx) and \$LATIQ_QUERY_GATEWAY is printed.
 
 Examples:
   ./dev.sh                                  # single node, no front door
@@ -144,7 +144,7 @@ wait_ready "$CP_PID" "control plane" "$CP_LOG" "$CP_PORT"
 # --- pond nodes ---------------------------------------------------------
 for ((i = 0; i < NODES; i++)); do
   log="$LOG_DIR/node-$i.log"
-  LATIQ_CONTROL="http://$HOST:$CP_PORT" "$BIN" node add \
+  LATIQ_SERVER="http://$HOST:$CP_PORT" "$BIN" node add \
     --node-id "node-$i" --port "${NODE_DATA[$i]}" --root "$ROOT" >"$log" 2>&1 &
   pid=$!; PIDS+=("$pid")
   wait_ready "$pid" "node-$i" "$log" "${NODE_DATA[$i]}" "${NODE_MCP[$i]}"
@@ -244,7 +244,7 @@ row "prometheus" "$PROM_CFG  (prometheus --config.file=$PROM_CFG)"
 echo
 if [[ $MULTI -eq 1 ]]; then
   printf '   %sDrive the CLI through the front door:%s\n' "$DIM" "$RST"
-  printf '   %sexport LATIQ_GATEWAY=http://%s:%s%s\n' "$VAL" "$HOST" "$GW_DATA" "$RST"
+  printf '   %sexport LATIQ_QUERY_GATEWAY=http://%s:%s%s\n' "$VAL" "$HOST" "$GW_DATA" "$RST"
   echo
 fi
 printf '   %sCtrl+C to stop.%s\n' "$DIM" "$RST"
