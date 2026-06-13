@@ -3,6 +3,13 @@
 //! DuckDB instance (`memory_limit` + `threads` — instance-global, one instance
 //! per pond). These are caps, not reservations: a small pond's queries simply
 //! can't exceed its budget; nothing is pre-allocated.
+//!
+//! NOTE (non-k8s only): in-process caps are the isolation model when one node
+//! process hosts many ponds on a shared host. Under Kubernetes the boundary is
+//! the pod's cgroup — there the tier should map to pod sizing (requests/limits)
+//! and DuckDB should use the full pod, NOT be capped again in-process below the
+//! cgroup (double-capping strands pod resources). Gate these `SET` caps to the
+//! non-k8s path when the k8s slice lands.
 use serde::{Deserialize, Serialize};
 
 /// Engine-neutral resource caps for one pond's instance.
@@ -10,8 +17,10 @@ use serde::{Deserialize, Serialize};
 pub struct ResourceLimits {
     /// DuckDB `memory_limit`, in bytes.
     pub memory_bytes: u64,
-    /// DuckDB `threads` (intra-query parallelism for this pond).
-    pub threads: u32,
+    /// CPU core budget for this pond — the number of cores its queries may use
+    /// in parallel. Applied internally as DuckDB's `threads` setting (a cap, not
+    /// a reservation).
+    pub cores: u32,
 }
 
 const MB: u64 = 1024 * 1024;
@@ -55,23 +64,23 @@ impl PondTier {
         match self {
             PondTier::XSmall => ResourceLimits {
                 memory_bytes: 512 * MB,
-                threads: 1,
+                cores: 1,
             },
             PondTier::Small => ResourceLimits {
                 memory_bytes: GB,
-                threads: 2,
+                cores: 2,
             },
             PondTier::Medium => ResourceLimits {
                 memory_bytes: 4 * GB,
-                threads: 4,
+                cores: 4,
             },
             PondTier::Large => ResourceLimits {
                 memory_bytes: 16 * GB,
-                threads: 8,
+                cores: 8,
             },
             PondTier::XLarge => ResourceLimits {
                 memory_bytes: 32 * GB,
-                threads: 8,
+                cores: 8,
             },
         }
     }
@@ -108,6 +117,6 @@ mod tests {
     fn limits_increase_with_tier() {
         assert!(PondTier::XSmall.limits().memory_bytes < PondTier::Small.limits().memory_bytes);
         assert!(PondTier::Small.limits().memory_bytes < PondTier::Medium.limits().memory_bytes);
-        assert!(PondTier::Large.limits().threads > PondTier::Medium.limits().threads);
+        assert!(PondTier::Large.limits().cores > PondTier::Medium.limits().cores);
     }
 }
