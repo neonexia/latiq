@@ -554,12 +554,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
         PondCmd::List => {
             let mut c = admin_client().await?;
             let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
-            for p in ponds {
-                println!(
-                    "{}\t{}\tnode={}\towner={}\t{}",
-                    p.pond_id, p.name, p.node_id, p.owner, p.created_at
-                );
-            }
+            print_pond_list_table(&ponds);
             Ok(())
         }
         PondCmd::Describe { pond } => {
@@ -803,6 +798,63 @@ async fn run_stats(a: StatsArgs) -> Result<()> {
         Format::Tabular => print_stats_dashboard(&nodes, &ponds, active, down, &tier_rows),
     }
     Ok(())
+}
+
+/// Render `pond list` as an aligned table: one row per pond, with its resource
+/// tier and the caps that tier maps to (memory + threads), plus owning node.
+fn print_pond_list_table(ponds: &[PondSummary]) {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    let (dim, rst) = if tty { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
+
+    if ponds.is_empty() {
+        println!("{dim}no ponds{rst}");
+        return;
+    }
+
+    // Header + each row's cells, so column widths fit the actual content.
+    let header = [
+        "NAME", "TIER", "MEMORY", "THREADS", "NODE", "OWNER", "POND ID",
+    ];
+    let rows: Vec<[String; 7]> = ponds
+        .iter()
+        .map(|p| {
+            let tier = PondTier::parse(&p.tier).unwrap_or_default();
+            let l = tier.limits();
+            [
+                p.name.clone(),
+                tier.as_str().to_string(),
+                fmt_bytes(l.memory_bytes),
+                l.threads.to_string(),
+                p.node_id.clone(),
+                p.owner.clone(),
+                p.pond_id.clone(),
+            ]
+        })
+        .collect();
+
+    let mut w = header.map(|h| h.len());
+    for r in &rows {
+        for (i, cell) in r.iter().enumerate() {
+            w[i] = w[i].max(cell.len());
+        }
+    }
+
+    let fmt_row = |cells: &[String; 7]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:<width$}", width = w[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+    let header_strs: [String; 7] = header.map(|h| h.to_string());
+    println!("{dim}{}{rst}", fmt_row(&header_strs));
+    for r in &rows {
+        println!("{}", fmt_row(r));
+    }
 }
 
 /// Humanize a byte cap for the dashboard (e.g. `512 MB`, `4 GB`).
