@@ -67,7 +67,7 @@ Runtime artifacts land under `~/.latiq/` (registry at `registry.duckdb`, pond st
 `dev.sh` preflights the ports and aborts (naming the culprit) if one is taken, so a stale stack fails loudly instead of producing confusing gRPC errors. Override via flags (`./dev.sh --help`); MCP is always the Data port + 1:
 
 ```bash
-./dev.sh --cp-port 41400 --data-port 41401 --root /tmp/latiq-dev
+./dev.sh --server-port 41400 --data-port 41401 --root /tmp/latiq-dev
 ```
 
 ### Multiple nodes behind a front door
@@ -127,7 +127,7 @@ For dev, put the build output on your PATH (every `cargo build` refreshes it in 
 
 ```bash
 export PATH="$PWD/target/debug:$PATH"           # or target/release after `cargo build --release`
-export LATIQ_SERVER=http://127.0.0.1:51400      # only if you changed --cp-port
+export LATIQ_SERVER=http://127.0.0.1:51400      # only if you changed --server-port
 ```
 
 ### Pond lifecycle
