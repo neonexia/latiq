@@ -556,8 +556,8 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
             for p in ponds {
                 println!(
-                    "{}\t{}\towner={}\t{}",
-                    p.pond_id, p.name, p.owner, p.created_at
+                    "{}\t{}\tnode={}\towner={}\t{}",
+                    p.pond_id, p.name, p.node_id, p.owner, p.created_at
                 );
             }
             Ok(())
