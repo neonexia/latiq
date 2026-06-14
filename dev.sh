@@ -7,23 +7,29 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST=127.0.0.1
-CP_PORT=51400
+SERVER_PORT=51400
 DATA_PORT=51401
 NODES=1
 ROOT="${HOME}/.latiq"
+DOWN=0
 
 usage() {
   cat <<EOF
 Usage: ./dev.sh [options]
 
-  --cp-port   <port>  Control plane (Control + Admin gRPC)  (default $CP_PORT)
-  --data-port <port>  First pond node's Data gRPC; MCP = +1  (default $DATA_PORT)
-  --nodes     <n>     Number of pond nodes to start          (default $NODES)
-  --root      <path>  Data root (registry + pond storage)    (default $ROOT)
-  -h, --help          Show this help
+  --server-port <port>  Control plane (Control + Admin gRPC)  (default $SERVER_PORT)
+  --data-port   <port>  First pond node's Data gRPC; MCP = +1  (default $DATA_PORT)
+  --nodes       <n>     Number of pond nodes to start          (default $NODES)
+  --root        <path>  Data root (registry + pond storage)    (default $ROOT)
+  --down                Tear down a stack from a previous run, then exit
+  -h, --help            Show this help
 
 Node i binds data port (data-port + 2*i) and MCP (data + 1). With --nodes > 1 an
-nginx front door is started (requires nginx) and \$LATIQ_GATEWAY is printed.
+nginx front door is started (requires nginx) and \$LATIQ_QUERY_GATEWAY is printed.
+
+A normal start first sweeps any survivors from a prior run (a hard-killed stack
+leaves backgrounded nodes/nginx the EXIT trap can't catch), so a stale stack
+self-cleans instead of blocking the port preflight. \`--down\` does only that.
 
 Examples:
   ./dev.sh                                  # single node, no front door
@@ -34,10 +40,11 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --cp-port)   CP_PORT=$2;   shift 2 ;;
+    --server-port) SERVER_PORT=$2; shift 2 ;;
     --data-port) DATA_PORT=$2; shift 2 ;;
     --nodes)     NODES=$2;     shift 2 ;;
     --root)      ROOT=$2;      shift 2 ;;
+    --down)      DOWN=1;       shift ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -59,7 +66,7 @@ for ((i = 0; i < NODES; i++)); do
 done
 GW_DATA=$((DATA_PORT + 2 * NODES))
 GW_MCP=$((GW_DATA + 1))
-CP_METRICS=$((CP_PORT + 1000))                     # control-plane /metrics
+CP_METRICS=$((SERVER_PORT + 1000))                     # control-plane /metrics
 
 # Colors — only when stdout is a terminal (so piping/redirecting stays clean).
 if [ -t 1 ]; then
@@ -73,28 +80,70 @@ else
   HDR='' LBL='' VAL='' DIM='' ERRC='' RST=''
 fi
 
-# Fail early (with the culprit) if a port is already taken.
+# Stack self-clean. Each child PID (control plane, nodes, nginx) is appended to
+# PID_FILE as it starts; on a clean Ctrl+C the EXIT trap kills them and removes
+# the file. If a run dies hard (SIGKILL / terminal closed), the trap can't fire
+# and the children orphan — but PID_FILE survives under $ROOT, so the next run
+# (or `--down`) reads it and kills the survivors. The ps check guards against PID
+# reuse: only kill a PID that is still a latiq/nginx process.
+PID_FILE="$ROOT/dev.pids"
+record_pid() { echo "$1" >>"$PID_FILE"; }
+sweep_stale() {
+  [[ -f "$PID_FILE" ]] || return 0
+  local pid cmd killed=0
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case "$cmd" in
+      *latiq*|*nginx*) kill "$pid" 2>/dev/null && killed=$((killed + 1)) || true ;;
+    esac
+  done <"$PID_FILE"
+  rm -f "$PID_FILE"
+  if [[ $killed -gt 0 ]]; then
+    printf '%sswept %d stale process(es) from a previous run%s\n' "$DIM" "$killed" "$RST" >&2
+  fi
+  return 0
+}
+
+if [[ $DOWN -eq 1 ]]; then
+  if [[ -f "$PID_FILE" ]]; then
+    sweep_stale
+    printf '%sstack down.%s\n' "$DIM" "$RST"
+  else
+    printf '%sno tracked stack under %s (nothing to tear down).%s\n' "$DIM" "$ROOT" "$RST"
+  fi
+  exit 0
+fi
+
+# Clear any orphans from a prior hard-killed run before the port preflight.
+sweep_stale
+
+# Fail early (with the culprit) if a port is already taken. `$3` is the
+# remedy hint: the flag that actually moves THIS port (control-plane ports
+# shift with --server-port; every node/gateway port derives from the
+# --data-port base), so the suggestion is always actionable.
 check_port() {
-  local port=$1 name=$2
+  local port=$1 name=$2 hint=$3
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     printf '%sERROR%s: %s port %s is already in use by:\n' "$ERRC" "$RST" "$name" "$port" >&2
     lsof -nP -iTCP:"$port" -sTCP:LISTEN >&2
-    printf 'Free it, or pick another port, e.g. ./dev.sh --cp-port 41400\n' >&2
+    printf 'Free it, or pick another port, e.g. ./dev.sh %s\n' "$hint" >&2
     exit 1
   fi
 }
-check_port "$CP_PORT" "Control plane"
+check_port "$SERVER_PORT" "Control plane" "--server-port 41400"
 for ((i = 0; i < NODES; i++)); do
-  check_port "${NODE_DATA[$i]}" "node-$i Data gRPC"
-  check_port "${NODE_MCP[$i]}" "node-$i MCP"
+  check_port "${NODE_DATA[$i]}" "node-$i Data gRPC" "--data-port 41401"
+  check_port "${NODE_MCP[$i]}" "node-$i MCP" "--data-port 41401"
 done
 if [[ $MULTI -eq 1 ]]; then
   command -v nginx >/dev/null 2>&1 || {
     printf '%sERROR%s: --nodes > 1 needs nginx for the front door. Install it: brew install nginx\n' "$ERRC" "$RST" >&2
     exit 1
   }
-  check_port "$GW_DATA" "gateway Data gRPC"
-  check_port "$GW_MCP" "gateway MCP"
+  check_port "$GW_DATA" "gateway Data gRPC" "--data-port 41401"
+  check_port "$GW_MCP" "gateway MCP" "--data-port 41401"
 fi
 
 printf '%sbuilding latiq…%s\n' "$DIM" "$RST"
@@ -106,9 +155,11 @@ CP_LOG="$LOG_DIR/control-plane.log"
 
 PIDS=()
 NGINX_PID=""
+: >"$PID_FILE"          # fresh tracking file for this run
 cleanup() {
   [[ -n "$NGINX_PID" ]] && kill "$NGINX_PID" 2>/dev/null || true
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  rm -f "$PID_FILE"     # children are being killed; drop the tracking file
 }
 trap cleanup INT TERM EXIT
 
@@ -137,16 +188,16 @@ wait_ready() {
 }
 
 # --- control plane ------------------------------------------------------
-"$BIN" serve --port "$CP_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
-CP_PID=$!; PIDS+=("$CP_PID")
-wait_ready "$CP_PID" "control plane" "$CP_LOG" "$CP_PORT"
+"$BIN" serve --port "$SERVER_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
+CP_PID=$!; PIDS+=("$CP_PID"); record_pid "$CP_PID"
+wait_ready "$CP_PID" "control plane" "$CP_LOG" "$SERVER_PORT"
 
 # --- pond nodes ---------------------------------------------------------
 for ((i = 0; i < NODES; i++)); do
   log="$LOG_DIR/node-$i.log"
-  LATIQ_CONTROL="http://$HOST:$CP_PORT" "$BIN" node add \
+  LATIQ_SERVER="http://$HOST:$SERVER_PORT" "$BIN" node add \
     --node-id "node-$i" --port "${NODE_DATA[$i]}" --root "$ROOT" >"$log" 2>&1 &
-  pid=$!; PIDS+=("$pid")
+  pid=$!; PIDS+=("$pid"); record_pid "$pid"
   wait_ready "$pid" "node-$i" "$log" "${NODE_DATA[$i]}" "${NODE_MCP[$i]}"
 done
 
@@ -198,7 +249,7 @@ $data_servers    }
 }
 EOF
   nginx -c "$NGINX_CONF" -p "$ROOT" -g 'daemon off;' >"$LOG_DIR/nginx.log" 2>&1 &
-  NGINX_PID=$!
+  NGINX_PID=$!; record_pid "$NGINX_PID"
   wait_ready "$NGINX_PID" "nginx front door" "$LOG_DIR/nginx.log" "$GW_DATA" "$GW_MCP"
 fi
 
@@ -219,7 +270,7 @@ printf '%s ━━━━━━━━━━━━━━━━━━━━━━━
 printf '%s  latiq%s %sagent-native data pond%s %s· v%s%s\n' "$HDR" "$RST" "$DIM" "$RST" "$DIM" "${VERSION:-?}" "$RST"
 printf '%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n' "$HDR" "$RST"
 echo
-row "control"   "$HOST:$CP_PORT   (Control + Admin gRPC)"
+row "control"   "$HOST:$SERVER_PORT   (Control + Admin gRPC)"
 if [[ $MULTI -eq 1 ]]; then
   row "gateway"   "data gRPC $HOST:$GW_DATA · mcp http://$HOST:$GW_MCP/mcp"
   for ((i = 0; i < NODES; i++)); do
@@ -244,7 +295,7 @@ row "prometheus" "$PROM_CFG  (prometheus --config.file=$PROM_CFG)"
 echo
 if [[ $MULTI -eq 1 ]]; then
   printf '   %sDrive the CLI through the front door:%s\n' "$DIM" "$RST"
-  printf '   %sexport LATIQ_GATEWAY=http://%s:%s%s\n' "$VAL" "$HOST" "$GW_DATA" "$RST"
+  printf '   %sexport LATIQ_QUERY_GATEWAY=http://%s:%s%s\n' "$VAL" "$HOST" "$GW_DATA" "$RST"
   echo
 fi
 printf '   %sCtrl+C to stop.%s\n' "$DIM" "$RST"

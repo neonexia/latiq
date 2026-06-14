@@ -9,3 +9,6 @@
 /latiq-cp.duckdb
 /latiq-cp.duckdb.wal
 /.latiq-dev
+
+# Prometheus TSDB if you run `prometheus` from deploy/ with the example config.
+/deploy/data
