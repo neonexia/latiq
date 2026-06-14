@@ -116,6 +116,14 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     )
     .await?;
 
+    // Warm the DuckDB extension cache once, in the background — the dev stand-in
+    // for image-baking (a no-op when the image is pre-baked). Keeps per-pond LOADs
+    // download-free; never blocks serving or the agent's pond-create path.
+    tokio::task::spawn_blocking(|| {
+        tracing::info!("warming DuckDB extension cache");
+        latiq_engine_duckdb::warm_extension_cache();
+    });
+
     // Prometheus /metrics + the gauge collector (if a metrics port is configured).
     if let Some(metrics_addr) = cfg.metrics_addr {
         let handle = latiq_metrics::init_recorder();

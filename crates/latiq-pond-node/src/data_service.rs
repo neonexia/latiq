@@ -102,7 +102,7 @@ impl Data for DataService {
         };
         let res = self
             .ops
-            .allocate_pond(&id, name, &policy, &tier)
+            .allocate_pond(&id, name, &policy, &tier, &[])
             .await
             .map_err(to_status)?;
         Ok(Response::new(AllocatePondResponse {

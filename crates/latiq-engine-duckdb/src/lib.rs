@@ -3,3 +3,4 @@ pub mod duck_engine;
 pub mod exec;
 pub mod instance;
 pub use duck_engine::DuckEngine;
+pub use instance::warm_extension_cache;

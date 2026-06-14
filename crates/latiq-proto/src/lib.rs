@@ -12,6 +12,7 @@ mod tests {
             owner_identity: "agent".into(),
             policy_json: "{}".into(),
             tier: "medium".into(),
+            extensions: vec![],
         };
     }
 }

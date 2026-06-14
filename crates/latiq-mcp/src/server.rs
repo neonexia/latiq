@@ -3,7 +3,7 @@
 //! defaulting to anonymous. (M6 moves this to the `X-Latiq-Agent-Id` header.)
 use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
 use crate::resources;
-use latiq_agent_core::AgentOps;
+use latiq_agent_core::{AgentError, AgentOps};
 use latiq_common::Identity;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
@@ -30,6 +30,10 @@ pub struct AllocateArgs {
         description = "Resource tier: x-small | small | medium | large | x-large (default medium). Caps the pond's memory + CPU."
     )]
     pub tier: Option<String>,
+    #[schemars(
+        description = "Optional DuckDB extensions to load on this pond, e.g. [\"spatial\",\"fts\"]. Signed/official extensions only; must be available on the deployment. See the latiq://guidance resource for the supported set."
+    )]
+    pub extensions: Option<Vec<String>>,
     #[schemars(description = "Calling agent identity (relaxed; defaults to anonymous)")]
     pub agent_id: Option<String>,
 }
@@ -101,7 +105,13 @@ Then write_query to create tables and load data, and read_query to query. See la
     async fn allocate_pond(&self, Parameters(a): Parameters<AllocateArgs>) -> CallToolResult {
         let id = Identity::claimed(a.agent_id.as_deref());
         let tier = a.tier.as_deref().unwrap_or("medium");
-        match self.ops.allocate_pond(&id, a.name, "{}", tier).await {
+        // Validate requested extensions against the signed/official allowlist
+        // before allocating, so a bad name returns a clear, actionable error.
+        let exts = match latiq_common::extensions::validate(&a.extensions.unwrap_or_default()) {
+            Ok(e) => e,
+            Err(msg) => return err_envelope(AgentError::unsupported_extension(msg).envelope()),
+        };
+        match self.ops.allocate_pond(&id, a.name, "{}", tier, &exts).await {
             Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
             Err(e) => err_envelope(e.envelope()),
         }
