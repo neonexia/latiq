@@ -50,6 +50,15 @@ impl AgentError {
         )
     }
 
+    pub fn unsupported_extension(message: impl Into<String>) -> Self {
+        Self::new(
+            ErrorKind::InvalidValue,
+            message,
+            "Request only signed/official extensions baked into this deployment; see latiq://guidance for the supported set.",
+            "latiq://guidance",
+        )
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(
             ErrorKind::Internal,

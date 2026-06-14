@@ -141,10 +141,13 @@ export LATIQ_SERVER=http://127.0.0.1:51400      # only if you changed --server-p
 ```bash
 latiq pond create --name demo                 # control plane picks a node; --name optional (auto-named)
 latiq pond create --name big --tier large     # resource tier (default medium); caps the pond's memory + CPU
+latiq pond create --name geo --extensions spatial,fts  # load DuckDB extensions on the pond
 latiq pond list                               # discover ponds (control-plane registry)
 latiq pond describe demo                       # metadata (incl. tier) + table summary
 latiq pond drop demo --confirm                 # DESTRUCTIVE — requires --confirm
 ```
+
+**Extensions** are baked into the deployment image: `parquet`/`json` are statically linked into the binary; `httpfs`/`ducklake` and the optional set (`spatial`, `fts`, `icu`, `inet`) are loaded from the image's extension cache. A pond `LOAD`s its requested extensions on open — never installs in the create path. A node warms its cache once at startup (the dev stand-in for image-baking); a requested extension that isn't present fails fast. Community/unsigned extensions are rejected.
 
 **Resource tiers** cap a pond's DuckDB instance (memory + threads) — caps, not reservations:
 

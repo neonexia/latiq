@@ -27,7 +27,7 @@ fn ops() -> AgentOps {
 async fn query_by_uri_local_csv_ingestion() {
     let ops = ops();
     let id = Identity::claimed(Some("ingestor"));
-    ops.allocate_pond(&id, Some("ing".into()), "{}", "medium")
+    ops.allocate_pond(&id, Some("ing".into()), "{}", "medium", &[])
         .await
         .unwrap();
 
@@ -52,7 +52,7 @@ async fn query_by_uri_local_csv_ingestion() {
 async fn concurrent_multi_agent_writes_are_consistent_and_attributed() {
     let ops = ops();
     let setup = Identity::claimed(Some("setup"));
-    ops.allocate_pond(&setup, Some("shared".into()), "{}", "medium")
+    ops.allocate_pond(&setup, Some("shared".into()), "{}", "medium", &[])
         .await
         .unwrap();
     ops.write_query(

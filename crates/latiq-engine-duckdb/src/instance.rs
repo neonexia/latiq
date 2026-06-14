@@ -4,8 +4,30 @@ use duckdb::Connection;
 use latiq_engine::EngineError;
 use latiq_storage::PondLocation;
 
-/// The Slice 0+ extension allowlist (public file sources only).
-pub const EXTENSIONS: &[&str] = &["ducklake", "httpfs", "parquet", "json"];
+/// Standard extensions loaded on every pond. `parquet`/`json` are statically
+/// linked into the binary (duckdb cargo features) so they need no `LOAD`;
+/// `ducklake`/`httpfs` have no cargo feature and are loaded from the deployment
+/// image. `INSTALL` here self-heals the required set on a cold cache.
+const STANDARD_LOAD: &[&str] = &["ducklake", "httpfs"];
+
+/// Best-effort: ensure the loadable standard set + the optional allowlist are
+/// present in the local extension cache, so pond opens are pure `LOAD`. Run once
+/// at node startup — the dev stand-in for image-baking (in production the image
+/// is pre-baked, making this a fast no-op). Network happens here, **never** in
+/// the pond-create path. Individual failures (offline, already present) are
+/// non-fatal.
+pub fn warm_extension_cache() {
+    let Ok(conn) = Connection::open_in_memory() else {
+        return;
+    };
+    let names = STANDARD_LOAD
+        .iter()
+        .copied()
+        .chain(latiq_common::extensions::OPTIONAL.iter().copied());
+    for ext in names {
+        let _ = conn.execute_batch(&format!("INSTALL {ext};"));
+    }
+}
 
 pub struct PondInstance {
     pub conn: Connection,
@@ -32,10 +54,25 @@ impl PondInstance {
             ))
             .map_err(|e| EngineError::Engine(format!("set resource limits: {e}")))?;
         }
-        // Load extensions (INSTALL may need network the first time; LOAD is local once installed).
-        for ext in EXTENSIONS {
+        // Standard set: required, self-healing (INSTALL is a no-op once cached;
+        // parquet/json are statically linked, so they're omitted here).
+        for ext in STANDARD_LOAD {
             conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
                 .map_err(|e| EngineError::Engine(format!("load {ext}: {e}")))?;
+        }
+        // Per-pond optional extensions: LOAD-only from the image. autoinstall off
+        // so a missing one fails fast — never a download in the pond path.
+        if !loc.extensions.is_empty() {
+            conn.execute_batch("SET autoinstall_known_extensions=false;")
+                .map_err(|e| EngineError::Engine(e.to_string()))?;
+            for ext in &loc.extensions {
+                conn.execute_batch(&format!("LOAD {ext};")).map_err(|e| {
+                    EngineError::Engine(format!(
+                        "extension '{ext}' is not available on this node — bake it \
+                         into the deployment image and upgrade Latiq ({e})"
+                    ))
+                })?;
+            }
         }
         // ATTACH the pond's DuckLake catalog under the pond's name, so callers
         // query `<pond>.snapshots()` / `<pond>.main.<table>`. The alias is quoted
@@ -101,5 +138,48 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn loads_a_baked_optional_extension() {
+        // Simulate image-baking: install the extension into the cache first.
+        warm_extension_cache();
+        Connection::open_in_memory()
+            .unwrap()
+            .execute_batch("INSTALL icu;")
+            .unwrap();
+        let fs = TempFs::new();
+        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        loc.extensions = vec!["icu".to_string()];
+        let inst = PondInstance::open(&loc).unwrap();
+        // Our LOAD plumbing landed it on the instance (test our integration, not
+        // DuckDB's enforcement — invariant 10).
+        let loaded: bool = inst
+            .conn
+            .query_row(
+                "SELECT loaded FROM duckdb_extensions() WHERE extension_name='icu'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(loaded, "icu should be LOADed on the pond");
+    }
+
+    #[test]
+    fn missing_optional_extension_fails_fast() {
+        // autoinstall is off → LOADing an unavailable extension errors (no
+        // download), so a cache miss never silently downloads in the pond path.
+        let fs = TempFs::new();
+        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        loc.extensions = vec!["definitely_not_an_extension_xyz".to_string()];
+        let err = match PondInstance::open(&loc) {
+            Ok(_) => panic!("expected open to fail for a missing extension"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not available") || msg.contains("definitely_not_an_extension_xyz"),
+            "expected a fail-fast extension error, got: {msg}"
+        );
     }
 }
