@@ -2,7 +2,7 @@
 //! Used for single-process operation and tests; M6 adds a gRPC-client impl.
 use crate::control::ControlPlane;
 use crate::error::AgentError;
-use crate::types::{AuditRecord, PondInfo};
+use crate::types::{AuditRecord, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_common::ErrorKind;
 use latiq_control_plane::registry::{AuditInsert, PondRow};
 use latiq_control_plane::{ControlPlaneError, Registry};
@@ -27,7 +27,35 @@ fn cp_err(e: ControlPlaneError) -> AgentError {
             "Ensure a pond node is registered with the control plane.",
             "latiq://troubleshooting",
         ),
+        ControlPlaneError::DatasetNotFound(r) => AgentError::dataset_not_found(&r),
+        ControlPlaneError::Invalid(m) => AgentError::new(
+            ErrorKind::InvalidValue,
+            m,
+            "Fix the request and retry.",
+            "latiq://guidance",
+        ),
         ControlPlaneError::Storage(m) => AgentError::internal(m),
+    }
+}
+
+fn dataset_to_info(d: latiq_control_plane::registry::DatasetRow) -> DatasetInfo {
+    DatasetInfo {
+        reference: d.reference,
+        namespace: d.namespace,
+        name: d.name,
+        description: d.description,
+        tags: d.tags,
+        tables: d
+            .tables
+            .into_iter()
+            .map(|t| DatasetTableInfo {
+                table_name: t.table_name,
+                source_uri: t.source_uri,
+                format: t.format,
+            })
+            .collect(),
+        created_by: d.created_by,
+        created_at: d.created_at,
     }
 }
 
@@ -99,6 +127,22 @@ impl ControlPlane for RegistryControlPlane {
 
     async fn drop_pond(&self, pond_id: &str) -> Result<(), AgentError> {
         self.registry.drop_pond(pond_id).map_err(cp_err)
+    }
+
+    async fn list_datasets(&self, query: &str) -> Result<Vec<DatasetInfo>, AgentError> {
+        Ok(self
+            .registry
+            .list_datasets(query)
+            .map_err(cp_err)?
+            .into_iter()
+            .map(dataset_to_info)
+            .collect())
+    }
+
+    async fn get_dataset(&self, reference: &str) -> Result<DatasetInfo, AgentError> {
+        Ok(dataset_to_info(
+            self.registry.get_dataset(reference).map_err(cp_err)?,
+        ))
     }
 
     async fn record_audit(&self, rec: AuditRecord) {

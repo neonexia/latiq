@@ -17,10 +17,11 @@ impl AdminService {
 
 fn to_status(e: ControlPlaneError) -> Status {
     match e {
-        ControlPlaneError::PondNotFound(m) | ControlPlaneError::NodeNotFound(m) => {
-            Status::not_found(m)
-        }
+        ControlPlaneError::PondNotFound(m)
+        | ControlPlaneError::NodeNotFound(m)
+        | ControlPlaneError::DatasetNotFound(m) => Status::not_found(m),
         ControlPlaneError::NameConflict(m) => Status::already_exists(m),
+        ControlPlaneError::Invalid(m) => Status::invalid_argument(m),
         ControlPlaneError::Storage(m) => Status::internal(m),
     }
 }
@@ -135,6 +136,62 @@ impl Admin for AdminService {
             .map(audit_entry)
             .collect();
         Ok(Response::new(AuditSearchResponse { entries }))
+    }
+
+    async fn dataset_add(
+        &self,
+        req: Request<DatasetAddRequest>,
+    ) -> Result<Response<DatasetAddResponse>, Status> {
+        let d = req
+            .into_inner()
+            .dataset
+            .ok_or_else(|| Status::invalid_argument("dataset is required"))?;
+        let created_by = if d.created_by.is_empty() {
+            "anonymous".to_string()
+        } else {
+            d.created_by
+        };
+        let tables: Vec<_> = d
+            .tables
+            .into_iter()
+            .map(crate::dataset_convert::table_from_msg)
+            .collect();
+        let reference = self
+            .registry
+            .add_dataset(
+                &d.namespace,
+                &d.name,
+                &d.description,
+                &created_by,
+                &d.tags,
+                &tables,
+            )
+            .map_err(to_status)?;
+        Ok(Response::new(DatasetAddResponse { r#ref: reference }))
+    }
+
+    async fn dataset_remove(
+        &self,
+        req: Request<DatasetRemoveRequest>,
+    ) -> Result<Response<DatasetRemoveResponse>, Status> {
+        self.registry
+            .remove_dataset(&req.into_inner().r#ref)
+            .map_err(to_status)?;
+        Ok(Response::new(DatasetRemoveResponse {}))
+    }
+
+    async fn dataset_list(
+        &self,
+        req: Request<DatasetListRequest>,
+    ) -> Result<Response<DatasetListResponse>, Status> {
+        let datasets = self
+            .registry
+            .list_datasets(&req.into_inner().query)
+            .map_err(to_status)?
+            .into_iter()
+            .map(crate::dataset_convert::to_msg)
+            .collect();
+        Ok(Response::new(DatasetListResponse { datasets }))
     }
 }
 

@@ -197,4 +197,22 @@ impl Data for DataService {
         })
         .await
     }
+
+    async fn load_dataset(
+        &self,
+        req: Request<LoadDatasetRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let id = identity_of(&req);
+        let tid = trace_id_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("load_dataset", tid, async move {
+            let res = ops
+                .load_dataset(&id, &r.pond, &r.dataset_ref)
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(res).unwrap_or_default()))
+        })
+        .await
+    }
 }

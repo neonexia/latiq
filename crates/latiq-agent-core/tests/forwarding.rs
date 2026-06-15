@@ -53,6 +53,15 @@ impl ControlPlane for FixedOwner {
     async fn drop_pond(&self, _: &str) -> Result<(), AgentError> {
         Ok(())
     }
+    async fn list_datasets(
+        &self,
+        _: &str,
+    ) -> Result<Vec<latiq_agent_core::DatasetInfo>, AgentError> {
+        Ok(vec![])
+    }
+    async fn get_dataset(&self, r: &str) -> Result<latiq_agent_core::DatasetInfo, AgentError> {
+        Err(AgentError::dataset_not_found(r))
+    }
     async fn record_audit(&self, _: AuditRecord) {}
 }
 

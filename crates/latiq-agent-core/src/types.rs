@@ -28,6 +28,35 @@ pub struct AllocateResult {
     pub pond_name: String,
 }
 
+/// One external table in a catalog dataset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetTableInfo {
+    pub table_name: String,
+    pub source_uri: String,
+    pub format: String,
+}
+
+/// A catalog dataset: namespaced, tagged, described external tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetInfo {
+    /// Full reference "<namespace>.<name>", e.g. "latiq.sample.tpch".
+    pub reference: String,
+    pub namespace: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    pub tables: Vec<DatasetTableInfo>,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+/// Result of loading a dataset into a pond.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadDatasetResult {
+    pub dataset: String,
+    pub tables: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeResult {
     pub pond: PondInfo,

@@ -50,6 +50,53 @@ pub const MIGRATIONS: &[&str] = &[
     // v3: per-pond optional DuckDB extensions, stored comma-separated (empty =
     // none). The engine LOADs them from the deployment image on pond open.
     "ALTER TABLE ponds ADD COLUMN extensions VARCHAR DEFAULT '';",
+    // v4: the dataset catalog — named, namespaced external tables operators curate
+    // and agents/clients load into ponds. `ref` is the full "<namespace>.<name>".
+    // Seeds the built-in samples under the `latiq.sample` namespace.
+    r#"
+    CREATE TABLE datasets (
+        ref          VARCHAR PRIMARY KEY,
+        namespace    VARCHAR NOT NULL,
+        name         VARCHAR NOT NULL,
+        description  VARCHAR NOT NULL DEFAULT '',
+        created_by   VARCHAR NOT NULL DEFAULT 'anonymous',
+        created_at   TIMESTAMP NOT NULL DEFAULT current_timestamp
+    );
+    CREATE TABLE dataset_tables (
+        ref          VARCHAR NOT NULL,
+        table_name   VARCHAR NOT NULL,
+        source_uri   VARCHAR NOT NULL,
+        format       VARCHAR NOT NULL DEFAULT 'auto',
+        PRIMARY KEY (ref, table_name)
+    );
+    CREATE TABLE dataset_tags (
+        ref          VARCHAR NOT NULL,
+        tag          VARCHAR NOT NULL,
+        PRIMARY KEY (ref, tag)
+    );
+    INSERT INTO datasets(ref, namespace, name, description, created_by) VALUES
+      ('latiq.sample.startrek','latiq.sample','startrek','Star Trek Season 1 scripts — CSV, ~2 KB','latiq'),
+      ('latiq.sample.holdings','latiq.sample','holdings','Example stock holdings — CSV, ~300 B','latiq'),
+      ('latiq.sample.tpch','latiq.sample','tpch','TPC-H scale 0.01 — 8 tables, Parquet, a few MB','latiq'),
+      ('latiq.sample.taxi','latiq.sample','taxi','NYC yellow-taxi, Apr 2019 — Parquet, ~127 MB (large)','latiq');
+    INSERT INTO dataset_tables(ref, table_name, source_uri) VALUES
+      ('latiq.sample.startrek','startrek','https://blobs.duckdb.org/data/Star_Trek-Season_1.csv'),
+      ('latiq.sample.holdings','holdings','https://duckdb.org/data/holdings.csv'),
+      ('latiq.sample.tpch','lineitem','https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet'),
+      ('latiq.sample.tpch','orders','https://shell.duckdb.org/data/tpch/0_01/parquet/orders.parquet'),
+      ('latiq.sample.tpch','customer','https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet'),
+      ('latiq.sample.tpch','part','https://shell.duckdb.org/data/tpch/0_01/parquet/part.parquet'),
+      ('latiq.sample.tpch','supplier','https://shell.duckdb.org/data/tpch/0_01/parquet/supplier.parquet'),
+      ('latiq.sample.tpch','partsupp','https://shell.duckdb.org/data/tpch/0_01/parquet/partsupp.parquet'),
+      ('latiq.sample.tpch','nation','https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet'),
+      ('latiq.sample.tpch','region','https://shell.duckdb.org/data/tpch/0_01/parquet/region.parquet'),
+      ('latiq.sample.taxi','taxi','https://blobs.duckdb.org/data/taxi_2019_04.parquet');
+    INSERT INTO dataset_tags(ref, tag) VALUES
+      ('latiq.sample.startrek','sample'),
+      ('latiq.sample.holdings','sample'),
+      ('latiq.sample.tpch','sample'),('latiq.sample.tpch','tpch'),
+      ('latiq.sample.taxi','sample');
+    "#,
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {

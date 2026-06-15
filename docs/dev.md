@@ -195,18 +195,26 @@ latiq query --pond demo "CREATE TABLE t AS SELECT * FROM read_csv('https://examp
 latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parquet'"
 ```
 
-### Sample datasets
+### Dataset catalog
 
-`latiq dataset` loads curated **public** datasets (DuckLake/standard data — nothing is stored in the repo) into a pond, one `CREATE TABLE` per table:
+`latiq dataset` is a **registry-backed catalog** of external tables. Datasets are **namespaced** (`<namespace>.<name>`), **tagged**, and **described**; operators add them, anyone loads them into a pond (one `CREATE TABLE` per table). The built-in samples are seeded under `latiq.sample`.
 
 ```bash
-latiq dataset list                       # startrek, holdings, tpch (8 tables), taxi (~127 MB)
-latiq dataset load tpch     -p demo       # loads lineitem, orders, customer, … into `demo`
-latiq dataset load startrek -p demo       # a tiny CSV, good for a quick smoke
-latiq dataset load --all    -p demo       # everything (taxi is large — downloads ~127 MB)
+latiq dataset list                       # all (the latiq.sample.* samples are seeded)
+latiq dataset list '#finance'            # by tag
+latiq dataset list 'hf.*'                # by namespace/ref glob
+latiq dataset list acme                  # substring over ref/description/tags
+
+# add (operator): one --table NAME=URI per table; repeatable --tag
+latiq dataset add hf.acme.sales \
+  --table sales=https://example.com/sales.parquet \
+  --tag finance --description "Acme sales export"
+
+latiq dataset load latiq.sample.tpch -p demo   # materialize all 8 TPC-H tables into `demo`
+latiq dataset remove hf.acme.sales             # operator
 ```
 
-Each table is created via the normal write path, so it's attributed to `--agent-id` and snapshotted like any other write. Needs network (the data is fetched from the public URLs).
+Loading runs on the pond node via the Data gRPC `LoadDataset` (it resolves the dataset from the control-plane catalog, then writes each table through the normal write path — attributed to `--agent-id`, snapshotted like any write). Slice 1 sources are **public**; credentialed external sources (private S3, Iceberg, …) come with the identity work — see issue #26. Needs network (data is fetched from the source URIs).
 
 ### Targeting a non-default control plane
 
