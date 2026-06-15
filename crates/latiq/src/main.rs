@@ -361,46 +361,44 @@ fn print_dataset_table(datasets: &[DatasetMsg]) {
         println!("{dim}no datasets{rst}");
         return;
     }
-    let rows: Vec<[String; 4]> = datasets
+    // Columns: NAME · NAMESPACE · TAGS · TABLES · DESCRIPTION. TABLES is the only
+    // right-aligned (numeric) column.
+    let header = ["NAME", "NAMESPACE", "TAGS", "TABLES", "DESCRIPTION"];
+    let rows: Vec<[String; 5]> = datasets
         .iter()
         .map(|d| {
             [
-                d.r#ref.clone(),
+                d.name.clone(),
+                d.namespace.clone(),
                 d.tags.join(","),
-                format!("{}", d.tables.len()),
+                d.tables.len().to_string(),
                 d.description.clone(),
             ]
         })
         .collect();
-    let header = ["DATASET", "TAGS", "TABLES", "DESCRIPTION"];
     let mut w = header.map(|h| h.len());
     for r in &rows {
         for (i, cell) in r.iter().enumerate() {
             w[i] = w[i].max(cell.len());
         }
     }
-    let fmt_row = |c: &[String; 4]| {
+    // Right-align TABLES (index 3); left-align the rest; last column unpadded.
+    let fmt_row = |c: &[String; 5]| {
         format!(
-            "{:<rw0$}  {:<rw1$}  {:>rw2$}  {}",
+            "{:<w0$}  {:<w1$}  {:<w2$}  {:>w3$}  {}",
             c[0],
             c[1],
             c[2],
             c[3],
-            rw0 = w[0],
-            rw1 = w[1],
-            rw2 = w[2],
+            c[4],
+            w0 = w[0],
+            w1 = w[1],
+            w2 = w[2],
+            w3 = w[3],
         )
     };
-    println!(
-        "{dim}{:<rw0$}  {:<rw1$}  {:>rw2$}  {}{rst}",
-        header[0],
-        header[1],
-        header[2],
-        header[3],
-        rw0 = w[0],
-        rw1 = w[1],
-        rw2 = w[2],
-    );
+    let header_strs: [String; 5] = header.map(|h| h.to_string());
+    println!("{dim}{}{rst}", fmt_row(&header_strs));
     for r in &rows {
         println!("{}", fmt_row(r));
     }
