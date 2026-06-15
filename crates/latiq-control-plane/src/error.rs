@@ -7,6 +7,10 @@ pub enum ControlPlaneError {
     PondNotFound(String),
     #[error("node not found: {0}")]
     NodeNotFound(String),
+    #[error("dataset not found: {0}")]
+    DatasetNotFound(String),
+    #[error("invalid request: {0}")]
+    Invalid(String),
     #[error("storage error: {0}")]
     Storage(String),
 }

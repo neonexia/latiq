@@ -60,7 +60,7 @@ enum Command {
     Pond(PondCmd),
     /// Run a SQL statement (read or write) against a pond.
     Query(QueryArgs),
-    /// Load curated sample datasets (public DuckLake/standard data) into a pond.
+    /// Dataset catalog: add/list/search/remove entries, and load them into a pond.
     #[command(subcommand)]
     Dataset(DatasetCmd),
     /// System snapshot: nodes (state + heartbeat age), ponds, tiers.
@@ -78,15 +78,31 @@ struct StatsArgs {
 #[derive(Subcommand)]
 #[command(after_help = SERVER_HELP)]
 enum DatasetCmd {
-    /// List the available sample datasets.
-    List,
-    /// Load a dataset (or --all) into a pond — one CREATE TABLE per table.
+    /// Add (or replace) a dataset in the catalog. Operator action.
+    Add {
+        /// Full reference "<namespace>.<name>", e.g. `hf.acme.sales`.
+        reference: String,
+        /// A table to include, `name=source_uri` (repeatable).
+        #[arg(short, long = "table", value_name = "NAME=URI", required = true)]
+        tables: Vec<String>,
+        /// Reader format for the tables: parquet | csv | json | auto (inferred).
+        #[arg(short, long, default_value = "auto")]
+        format: String,
+        /// Human description.
+        #[arg(short, long, default_value = "")]
+        description: String,
+        /// Searchable tag (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List/search datasets. Query: `#tag`, `prefix*` (ref glob), or a substring.
+    List { query: Option<String> },
+    /// Remove a dataset from the catalog. Operator action.
+    Remove { reference: String },
+    /// Load a dataset's tables into a pond (one table each).
     Load {
-        /// Dataset name (omit and pass --all to load every dataset).
-        name: Option<String>,
-        /// Load every dataset.
-        #[arg(long)]
-        all: bool,
+        /// Dataset reference, e.g. `latiq.sample.tpch`.
+        reference: String,
         #[arg(short, long)]
         pond: String,
         #[arg(short, long)]
@@ -212,151 +228,181 @@ async fn main() -> Result<()> {
     }
 }
 
-// ---- sample datasets ----------------------------------------------------
+// ---- dataset catalog ----------------------------------------------------
 
-/// A curated sample dataset: one or more tables, each loaded from a public URL.
-/// Data is NOT stored in the repo — these are standard public datasets.
-struct SampleDataset {
-    name: &'static str,
-    description: &'static str,
-    tables: &'static [(&'static str, &'static str)], // (table name, source URL)
-}
-
-const DATASETS: &[SampleDataset] = &[
-    SampleDataset {
-        name: "startrek",
-        description: "Star Trek Season 1 scripts — CSV, ~2 KB",
-        tables: &[(
-            "startrek",
-            "https://blobs.duckdb.org/data/Star_Trek-Season_1.csv",
-        )],
-    },
-    SampleDataset {
-        name: "holdings",
-        description: "Example stock holdings — CSV, ~300 B",
-        tables: &[("holdings", "https://duckdb.org/data/holdings.csv")],
-    },
-    SampleDataset {
-        name: "tpch",
-        description: "TPC-H scale 0.01 — 8 tables, Parquet, a few MB",
-        tables: &[
-            (
-                "lineitem",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet",
-            ),
-            (
-                "orders",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/orders.parquet",
-            ),
-            (
-                "customer",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet",
-            ),
-            (
-                "part",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/part.parquet",
-            ),
-            (
-                "supplier",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/supplier.parquet",
-            ),
-            (
-                "partsupp",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/partsupp.parquet",
-            ),
-            (
-                "nation",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet",
-            ),
-            (
-                "region",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/region.parquet",
-            ),
-        ],
-    },
-    SampleDataset {
-        name: "taxi",
-        description: "NYC yellow-taxi, Apr 2019 — Parquet, ~127 MB (large)",
-        tables: &[("taxi", "https://blobs.duckdb.org/data/taxi_2019_04.parquet")],
-    },
-];
-
-/// The DuckDB reader for a URL, picked by extension.
-fn read_fn(url: &str) -> String {
-    let u = url.to_lowercase();
-    if u.ends_with(".csv") {
-        format!("read_csv_auto('{url}')")
-    } else if u.ends_with(".json") || u.ends_with(".ndjson") {
-        format!("read_json_auto('{url}')")
-    } else {
-        format!("read_parquet('{url}')")
+/// Split a full reference `"<namespace>.<name>"` on the last dot.
+fn split_ref(reference: &str) -> Result<(String, String)> {
+    match reference.rsplit_once('.') {
+        Some((ns, name)) if !ns.is_empty() && !name.is_empty() => {
+            Ok((ns.to_string(), name.to_string()))
+        }
+        _ => Err(anyhow!(
+            "dataset reference must be '<namespace>.<name>', e.g. hf.acme.sales"
+        )),
     }
 }
 
 async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
     match cmd {
-        DatasetCmd::List => {
-            for d in DATASETS {
-                let tn = d.tables.len();
-                println!(
-                    "{:<10} {} table{}  {}",
-                    d.name,
-                    tn,
-                    if tn == 1 { " " } else { "s" },
-                    d.description
-                );
+        DatasetCmd::Add {
+            reference,
+            tables,
+            format,
+            description,
+            tags,
+        } => {
+            let (namespace, name) = split_ref(&reference)?;
+            let mut table_msgs = Vec::with_capacity(tables.len());
+            for t in &tables {
+                let (tn, uri) = t
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("--table must be NAME=URI (got '{t}')"))?;
+                table_msgs.push(DatasetTableMsg {
+                    table_name: tn.trim().to_string(),
+                    source_uri: uri.trim().to_string(),
+                    format: format.clone(),
+                });
             }
+            let mut c = admin_client().await?;
+            let r = c
+                .dataset_add(DatasetAddRequest {
+                    dataset: Some(DatasetMsg {
+                        r#ref: format!("{namespace}.{name}"),
+                        namespace,
+                        name,
+                        description,
+                        tags,
+                        tables: table_msgs,
+                        created_by: "anonymous".into(),
+                        created_at: String::new(),
+                    }),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner();
+            println!("added {}", r.r#ref);
+            Ok(())
+        }
+        DatasetCmd::List { query } => {
+            let mut c = admin_client().await?;
+            let datasets = c
+                .dataset_list(DatasetListRequest {
+                    query: query.unwrap_or_default(),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner()
+                .datasets;
+            print_dataset_table(&datasets);
+            Ok(())
+        }
+        DatasetCmd::Remove { reference } => {
+            let mut c = admin_client().await?;
+            c.dataset_remove(DatasetRemoveRequest {
+                r#ref: reference.clone(),
+            })
+            .await
+            .map_err(|st| anyhow!("{}", st.message()))?;
+            println!("removed {reference}");
             Ok(())
         }
         DatasetCmd::Load {
-            name,
-            all,
+            reference,
             pond,
             agent_id,
         } => {
-            let selected: Vec<&SampleDataset> = if all {
-                DATASETS.iter().collect()
-            } else {
-                let n = name.ok_or_else(|| {
-                    anyhow!("pass a dataset name or --all (see `latiq dataset list`)")
-                })?;
-                vec![DATASETS
-                    .iter()
-                    .find(|d| d.name == n)
-                    .ok_or_else(|| anyhow!("unknown dataset '{n}'; see `latiq dataset list`"))?]
-            };
-            // Resolve the pond's node once; load each table node-direct.
+            // Load runs on the pond node (Data gRPC): it resolves the dataset via
+            // the control plane and materializes each table into the pond.
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
-            for d in selected {
-                for (table, url) in d.tables {
-                    let sql = format!(
-                        "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM {}",
-                        read_fn(url)
-                    );
-                    print!("  {} → {table} … ", d.name);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                    match c
-                        .write_query(with_id(
-                            QueryRequest {
-                                pond: pond.clone(),
-                                sql,
-                            },
-                            &agent_id,
-                        ))
-                        .await
-                    {
-                        Ok(_) => println!("ok"),
-                        Err(st) => {
-                            println!("FAILED");
-                            return print_status(&st);
-                        }
-                    }
+            print!("loading {reference} into {pond} … ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            match c
+                .load_dataset(with_id(
+                    LoadDatasetRequest {
+                        pond: pond.clone(),
+                        dataset_ref: reference,
+                    },
+                    &agent_id,
+                ))
+                .await
+            {
+                Ok(resp) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&resp.into_inner().json).unwrap_or_default();
+                    let tables = v
+                        .get("tables")
+                        .and_then(|t| t.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    println!("ok ({tables} table{})", if tables == 1 { "" } else { "s" });
+                    Ok(())
+                }
+                Err(st) => {
+                    println!("FAILED");
+                    print_status(&st)
                 }
             }
-            Ok(())
         }
+    }
+}
+
+/// Render `dataset list` as an aligned table: ref, tags, table count, description.
+fn print_dataset_table(datasets: &[DatasetMsg]) {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    let (dim, rst) = if tty {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    if datasets.is_empty() {
+        println!("{dim}no datasets{rst}");
+        return;
+    }
+    let rows: Vec<[String; 4]> = datasets
+        .iter()
+        .map(|d| {
+            [
+                d.r#ref.clone(),
+                d.tags.join(","),
+                format!("{}", d.tables.len()),
+                d.description.clone(),
+            ]
+        })
+        .collect();
+    let header = ["DATASET", "TAGS", "TABLES", "DESCRIPTION"];
+    let mut w = header.map(|h| h.len());
+    for r in &rows {
+        for (i, cell) in r.iter().enumerate() {
+            w[i] = w[i].max(cell.len());
+        }
+    }
+    let fmt_row = |c: &[String; 4]| {
+        format!(
+            "{:<rw0$}  {:<rw1$}  {:>rw2$}  {}",
+            c[0],
+            c[1],
+            c[2],
+            c[3],
+            rw0 = w[0],
+            rw1 = w[1],
+            rw2 = w[2],
+        )
+    };
+    println!(
+        "{dim}{:<rw0$}  {:<rw1$}  {:>rw2$}  {}{rst}",
+        header[0],
+        header[1],
+        header[2],
+        header[3],
+        rw0 = w[0],
+        rw1 = w[1],
+        rw2 = w[2],
+    );
+    for r in &rows {
+        println!("{}", fmt_row(r));
     }
 }
 
@@ -970,28 +1016,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_fn_picks_reader_by_extension() {
-        assert!(read_fn("https://x/a.parquet").starts_with("read_parquet("));
-        assert!(read_fn("https://x/a.csv").starts_with("read_csv_auto("));
-        assert!(read_fn("https://x/a.json").starts_with("read_json_auto("));
-        // unknown extension defaults to parquet
-        assert!(read_fn("https://x/a").starts_with("read_parquet("));
-    }
-
-    #[test]
-    fn dataset_catalog_is_well_formed() {
-        let mut names = std::collections::HashSet::new();
-        for d in DATASETS {
-            assert!(names.insert(d.name), "duplicate dataset name '{}'", d.name);
-            assert!(!d.tables.is_empty(), "dataset '{}' has no tables", d.name);
-            for (table, url) in d.tables {
-                assert!(!table.is_empty(), "{} has an empty table name", d.name);
-                assert!(
-                    url.starts_with("https://"),
-                    "{}.{table} url must be https (public): {url}",
-                    d.name
-                );
-            }
-        }
+    fn split_ref_takes_last_dot_as_name() {
+        assert_eq!(
+            split_ref("latiq.sample.tpch").unwrap(),
+            ("latiq.sample".to_string(), "tpch".to_string())
+        );
+        assert_eq!(
+            split_ref("hf.acme").unwrap(),
+            ("hf".to_string(), "acme".to_string())
+        );
+        assert!(split_ref("nodot").is_err());
+        assert!(split_ref(".name").is_err());
+        assert!(split_ref("ns.").is_err());
     }
 }

@@ -14,7 +14,11 @@ service Data {
   rpc ReadQuery(QueryRequest) returns (JsonResponse);
   rpc WriteQuery(QueryRequest) returns (JsonResponse);
   rpc ExplainQuery(QueryRequest) returns (JsonResponse);
+  // Materialize a catalog dataset's tables into the pond (one CREATE TABLE each).
+  rpc LoadDataset(LoadDatasetRequest) returns (JsonResponse);
 }
+
+message LoadDatasetRequest { string pond = 1; string dataset_ref = 2; }
 
 message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; }
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }

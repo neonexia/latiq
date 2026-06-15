@@ -3,7 +3,7 @@
 //! registry remotely. `ControlClient<Channel>` is cheaply cloneable, so each
 //! call clones it (tonic RPC methods take `&mut self`).
 use latiq_agent_core::{AgentError, ControlPlane};
-use latiq_agent_core::{AuditRecord, PondInfo};
+use latiq_agent_core::{AuditRecord, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::*;
 use tonic::transport::Channel;
@@ -49,6 +49,27 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         node_endpoint: Some(m.node_endpoint).filter(|s| !s.is_empty()),
         tier: m.tier,
         extensions: m.extensions,
+    }
+}
+
+fn dataset_to_info(m: DatasetMsg) -> DatasetInfo {
+    DatasetInfo {
+        reference: m.r#ref,
+        namespace: m.namespace,
+        name: m.name,
+        description: m.description,
+        tags: m.tags,
+        tables: m
+            .tables
+            .into_iter()
+            .map(|t| DatasetTableInfo {
+                table_name: t.table_name,
+                source_uri: t.source_uri,
+                format: t.format,
+            })
+            .collect(),
+        created_by: m.created_by,
+        created_at: m.created_at,
     }
 }
 
@@ -130,6 +151,37 @@ impl ControlPlane for GrpcControlPlane {
         .await
         .map_err(status_err)?;
         Ok(())
+    }
+
+    async fn list_datasets(&self, query: &str) -> Result<Vec<DatasetInfo>, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .list_datasets(ListDatasetsRequest {
+                query: query.to_string(),
+            })
+            .await
+            .map_err(status_err)?
+            .into_inner();
+        Ok(resp.datasets.into_iter().map(dataset_to_info).collect())
+    }
+
+    async fn get_dataset(&self, reference: &str) -> Result<DatasetInfo, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .get_dataset(GetDatasetRequest {
+                r#ref: reference.to_string(),
+            })
+            .await
+            // A missing dataset is a dataset error, not a pond error (status_err
+            // defaults NotFound → pond). We know the ref here, so name it.
+            .map_err(|s| match s.code() {
+                Code::NotFound => AgentError::dataset_not_found(reference),
+                _ => status_err(s),
+            })?
+            .into_inner();
+        resp.dataset
+            .map(dataset_to_info)
+            .ok_or_else(|| AgentError::dataset_not_found(reference))
     }
 
     async fn record_audit(&self, rec: AuditRecord) {

@@ -6,7 +6,9 @@ use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
-use crate::types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
+use crate::types::{
+    AllocateResult, AuditRecord, DatasetInfo, DescribeResult, LoadDatasetResult, PondInfo,
+};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use latiq_common::ErrorKind;
@@ -276,6 +278,40 @@ impl AgentOps {
         Ok(res)
     }
 
+    // ---- dataset catalog --------------------------------------------------
+
+    /// Browse/search the dataset catalog (delegates to the control plane).
+    pub async fn list_datasets(&self, query: &str) -> Result<Vec<DatasetInfo>, AgentError> {
+        self.control.list_datasets(query).await
+    }
+
+    pub async fn get_dataset(&self, reference: &str) -> Result<DatasetInfo, AgentError> {
+        self.control.get_dataset(reference).await
+    }
+
+    /// Materialize a catalog dataset's tables into a pond — one `CREATE OR REPLACE
+    /// TABLE … AS SELECT * FROM read_*(uri)` per table, routed through the normal
+    /// write path (so forwarding to the owning node is handled). Slice 1 sources
+    /// are public; credentialed sources come with the identity work (issue #26).
+    pub async fn load_dataset(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        dataset_ref: &str,
+    ) -> Result<LoadDatasetResult, AgentError> {
+        let ds = self.control.get_dataset(dataset_ref).await?;
+        let mut loaded = Vec::with_capacity(ds.tables.len());
+        for t in &ds.tables {
+            let sql = dataset_load_sql(&t.table_name, &t.source_uri, &t.format);
+            self.write_query(identity, pond_ref, &sql).await?;
+            loaded.push(t.table_name.clone());
+        }
+        Ok(LoadDatasetResult {
+            dataset: ds.reference,
+            tables: loaded,
+        })
+    }
+
     /// Stream a read as Arrow batches. Local: drive the engine's `read_arrow` on
     /// the blocking pool, delivering the schema then batches over channels
     /// (bounded mpsc → backpressure). Remote: forward to the owning node. The
@@ -543,6 +579,32 @@ impl AgentOps {
 /// Map a pond's tier name to its resource caps (unknown/empty → medium).
 fn tier_limits(tier: &str) -> Option<ResourceLimits> {
     Some(PondTier::parse(tier).unwrap_or_default().limits())
+}
+
+/// Build the `CREATE OR REPLACE TABLE … AS SELECT * FROM read_*(uri)` for one
+/// dataset table. `format` picks the DuckDB reader; `auto` infers from the URI
+/// extension. The table name is quoted and the URI's single quotes are escaped
+/// (the catalog is operator-curated, but we still don't let a stray quote break
+/// out of the string literal).
+fn dataset_load_sql(table_name: &str, source_uri: &str, format: &str) -> String {
+    let reader = match format.trim().to_lowercase().as_str() {
+        "csv" => "read_csv_auto",
+        "json" => "read_json_auto",
+        "parquet" => "read_parquet",
+        _ => {
+            let u = source_uri.to_lowercase();
+            if u.ends_with(".csv") {
+                "read_csv_auto"
+            } else if u.ends_with(".json") || u.ends_with(".ndjson") {
+                "read_json_auto"
+            } else {
+                "read_parquet"
+            }
+        }
+    };
+    let table = format!("\"{}\"", table_name.replace('"', "\"\""));
+    let uri = source_uri.replace('\'', "''");
+    format!("CREATE OR REPLACE TABLE {table} AS SELECT * FROM {reader}('{uri}')")
 }
 
 /// Per-pond query/error counters — recorded on the node that actually runs the

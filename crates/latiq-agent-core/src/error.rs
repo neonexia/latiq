@@ -50,6 +50,15 @@ impl AgentError {
         )
     }
 
+    pub fn dataset_not_found(reference: &str) -> Self {
+        Self::new(
+            ErrorKind::DatasetNotFound,
+            format!("Dataset '{reference}' is not in the catalog."),
+            "Call list_datasets to see what's available (try a namespace like 'latiq.sample').",
+            "latiq://datasets",
+        )
+    }
+
     pub fn unsupported_extension(message: impl Into<String>) -> Self {
         Self::new(
             ErrorKind::InvalidValue,

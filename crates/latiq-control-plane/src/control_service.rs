@@ -23,6 +23,8 @@ fn to_status(e: ControlPlaneError) -> Status {
         // failure, NOT "pond not found" — collapsing them mislabels allocate-with-
         // no-node as a missing pond (review #13).
         ControlPlaneError::NodeNotFound(m) => Status::failed_precondition(m),
+        ControlPlaneError::DatasetNotFound(m) => Status::not_found(m),
+        ControlPlaneError::Invalid(m) => Status::invalid_argument(m),
         ControlPlaneError::Storage(m) => Status::internal(m),
     }
 }
@@ -189,5 +191,32 @@ impl Control for ControlService {
             })
             .map_err(to_status)?;
         Ok(Response::new(RecordAuditResponse {}))
+    }
+
+    async fn get_dataset(
+        &self,
+        req: Request<GetDatasetRequest>,
+    ) -> Result<Response<GetDatasetResponse>, Status> {
+        let d = self
+            .registry
+            .get_dataset(&req.into_inner().r#ref)
+            .map_err(to_status)?;
+        Ok(Response::new(GetDatasetResponse {
+            dataset: Some(crate::dataset_convert::to_msg(d)),
+        }))
+    }
+
+    async fn list_datasets(
+        &self,
+        req: Request<ListDatasetsRequest>,
+    ) -> Result<Response<ListDatasetsResponse>, Status> {
+        let datasets = self
+            .registry
+            .list_datasets(&req.into_inner().query)
+            .map_err(to_status)?
+            .into_iter()
+            .map(crate::dataset_convert::to_msg)
+            .collect();
+        Ok(Response::new(ListDatasetsResponse { datasets }))
     }
 }
