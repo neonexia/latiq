@@ -106,6 +106,19 @@ pub async fn serve_data(
 /// Run a pond node: register with the control plane, start a heartbeat loop, and
 /// serve the agent MCP surface + the Data/Query gRPC surface (blocks).
 pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
+    // Latiq is built on the ducklake + httpfs extensions — ensure they load BEFORE
+    // we register or serve, so a node that can't function never joins the cluster.
+    // Fail fast with a clear error rather than degrading per pond.
+    tokio::task::spawn_blocking(latiq_engine_duckdb::ensure_standard_extensions)
+        .await
+        .map_err(|e| anyhow::anyhow!("extension check failed to run: {e}"))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Latiq requires the ducklake and httpfs DuckDB extensions but could \
+                 not load them (bake them into the deployment image): {e}"
+            )
+        })?;
+
     let mcp_endpoint = format!("http://{}/mcp", cfg.mcp_addr);
     let ops = build_ops(
         &cfg.node_id,
@@ -116,12 +129,12 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     )
     .await?;
 
-    // Warm the DuckDB extension cache once, in the background — the dev stand-in
-    // for image-baking (a no-op when the image is pre-baked). Keeps per-pond LOADs
-    // download-free; never blocks serving or the agent's pond-create path.
+    // Warm the OPTIONAL extension cache once, in the background — the dev stand-in
+    // for image-baking (a no-op when the image is pre-baked). Best-effort: keeps
+    // per-pond LOADs download-free without blocking serving or the create path.
     tokio::task::spawn_blocking(|| {
-        tracing::info!("warming DuckDB extension cache");
-        latiq_engine_duckdb::warm_extension_cache();
+        tracing::info!("warming optional DuckDB extension cache");
+        latiq_engine_duckdb::warm_optional_extensions();
     });
 
     // Prometheus /metrics + the gauge collector (if a metrics port is configured).
