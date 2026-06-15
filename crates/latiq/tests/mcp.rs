@@ -1,4 +1,4 @@
-//! Full-stack feature tests for the agent MCP surface: the 7 tools (annotated),
+//! Full-stack feature tests for the agent MCP surface: the tools (annotated),
 //! resources (latiq://…), and prompts (SOPs), driven by the agent-sim client
 //! over the real MCP transport. Names prefixed by feature.
 mod common;
@@ -6,6 +6,60 @@ mod common;
 use common::start_stack;
 use latiq_client::LatiqClient;
 use serde_json::{Map, Value};
+
+#[tokio::test]
+async fn external_data_tools_discover_and_load_via_mcp() {
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
+        .await
+        .unwrap();
+
+    // The dataset/catalog tools are advertised, with correct annotations.
+    let tools = c.list_tools().await.unwrap();
+    for name in [
+        "list_datasets",
+        "load_dataset",
+        "list_catalogs",
+        "describe_catalog",
+        "pull_catalog",
+    ] {
+        assert!(tools.iter().any(|t| t.name == name), "missing tool {name}");
+    }
+    let pull = tools.iter().find(|t| t.name == "pull_catalog").unwrap();
+    assert_eq!(
+        pull.annotations.as_ref().and_then(|a| a.destructive_hint),
+        Some(true),
+        "pull_catalog writes into the pond → destructive"
+    );
+
+    // The agent-facing recipe is discoverable.
+    let uris = c.list_resource_uris().await.unwrap();
+    assert!(uris.iter().any(|u| u == "latiq://recipes/external-data"));
+
+    // list_datasets surfaces the seeded samples; load_dataset copies one in.
+    let ds = c.call_tool("list_datasets", Map::new()).await.unwrap();
+    assert!(!ds.is_error, "{:?}", ds.value);
+    let names: Vec<&str> = ds.value["datasets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str())
+        .collect();
+    assert!(names.contains(&"holdings"), "seeded datasets: {names:?}");
+
+    c.allocate_pond(Some("work")).await.unwrap();
+    let mut args = Map::new();
+    args.insert("pond".into(), "work".into());
+    args.insert("dataset".into(), "holdings".into());
+    let loaded = c.call_tool("load_dataset", args).await.unwrap();
+    assert!(!loaded.is_error, "{:?}", loaded.value);
+    let r = c
+        .query("work", "SELECT count(*) AS n FROM holdings")
+        .await
+        .unwrap();
+    assert!(r.value["rows"][0][0].as_i64().unwrap() >= 1);
+    c.close().await.unwrap();
+}
 
 #[tokio::test]
 async fn mcp_tools_full_agent_loop() {

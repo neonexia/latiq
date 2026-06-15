@@ -87,6 +87,16 @@ impl LatiqClient {
         self.call("explain_query", query_args(pond, sql)).await
     }
 
+    /// Call any tool by name with arbitrary args (agent-sim escape hatch for the
+    /// dataset/catalog tools that don't have typed wrappers here).
+    pub async fn call_tool(
+        &self,
+        name: &'static str,
+        args: Map<String, Value>,
+    ) -> Result<CallOutcome> {
+        self.call(name, args).await
+    }
+
     // --- agent-discovery surface (tools/resources/prompts) ---------------
 
     /// All tools, with their MCP annotations (for inspecting read_only/destructive hints).
