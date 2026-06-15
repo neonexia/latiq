@@ -1,136 +1,108 @@
-# Latiq — Dataset Catalog
+# Latiq — Datasets & Catalogs
 
-The dataset catalog is a **registry-backed list of external tables** that operators
-curate and agents/clients load into ponds. Instead of every caller remembering a
-pile of `read_parquet('https://…')` URLs, a dataset gives those sources a **name**,
-a **namespace**, **tags**, and a **description** — so they're discoverable and
-loadable in one command.
+Latiq has **two first-class, separate concepts** for getting external data into a
+pond. The rule of thumb: a **dataset** is a simple file you *copy in*; a
+**catalog** is an external database you *pull from once*.
 
-> **Slice 1 (this doc):** public sources only (https/public object stores).
-> Credentialed sources (private S3, Iceberg/Databricks REST catalogs) arrive with
-> the identity work — see [issue #26](https://github.com/neonexia/latiq/issues/26).
+> **Everything lands in the Latiq data lake.** We never query external catalogs
+> live — a catalog is a tap you open, pull through, and close. All real work
+> happens on the pond (DuckLake).
 
 ---
 
-## Concepts
+## Datasets — simple files in the `latiq` catalog
 
-A **dataset** is:
-
-| Field | Meaning | Example |
-|---|---|---|
-| **namespace** | a dotted path that groups datasets | `latiq.sample`, `hf.acme` |
-| **name** | the leaf name within the namespace | `tpch`, `sales` |
-| **reference** | the full id, `<namespace>.<name>` | `latiq.sample.tpch` |
-| **tables** | one or more external tables (`name` + `source_uri` + `format`) | `lineitem` → `…/lineitem.parquet` |
-| **tags** | searchable labels | `finance`, `apple_hr` |
-| **description** | a human summary | "TPC-H scale 0.01" |
-
-The reference is parsed by splitting on the **last** dot, so the namespace may be
-arbitrarily deep: `hf.acme.sales` → namespace `hf.acme`, name `sales`.
-
-**Where it lives:** the catalog is metadata in the **control-plane registry** (it
-isn't pond data). Loading a dataset materializes its tables into a pond as normal
-tables — so after a load you query them like anything else, and the pond's catalog
-holds no reference back to the source.
-
-**Built-in samples:** the public sample datasets ship seeded under the
-`latiq.sample` namespace (`startrek`, `holdings`, `tpch`, `taxi`).
-
----
-
-## Commands
-
-### List / search
+A dataset is one or more file tables (parquet/CSV/…), each a public URL. Adding
+one registers it; `load` copies its tables into a pond.
 
 ```bash
-latiq dataset list                 # everything
-latiq dataset list '#finance'      # by tag (leading #)
-latiq dataset list 'hf.*'          # by namespace / ref glob (* → wildcard)
-latiq dataset list sales           # substring over ref / description / tags
-```
-
-Output (one row per dataset):
-
-```
-NAME      NAMESPACE     TAGS               TABLES  DESCRIPTION
-sales     hf.acme       #apple_hr,finance       1  Acme sales export
-holdings  latiq.sample  sample                  1  Example stock holdings — CSV, ~300 B
-tpch      latiq.sample  sample,tpch             8  TPC-H scale 0.01 — 8 tables, Parquet
-```
-
-**Search syntax** (the optional `query` argument):
-- `#tag` — datasets carrying that exact tag.
-- `prefix*` — glob over the full reference (e.g. `hf.*`, `latiq.sample.*`, `*tpch`).
-- anything else — case-insensitive substring over reference, description, and tags.
-- omitted — list all.
-
-### Add (operator)
-
-```bash
-latiq dataset add hf.acme.sales \
-  --table sales=https://example.com/sales.parquet \
-  --tag finance --tag apple_hr \
-  --description "Acme sales export"
-```
-
-- The first positional argument is the full reference `<namespace>.<name>`.
-- `--table NAME=URI` is **repeatable** — one per table the dataset exposes:
-  ```bash
-  latiq dataset add acme.events \
+latiq dataset add sales --table sales=https://example.com/sales.parquet \
+    --tag finance --description "Acme sales export"
+latiq dataset add events \
     --table clicks=https://example.com/clicks.parquet \
-    --table views=https://example.com/views.parquet \
-    --description "Acme web events"
-  ```
-- `--tag` is repeatable. `--format` (`parquet` | `csv` | `json` | `auto`, default
-  `auto`) applies to all tables; `auto` infers the reader from the URI extension.
-- Re-adding the same reference **replaces** it (idempotent).
+    --table views=https://example.com/views.parquet         # multiple tables
 
-### Remove (operator)
-
-```bash
-latiq dataset remove hf.acme.sales
+latiq dataset list                 # all
+latiq dataset list '#finance'      # by tag
+latiq dataset list sal*            # name glob / substring
+latiq dataset load tpch -p shop    # copy a dataset's tables into pond `shop`
+latiq dataset remove sales
 ```
 
-### Load into a pond
-
-```bash
-latiq pond create --name demo
-latiq dataset load latiq.sample.tpch -p demo     # materializes all 8 TPC-H tables
-latiq query -p demo "SELECT count(*) FROM orders" # 15000
-```
-
-Each table is created with `CREATE OR REPLACE TABLE <name> AS SELECT * FROM
-read_*('<uri>')` through the **normal write path**, so it's attributed to
-`--agent-id`, snapshotted, and routed/forwarded to the pond's owning node like any
-other write. Loading needs network (the data is fetched from the source URIs).
+The built-in samples (`startrek`, `holdings`, `tpch`, `taxi`) are seeded in the
+`latiq` catalog.
 
 ---
+
+## Catalogs — external sources you pull from
+
+A catalog is an external attachable database (iceberg today; ducklake/duckdb/…
+later). An operator registers it with a **type** and **`--set` params** (locator
+metadata only). Agents/clients then **pull** from it: a one-shot transient
+`attach → run your query → detach` that materializes a subset into the pond.
+
+```bash
+# register (operator). --set carries locator params; credentials are NOT stored.
+latiq catalog add lake --type iceberg \
+    --set endpoint=https://polaris.acme/api/catalog \
+    --set warehouse=prod \
+    --description "Acme Iceberg" --tag prod
+
+latiq catalog list                       # all / '#tag' / glob / substring
+latiq catalog describe lake -p shop --set token="$BEARER"   # list its tables (transient)
+
+# pull a subset into the pond (the query names the catalog + its target table):
+latiq catalog pull lake -p shop --set token="$BEARER" \
+    --query "CREATE TABLE us_orders AS SELECT id,total FROM lake.sales.orders WHERE region='us'"
+
+latiq catalog remove lake
+```
+
+DuckDB's parquet/Iceberg pushdown means the pull downloads only the columns and
+row-groups your query touches — not the whole table.
+
+### Credentials (`--set` everywhere, never stored)
+
+The same `--set key=value` is used on `add`, `describe`, and `pull`. The
+per-type **attacher** maps the keys to the right DuckDB `CREATE SECRET` / `ATTACH`
+clauses. Two rules keep Latiq credential-free:
+
+- **At `add`, credential-shaped keys are dropped** (an allowlist per type keeps
+  only locator metadata like `endpoint`/`warehouse`). The CLI tells you:
+  `(not stored, pass at pull: token)`.
+- **Credentials ride in at `pull`/`describe`** as `--set token=…` (or, later, the
+  caller's identity bearer). They build a *temporary* DuckDB secret for that one
+  operation and are dropped on detach. Nothing persists.
+
+Pull-time `--set` values are merged over the catalog's stored locator params
+(**pull wins**). See [issue #26](https://github.com/neonexia/latiq/issues/26) for
+the identity-bearer integration.
+
+### Iceberg params
+
+| `--set` key | When | Meaning |
+|---|---|---|
+| `endpoint` | add | REST catalog URL |
+| `warehouse` | add | warehouse/catalog name to ATTACH |
+| `s3_endpoint`, `s3_region` | add | storage backend locator |
+| `token` | pull/describe | OAuth bearer for the REST catalog |
+| `s3_access_key`, `s3_secret_key` | pull/describe | SigV4 storage creds |
+
+---
+
+## The split
+
+| | **Dataset** | **Catalog** |
+|---|---|---|
+| What | one or more simple files | an external database/lake |
+| Lives | in the built-in `latiq` catalog | first-class, registered |
+| Tables | it *is* the tables | **discovered** (`describe`) |
+| Into a pond | **load** (copy) | **pull** (transient attach → query → detach) |
+| Credentials | n/a (public) | at pull, never stored |
 
 ## Surfaces
 
-The catalog respects Latiq's surface separation — agents can load datasets but
-only operators can curate them.
-
-| Operation | Admin gRPC (operators) | Data gRPC (CLI / SDK) | MCP (agents) |
-|---|---|---|---|
-| add / remove | ✅ | — | — |
-| list / search | ✅ | ✅ (via the node) | ✅ *(next slice)* |
-| load into a pond | — | ✅ | ✅ *(next slice)* |
-
-Internally a pond node reads the catalog over **Control gRPC** (`GetDataset` /
-`ListDatasets`) and loads via the Data gRPC `LoadDataset`; the control plane is
-never in the data path.
-
-> **Agent (MCP) access** — list/load tools plus a `latiq://datasets` resource so
-> agents can discover and pull datasets — is the next slice on top of the same
-> `AgentOps` methods.
-
----
-
-## Credentials (deferred)
-
-Slice 1 datasets point at **public** URIs. For private sources, Latiq will be a
-**pass-through**: it stores no credentials — the caller's token is attached to a
-temporary, source-scoped DuckDB secret only for the duration of the load, then
-dropped. See [issue #26](https://github.com/neonexia/latiq/issues/26) (done with
-the identity work, [#5](https://github.com/neonexia/latiq/issues/5)).
+`dataset add/remove`, `catalog add/remove` are **operator** (Admin gRPC) actions.
+`list`, `dataset load`, `catalog describe/pull` are available to **CLI/SDK** (Data
+gRPC) and **agents** (MCP — the tool layer is the next slice on top of the same
+`AgentOps` methods).

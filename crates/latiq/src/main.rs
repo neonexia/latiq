@@ -60,9 +60,12 @@ enum Command {
     Pond(PondCmd),
     /// Run a SQL statement (read or write) against a pond.
     Query(QueryArgs),
-    /// Dataset catalog: add/list/search/remove entries, and load them into a pond.
+    /// Datasets (simple files in the `latiq` catalog): add/list/load/remove.
     #[command(subcommand)]
     Dataset(DatasetCmd),
+    /// External catalogs (iceberg/…): add/list/describe/pull/remove.
+    #[command(subcommand)]
+    Catalog(CatalogCmd),
     /// System snapshot: nodes (state + heartbeat age), ponds, tiers.
     Stats(StatsArgs),
 }
@@ -78,10 +81,10 @@ struct StatsArgs {
 #[derive(Subcommand)]
 #[command(after_help = SERVER_HELP)]
 enum DatasetCmd {
-    /// Add (or replace) a dataset in the catalog. Operator action.
+    /// Add (or replace) a dataset. Operator action.
     Add {
-        /// Full reference "<namespace>.<name>", e.g. `hf.acme.sales`.
-        reference: String,
+        /// Dataset name (a bare identifier), e.g. `sales`.
+        name: String,
         /// A table to include, `name=source_uri` (repeatable).
         #[arg(short, long = "table", value_name = "NAME=URI", required = true)]
         tables: Vec<String>,
@@ -95,19 +98,67 @@ enum DatasetCmd {
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
-    /// List/search datasets. Query: `#tag`, `prefix*` (ref glob), or a substring.
+    /// List/search datasets. Query: `#tag`, `prefix*`, or a substring.
     List { query: Option<String> },
-    /// Remove a dataset from the catalog. Operator action.
-    Remove { reference: String },
+    /// Remove a dataset. Operator action.
+    Remove { name: String },
     /// Load a dataset's tables into a pond (one table each).
     Load {
-        /// Dataset reference, e.g. `latiq.sample.tpch`.
-        reference: String,
+        name: String,
         #[arg(short, long)]
         pond: String,
         #[arg(short, long)]
         agent_id: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+#[command(after_help = SERVER_HELP)]
+enum CatalogCmd {
+    /// Register (or replace) an external catalog. Operator action. `--set` carries
+    /// locator params (credentials are dropped here — pass them at pull/describe).
+    Add {
+        /// Catalog name (a bare identifier), e.g. `lake`.
+        name: String,
+        /// Catalog type: iceberg.
+        #[arg(short, long)]
+        r#type: String,
+        /// Config param `key=value` (repeatable), e.g. `--set endpoint=...`.
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(short, long, default_value = "")]
+        description: String,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List/search catalogs. Query: `#tag`, `prefix*`, or a substring.
+    List { query: Option<String> },
+    /// List a catalog's tables (transient attach on a pond). `--set` for creds.
+    Describe {
+        name: String,
+        #[arg(short, long)]
+        pond: String,
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
+    /// Pull from a catalog into a pond: transient attach → run the query → detach.
+    Pull {
+        name: String,
+        #[arg(short, long)]
+        pond: String,
+        /// SQL that materializes into the pond, e.g.
+        /// `CREATE TABLE t AS SELECT * FROM <catalog>.schema.table WHERE …`.
+        #[arg(short, long)]
+        query: String,
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
+    /// Remove a catalog. Operator action.
+    Remove { name: String },
 }
 
 #[derive(Args)]
@@ -224,34 +275,34 @@ async fn main() -> Result<()> {
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
         Command::Query(a) => run_query(a).await,
         Command::Dataset(cmd) => run_dataset_cmd(cmd).await,
+        Command::Catalog(cmd) => run_catalog_cmd(cmd).await,
         Command::Stats(a) => run_stats(a).await,
     }
 }
 
-// ---- dataset catalog ----------------------------------------------------
+// ---- datasets + external catalogs ---------------------------------------
 
-/// Split a full reference `"<namespace>.<name>"` on the last dot.
-fn split_ref(reference: &str) -> Result<(String, String)> {
-    match reference.rsplit_once('.') {
-        Some((ns, name)) if !ns.is_empty() && !name.is_empty() => {
-            Ok((ns.to_string(), name.to_string()))
-        }
-        _ => Err(anyhow!(
-            "dataset reference must be '<namespace>.<name>', e.g. hf.acme.sales"
-        )),
+/// Parse repeatable `key=value` flags into a map (used by `--set`).
+fn parse_kv(items: &[String], flag: &str) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    for it in items {
+        let (k, v) = it
+            .split_once('=')
+            .ok_or_else(|| anyhow!("{flag} must be KEY=VALUE (got '{it}')"))?;
+        out.insert(k.trim().to_string(), v.trim().to_string());
     }
+    Ok(out)
 }
 
 async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
     match cmd {
         DatasetCmd::Add {
-            reference,
+            name,
             tables,
             format,
             description,
             tags,
         } => {
-            let (namespace, name) = split_ref(&reference)?;
             let mut table_msgs = Vec::with_capacity(tables.len());
             for t in &tables {
                 let (tn, uri) = t
@@ -267,8 +318,6 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
             let r = c
                 .dataset_add(DatasetAddRequest {
                     dataset: Some(DatasetMsg {
-                        r#ref: format!("{namespace}.{name}"),
-                        namespace,
                         name,
                         description,
                         tags,
@@ -280,7 +329,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                 .await
                 .map_err(|st| anyhow!("{}", st.message()))?
                 .into_inner();
-            println!("added {}", r.r#ref);
+            println!("added {}", r.name);
             Ok(())
         }
         DatasetCmd::List { query } => {
@@ -293,36 +342,48 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                 .map_err(|st| anyhow!("{}", st.message()))?
                 .into_inner()
                 .datasets;
-            print_dataset_table(&datasets);
+            let rows: Vec<[String; 4]> = datasets
+                .iter()
+                .map(|d| {
+                    [
+                        d.name.clone(),
+                        d.tags.join(","),
+                        d.tables.len().to_string(),
+                        d.description.clone(),
+                    ]
+                })
+                .collect();
+            print_kv_table(
+                &["NAME", "TAGS", "TABLES", "DESCRIPTION"],
+                &rows,
+                2,
+                "no datasets",
+            );
             Ok(())
         }
-        DatasetCmd::Remove { reference } => {
+        DatasetCmd::Remove { name } => {
             let mut c = admin_client().await?;
-            c.dataset_remove(DatasetRemoveRequest {
-                r#ref: reference.clone(),
-            })
-            .await
-            .map_err(|st| anyhow!("{}", st.message()))?;
-            println!("removed {reference}");
+            c.dataset_remove(DatasetRemoveRequest { name: name.clone() })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?;
+            println!("removed {name}");
             Ok(())
         }
         DatasetCmd::Load {
-            reference,
+            name,
             pond,
             agent_id,
         } => {
-            // Load runs on the pond node (Data gRPC): it resolves the dataset via
-            // the control plane and materializes each table into the pond.
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
-            print!("loading {reference} into {pond} … ");
+            print!("loading {name} into {pond} … ");
             use std::io::Write;
             std::io::stdout().flush().ok();
             match c
                 .load_dataset(with_id(
                     LoadDatasetRequest {
                         pond: pond.clone(),
-                        dataset_ref: reference,
+                        dataset: name,
                     },
                     &agent_id,
                 ))
@@ -331,12 +392,11 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                 Ok(resp) => {
                     let v: serde_json::Value =
                         serde_json::from_str(&resp.into_inner().json).unwrap_or_default();
-                    let tables = v
+                    let n = v
                         .get("tables")
                         .and_then(|t| t.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    println!("ok ({tables} table{})", if tables == 1 { "" } else { "s" });
+                        .map_or(0, |a| a.len());
+                    println!("ok ({n} table{})", if n == 1 { "" } else { "s" });
                     Ok(())
                 }
                 Err(st) => {
@@ -348,59 +408,191 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
     }
 }
 
-/// Render `dataset list` as an aligned table: ref, tags, table count, description.
-fn print_dataset_table(datasets: &[DatasetMsg]) {
+async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
+    match cmd {
+        CatalogCmd::Add {
+            name,
+            r#type,
+            set,
+            description,
+            tags,
+        } => {
+            let params = parse_kv(&set, "--set")?;
+            let mut c = admin_client().await?;
+            let r = c
+                .catalog_add(CatalogAddRequest {
+                    catalog: Some(CatalogMsg {
+                        name,
+                        r#type,
+                        params,
+                        description,
+                        tags,
+                        created_by: "anonymous".into(),
+                        created_at: String::new(),
+                    }),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner();
+            println!("added {}", r.name);
+            if !r.dropped_params.is_empty() {
+                // Credentials never persist — they're dropped here and passed at pull.
+                println!(
+                    "  (not stored, pass at pull: {})",
+                    r.dropped_params.join(", ")
+                );
+            }
+            Ok(())
+        }
+        CatalogCmd::List { query } => {
+            let mut c = admin_client().await?;
+            let catalogs = c
+                .catalog_list(CatalogListRequest {
+                    query: query.unwrap_or_default(),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner()
+                .catalogs;
+            let rows: Vec<[String; 4]> = catalogs
+                .iter()
+                .map(|c| {
+                    [
+                        c.name.clone(),
+                        c.r#type.clone(),
+                        c.tags.join(","),
+                        c.description.clone(),
+                    ]
+                })
+                .collect();
+            print_kv_table(
+                &["NAME", "TYPE", "TAGS", "DESCRIPTION"],
+                &rows,
+                99,
+                "no catalogs",
+            );
+            Ok(())
+        }
+        CatalogCmd::Describe {
+            name,
+            pond,
+            set,
+            agent_id,
+        } => {
+            let params = parse_kv(&set, "--set")?;
+            let node = data_target(&pond).await?;
+            let mut c = data_client(&node).await?;
+            let resp = c
+                .catalog_describe(with_id(
+                    CatalogDescribeRequest {
+                        pond,
+                        catalog: name,
+                        params,
+                    },
+                    &agent_id,
+                ))
+                .await
+                .map_err(|st| {
+                    let _ = print_status(&st);
+                    anyhow!("describe failed")
+                })?
+                .into_inner();
+            println!("{}", resp.json);
+            Ok(())
+        }
+        CatalogCmd::Pull {
+            name,
+            pond,
+            query,
+            set,
+            agent_id,
+        } => {
+            let params = parse_kv(&set, "--set")?;
+            let node = data_target(&pond).await?;
+            let mut c = data_client(&node).await?;
+            print!("pulling from {name} into {pond} … ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            match c
+                .catalog_pull(with_id(
+                    CatalogPullRequest {
+                        pond,
+                        catalog: name,
+                        query,
+                        params,
+                    },
+                    &agent_id,
+                ))
+                .await
+            {
+                Ok(_) => {
+                    println!("ok");
+                    Ok(())
+                }
+                Err(st) => {
+                    println!("FAILED");
+                    print_status(&st)
+                }
+            }
+        }
+        CatalogCmd::Remove { name } => {
+            let mut c = admin_client().await?;
+            c.catalog_remove(CatalogRemoveRequest { name: name.clone() })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?;
+            println!("removed {name}");
+            Ok(())
+        }
+    }
+}
+
+/// Render an aligned table. `right_col` is the index to right-align (use a large
+/// number for none); the last column is left unpadded.
+fn print_kv_table<const N: usize>(
+    header: &[&str; N],
+    rows: &[[String; N]],
+    right_col: usize,
+    empty: &str,
+) {
     use std::io::IsTerminal;
-    let tty = std::io::stdout().is_terminal();
-    let (dim, rst) = if tty {
+    let (dim, rst) = if std::io::stdout().is_terminal() {
         ("\x1b[2m", "\x1b[0m")
     } else {
         ("", "")
     };
-    if datasets.is_empty() {
-        println!("{dim}no datasets{rst}");
+    if rows.is_empty() {
+        println!("{dim}{empty}{rst}");
         return;
     }
-    // Columns: NAME · NAMESPACE · TAGS · TABLES · DESCRIPTION. TABLES is the only
-    // right-aligned (numeric) column.
-    let header = ["NAME", "NAMESPACE", "TAGS", "TABLES", "DESCRIPTION"];
-    let rows: Vec<[String; 5]> = datasets
-        .iter()
-        .map(|d| {
-            [
-                d.name.clone(),
-                d.namespace.clone(),
-                d.tags.join(","),
-                d.tables.len().to_string(),
-                d.description.clone(),
-            ]
-        })
-        .collect();
-    let mut w = header.map(|h| h.len());
-    for r in &rows {
+    let mut w = [0usize; N];
+    for (i, h) in header.iter().enumerate() {
+        w[i] = h.len();
+    }
+    for r in rows {
         for (i, cell) in r.iter().enumerate() {
             w[i] = w[i].max(cell.len());
         }
     }
-    // Right-align TABLES (index 3); left-align the rest; last column unpadded.
-    let fmt_row = |c: &[String; 5]| {
-        format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:>w3$}  {}",
-            c[0],
-            c[1],
-            c[2],
-            c[3],
-            c[4],
-            w0 = w[0],
-            w1 = w[1],
-            w2 = w[2],
-            w3 = w[3],
-        )
+    let fmt = |cells: &[String; N]| -> String {
+        let mut s = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                s.push_str("  ");
+            }
+            if i == N - 1 {
+                s.push_str(cell);
+            } else if i == right_col {
+                s.push_str(&format!("{cell:>width$}", width = w[i]));
+            } else {
+                s.push_str(&format!("{cell:<width$}", width = w[i]));
+            }
+        }
+        s
     };
-    let header_strs: [String; 5] = header.map(|h| h.to_string());
-    println!("{dim}{}{rst}", fmt_row(&header_strs));
-    for r in &rows {
-        println!("{}", fmt_row(r));
+    let head: [String; N] = std::array::from_fn(|i| header[i].to_string());
+    println!("{dim}{}{rst}", fmt(&head));
+    for r in rows {
+        println!("{}", fmt(r));
     }
 }
 
@@ -1014,17 +1206,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_ref_takes_last_dot_as_name() {
-        assert_eq!(
-            split_ref("latiq.sample.tpch").unwrap(),
-            ("latiq.sample".to_string(), "tpch".to_string())
-        );
-        assert_eq!(
-            split_ref("hf.acme").unwrap(),
-            ("hf".to_string(), "acme".to_string())
-        );
-        assert!(split_ref("nodot").is_err());
-        assert!(split_ref(".name").is_err());
-        assert!(split_ref("ns.").is_err());
+    fn parse_kv_splits_on_first_equals() {
+        let m = parse_kv(
+            &[
+                "endpoint=https://x?a=b".to_string(),
+                "warehouse=prod".to_string(),
+            ],
+            "--set",
+        )
+        .unwrap();
+        assert_eq!(m["endpoint"], "https://x?a=b");
+        assert_eq!(m["warehouse"], "prod");
+        assert!(parse_kv(&["noequals".to_string()], "--set").is_err());
     }
 }

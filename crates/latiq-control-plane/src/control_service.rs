@@ -23,7 +23,9 @@ fn to_status(e: ControlPlaneError) -> Status {
         // failure, NOT "pond not found" — collapsing them mislabels allocate-with-
         // no-node as a missing pond (review #13).
         ControlPlaneError::NodeNotFound(m) => Status::failed_precondition(m),
-        ControlPlaneError::DatasetNotFound(m) => Status::not_found(m),
+        ControlPlaneError::DatasetNotFound(m) | ControlPlaneError::CatalogNotFound(m) => {
+            Status::not_found(m)
+        }
         ControlPlaneError::Invalid(m) => Status::invalid_argument(m),
         ControlPlaneError::Storage(m) => Status::internal(m),
     }
@@ -199,10 +201,10 @@ impl Control for ControlService {
     ) -> Result<Response<GetDatasetResponse>, Status> {
         let d = self
             .registry
-            .get_dataset(&req.into_inner().r#ref)
+            .get_dataset(&req.into_inner().name)
             .map_err(to_status)?;
         Ok(Response::new(GetDatasetResponse {
-            dataset: Some(crate::dataset_convert::to_msg(d)),
+            dataset: Some(crate::dataset_convert::dataset_to_msg(d)),
         }))
     }
 
@@ -215,8 +217,35 @@ impl Control for ControlService {
             .list_datasets(&req.into_inner().query)
             .map_err(to_status)?
             .into_iter()
-            .map(crate::dataset_convert::to_msg)
+            .map(crate::dataset_convert::dataset_to_msg)
             .collect();
         Ok(Response::new(ListDatasetsResponse { datasets }))
+    }
+
+    async fn get_catalog(
+        &self,
+        req: Request<GetCatalogRequest>,
+    ) -> Result<Response<GetCatalogResponse>, Status> {
+        let c = self
+            .registry
+            .get_catalog(&req.into_inner().name)
+            .map_err(to_status)?;
+        Ok(Response::new(GetCatalogResponse {
+            catalog: Some(crate::dataset_convert::catalog_to_msg(c)),
+        }))
+    }
+
+    async fn list_catalogs(
+        &self,
+        req: Request<ListCatalogsRequest>,
+    ) -> Result<Response<ListCatalogsResponse>, Status> {
+        let catalogs = self
+            .registry
+            .list_catalogs(&req.into_inner().query)
+            .map_err(to_status)?
+            .into_iter()
+            .map(crate::dataset_convert::catalog_to_msg)
+            .collect();
+        Ok(Response::new(ListCatalogsResponse { catalogs }))
     }
 }

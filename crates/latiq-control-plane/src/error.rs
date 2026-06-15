@@ -9,6 +9,8 @@ pub enum ControlPlaneError {
     NodeNotFound(String),
     #[error("dataset not found: {0}")]
     DatasetNotFound(String),
+    #[error("catalog not found: {0}")]
+    CatalogNotFound(String),
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("storage error: {0}")]

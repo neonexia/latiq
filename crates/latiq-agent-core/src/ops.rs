@@ -7,7 +7,8 @@ use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
 use crate::types::{
-    AllocateResult, AuditRecord, DatasetInfo, DescribeResult, LoadDatasetResult, PondInfo,
+    AllocateResult, AuditRecord, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult,
+    PondInfo, PullResult,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -278,28 +279,36 @@ impl AgentOps {
         Ok(res)
     }
 
-    // ---- dataset catalog --------------------------------------------------
+    // ---- datasets + external catalogs -------------------------------------
 
-    /// Browse/search the dataset catalog (delegates to the control plane).
+    /// Browse/search datasets (in the built-in `latiq` catalog).
     pub async fn list_datasets(&self, query: &str) -> Result<Vec<DatasetInfo>, AgentError> {
         self.control.list_datasets(query).await
     }
 
-    pub async fn get_dataset(&self, reference: &str) -> Result<DatasetInfo, AgentError> {
-        self.control.get_dataset(reference).await
+    pub async fn get_dataset(&self, name: &str) -> Result<DatasetInfo, AgentError> {
+        self.control.get_dataset(name).await
     }
 
-    /// Materialize a catalog dataset's tables into a pond — one `CREATE OR REPLACE
-    /// TABLE … AS SELECT * FROM read_*(uri)` per table, routed through the normal
-    /// write path (so forwarding to the owning node is handled). Slice 1 sources
-    /// are public; credentialed sources come with the identity work (issue #26).
+    /// Browse/search external catalogs.
+    pub async fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogInfo>, AgentError> {
+        self.control.list_catalogs(query).await
+    }
+
+    pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo, AgentError> {
+        self.control.get_catalog(name).await
+    }
+
+    /// Copy a dataset's tables into a pond — one `CREATE OR REPLACE TABLE … AS
+    /// SELECT * FROM read_*(uri)` per table, routed through the normal write path
+    /// (so forwarding to the owning node is handled).
     pub async fn load_dataset(
         &self,
         identity: &Identity,
         pond_ref: &str,
-        dataset_ref: &str,
+        dataset: &str,
     ) -> Result<LoadDatasetResult, AgentError> {
-        let ds = self.control.get_dataset(dataset_ref).await?;
+        let ds = self.control.get_dataset(dataset).await?;
         let mut loaded = Vec::with_capacity(ds.tables.len());
         for t in &ds.tables {
             let sql = dataset_load_sql(&t.table_name, &t.source_uri, &t.format);
@@ -307,9 +316,94 @@ impl AgentOps {
             loaded.push(t.table_name.clone());
         }
         Ok(LoadDatasetResult {
-            dataset: ds.reference,
+            dataset: ds.name,
             tables: loaded,
         })
+    }
+
+    /// Transient pull from an external catalog: resolve it, merge the pull-time
+    /// `params` over its persisted locator params (pull wins), then on the pond's
+    /// engine: attach (with creds) → run `query` (a CREATE TABLE …) → detach. The
+    /// query's result table lands in the pond; nothing about the catalog persists.
+    pub async fn catalog_pull(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        catalog: &str,
+        query: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<PullResult, AgentError> {
+        let (loc, cat, merged) = self.prepare_pull(pond_ref, catalog, params).await?;
+        let engine = self.engine.clone();
+        let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
+        tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        self.audit(
+            identity,
+            "catalog_pull",
+            Some(pond_ref),
+            Some(query.to_string()),
+            0,
+        )
+        .await;
+        Ok(PullResult {
+            catalog: cat.name,
+            query: query.to_string(),
+        })
+    }
+
+    /// Transiently attach a catalog on the pond and list its tables.
+    pub async fn catalog_describe(
+        &self,
+        _identity: &Identity,
+        pond_ref: &str,
+        catalog: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, AgentError> {
+        let (loc, cat, merged) = self.prepare_pull(pond_ref, catalog, params).await?;
+        let engine = self.engine.clone();
+        let (ty, alias) = (cat.r#type.clone(), cat.name.clone());
+        tokio::task::spawn_blocking(move || engine.describe_catalog(&loc, &ty, &alias, &merged))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))?
+            .map_err(Into::into)
+    }
+
+    /// Shared setup for pull/describe: resolve the pond (must be owned locally —
+    /// forwarding for catalog ops is a follow-up), resolve the catalog, and merge
+    /// the catalog's locator params with the pull-time params (pull wins).
+    async fn prepare_pull(
+        &self,
+        pond_ref: &str,
+        catalog: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<
+        (
+            latiq_storage::PondLocation,
+            CatalogInfo,
+            std::collections::BTreeMap<String, String>,
+        ),
+        AgentError,
+    > {
+        let cat = self.control.get_catalog(catalog).await?;
+        let info = self.control.pond_info(pond_ref).await?;
+        if self.forward_target(&info).is_some() {
+            return Err(AgentError::internal(
+                "catalog pull/describe must be sent to the pond's owning node",
+            ));
+        }
+        let mut merged = cat.params.clone();
+        merged.extend(params);
+        let pid = Self::parse_id(&info.pond_id)?;
+        let mut loc = self
+            .storage
+            .ensure_pond(pid)
+            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
+        loc.extensions = info.extensions.clone();
+        Ok((loc, cat, merged))
     }
 
     /// Stream a read as Arrow batches. Local: drive the engine's `read_arrow` on

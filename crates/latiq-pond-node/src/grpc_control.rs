@@ -3,7 +3,7 @@
 //! registry remotely. `ControlClient<Channel>` is cheaply cloneable, so each
 //! call clones it (tonic RPC methods take `&mut self`).
 use latiq_agent_core::{AgentError, ControlPlane};
-use latiq_agent_core::{AuditRecord, DatasetInfo, DatasetTableInfo, PondInfo};
+use latiq_agent_core::{AuditRecord, CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::*;
 use tonic::transport::Channel;
@@ -54,8 +54,6 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
 
 fn dataset_to_info(m: DatasetMsg) -> DatasetInfo {
     DatasetInfo {
-        reference: m.r#ref,
-        namespace: m.namespace,
         name: m.name,
         description: m.description,
         tags: m.tags,
@@ -68,6 +66,18 @@ fn dataset_to_info(m: DatasetMsg) -> DatasetInfo {
                 format: t.format,
             })
             .collect(),
+        created_by: m.created_by,
+        created_at: m.created_at,
+    }
+}
+
+fn catalog_to_info(m: CatalogMsg) -> CatalogInfo {
+    CatalogInfo {
+        name: m.name,
+        r#type: m.r#type,
+        params: m.params.into_iter().collect(),
+        description: m.description,
+        tags: m.tags,
         created_by: m.created_by,
         created_at: m.created_at,
     }
@@ -165,23 +175,47 @@ impl ControlPlane for GrpcControlPlane {
         Ok(resp.datasets.into_iter().map(dataset_to_info).collect())
     }
 
-    async fn get_dataset(&self, reference: &str) -> Result<DatasetInfo, AgentError> {
+    async fn get_dataset(&self, name: &str) -> Result<DatasetInfo, AgentError> {
         let mut c = self.client.clone();
         let resp = c
             .get_dataset(GetDatasetRequest {
-                r#ref: reference.to_string(),
+                name: name.to_string(),
             })
             .await
-            // A missing dataset is a dataset error, not a pond error (status_err
-            // defaults NotFound → pond). We know the ref here, so name it.
             .map_err(|s| match s.code() {
-                Code::NotFound => AgentError::dataset_not_found(reference),
+                Code::NotFound => AgentError::dataset_not_found(name),
                 _ => status_err(s),
             })?
             .into_inner();
         resp.dataset
             .map(dataset_to_info)
-            .ok_or_else(|| AgentError::dataset_not_found(reference))
+            .ok_or_else(|| AgentError::dataset_not_found(name))
+    }
+
+    async fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogInfo>, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .list_catalogs(ListCatalogsRequest {
+                query: query.to_string(),
+            })
+            .await
+            .map_err(status_err)?
+            .into_inner();
+        Ok(resp.catalogs.into_iter().map(catalog_to_info).collect())
+    }
+
+    async fn get_catalog(&self, name: &str) -> Result<CatalogInfo, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .get_catalog(GetCatalogRequest {
+                name: name.to_string(),
+            })
+            .await
+            .map_err(status_err)?
+            .into_inner();
+        resp.catalog
+            .map(catalog_to_info)
+            .ok_or_else(|| AgentError::internal(format!("catalog '{name}' not found")))
     }
 
     async fn record_audit(&self, rec: AuditRecord) {

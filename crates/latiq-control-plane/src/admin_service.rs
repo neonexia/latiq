@@ -19,7 +19,8 @@ fn to_status(e: ControlPlaneError) -> Status {
     match e {
         ControlPlaneError::PondNotFound(m)
         | ControlPlaneError::NodeNotFound(m)
-        | ControlPlaneError::DatasetNotFound(m) => Status::not_found(m),
+        | ControlPlaneError::DatasetNotFound(m)
+        | ControlPlaneError::CatalogNotFound(m) => Status::not_found(m),
         ControlPlaneError::NameConflict(m) => Status::already_exists(m),
         ControlPlaneError::Invalid(m) => Status::invalid_argument(m),
         ControlPlaneError::Storage(m) => Status::internal(m),
@@ -146,28 +147,24 @@ impl Admin for AdminService {
             .into_inner()
             .dataset
             .ok_or_else(|| Status::invalid_argument("dataset is required"))?;
-        let created_by = if d.created_by.is_empty() {
-            "anonymous".to_string()
-        } else {
-            d.created_by
+        let row = crate::registry::DatasetRow {
+            name: d.name,
+            description: d.description,
+            tags: d.tags,
+            tables: d
+                .tables
+                .into_iter()
+                .map(crate::dataset_convert::dataset_table_from_msg)
+                .collect(),
+            created_by: if d.created_by.is_empty() {
+                "anonymous".into()
+            } else {
+                d.created_by
+            },
+            created_at: String::new(),
         };
-        let tables: Vec<_> = d
-            .tables
-            .into_iter()
-            .map(crate::dataset_convert::table_from_msg)
-            .collect();
-        let reference = self
-            .registry
-            .add_dataset(
-                &d.namespace,
-                &d.name,
-                &d.description,
-                &created_by,
-                &d.tags,
-                &tables,
-            )
-            .map_err(to_status)?;
-        Ok(Response::new(DatasetAddResponse { r#ref: reference }))
+        let name = self.registry.add_dataset(&row).map_err(to_status)?;
+        Ok(Response::new(DatasetAddResponse { name }))
     }
 
     async fn dataset_remove(
@@ -175,7 +172,7 @@ impl Admin for AdminService {
         req: Request<DatasetRemoveRequest>,
     ) -> Result<Response<DatasetRemoveResponse>, Status> {
         self.registry
-            .remove_dataset(&req.into_inner().r#ref)
+            .remove_dataset(&req.into_inner().name)
             .map_err(to_status)?;
         Ok(Response::new(DatasetRemoveResponse {}))
     }
@@ -189,9 +186,70 @@ impl Admin for AdminService {
             .list_datasets(&req.into_inner().query)
             .map_err(to_status)?
             .into_iter()
-            .map(crate::dataset_convert::to_msg)
+            .map(crate::dataset_convert::dataset_to_msg)
             .collect();
         Ok(Response::new(DatasetListResponse { datasets }))
+    }
+
+    async fn catalog_add(
+        &self,
+        req: Request<CatalogAddRequest>,
+    ) -> Result<Response<CatalogAddResponse>, Status> {
+        let c = req
+            .into_inner()
+            .catalog
+            .ok_or_else(|| Status::invalid_argument("catalog is required"))?;
+        if !latiq_common::catalog::is_known_type(&c.r#type) {
+            return Err(Status::invalid_argument(format!(
+                "unknown catalog type '{}' (supported: iceberg)",
+                c.r#type
+            )));
+        }
+        // Allowlist the params at registration — credentials never persist.
+        let incoming: std::collections::BTreeMap<String, String> = c.params.into_iter().collect();
+        let (kept, dropped) = latiq_common::catalog::filter_params(&c.r#type, &incoming);
+        let row = crate::registry::CatalogRow {
+            name: c.name,
+            r#type: c.r#type,
+            params: kept,
+            description: c.description,
+            tags: c.tags,
+            created_by: if c.created_by.is_empty() {
+                "anonymous".into()
+            } else {
+                c.created_by
+            },
+            created_at: String::new(),
+        };
+        let name = self.registry.add_catalog(&row).map_err(to_status)?;
+        Ok(Response::new(CatalogAddResponse {
+            name,
+            dropped_params: dropped,
+        }))
+    }
+
+    async fn catalog_remove(
+        &self,
+        req: Request<CatalogRemoveRequest>,
+    ) -> Result<Response<CatalogRemoveResponse>, Status> {
+        self.registry
+            .remove_catalog(&req.into_inner().name)
+            .map_err(to_status)?;
+        Ok(Response::new(CatalogRemoveResponse {}))
+    }
+
+    async fn catalog_list(
+        &self,
+        req: Request<CatalogListRequest>,
+    ) -> Result<Response<CatalogListResponse>, Status> {
+        let catalogs = self
+            .registry
+            .list_catalogs(&req.into_inner().query)
+            .map_err(to_status)?
+            .into_iter()
+            .map(crate::dataset_convert::catalog_to_msg)
+            .collect();
+        Ok(Response::new(CatalogListResponse { catalogs }))
     }
 }
 

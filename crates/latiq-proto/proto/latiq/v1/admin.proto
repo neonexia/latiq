@@ -18,16 +18,25 @@ service Admin {
   rpc DatasetAdd(DatasetAddRequest) returns (DatasetAddResponse);
   rpc DatasetRemove(DatasetRemoveRequest) returns (DatasetRemoveResponse);
   rpc DatasetList(DatasetListRequest) returns (DatasetListResponse);
+  rpc CatalogAdd(CatalogAddRequest) returns (CatalogAddResponse);
+  rpc CatalogRemove(CatalogRemoveRequest) returns (CatalogRemoveResponse);
+  rpc CatalogList(CatalogListRequest) returns (CatalogListResponse);
 }
 
 message DatasetAddRequest { DatasetMsg dataset = 1; }
-message DatasetAddResponse { string ref = 1; }
-message DatasetRemoveRequest { string ref = 1; }
+message DatasetAddResponse { string name = 1; }
+message DatasetRemoveRequest { string name = 1; }
 message DatasetRemoveResponse { }
-// query: empty = all; "#tag" = by tag; "prefix*" = namespace/ref glob; else a
-// substring match over ref/name/description.
+// query: empty = all; "#tag" = by tag; "prefix*" = name glob; else a substring.
 message DatasetListRequest { string query = 1; }
 message DatasetListResponse { repeated DatasetMsg datasets = 1; }
+
+message CatalogAddRequest { CatalogMsg catalog = 1; }
+message CatalogAddResponse { string name = 1; repeated string dropped_params = 2; }
+message CatalogRemoveRequest { string name = 1; }
+message CatalogRemoveResponse { }
+message CatalogListRequest { string query = 1; }
+message CatalogListResponse { repeated CatalogMsg catalogs = 1; }
 
 message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; }
 message PondListRequest { }

@@ -28,7 +28,7 @@ pub struct AllocateResult {
     pub pond_name: String,
 }
 
-/// One external table in a catalog dataset.
+/// One file table in a dataset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetTableInfo {
     pub table_name: String,
@@ -36,16 +36,25 @@ pub struct DatasetTableInfo {
     pub format: String,
 }
 
-/// A catalog dataset: namespaced, tagged, described external tables.
+/// A dataset: simple file tables in the built-in `latiq` catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetInfo {
-    /// Full reference "<namespace>.<name>", e.g. "latiq.sample.tpch".
-    pub reference: String,
-    pub namespace: String,
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
     pub tables: Vec<DatasetTableInfo>,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+/// An external catalog (iceberg/…): a type + locator params (no credentials).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogInfo {
+    pub name: String,
+    pub r#type: String,
+    pub params: std::collections::BTreeMap<String, String>,
+    pub description: String,
+    pub tags: Vec<String>,
     pub created_by: String,
     pub created_at: String,
 }
@@ -55,6 +64,13 @@ pub struct DatasetInfo {
 pub struct LoadDatasetResult {
     pub dataset: String,
     pub tables: Vec<String>,
+}
+
+/// Result of a transient pull from an external catalog (the query ran in-pond).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullResult {
+    pub catalog: String,
+    pub query: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
