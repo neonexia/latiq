@@ -17,6 +17,9 @@ pub struct PondInfo {
     /// the pond instance's memory/thread caps. Empty → medium.
     #[serde(default)]
     pub tier: String,
+    /// Optional DuckDB extensions the pond loads on open (LOADed from the image).
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

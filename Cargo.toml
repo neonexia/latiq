@@ -36,7 +36,10 @@ prost = "0.13"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 tokio-util = { version = "0.7", features = ["rt"] }
-duckdb = { version = "1", features = ["bundled"] }
+# json + parquet are statically linked into the binary (the "standard" set, no
+# runtime INSTALL). httpfs/ducklake/spatial have no cargo feature → loaded from
+# the deployment image's extension dir. See crates/latiq-common/src/extensions.rs.
+duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 # `query_arrow` is always available in duckdb-rs (its `arrow` dep is non-optional).
 # Pin the same arrow major DuckDB pulls (58) so query_arrow's RecordBatch is the
 # same type across crates; `ipc` for streaming encode/decode on the wire.

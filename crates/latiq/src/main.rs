@@ -145,6 +145,11 @@ enum PondCmd {
         /// pond's memory + CPU). Defaults to medium.
         #[arg(short, long, default_value = "medium")]
         tier: String,
+        /// Comma-separated DuckDB extensions to load on the pond, e.g.
+        /// `--extensions spatial,fts`. Must be baked into the deployment image;
+        /// signed/official extensions only (no community extensions).
+        #[arg(short, long)]
+        extensions: Option<String>,
         /// Owner identity recorded for the pond (relaxed; defaults to anonymous).
         #[arg(short, long)]
         agent_id: Option<String>,
@@ -540,8 +545,17 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
         PondCmd::Create {
             name,
             tier,
+            extensions,
             agent_id,
         } => {
+            // Validate the requested extensions against the allowlist before we
+            // call the control plane, so a typo/community name fails locally.
+            let exts = match latiq_common::extensions::validate(
+                &latiq_common::extensions::parse_csv(&extensions.unwrap_or_default()),
+            ) {
+                Ok(e) => e,
+                Err(msg) => return Err(anyhow!("{msg}")),
+            };
             // Pure control-plane op: the registry assigns a (random) node; the
             // node materializes storage lazily on first query.
             let mut c = control_client().await?;
@@ -552,6 +566,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                     owner_identity: owner,
                     policy_json: "{}".into(),
                     tier,
+                    extensions: exts,
                 })
                 .await
             {
@@ -829,7 +844,11 @@ async fn run_stats(a: StatsArgs) -> Result<()> {
 fn print_pond_list_table(ponds: &[PondSummary]) {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
-    let (dim, rst) = if tty { ("\x1b[2m", "\x1b[0m") } else { ("", "") };
+    let (dim, rst) = if tty {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
 
     if ponds.is_empty() {
         println!("{dim}no ponds{rst}");

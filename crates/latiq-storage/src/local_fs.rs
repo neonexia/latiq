@@ -26,6 +26,8 @@ impl LocalFs {
             catalog_name: "pond".to_string(),
             // AgentOps sets caps from the pond's tier; default to engine defaults.
             limits: None,
+            // AgentOps sets these from the pond's registry record.
+            extensions: Vec::new(),
         }
     }
 }

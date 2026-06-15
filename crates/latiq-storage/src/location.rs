@@ -18,4 +18,9 @@ pub struct PondLocation {
     /// it from the pond's tier.
     #[serde(default)]
     pub limits: Option<ResourceLimits>,
+    /// Optional DuckDB extensions to LOAD on open (from the pond's registry
+    /// record). Storage leaves this empty; AgentOps sets it from the pond info.
+    /// LOADed from the deployment image — never installed in the pond path.
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
