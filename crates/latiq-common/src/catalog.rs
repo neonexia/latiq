@@ -19,14 +19,25 @@ pub struct CatalogTypeSpec {
 
 /// Supported external-catalog types. Iceberg first; add a row + an attacher impl
 /// in `latiq-engine-duckdb` to support a new type.
-pub const TYPES: &[CatalogTypeSpec] = &[CatalogTypeSpec {
-    name: "iceberg",
-    // endpoint + warehouse locate the REST catalog; s3_endpoint/s3_region locate
-    // the storage backend. Credentials (token, s3_access_key, s3_secret_key) are
-    // deliberately NOT here — they ride in at pull/describe and are never stored.
-    allowed_params: &["endpoint", "warehouse", "s3_endpoint", "s3_region"],
-    required_extensions: &["iceberg", "httpfs"],
-}];
+pub const TYPES: &[CatalogTypeSpec] = &[
+    CatalogTypeSpec {
+        name: "iceberg",
+        // endpoint + warehouse locate the REST catalog; s3_endpoint/s3_region
+        // locate the storage backend. Credentials (token, s3_access_key,
+        // s3_secret_key) are deliberately NOT here — they ride in at
+        // pull/describe and are never stored.
+        allowed_params: &["endpoint", "warehouse", "s3_endpoint", "s3_region"],
+        required_extensions: &["iceberg", "httpfs"],
+    },
+    CatalogTypeSpec {
+        name: "ducklake",
+        // A DuckLake catalog = a metadata DB + a data path. Local (file metadata +
+        // local/S3 data) needs no credentials; remote (postgres metadata, S3 data)
+        // brings its creds in at pull (s3_access_key/s3_secret_key/etc.).
+        allowed_params: &["metadata_path", "data_path", "s3_endpoint", "s3_region"],
+        required_extensions: &["ducklake", "httpfs"],
+    },
+];
 
 pub fn lookup(type_: &str) -> Option<&'static CatalogTypeSpec> {
     TYPES.iter().find(|t| t.name == type_)

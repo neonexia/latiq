@@ -54,10 +54,77 @@ pub fn plan(
         .unwrap_or_default();
     match type_ {
         "iceberg" => iceberg(alias, params, load),
+        "ducklake" => ducklake(alias, params, load),
         other => Err(err(format!(
-            "unsupported catalog type '{other}' (supported: iceberg)"
+            "unsupported catalog type '{other}' (supported: iceberg, ducklake)"
         ))),
     }
+}
+
+/// A DuckLake catalog: `ATTACH 'ducklake:<metadata>' AS <alias> (DATA_PATH …,
+/// READ_ONLY)`. Optional S3 storage creds (for data on MinIO/S3) build an `s3`
+/// secret. We only ever read from it, so the attach is read-only.
+fn ducklake(
+    alias: &str,
+    params: &BTreeMap<String, String>,
+    load: Vec<String>,
+) -> Result<AttachPlan, EngineError> {
+    let metadata = params
+        .get("metadata_path")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| err("ducklake catalog requires --set metadata_path=<catalog-db>"))?;
+    let data_path = params
+        .get("data_path")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| err("ducklake catalog requires --set data_path=<data-dir-or-s3-uri>"))?;
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    if let Some(line) = s3_secret_line(alias, params) {
+        secrets.push(line);
+    }
+    let attach = format!(
+        "ATTACH 'ducklake:{}' AS {} (DATA_PATH '{}', READ_ONLY)",
+        esc(metadata),
+        quote_ident(alias),
+        esc(data_path),
+    );
+    Ok(AttachPlan {
+        alias: alias.to_string(),
+        load,
+        secrets,
+        attach,
+    })
+}
+
+/// Build an `s3` secret from `s3_access_key`/`s3_secret_key` (+ endpoint/region)
+/// for catalogs whose storage backend is MinIO/S3. SigV4 keys ride in at pull.
+fn s3_secret_line(alias: &str, params: &BTreeMap<String, String>) -> Option<(String, String)> {
+    let k = params.get("s3_access_key").filter(|s| !s.is_empty())?;
+    let s = params.get("s3_secret_key").filter(|s| !s.is_empty())?;
+    let name = format!("_latiq_{alias}_s3");
+    let mut lines = vec![
+        "TYPE s3".to_string(),
+        format!("KEY_ID '{}'", esc(k)),
+        format!("SECRET '{}'", esc(s)),
+        "URL_STYLE 'path'".to_string(),
+    ];
+    if let Some(region) = params.get("s3_region").filter(|s| !s.is_empty()) {
+        lines.push(format!("REGION '{}'", esc(region)));
+    }
+    if let Some(ep) = params.get("s3_endpoint").filter(|s| !s.is_empty()) {
+        let (host, ssl) = if let Some(rest) = ep.strip_prefix("http://") {
+            (rest, "false")
+        } else if let Some(rest) = ep.strip_prefix("https://") {
+            (rest, "true")
+        } else {
+            (ep.as_str(), "true")
+        };
+        lines.push(format!("ENDPOINT '{}'", esc(host)));
+        lines.push(format!("USE_SSL {ssl}"));
+    }
+    Some((
+        name.clone(),
+        format!("CREATE OR REPLACE SECRET {name} ({})", lines.join(", ")),
+    ))
 }
 
 /// Iceberg REST catalog (Polaris / vendor-hosted). The bearer rides in via the
