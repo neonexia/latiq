@@ -32,6 +32,8 @@ pub struct PondRow {
     pub node_id: String,
     /// Resource tier name (small/medium/large/x-large); defaults to medium.
     pub tier: String,
+    /// Optional DuckDB extensions the pond loads on open (empty = none).
+    pub extensions: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +178,7 @@ impl Registry {
         owner_identity: &str,
         policy_json: &str,
         tier: &str,
+        extensions: &[String],
     ) -> Result<PondRow, ControlPlaneError> {
         let pond_id = PondId::new().to_string();
         let name = name.unwrap_or_else(|| pond_id.clone());
@@ -197,9 +200,10 @@ impl Registry {
         if exists > 0 {
             return Err(ControlPlaneError::NameConflict(name));
         }
+        let ext_csv = extensions.join(",");
         c.execute(
-            "INSERT INTO ponds(pond_id, name, owner_identity, node_id, policy_json, tier) VALUES (?,?,?,?,?,?)",
-            duckdb::params![pond_id, name, owner_identity, node_id, policy_json, tier],
+            "INSERT INTO ponds(pond_id, name, owner_identity, node_id, policy_json, tier, extensions) VALUES (?,?,?,?,?,?,?)",
+            duckdb::params![pond_id, name, owner_identity, node_id, policy_json, tier, ext_csv],
         )?;
         // Persist immediately so the pond survives a lost .wal (see register_node).
         let _ = c.execute_batch("CHECKPOINT");
@@ -210,6 +214,7 @@ impl Registry {
             owner_identity: owner_identity.to_string(),
             node_id,
             tier: tier.to_string(),
+            extensions: extensions.to_vec(),
         })
     }
 
@@ -227,7 +232,8 @@ impl Registry {
     pub fn list_ponds(&self) -> Result<Vec<PondRow>, ControlPlaneError> {
         let c = self.lock();
         let mut stmt = c.prepare(
-            "SELECT pond_id, name, owner_identity, node_id, coalesce(tier, 'medium') FROM ponds ORDER BY created_at",
+            "SELECT pond_id, name, owner_identity, node_id, coalesce(tier, 'medium'),
+                    coalesce(extensions, '') FROM ponds ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(PondRow {
@@ -236,6 +242,7 @@ impl Registry {
                 owner_identity: r.get(2)?,
                 node_id: r.get(3)?,
                 tier: r.get(4)?,
+                extensions: latiq_common::extensions::parse_csv(&r.get::<_, String>(5)?),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -252,7 +259,7 @@ impl Registry {
         c.query_row(
             "SELECT p.pond_id, p.name, p.owner_identity, p.node_id,
                     p.created_at::VARCHAR, p.policy_json, n.internal_endpoint,
-                    coalesce(p.tier, 'medium')
+                    coalesce(p.tier, 'medium'), coalesce(p.extensions, '')
              FROM ponds p LEFT JOIN nodes n ON n.node_id = p.node_id
              WHERE p.pond_id=? OR p.name=? LIMIT 1",
             duckdb::params![pond_ref, pond_ref],
@@ -264,6 +271,7 @@ impl Registry {
                         owner_identity: r.get(2)?,
                         node_id: r.get(3)?,
                         tier: r.get::<_, String>(7)?,
+                        extensions: latiq_common::extensions::parse_csv(&r.get::<_, String>(8)?),
                     },
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
@@ -377,9 +385,9 @@ mod tests {
         let r = reg();
         r.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 100)
             .unwrap();
-        r.create_pond(Some("p-one".into()), "agent-x", "{\"k\":1}", "medium")
+        r.create_pond(Some("p-one".into()), "agent-x", "{\"k\":1}", "medium", &[])
             .unwrap();
-        r.create_pond(Some("p-two".into()), "agent-y", "{}", "medium")
+        r.create_pond(Some("p-two".into()), "agent-y", "{}", "medium", &[])
             .unwrap();
         let ponds = r.list_ponds().unwrap();
         assert_eq!(ponds.len(), 2);
@@ -397,6 +405,33 @@ mod tests {
     }
 
     #[test]
+    fn create_pond_round_trips_extensions() {
+        let r = reg();
+        r.register_node("node-a", "http://n/mcp", "http://n:9092", 100)
+            .unwrap();
+        let row = r
+            .create_pond(
+                Some("geo".into()),
+                "x",
+                "{}",
+                "large",
+                &["spatial".to_string()],
+            )
+            .unwrap();
+        assert_eq!(row.extensions, vec!["spatial".to_string()]);
+        // pond_info and list_ponds both carry the extension set back.
+        let (info, ..) = r.pond_info("geo").unwrap();
+        assert_eq!(info.extensions, vec!["spatial".to_string()]);
+        let listed = r.list_ponds().unwrap();
+        assert_eq!(listed[0].extensions, vec!["spatial".to_string()]);
+        // A pond created with no extensions reads back as empty.
+        r.create_pond(Some("plain".into()), "x", "{}", "medium", &[])
+            .unwrap();
+        let (plain, ..) = r.pond_info("plain").unwrap();
+        assert!(plain.extensions.is_empty());
+    }
+
+    #[test]
     fn node_and_pond_lifecycle() {
         let r = reg();
         r.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 100)
@@ -404,14 +439,14 @@ mod tests {
         r.heartbeat("node-a", 3).unwrap();
         assert_eq!(r.list_nodes().unwrap().len(), 1);
         let p = r
-            .create_pond(Some("incident-1".into()), "agent-x", "{}", "medium")
+            .create_pond(Some("incident-1".into()), "agent-x", "{}", "medium", &[])
             .unwrap();
         assert_eq!(p.name, "incident-1");
         let (pid, endpoint) = r.get_pond_location("incident-1").unwrap();
         assert_eq!(pid, p.pond_id);
         assert_eq!(endpoint, "http://n:9092");
         assert!(matches!(
-            r.create_pond(Some("incident-1".into()), "y", "{}", "medium"),
+            r.create_pond(Some("incident-1".into()), "y", "{}", "medium", &[]),
             Err(ControlPlaneError::NameConflict(_))
         ));
         r.drop_pond(&p.pond_id).unwrap();
@@ -458,7 +493,7 @@ mod tests {
         // create_pond must pick the only active node (node-b), repeatedly.
         for i in 0..5 {
             let p = r
-                .create_pond(Some(format!("p{i}")), "x", "{}", "medium")
+                .create_pond(Some(format!("p{i}")), "x", "{}", "medium", &[])
                 .unwrap();
             assert_eq!(p.node_id, "node-b", "placement skipped down node-a");
         }
@@ -472,7 +507,7 @@ mod tests {
     fn create_pond_without_node_errors() {
         let r = reg();
         assert!(matches!(
-            r.create_pond(None, "x", "{}", "medium"),
+            r.create_pond(None, "x", "{}", "medium", &[]),
             Err(ControlPlaneError::NodeNotFound(_))
         ));
     }
@@ -489,7 +524,7 @@ mod tests {
         let r = Registry::open(Some(&path)).unwrap();
         r.register_node("node-a", "http://n/mcp", "http://n:9092", 10)
             .unwrap();
-        r.create_pond(Some("durable".into()), "agent-x", "{}", "medium")
+        r.create_pond(Some("durable".into()), "agent-x", "{}", "medium", &[])
             .unwrap();
 
         let copy = dir.join("copy.duckdb");

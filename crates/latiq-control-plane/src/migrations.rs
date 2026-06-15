@@ -47,6 +47,9 @@ pub const MIGRATIONS: &[&str] = &[
     // v2: per-pond resource tier (small/medium/large/x-large). Nullable with a
     // default so existing rows read as 'medium'; the engine maps it to caps.
     "ALTER TABLE ponds ADD COLUMN tier VARCHAR DEFAULT 'medium';",
+    // v3: per-pond optional DuckDB extensions, stored comma-separated (empty =
+    // none). The engine LOADs them from the deployment image on pond open.
+    "ALTER TABLE ponds ADD COLUMN extensions VARCHAR DEFAULT '';",
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {
