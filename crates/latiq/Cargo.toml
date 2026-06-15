@@ -30,3 +30,5 @@ latiq-client = { path = "../latiq-client" }
 tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 arrow = { workspace = true }
+# Seeds a local external DuckLake catalog in the catalogs e2e test.
+duckdb = { workspace = true }
