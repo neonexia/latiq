@@ -62,6 +62,15 @@ impl ControlPlane for FixedOwner {
     async fn get_dataset(&self, r: &str) -> Result<latiq_agent_core::DatasetInfo, AgentError> {
         Err(AgentError::dataset_not_found(r))
     }
+    async fn list_catalogs(
+        &self,
+        _: &str,
+    ) -> Result<Vec<latiq_agent_core::CatalogInfo>, AgentError> {
+        Ok(vec![])
+    }
+    async fn get_catalog(&self, r: &str) -> Result<latiq_agent_core::CatalogInfo, AgentError> {
+        Err(AgentError::internal(format!("no catalog {r}")))
+    }
     async fn record_audit(&self, _: AuditRecord) {}
 }
 

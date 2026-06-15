@@ -1,12 +1,10 @@
-//! Map registry dataset rows ↔ proto `DatasetMsg`, shared by the Admin and
-//! Control gRPC services (keeps `registry` free of transport types).
-use crate::registry::{DatasetRow, DatasetTableRow};
-use latiq_proto::v1::{DatasetMsg, DatasetTableMsg};
+//! Map registry rows ↔ proto messages for datasets and catalogs, shared by the
+//! Admin and Control gRPC services (keeps `registry` free of transport types).
+use crate::registry::{CatalogRow, DatasetRow, DatasetTableRow};
+use latiq_proto::v1::{CatalogMsg, DatasetMsg, DatasetTableMsg};
 
-pub fn to_msg(d: DatasetRow) -> DatasetMsg {
+pub fn dataset_to_msg(d: DatasetRow) -> DatasetMsg {
     DatasetMsg {
-        r#ref: d.reference,
-        namespace: d.namespace,
         name: d.name,
         description: d.description,
         tags: d.tags,
@@ -24,7 +22,7 @@ pub fn to_msg(d: DatasetRow) -> DatasetMsg {
     }
 }
 
-pub fn table_from_msg(t: DatasetTableMsg) -> DatasetTableRow {
+pub fn dataset_table_from_msg(t: DatasetTableMsg) -> DatasetTableRow {
     DatasetTableRow {
         table_name: t.table_name,
         source_uri: t.source_uri,
@@ -33,5 +31,17 @@ pub fn table_from_msg(t: DatasetTableMsg) -> DatasetTableRow {
         } else {
             t.format
         },
+    }
+}
+
+pub fn catalog_to_msg(c: CatalogRow) -> CatalogMsg {
+    CatalogMsg {
+        name: c.name,
+        r#type: c.r#type,
+        params: c.params.into_iter().collect(),
+        description: c.description,
+        tags: c.tags,
+        created_by: c.created_by,
+        created_at: c.created_at,
     }
 }

@@ -2,7 +2,7 @@
 //! Used for single-process operation and tests; M6 adds a gRPC-client impl.
 use crate::control::ControlPlane;
 use crate::error::AgentError;
-use crate::types::{AuditRecord, DatasetInfo, DatasetTableInfo, PondInfo};
+use crate::types::{AuditRecord, CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_common::ErrorKind;
 use latiq_control_plane::registry::{AuditInsert, PondRow};
 use latiq_control_plane::{ControlPlaneError, Registry};
@@ -28,6 +28,12 @@ fn cp_err(e: ControlPlaneError) -> AgentError {
             "latiq://troubleshooting",
         ),
         ControlPlaneError::DatasetNotFound(r) => AgentError::dataset_not_found(&r),
+        ControlPlaneError::CatalogNotFound(r) => AgentError::new(
+            ErrorKind::DatasetNotFound,
+            format!("Catalog '{r}' is not registered."),
+            "Call list_catalogs to see registered catalogs.",
+            "latiq://catalogs",
+        ),
         ControlPlaneError::Invalid(m) => AgentError::new(
             ErrorKind::InvalidValue,
             m,
@@ -40,8 +46,6 @@ fn cp_err(e: ControlPlaneError) -> AgentError {
 
 fn dataset_to_info(d: latiq_control_plane::registry::DatasetRow) -> DatasetInfo {
     DatasetInfo {
-        reference: d.reference,
-        namespace: d.namespace,
         name: d.name,
         description: d.description,
         tags: d.tags,
@@ -56,6 +60,18 @@ fn dataset_to_info(d: latiq_control_plane::registry::DatasetRow) -> DatasetInfo 
             .collect(),
         created_by: d.created_by,
         created_at: d.created_at,
+    }
+}
+
+fn catalog_to_info(c: latiq_control_plane::registry::CatalogRow) -> CatalogInfo {
+    CatalogInfo {
+        name: c.name,
+        r#type: c.r#type,
+        params: c.params,
+        description: c.description,
+        tags: c.tags,
+        created_by: c.created_by,
+        created_at: c.created_at,
     }
 }
 
@@ -139,9 +155,25 @@ impl ControlPlane for RegistryControlPlane {
             .collect())
     }
 
-    async fn get_dataset(&self, reference: &str) -> Result<DatasetInfo, AgentError> {
+    async fn get_dataset(&self, name: &str) -> Result<DatasetInfo, AgentError> {
         Ok(dataset_to_info(
-            self.registry.get_dataset(reference).map_err(cp_err)?,
+            self.registry.get_dataset(name).map_err(cp_err)?,
+        ))
+    }
+
+    async fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogInfo>, AgentError> {
+        Ok(self
+            .registry
+            .list_catalogs(query)
+            .map_err(cp_err)?
+            .into_iter()
+            .map(catalog_to_info)
+            .collect())
+    }
+
+    async fn get_catalog(&self, name: &str) -> Result<CatalogInfo, AgentError> {
+        Ok(catalog_to_info(
+            self.registry.get_catalog(name).map_err(cp_err)?,
         ))
     }
 

@@ -180,6 +180,86 @@ impl QueryEngine for DuckEngine {
             .collect();
         Ok(SchemaSummary { tables })
     }
+
+    fn pull_catalog(
+        &self,
+        loc: &PondLocation,
+        catalog_type: &str,
+        alias: &str,
+        params: &std::collections::BTreeMap<String, String>,
+        query: &str,
+    ) -> Result<(), EngineError> {
+        let inst = self.instance(loc)?;
+        let guard = lock_recover(&inst);
+        let plan = crate::attachers::plan(catalog_type, alias, params)?;
+        attach_catalog(&guard.conn, &plan)?;
+        // Run the pull query (a CREATE TABLE … in the pond's default catalog),
+        // then tear the attachment down regardless of the outcome.
+        let ran = guard
+            .conn
+            .execute_batch(query)
+            .map_err(|e| EngineError::Engine(format!("pull query: {e}")));
+        teardown_catalog(&guard.conn, &plan);
+        ran
+    }
+
+    fn describe_catalog(
+        &self,
+        loc: &PondLocation,
+        catalog_type: &str,
+        alias: &str,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, EngineError> {
+        let inst = self.instance(loc)?;
+        let guard = lock_recover(&inst);
+        let plan = crate::attachers::plan(catalog_type, alias, params)?;
+        attach_catalog(&guard.conn, &plan)?;
+        let cat = alias.replace('\'', "''");
+        let listed = run_read(
+            &guard,
+            &format!(
+                "SELECT table_schema, table_name FROM information_schema.tables \
+                 WHERE table_catalog = '{cat}' ORDER BY table_schema, table_name"
+            ),
+        );
+        teardown_catalog(&guard.conn, &plan);
+        let res = listed?;
+        Ok(res
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                )
+            })
+            .collect())
+    }
+}
+
+/// LOAD the type's extensions, create its secrets, and ATTACH it.
+fn attach_catalog(
+    conn: &duckdb::Connection,
+    plan: &crate::attachers::AttachPlan,
+) -> Result<(), EngineError> {
+    for s in &plan.load {
+        conn.execute_batch(s)
+            .map_err(|e| EngineError::Engine(format!("catalog extensions: {e}")))?;
+    }
+    for (_, sql) in &plan.secrets {
+        conn.execute_batch(sql)
+            .map_err(|e| EngineError::Engine(format!("catalog secret: {e}")))?;
+    }
+    conn.execute_batch(&plan.attach)
+        .map_err(|e| EngineError::Engine(format!("attach: {e}")))?;
+    Ok(())
+}
+
+/// Best-effort DETACH + drop the plan's secrets (run regardless of pull outcome).
+fn teardown_catalog(conn: &duckdb::Connection, plan: &crate::attachers::AttachPlan) {
+    for s in plan.teardown() {
+        let _ = conn.execute_batch(&s);
+    }
 }
 
 #[cfg(test)]

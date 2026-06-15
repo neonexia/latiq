@@ -12,15 +12,21 @@ service Control {
   rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
   rpc ListPonds(ListPondsRequest) returns (ListPondsResponse);
   rpc GetPondInfo(GetPondInfoRequest) returns (GetPondInfoResponse);
-  // A pond node reads the dataset catalog to load datasets into ponds.
+  // A pond node reads the catalog to load datasets / pull from external catalogs.
   rpc GetDataset(GetDatasetRequest) returns (GetDatasetResponse);
   rpc ListDatasets(ListDatasetsRequest) returns (ListDatasetsResponse);
+  rpc GetCatalog(GetCatalogRequest) returns (GetCatalogResponse);
+  rpc ListCatalogs(ListCatalogsRequest) returns (ListCatalogsResponse);
 }
 
-message GetDatasetRequest { string ref = 1; }
+message GetDatasetRequest { string name = 1; }
 message GetDatasetResponse { DatasetMsg dataset = 1; }
 message ListDatasetsRequest { string query = 1; }
 message ListDatasetsResponse { repeated DatasetMsg datasets = 1; }
+message GetCatalogRequest { string name = 1; }
+message GetCatalogResponse { CatalogMsg catalog = 1; }
+message ListCatalogsRequest { string query = 1; }
+message ListCatalogsResponse { repeated CatalogMsg catalogs = 1; }
 
 message PondInfoMsg {
   string pond_id = 1; string name = 2; string owner = 3;

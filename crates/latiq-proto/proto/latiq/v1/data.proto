@@ -14,11 +14,25 @@ service Data {
   rpc ReadQuery(QueryRequest) returns (JsonResponse);
   rpc WriteQuery(QueryRequest) returns (JsonResponse);
   rpc ExplainQuery(QueryRequest) returns (JsonResponse);
-  // Materialize a catalog dataset's tables into the pond (one CREATE TABLE each).
+  // Copy a dataset's tables into the pond (one CREATE TABLE each).
   rpc LoadDataset(LoadDatasetRequest) returns (JsonResponse);
+  // Transient pull from an external catalog: attach (with creds) → run the query
+  // (a CREATE TABLE … AS SELECT … FROM <catalog>.…) → detach. Nothing persists.
+  rpc CatalogPull(CatalogPullRequest) returns (JsonResponse);
+  // Transient attach → list the catalog's tables/columns → detach.
+  rpc CatalogDescribe(CatalogDescribeRequest) returns (JsonResponse);
 }
 
-message LoadDatasetRequest { string pond = 1; string dataset_ref = 2; }
+message LoadDatasetRequest { string pond = 1; string dataset = 2; }
+// params carry runtime --set values (incl. credentials like `token`); merged
+// over the catalog's persisted locator params (these win).
+message CatalogPullRequest {
+  string pond = 1; string catalog = 2; string query = 3;
+  map<string, string> params = 4;
+}
+message CatalogDescribeRequest {
+  string pond = 1; string catalog = 2; map<string, string> params = 3;
+}
 
 message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; }
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }

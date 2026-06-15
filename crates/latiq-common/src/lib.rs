@@ -9,4 +9,5 @@ pub mod meta;
 pub use meta::{QueryMeta, Warning, WarningKind};
 pub mod tier;
 pub use tier::{PondTier, ResourceLimits};
+pub mod catalog;
 pub mod extensions;

@@ -44,16 +44,29 @@ pub struct DatasetTableRow {
     pub format: String,
 }
 
-/// A catalog dataset: a namespaced, tagged, described set of external tables.
+/// A dataset: one or more simple file tables living in the built-in `latiq`
+/// catalog. `load`ed into a pond (copied).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DatasetRow {
-    /// Full reference, "<namespace>.<name>" (e.g. "latiq.sample.tpch").
-    pub reference: String,
-    pub namespace: String,
     pub name: String,
     pub description: String,
     pub tags: Vec<String>,
     pub tables: Vec<DatasetTableRow>,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+/// An external catalog (iceberg/…): a `type` + opaque locator `params` (the
+/// per-type attacher allowlists them — never credentials). Pulled from
+/// transiently; its tables are discovered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogRow {
+    pub name: String,
+    pub r#type: String,
+    /// Locator params (key→value). Credentials are never stored here.
+    pub params: std::collections::BTreeMap<String, String>,
+    pub description: String,
+    pub tags: Vec<String>,
     pub created_by: String,
     pub created_at: String,
 }
@@ -317,101 +330,99 @@ impl Registry {
         Ok(())
     }
 
-    // ---- dataset catalog --------------------------------------------------
+    // ---- datasets (file tables in the built-in `latiq` catalog) -----------
 
-    /// Add (or replace) a dataset. `reference` is computed `<namespace>.<name>`.
-    /// Tables/tags are replaced wholesale so re-adding is idempotent.
-    pub fn add_dataset(
-        &self,
-        namespace: &str,
-        name: &str,
-        description: &str,
-        created_by: &str,
-        tags: &[String],
-        tables: &[DatasetTableRow],
-    ) -> Result<String, ControlPlaneError> {
-        if namespace.is_empty() || name.is_empty() {
+    /// Add (or replace) a dataset. Tables/tags are replaced wholesale so re-adding
+    /// is idempotent.
+    pub fn add_dataset(&self, d: &DatasetRow) -> Result<String, ControlPlaneError> {
+        if d.name.is_empty() {
             return Err(ControlPlaneError::Invalid(
-                "dataset namespace and name are required".into(),
+                "dataset name is required".into(),
             ));
         }
-        if tables.is_empty() {
+        if !is_ident(&d.name) {
+            return Err(ControlPlaneError::Invalid(
+                "dataset name must be a bare identifier (letters/digits/underscore)".into(),
+            ));
+        }
+        if d.tables.is_empty() {
             return Err(ControlPlaneError::Invalid(
                 "a dataset needs at least one table".into(),
             ));
         }
-        let reference = format!("{namespace}.{name}");
         let c = self.lock();
-        // Replace any existing rows for this ref (idempotent re-add).
         c.execute(
-            "DELETE FROM dataset_tables WHERE ref=?",
-            duckdb::params![reference],
+            "DELETE FROM dataset_tables WHERE dataset=?",
+            duckdb::params![d.name],
         )?;
         c.execute(
-            "DELETE FROM dataset_tags WHERE ref=?",
-            duckdb::params![reference],
+            "DELETE FROM dataset_tags WHERE dataset=?",
+            duckdb::params![d.name],
         )?;
+        c.execute("DELETE FROM datasets WHERE name=?", duckdb::params![d.name])?;
         c.execute(
-            "DELETE FROM datasets WHERE ref=?",
-            duckdb::params![reference],
+            "INSERT INTO datasets(name, description, created_by) VALUES (?,?,?)",
+            duckdb::params![d.name, d.description, d.created_by],
         )?;
-        c.execute(
-            "INSERT INTO datasets(ref, namespace, name, description, created_by) VALUES (?,?,?,?,?)",
-            duckdb::params![reference, namespace, name, description, created_by],
-        )?;
-        for t in tables {
+        for t in &d.tables {
             c.execute(
-                "INSERT INTO dataset_tables(ref, table_name, source_uri, format) VALUES (?,?,?,?)",
-                duckdb::params![reference, t.table_name, t.source_uri, t.format],
+                "INSERT INTO dataset_tables(dataset, table_name, source_uri, format) VALUES (?,?,?,?)",
+                duckdb::params![d.name, t.table_name, t.source_uri, t.format],
             )?;
         }
-        for tag in tags {
+        for tag in &d.tags {
             c.execute(
-                "INSERT OR IGNORE INTO dataset_tags(ref, tag) VALUES (?,?)",
-                duckdb::params![reference, tag],
+                "INSERT OR IGNORE INTO dataset_tags(dataset, tag) VALUES (?,?)",
+                duckdb::params![d.name, tag],
             )?;
         }
         let _ = c.execute_batch("CHECKPOINT");
-        Ok(reference)
+        Ok(d.name.clone())
     }
 
-    pub fn remove_dataset(&self, reference: &str) -> Result<(), ControlPlaneError> {
+    pub fn remove_dataset(&self, name: &str) -> Result<(), ControlPlaneError> {
         let c = self.lock();
-        let n = c.execute(
-            "DELETE FROM datasets WHERE ref=?",
-            duckdb::params![reference],
-        )?;
+        let n = c.execute("DELETE FROM datasets WHERE name=?", duckdb::params![name])?;
         if n == 0 {
-            return Err(ControlPlaneError::DatasetNotFound(reference.to_string()));
+            return Err(ControlPlaneError::DatasetNotFound(name.to_string()));
         }
         c.execute(
-            "DELETE FROM dataset_tables WHERE ref=?",
-            duckdb::params![reference],
+            "DELETE FROM dataset_tables WHERE dataset=?",
+            duckdb::params![name],
         )?;
         c.execute(
-            "DELETE FROM dataset_tags WHERE ref=?",
-            duckdb::params![reference],
+            "DELETE FROM dataset_tags WHERE dataset=?",
+            duckdb::params![name],
         )?;
         let _ = c.execute_batch("CHECKPOINT");
         Ok(())
     }
 
-    pub fn get_dataset(&self, reference: &str) -> Result<DatasetRow, ControlPlaneError> {
+    pub fn get_dataset(&self, name: &str) -> Result<DatasetRow, ControlPlaneError> {
         let c = self.lock();
-        let (namespace, name, description, created_by, created_at) = c
+        let (description, created_by, created_at) = c
             .query_row(
-                "SELECT namespace, name, description, created_by, created_at::VARCHAR
-                 FROM datasets WHERE ref=?",
-                duckdb::params![reference],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                "SELECT description, created_by, created_at::VARCHAR FROM datasets WHERE name=?",
+                duckdb::params![name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .map_err(|_| ControlPlaneError::DatasetNotFound(reference.to_string()))?;
-        let tables = Self::dataset_tables(&c, reference)?;
-        let tags = Self::dataset_tags(&c, reference)?;
+            .map_err(|_| ControlPlaneError::DatasetNotFound(name.to_string()))?;
+        let mut ts = c.prepare(
+            "SELECT table_name, source_uri, format FROM dataset_tables
+             WHERE dataset=? ORDER BY table_name",
+        )?;
+        let tables = ts
+            .query_map(duckdb::params![name], |r| {
+                Ok(DatasetTableRow {
+                    table_name: r.get(0)?,
+                    source_uri: r.get(1)?,
+                    format: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        let tags = tags_for(&c, "dataset_tags", "dataset", name)?;
         Ok(DatasetRow {
-            reference: reference.to_string(),
-            namespace,
-            name,
+            name: name.to_string(),
             description,
             tags,
             tables,
@@ -420,61 +431,143 @@ impl Registry {
         })
     }
 
-    /// Search the catalog. `query`: empty = all; `#tag` = by tag; `prefix*` = ref
-    /// glob; otherwise a case-insensitive substring over ref/name/description/tag.
+    /// Search datasets. `query`: empty = all; `#tag` = by tag; `prefix*` = name
+    /// glob; otherwise a substring over name/description/tag.
     pub fn list_datasets(&self, query: &str) -> Result<Vec<DatasetRow>, ControlPlaneError> {
+        let names = self.search("datasets", "dataset_tags", "dataset", query)?;
+        names.into_iter().map(|n| self.get_dataset(&n)).collect()
+    }
+
+    // ---- external catalogs ------------------------------------------------
+
+    /// Add (or replace) an external catalog. `params` should already be filtered
+    /// to the type's allowlist (no credentials) by the caller.
+    pub fn add_catalog(&self, ca: &CatalogRow) -> Result<String, ControlPlaneError> {
+        if ca.name.is_empty() || ca.r#type.is_empty() {
+            return Err(ControlPlaneError::Invalid(
+                "catalog name and type are required".into(),
+            ));
+        }
+        if !is_ident(&ca.name) {
+            return Err(ControlPlaneError::Invalid(
+                "catalog name must be a bare identifier (letters/digits/underscore)".into(),
+            ));
+        }
+        let params_json = serde_json::to_string(&ca.params)
+            .map_err(|e| ControlPlaneError::Invalid(e.to_string()))?;
+        let c = self.lock();
+        c.execute(
+            "DELETE FROM catalog_tags WHERE catalog=?",
+            duckdb::params![ca.name],
+        )?;
+        c.execute(
+            "DELETE FROM catalogs WHERE name=?",
+            duckdb::params![ca.name],
+        )?;
+        c.execute(
+            "INSERT INTO catalogs(name, type, params_json, description, created_by) VALUES (?,?,?,?,?)",
+            duckdb::params![ca.name, ca.r#type, params_json, ca.description, ca.created_by],
+        )?;
+        for tag in &ca.tags {
+            c.execute(
+                "INSERT OR IGNORE INTO catalog_tags(catalog, tag) VALUES (?,?)",
+                duckdb::params![ca.name, tag],
+            )?;
+        }
+        let _ = c.execute_batch("CHECKPOINT");
+        Ok(ca.name.clone())
+    }
+
+    pub fn remove_catalog(&self, name: &str) -> Result<(), ControlPlaneError> {
+        let c = self.lock();
+        let n = c.execute("DELETE FROM catalogs WHERE name=?", duckdb::params![name])?;
+        if n == 0 {
+            return Err(ControlPlaneError::CatalogNotFound(name.to_string()));
+        }
+        c.execute(
+            "DELETE FROM catalog_tags WHERE catalog=?",
+            duckdb::params![name],
+        )?;
+        let _ = c.execute_batch("CHECKPOINT");
+        Ok(())
+    }
+
+    pub fn get_catalog(&self, name: &str) -> Result<CatalogRow, ControlPlaneError> {
+        let c = self.lock();
+        let (r#type, params_json, description, created_by, created_at) = c
+            .query_row(
+                "SELECT type, params_json, description, created_by, created_at::VARCHAR
+                 FROM catalogs WHERE name=?",
+                duckdb::params![name],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                },
+            )
+            .map_err(|_| ControlPlaneError::CatalogNotFound(name.to_string()))?;
+        let params = serde_json::from_str(&params_json).unwrap_or_default();
+        let tags = tags_for(&c, "catalog_tags", "catalog", name)?;
+        Ok(CatalogRow {
+            name: name.to_string(),
+            r#type,
+            params,
+            description,
+            tags,
+            created_by,
+            created_at,
+        })
+    }
+
+    pub fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogRow>, ControlPlaneError> {
+        let names = self.search("catalogs", "catalog_tags", "catalog", query)?;
+        names.into_iter().map(|n| self.get_catalog(&n)).collect()
+    }
+
+    /// Shared name search over a `<table>(name)` + `<tag_table>(<owner_col>, tag)`
+    /// pair: empty = all; `#tag` = by tag; `prefix*` = name glob; else substring
+    /// over name/description/tag.
+    fn search(
+        &self,
+        table: &str,
+        tag_table: &str,
+        owner_col: &str,
+        query: &str,
+    ) -> Result<Vec<String>, ControlPlaneError> {
         let c = self.lock();
         let q = query.trim();
-        let refs: Vec<String> = if q.is_empty() {
-            let mut stmt = c.prepare("SELECT ref FROM datasets ORDER BY ref")?;
-            stmt.query_map([], |r| r.get(0))?
-                .collect::<Result<_, _>>()?
+        let names: Vec<String> = if q.is_empty() {
+            let mut s = c.prepare(&format!("SELECT name FROM {table} ORDER BY name"))?;
+            s.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?
         } else if let Some(tag) = q.strip_prefix('#') {
-            let mut stmt = c.prepare("SELECT ref FROM dataset_tags WHERE tag=? ORDER BY ref")?;
-            stmt.query_map(duckdb::params![tag], |r| r.get(0))?
+            let mut s = c.prepare(&format!(
+                "SELECT {owner_col} FROM {tag_table} WHERE tag=? ORDER BY {owner_col}"
+            ))?;
+            s.query_map(duckdb::params![tag], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         } else if q.contains('*') {
             let like = q.replace('*', "%");
-            let mut stmt = c.prepare("SELECT ref FROM datasets WHERE ref LIKE ? ORDER BY ref")?;
-            stmt.query_map(duckdb::params![like], |r| r.get(0))?
+            let mut s = c.prepare(&format!(
+                "SELECT name FROM {table} WHERE name LIKE ? ORDER BY name"
+            ))?;
+            s.query_map(duckdb::params![like], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         } else {
             let like = format!("%{q}%");
-            let mut stmt = c.prepare(
-                "SELECT ref FROM datasets
-                 WHERE ref ILIKE ?1 OR description ILIKE ?1
-                    OR ref IN (SELECT ref FROM dataset_tags WHERE tag ILIKE ?1)
-                 ORDER BY ref",
-            )?;
-            stmt.query_map(duckdb::params![like], |r| r.get(0))?
+            let mut s = c.prepare(&format!(
+                "SELECT name FROM {table}
+                 WHERE name ILIKE ?1 OR description ILIKE ?1
+                    OR name IN (SELECT {owner_col} FROM {tag_table} WHERE tag ILIKE ?1)
+                 ORDER BY name"
+            ))?;
+            s.query_map(duckdb::params![like], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
-        drop(c);
-        refs.into_iter().map(|r| self.get_dataset(&r)).collect()
-    }
-
-    fn dataset_tables(
-        c: &Connection,
-        reference: &str,
-    ) -> Result<Vec<DatasetTableRow>, ControlPlaneError> {
-        let mut stmt = c.prepare(
-            "SELECT table_name, source_uri, format FROM dataset_tables
-             WHERE ref=? ORDER BY table_name",
-        )?;
-        let rows = stmt.query_map(duckdb::params![reference], |r| {
-            Ok(DatasetTableRow {
-                table_name: r.get(0)?,
-                source_uri: r.get(1)?,
-                format: r.get(2)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    fn dataset_tags(c: &Connection, reference: &str) -> Result<Vec<String>, ControlPlaneError> {
-        let mut stmt = c.prepare("SELECT tag FROM dataset_tags WHERE ref=? ORDER BY tag")?;
-        let rows = stmt.query_map(duckdb::params![reference], |r| r.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        Ok(names)
     }
 
     pub fn policy_get(&self) -> Result<serde_json::Value, ControlPlaneError> {
@@ -554,6 +647,29 @@ fn audit_row(r: &duckdb::Row<'_>) -> duckdb::Result<AuditRow> {
     })
 }
 
+/// A bare SQL identifier — letters/digits/underscore, starting with a letter or
+/// underscore. Catalog/dataset names flow into SQL (schema/catalog aliases) that
+/// agents write by hand, so we reject anything that would need quoting.
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Read tags from a `<tag_table>(<owner_col>, tag)` table for one owner.
+fn tags_for(
+    c: &Connection,
+    tag_table: &str,
+    owner_col: &str,
+    owner: &str,
+) -> Result<Vec<String>, ControlPlaneError> {
+    let mut s = c.prepare(&format!(
+        "SELECT tag FROM {tag_table} WHERE {owner_col}=? ORDER BY tag"
+    ))?;
+    Ok(s.query_map(duckdb::params![owner], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,64 +702,88 @@ mod tests {
         ));
     }
 
+    fn dataset(name: &str, desc: &str, tags: &[&str], uri: &str) -> DatasetRow {
+        DatasetRow {
+            name: name.into(),
+            description: desc.into(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            tables: vec![DatasetTableRow {
+                table_name: name.into(),
+                source_uri: uri.into(),
+                format: "auto".into(),
+            }],
+            created_by: "op".into(),
+            created_at: String::new(),
+        }
+    }
+
     #[test]
-    fn dataset_catalog_add_get_search_remove() {
+    fn datasets_seeded_add_search_remove() {
         let r = reg();
-        // The v4 migration seeds latiq.sample.* — they're browsable.
-        let all = r.list_datasets("").unwrap();
-        assert!(all.iter().any(|d| d.reference == "latiq.sample.tpch"));
-        let tpch = r.get_dataset("latiq.sample.tpch").unwrap();
+        // The v4 migration seeds the samples in the latiq catalog.
+        assert!(r
+            .list_datasets("")
+            .unwrap()
+            .iter()
+            .any(|d| d.name == "tpch"));
+        let tpch = r.get_dataset("tpch").unwrap();
         assert_eq!(tpch.tables.len(), 8);
         assert!(tpch.tags.contains(&"tpch".to_string()));
 
-        // Add a custom dataset with tags.
-        let reference = r
-            .add_dataset(
-                "hf.acme",
+        // Add, search by tag/glob/substring, idempotent re-add, remove.
+        assert_eq!(
+            r.add_dataset(&dataset(
                 "sales",
                 "Acme sales",
-                "op",
-                &["finance".to_string()],
-                &[DatasetTableRow {
-                    table_name: "sales".into(),
-                    source_uri: "https://x/s.parquet".into(),
-                    format: "auto".into(),
-                }],
-            )
-            .unwrap();
-        assert_eq!(reference, "hf.acme.sales");
-
-        // Search: by tag, by glob, by substring.
-        assert_eq!(r.list_datasets("#finance").unwrap().len(), 1);
-        assert_eq!(
-            r.list_datasets("hf.*").unwrap()[0].reference,
-            "hf.acme.sales"
+                &["finance"],
+                "https://x/s.parquet"
+            ))
+            .unwrap(),
+            "sales"
         );
+        assert_eq!(r.list_datasets("#finance").unwrap().len(), 1);
+        assert_eq!(r.list_datasets("sal*").unwrap()[0].name, "sales");
         assert!(r
             .list_datasets("acme")
             .unwrap()
             .iter()
-            .any(|d| d.reference == "hf.acme.sales"));
-
-        // Re-add replaces (idempotent); remove deletes.
-        r.add_dataset(
-            "hf.acme",
-            "sales",
-            "v2",
-            "op",
-            &[],
-            &[DatasetTableRow {
-                table_name: "sales".into(),
-                source_uri: "https://x/s2.parquet".into(),
-                format: "auto".into(),
-            }],
-        )
-        .unwrap();
-        assert_eq!(r.get_dataset("hf.acme.sales").unwrap().description, "v2");
-        r.remove_dataset("hf.acme.sales").unwrap();
+            .any(|d| d.name == "sales"));
+        r.add_dataset(&dataset("sales", "v2", &[], "https://x/s2.parquet"))
+            .unwrap();
+        assert_eq!(r.get_dataset("sales").unwrap().description, "v2");
+        r.remove_dataset("sales").unwrap();
         assert!(matches!(
-            r.get_dataset("hf.acme.sales"),
+            r.get_dataset("sales"),
             Err(ControlPlaneError::DatasetNotFound(_))
+        ));
+        // Names must be bare identifiers (they flow into SQL).
+        assert!(r.add_dataset(&dataset("bad.name", "", &[], "u")).is_err());
+    }
+
+    #[test]
+    fn catalog_add_get_remove() {
+        let r = reg();
+        let ca = CatalogRow {
+            name: "lake".into(),
+            r#type: "iceberg".into(),
+            params: std::collections::BTreeMap::from([
+                ("endpoint".to_string(), "https://polaris/api".to_string()),
+                ("warehouse".to_string(), "prod".to_string()),
+            ]),
+            description: "Acme lake".into(),
+            tags: vec!["prod".into()],
+            created_by: "op".into(),
+            created_at: String::new(),
+        };
+        assert_eq!(r.add_catalog(&ca).unwrap(), "lake");
+        let got = r.get_catalog("lake").unwrap();
+        assert_eq!(got.r#type, "iceberg");
+        assert_eq!(got.params["warehouse"], "prod");
+        assert_eq!(r.list_catalogs("#prod").unwrap().len(), 1);
+        r.remove_catalog("lake").unwrap();
+        assert!(matches!(
+            r.get_catalog("lake"),
+            Err(ControlPlaneError::CatalogNotFound(_))
         ));
     }
 

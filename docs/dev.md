@@ -195,26 +195,29 @@ latiq query --pond demo "CREATE TABLE t AS SELECT * FROM read_csv('https://examp
 latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parquet'"
 ```
 
-### Dataset catalog
+### Datasets & catalogs
 
-`latiq dataset` is a **registry-backed catalog** of external tables. Datasets are **namespaced** (`<namespace>.<name>`), **tagged**, and **described**; operators add them, anyone loads them into a pond (one `CREATE TABLE` per table). The built-in samples are seeded under `latiq.sample`.
+Latiq has two ways to get external data into a pond: **datasets** (simple files
+you copy in) and **catalogs** (external databases you pull from once). Full guide:
+[`docs/dataset.md`](dataset.md).
 
 ```bash
-latiq dataset list                       # all (the latiq.sample.* samples are seeded)
-latiq dataset list '#finance'            # by tag
-latiq dataset list 'hf.*'                # by namespace/ref glob
-latiq dataset list acme                  # substring over ref/description/tags
+# datasets — simple files in the built-in `latiq` catalog
+latiq dataset list                                 # samples are seeded (tpch, …)
+latiq dataset add sales --table sales=https://example.com/sales.parquet --tag finance
+latiq dataset load tpch -p demo                     # copy all 8 TPC-H tables into `demo`
 
-# add (operator): one --table NAME=URI per table; repeatable --tag
-latiq dataset add hf.acme.sales \
-  --table sales=https://example.com/sales.parquet \
-  --tag finance --description "Acme sales export"
-
-latiq dataset load latiq.sample.tpch -p demo   # materialize all 8 TPC-H tables into `demo`
-latiq dataset remove hf.acme.sales             # operator
+# catalogs — external (iceberg/…); credentials ride in at pull, never stored
+latiq catalog add lake --type iceberg \
+  --set endpoint=https://polaris.acme/api/catalog --set warehouse=prod --tag prod
+latiq catalog describe lake -p demo --set token="$BEARER"
+latiq catalog pull lake -p demo --set token="$BEARER" \
+  --query "CREATE TABLE us AS SELECT * FROM lake.sales.orders WHERE region='us'"
 ```
 
-Loading runs on the pond node via the Data gRPC `LoadDataset` (it resolves the dataset from the control-plane catalog, then writes each table through the normal write path — attributed to `--agent-id`, snapshotted like any write). Slice 1 sources are **public**; credentialed external sources (private S3, Iceberg, …) come with the identity work — see issue #26. Needs network (data is fetched from the source URIs).
+`dataset add`/`catalog add` are operator actions; loading/pulling are available to
+anyone. A `--set token=…` at `add` is **dropped** (credentials never persist) — pass
+it at pull/describe. Credentialed identity integration: issue #26.
 
 ### Targeting a non-default control plane
 

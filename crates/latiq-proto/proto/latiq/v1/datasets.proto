@@ -1,23 +1,32 @@
 syntax = "proto3";
 package latiq.v1;
 
-// A dataset is a named, namespaced set of external tables an operator curates and
-// agents/clients load into a pond. Shared across the Admin (operators add/list),
-// Control (a pond node reads the catalog), and Data (load into a pond) surfaces.
+// Two first-class concepts. A DATASET is simple file tables living in the
+// built-in `latiq` catalog (loaded/copied into a pond). A CATALOG is an external
+// attachable source (iceberg/…) registered with a type + locator params, pulled
+// from transiently. Shared across the Admin / Control / Data surfaces.
 
 message DatasetTableMsg {
   string table_name = 1;   // the table created in the pond
-  string source_uri = 2;   // external location (https/s3/... ; public in Slice 1)
+  string source_uri = 2;   // external location (https/s3/...)
   string format = 3;       // parquet | csv | json | auto
 }
 
 message DatasetMsg {
-  string ref = 1;                       // full reference: "<namespace>.<name>"
-  string namespace = 2;                 // dotted path, e.g. "latiq.sample", "hf.acme"
-  string name = 3;                      // leaf name, e.g. "tpch"
+  string name = 1;                      // bare identifier, e.g. "tpch"
+  string description = 2;
+  repeated string tags = 3;
+  repeated DatasetTableMsg tables = 4;
+  string created_by = 5;
+  string created_at = 6;
+}
+
+message CatalogMsg {
+  string name = 1;                      // bare identifier, e.g. "lake"
+  string type = 2;                      // iceberg | ducklake | duckdb | ...
+  map<string, string> params = 3;       // locator metadata only (NEVER credentials)
   string description = 4;
-  repeated string tags = 5;             // searchable tags, e.g. "finance", "apple_hr"
-  repeated DatasetTableMsg tables = 6;
-  string created_by = 7;
-  string created_at = 8;
+  repeated string tags = 5;
+  string created_by = 6;
+  string created_at = 7;
 }
