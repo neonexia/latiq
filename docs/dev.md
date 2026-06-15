@@ -147,7 +147,7 @@ latiq pond describe demo                       # metadata (incl. tier) + table s
 latiq pond drop demo --confirm                 # DESTRUCTIVE — requires --confirm
 ```
 
-**Extensions** are baked into the deployment image: `parquet`/`json` are statically linked into the binary; `httpfs`/`ducklake` and the optional set (`spatial`, `fts`, `icu`, `inet`) are loaded from the image's extension cache. A pond `LOAD`s its requested extensions on open — never installs in the create path. A node warms its cache once at startup (the dev stand-in for image-baking); a requested extension that isn't present fails fast. Community/unsigned extensions are rejected.
+**Extensions** are baked into the deployment image. The **required standard** set is always loaded on every pond: `parquet`/`json` are statically linked into the binary, and `ducklake` (the catalog format) + `httpfs` (remote reads) load from the image — Latiq is built on these, so a node **ensures them at startup and refuses to serve if it can't load them**. The **optional** set (`spatial`, `fts`, `icu`, `inet`) is requested per pond and `LOAD`ed on open — never installed in the create path; a requested extension that isn't present fails fast. A node warms the optional cache once at startup (the dev stand-in for image-baking). Community/unsigned extensions are rejected.
 
 **Resource tiers** cap a pond's DuckDB instance (memory + threads) — caps, not reservations:
 

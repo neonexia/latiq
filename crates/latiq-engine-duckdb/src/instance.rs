@@ -4,27 +4,37 @@ use duckdb::Connection;
 use latiq_engine::EngineError;
 use latiq_storage::PondLocation;
 
-/// Standard extensions loaded on every pond. `parquet`/`json` are statically
-/// linked into the binary (duckdb cargo features) so they need no `LOAD`;
-/// `ducklake`/`httpfs` have no cargo feature and are loaded from the deployment
-/// image. `INSTALL` here self-heals the required set on a cold cache.
+/// **Required** standard extensions, loaded on every pond. The whole of Latiq is
+/// built on these — `ducklake` is the catalog format, `httpfs` reads remote
+/// sources — so a node that can't load them cannot function. `parquet`/`json` are
+/// statically linked into the binary (duckdb cargo features), so they're always
+/// present and omitted here; `ducklake`/`httpfs` have no cargo feature and load
+/// from the deployment image.
 const STANDARD_LOAD: &[&str] = &["ducklake", "httpfs"];
 
-/// Best-effort: ensure the loadable standard set + the optional allowlist are
-/// present in the local extension cache, so pond opens are pure `LOAD`. Run once
-/// at node startup — the dev stand-in for image-baking (in production the image
-/// is pre-baked, making this a fast no-op). Network happens here, **never** in
-/// the pond-create path. Individual failures (offline, already present) are
-/// non-fatal.
-pub fn warm_extension_cache() {
+/// Ensure the required standard extensions ([`STANDARD_LOAD`]) install and load.
+/// The node calls this at **startup** and refuses to serve if it fails — Latiq is
+/// useless without ducklake/httpfs, so this is a hard, fail-fast check rather than
+/// a per-pond surprise. `INSTALL` may hit the network on a cold cache (in
+/// production the image is pre-baked, making it a no-op).
+pub fn ensure_standard_extensions() -> Result<(), EngineError> {
+    let conn = Connection::open_in_memory().map_err(|e| EngineError::Engine(e.to_string()))?;
+    for ext in STANDARD_LOAD {
+        conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
+            .map_err(|e| EngineError::Engine(format!("required extension '{ext}': {e}")))?;
+    }
+    Ok(())
+}
+
+/// Best-effort: install the **optional** allowlist into the local cache so
+/// per-pond `LOAD`s don't download. Run once at node startup — the dev stand-in
+/// for image-baking. Failures (offline, already present) are non-fatal; a pond
+/// requesting an extension that didn't warm simply fails fast on open.
+pub fn warm_optional_extensions() {
     let Ok(conn) = Connection::open_in_memory() else {
         return;
     };
-    let names = STANDARD_LOAD
-        .iter()
-        .copied()
-        .chain(latiq_common::extensions::OPTIONAL.iter().copied());
-    for ext in names {
+    for ext in latiq_common::extensions::OPTIONAL {
         let _ = conn.execute_batch(&format!("INSTALL {ext};"));
     }
 }
@@ -143,7 +153,6 @@ mod tests {
     #[test]
     fn loads_a_baked_optional_extension() {
         // Simulate image-baking: install the extension into the cache first.
-        warm_extension_cache();
         Connection::open_in_memory()
             .unwrap()
             .execute_batch("INSTALL icu;")
