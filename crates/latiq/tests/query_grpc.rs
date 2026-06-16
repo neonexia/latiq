@@ -89,6 +89,33 @@ async fn result_encoding_arrow_edge_renders_date_and_nested() {
 }
 
 #[tokio::test]
+async fn result_encoding_renders_timestamptz_named_zone() {
+    // Regression: a TIMESTAMP WITH TIME ZONE comes back as Arrow Timestamp(_,
+    // Some("UTC")) — a *named* zone (DuckLake's snapshots() does exactly this).
+    // The arrow->json path needs arrow's `chrono-tz` feature, or it errors with
+    // "only offset based timezones supported without chrono-tz feature".
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(req(alloc("tz"), "a")).await.unwrap();
+    let resp = c
+        .read_query(req(
+            q("tz", "SELECT TIMESTAMPTZ '2024-01-02 03:04:05+00' AS ts"),
+            "a",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let v: serde_json::Value = serde_json::from_str(&resp.json).unwrap();
+    assert!(
+        v["rows"][0][0]
+            .as_str()
+            .is_some_and(|s| s.contains("2024-01-02")),
+        "timestamptz should render as a readable string, got {}",
+        v["rows"][0][0]
+    );
+}
+
+#[tokio::test]
 async fn pond_lifecycle_happy() {
     let s = start_stack().await;
     let mut c = client(&s.data_endpoint).await;
