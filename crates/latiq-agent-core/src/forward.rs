@@ -7,9 +7,10 @@
 //! already abstracts "the registry".
 use crate::arrow::ArrowReadStream;
 use crate::error::AgentError;
-use crate::types::DescribeResult;
+use crate::types::{DescribeResult, PullResult};
 use latiq_common::Identity;
 use latiq_engine::{ExplainResult, QueryResult};
+use std::collections::BTreeMap;
 
 #[async_trait::async_trait]
 pub trait Forwarder: Send + Sync {
@@ -61,4 +62,27 @@ pub trait Forwarder: Send + Sync {
         pond: &str,
         confirm: bool,
     ) -> Result<(), AgentError>;
+
+    /// Transient pull from an external catalog on the owning node. The runtime
+    /// `params` (incl. any credentials) ride the gRPC hop and are dropped after
+    /// the attach/detach on the owner — nothing about the catalog persists.
+    async fn catalog_pull(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        catalog: &str,
+        query: &str,
+        params: BTreeMap<String, String>,
+    ) -> Result<PullResult, AgentError>;
+
+    /// List an external catalog's tables on the owning node (transient attach).
+    async fn catalog_describe(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        catalog: &str,
+        params: BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, AgentError>;
 }

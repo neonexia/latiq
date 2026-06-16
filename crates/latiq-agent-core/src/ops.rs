@@ -333,7 +333,19 @@ impl AgentOps {
         query: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<PullResult, AgentError> {
-        let (loc, cat, merged) = self.prepare_pull(pond_ref, catalog, params).await?;
+        let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "catalog_pull",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            return fwd
+                .catalog_pull(owner, identity, pond_ref, catalog, query, params)
+                .await;
+        }
+        let (loc, cat, merged) = self.prepare_pull(&info, catalog, params).await?;
         let engine = self.engine.clone();
         let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
         tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
@@ -356,12 +368,24 @@ impl AgentOps {
     /// Transiently attach a catalog on the pond and list its tables.
     pub async fn catalog_describe(
         &self,
-        _identity: &Identity,
+        identity: &Identity,
         pond_ref: &str,
         catalog: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, String)>, AgentError> {
-        let (loc, cat, merged) = self.prepare_pull(pond_ref, catalog, params).await?;
+        let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "catalog_describe",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            return fwd
+                .catalog_describe(owner, identity, pond_ref, catalog, params)
+                .await;
+        }
+        let (loc, cat, merged) = self.prepare_pull(&info, catalog, params).await?;
         let engine = self.engine.clone();
         let (ty, alias) = (cat.r#type.clone(), cat.name.clone());
         tokio::task::spawn_blocking(move || engine.describe_catalog(&loc, &ty, &alias, &merged))
@@ -370,12 +394,13 @@ impl AgentOps {
             .map_err(Into::into)
     }
 
-    /// Shared setup for pull/describe: resolve the pond (must be owned locally —
-    /// forwarding for catalog ops is a follow-up), resolve the catalog, and merge
-    /// the catalog's locator params with the pull-time params (pull wins).
+    /// Shared LOCAL setup for pull/describe (the caller has already resolved the
+    /// pond and confirmed this node owns it — remote ponds are forwarded before
+    /// reaching here): resolve the catalog and merge its locator params with the
+    /// pull-time params (pull wins).
     async fn prepare_pull(
         &self,
-        pond_ref: &str,
+        info: &PondInfo,
         catalog: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<
@@ -387,12 +412,6 @@ impl AgentOps {
         AgentError,
     > {
         let cat = self.control.get_catalog(catalog).await?;
-        let info = self.control.pond_info(pond_ref).await?;
-        if self.forward_target(&info).is_some() {
-            return Err(AgentError::internal(
-                "catalog pull/describe must be sent to the pond's owning node",
-            ));
-        }
         let mut merged = cat.params.clone();
         merged.extend(params);
         let pid = Self::parse_id(&info.pond_id)?;
