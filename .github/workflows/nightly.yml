@@ -1,0 +1,91 @@
+name: Nightly
+
+# Heavy suite runs nightly (and on demand) — NOT per-PR — to stay within GitHub
+# usage limits (see #28). Lint + unit + e2e, the iceberg/MinIO catalog e2e, and a
+# real 3-node dockerized cluster scale-out test.
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC nightly
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Linking bundled DuckDB with full debug info OOMs the runner's linker
+  # (ld ... signal 7 [Bus error]); CI doesn't debug from these binaries.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  checks:
+    name: fmt + clippy + test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Full suite incl. the deterministic datasets + DuckLake-catalog e2e.
+      - run: cargo test --workspace
+
+  iceberg:
+    name: iceberg + minio catalog e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Bring up MinIO + Iceberg REST + seed a table
+        run: ./deploy/iceberg-minio/up.sh
+      - name: Run the ignored iceberg e2e
+        env:
+          LATIQ_ICEBERG_ENDPOINT: http://localhost:8181
+          LATIQ_ICEBERG_WAREHOUSE: demo
+          LATIQ_ICEBERG_TOKEN: dummy
+          LATIQ_S3_ENDPOINT: http://localhost:9000
+          LATIQ_S3_ACCESS_KEY: admin
+          LATIQ_S3_SECRET_KEY: password
+        run: cargo test -p latiq --test catalogs_iceberg -- --ignored --nocapture
+
+  cluster-scale-out:
+    name: dockerized cluster + scale-out e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Build the single-binary image once (DuckDB compiles from source — slow).
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:nightly .
+      - name: Bring up the 2-node cluster (+ Prometheus, MinIO/Iceberg)
+        working-directory: deploy/cluster
+        run: |
+          LATIQ_IMAGE=latiq:nightly docker compose up -d \
+            control-plane pond-node-1 pond-node-2 prometheus
+      - name: Wait for the control plane + nodes to be healthy
+        working-directory: deploy/cluster
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Scale-out e2e (add a 3rd node, allocate, query)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: ./scale_out_test.sh
+      - name: Cluster logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        run: docker compose logs --tail=200
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        run: docker compose --profile scale down -v
