@@ -1,5 +1,6 @@
 //! The control-plane operations AgentOps depends on. Abstracted as a trait so
-//! it can be backed in-process by the Registry (now) or a gRPC client (M6).
+//! it can be backed in-process by the Registry (`RegistryControlPlane`) or over
+//! the Control gRPC (`GrpcControlPlane`, in `latiq-pond-node`).
 use crate::error::AgentError;
 use crate::types::{CatalogInfo, DatasetInfo, PondInfo};
 
