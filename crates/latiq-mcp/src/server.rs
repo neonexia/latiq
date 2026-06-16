@@ -325,11 +325,12 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
         }
     }
 
-    /// Copy a dataset's tables into a pond (one table each). Pick a name from list_datasets.
+    /// Copy a dataset's tables into a pond, under a schema named after the dataset. Pick a name from list_datasets.
     #[tool(
-        description = "Copy a DATASET's tables into a pond — one real table per file, materialized into the pond's DuckLake. \
-Pass `dataset` (a name from list_datasets) and the target `pond`. After this, query the new tables with read_query like any other table. \
-This is a WRITE (it creates tables, attributed to you). For an external database/lakehouse, use pull_catalog instead. See latiq://recipes/external-data.",
+        description = "Copy a DATASET's tables into a pond — materialized into the pond's DuckLake under a SCHEMA named after the dataset. \
+Pass `dataset` (a name from list_datasets) and the target `pond`. The response returns `schema` and schema-qualified `tables`; \
+query them as `<dataset>.<table>` with read_query (e.g. `SELECT * FROM tpch.lineitem`). \
+This is a WRITE (it creates a schema + tables, attributed to you). For an external database/lakehouse, use pull_catalog instead. See latiq://recipes/external-data.",
         annotations(
             title = "Load dataset",
             read_only_hint = false,
