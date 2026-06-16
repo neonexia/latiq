@@ -78,6 +78,8 @@ impl ControlPlane for FixedOwner {
 struct RecordingForwarder {
     reads: AtomicUsize,
     writes: AtomicUsize,
+    pulls: AtomicUsize,
+    describes: AtomicUsize,
     last_endpoint: Mutex<String>,
     last_pond: Mutex<String>,
     last_sql: Mutex<String>,
@@ -175,6 +177,34 @@ impl Forwarder for RecordingForwarder {
         self.note(e, p, "");
         Ok(())
     }
+    async fn catalog_pull(
+        &self,
+        e: &str,
+        _: &Identity,
+        p: &str,
+        catalog: &str,
+        q: &str,
+        _params: std::collections::BTreeMap<String, String>,
+    ) -> Result<latiq_agent_core::PullResult, AgentError> {
+        self.pulls.fetch_add(1, Ordering::SeqCst);
+        self.note(e, p, q);
+        Ok(latiq_agent_core::PullResult {
+            catalog: catalog.to_string(),
+            query: q.to_string(),
+        })
+    }
+    async fn catalog_describe(
+        &self,
+        e: &str,
+        _: &Identity,
+        p: &str,
+        _catalog: &str,
+        _params: std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, AgentError> {
+        self.describes.fetch_add(1, Ordering::SeqCst);
+        self.note(e, p, "");
+        Ok(vec![("main".to_string(), "forwarded_table".to_string())])
+    }
 }
 
 fn ops_with(owner: Option<&str>, self_ep: &str, fwd: Arc<RecordingForwarder>) -> AgentOps {
@@ -245,6 +275,55 @@ async fn forwarding_skipped_when_self_owns() {
         "must not forward to self"
     );
     assert_eq!(r.rows[0][0], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn forwarding_catalog_pull_delegates_to_owner() {
+    let fwd = Arc::new(RecordingForwarder::default());
+    let ops = ops_with(
+        Some("http://owner:9092"),
+        "http://greeter:9092",
+        fwd.clone(),
+    );
+    let r = ops
+        .catalog_pull(
+            &Identity::claimed(Some("a")),
+            "pond-x",
+            "lake",
+            "CREATE TABLE t AS SELECT 1",
+            std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fwd.pulls.load(Ordering::SeqCst), 1);
+    assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
+    assert_eq!(*fwd.last_pond.lock().unwrap(), "pond-x");
+    assert_eq!(r.catalog, "lake");
+}
+
+#[tokio::test]
+async fn forwarding_catalog_describe_delegates_to_owner() {
+    let fwd = Arc::new(RecordingForwarder::default());
+    let ops = ops_with(
+        Some("http://owner:9092"),
+        "http://greeter:9092",
+        fwd.clone(),
+    );
+    let tables = ops
+        .catalog_describe(
+            &Identity::claimed(Some("a")),
+            "pond-x",
+            "lake",
+            std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fwd.describes.load(Ordering::SeqCst), 1);
+    assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
+    assert_eq!(
+        tables,
+        vec![("main".to_string(), "forwarded_table".to_string())]
+    );
 }
 
 #[tokio::test]
