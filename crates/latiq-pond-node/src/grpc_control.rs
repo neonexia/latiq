@@ -26,6 +26,13 @@ impl GrpcControlPlane {
 }
 
 fn status_err(s: tonic::Status) -> AgentError {
+    // Prefer the structured ErrorEnvelope the control plane attaches to the
+    // Status details (control_service/admin_service to_status) — it carries the
+    // correct kind + guidance (e.g. a missing catalog is dataset_not_found, not
+    // pond_not_found). Fall back to a code-based mapping only when absent.
+    if let Ok(env) = serde_json::from_slice::<latiq_common::ErrorEnvelope>(s.details()) {
+        return AgentError::from_envelope(env);
+    }
     match s.code() {
         Code::NotFound => AgentError::pond_not_found(s.message()),
         Code::AlreadyExists => AgentError::name_conflict(s.message()),
@@ -182,10 +189,7 @@ impl ControlPlane for GrpcControlPlane {
                 name: name.to_string(),
             })
             .await
-            .map_err(|s| match s.code() {
-                Code::NotFound => AgentError::dataset_not_found(name),
-                _ => status_err(s),
-            })?
+            .map_err(status_err)?
             .into_inner();
         resp.dataset
             .map(dataset_to_info)

@@ -10,6 +10,10 @@ pub enum ControlPlaneError {
     PondNotFound(String),
     #[error("node not found: {0}")]
     NodeNotFound(String),
+    /// No active node is available to host a pond (allocate-time availability),
+    /// distinct from a node-lookup miss — different gRPC code (review #13).
+    #[error("no pond node available: {0}")]
+    NoNodeAvailable(String),
     #[error("dataset not found: {0}")]
     DatasetNotFound(String),
     #[error("catalog not found: {0}")]
@@ -36,10 +40,18 @@ impl ControlPlaneError {
             ),
             // No node available to host the pond is an availability/precondition
             // failure, not a missing pond — so it is NOT PondNotFound (review #13).
-            ControlPlaneError::NodeNotFound(m) => ErrorEnvelope::new(
+            ControlPlaneError::NoNodeAvailable(m) => ErrorEnvelope::new(
                 ErrorKind::Internal,
                 format!("No pond node is available: {m}"),
                 "Ensure a pond node is registered and healthy with the control plane, then retry.",
+                "latiq://troubleshooting",
+            ),
+            // A node-lookup miss (e.g. `node describe <bad-id>`) — the node simply
+            // isn't registered; this is a not-found, not an outage.
+            ControlPlaneError::NodeNotFound(n) => ErrorEnvelope::new(
+                ErrorKind::Internal,
+                format!("Node '{n}' is not registered."),
+                "Run `latiq node list` to see registered nodes.",
                 "latiq://troubleshooting",
             ),
             ControlPlaneError::DatasetNotFound(r) => ErrorEnvelope::for_kind(
@@ -61,15 +73,16 @@ impl ControlPlaneError {
         }
     }
 
-    /// The gRPC code for this error. Kept distinct from the envelope kind because
-    /// NodeNotFound is a precondition (no host), not NotFound (review #13).
+    /// The gRPC code for this error. `NoNodeAvailable` is a precondition (no host
+    /// to place a pond), distinct from `NodeNotFound` (a lookup miss = NotFound).
     fn code(&self) -> Code {
         match self {
             ControlPlaneError::NameConflict(_) => Code::AlreadyExists,
             ControlPlaneError::PondNotFound(_)
             | ControlPlaneError::DatasetNotFound(_)
-            | ControlPlaneError::CatalogNotFound(_) => Code::NotFound,
-            ControlPlaneError::NodeNotFound(_) => Code::FailedPrecondition,
+            | ControlPlaneError::CatalogNotFound(_)
+            | ControlPlaneError::NodeNotFound(_) => Code::NotFound,
+            ControlPlaneError::NoNodeAvailable(_) => Code::FailedPrecondition,
             ControlPlaneError::Invalid(_) => Code::InvalidArgument,
             ControlPlaneError::Storage(_) => Code::Internal,
         }
@@ -113,11 +126,17 @@ mod tests {
         let env: ErrorEnvelope = serde_json::from_slice(st.details()).unwrap();
         assert_eq!(env.kind, ErrorKind::PondNotFound);
 
-        // No-node-available stays a precondition (review #13), with Internal-kind
-        // guidance (there is no "unavailable" kind).
-        let st = to_status(ControlPlaneError::NodeNotFound("none".into()));
+        // No-node-available (allocate-time) is a precondition (review #13).
+        let st = to_status(ControlPlaneError::NoNodeAvailable("none".into()));
         assert_eq!(st.code(), Code::FailedPrecondition);
         let env: ErrorEnvelope = serde_json::from_slice(st.details()).unwrap();
         assert_eq!(env.kind, ErrorKind::Internal);
+        assert!(env.message.contains("No pond node is available"));
+
+        // A node-lookup miss (describe a bad id) is NotFound, not a precondition.
+        let st = to_status(ControlPlaneError::NodeNotFound("bad-id".into()));
+        assert_eq!(st.code(), Code::NotFound);
+        let env: ErrorEnvelope = serde_json::from_slice(st.details()).unwrap();
+        assert!(env.message.contains("'bad-id' is not registered"));
     }
 }

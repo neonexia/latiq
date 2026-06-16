@@ -205,7 +205,7 @@ impl Registry {
                 [],
                 |r| r.get(0),
             )
-            .map_err(|_| ControlPlaneError::NodeNotFound("no active node registered".into()))?;
+            .map_err(|_| ControlPlaneError::NoNodeAvailable("no active node registered".into()))?;
         let exists: i64 = c.query_row(
             "SELECT count(*) FROM ponds WHERE name=?",
             duckdb::params![name],
@@ -330,31 +330,36 @@ impl Registry {
             ));
         }
         let c = self.lock();
-        c.execute(
-            "DELETE FROM dataset_tables WHERE dataset=?",
-            duckdb::params![d.name],
-        )?;
-        c.execute(
-            "DELETE FROM dataset_tags WHERE dataset=?",
-            duckdb::params![d.name],
-        )?;
-        c.execute("DELETE FROM datasets WHERE name=?", duckdb::params![d.name])?;
-        c.execute(
-            "INSERT INTO datasets(name, description, created_by) VALUES (?,?,?)",
-            duckdb::params![d.name, d.description, d.created_by],
-        )?;
-        for t in &d.tables {
+        // All-or-nothing: a mid-way failure (e.g. a duplicate table_name hitting
+        // the (dataset, table_name) PK) must not leave a half-written dataset.
+        in_txn(&c, || {
             c.execute(
-                "INSERT INTO dataset_tables(dataset, table_name, source_uri, format) VALUES (?,?,?,?)",
-                duckdb::params![d.name, t.table_name, t.source_uri, t.format],
+                "DELETE FROM dataset_tables WHERE dataset=?",
+                duckdb::params![d.name],
             )?;
-        }
-        for tag in &d.tags {
             c.execute(
-                "INSERT OR IGNORE INTO dataset_tags(dataset, tag) VALUES (?,?)",
-                duckdb::params![d.name, tag],
+                "DELETE FROM dataset_tags WHERE dataset=?",
+                duckdb::params![d.name],
             )?;
-        }
+            c.execute("DELETE FROM datasets WHERE name=?", duckdb::params![d.name])?;
+            c.execute(
+                "INSERT INTO datasets(name, description, created_by) VALUES (?,?,?)",
+                duckdb::params![d.name, d.description, d.created_by],
+            )?;
+            for t in &d.tables {
+                c.execute(
+                    "INSERT INTO dataset_tables(dataset, table_name, source_uri, format) VALUES (?,?,?,?)",
+                    duckdb::params![d.name, t.table_name, t.source_uri, t.format],
+                )?;
+            }
+            for tag in &d.tags {
+                c.execute(
+                    "INSERT OR IGNORE INTO dataset_tags(dataset, tag) VALUES (?,?)",
+                    duckdb::params![d.name, tag],
+                )?;
+            }
+            Ok(())
+        })?;
         let _ = c.execute_batch("CHECKPOINT");
         Ok(d.name.clone())
     }
@@ -435,24 +440,28 @@ impl Registry {
         let params_json = serde_json::to_string(&ca.params)
             .map_err(|e| ControlPlaneError::Invalid(e.to_string()))?;
         let c = self.lock();
-        c.execute(
-            "DELETE FROM catalog_tags WHERE catalog=?",
-            duckdb::params![ca.name],
-        )?;
-        c.execute(
-            "DELETE FROM catalogs WHERE name=?",
-            duckdb::params![ca.name],
-        )?;
-        c.execute(
-            "INSERT INTO catalogs(name, type, params_json, description, created_by) VALUES (?,?,?,?,?)",
-            duckdb::params![ca.name, ca.r#type, params_json, ca.description, ca.created_by],
-        )?;
-        for tag in &ca.tags {
+        // All-or-nothing (no half-written catalog on a mid-way failure).
+        in_txn(&c, || {
             c.execute(
-                "INSERT OR IGNORE INTO catalog_tags(catalog, tag) VALUES (?,?)",
-                duckdb::params![ca.name, tag],
+                "DELETE FROM catalog_tags WHERE catalog=?",
+                duckdb::params![ca.name],
             )?;
-        }
+            c.execute(
+                "DELETE FROM catalogs WHERE name=?",
+                duckdb::params![ca.name],
+            )?;
+            c.execute(
+                "INSERT INTO catalogs(name, type, params_json, description, created_by) VALUES (?,?,?,?,?)",
+                duckdb::params![ca.name, ca.r#type, params_json, ca.description, ca.created_by],
+            )?;
+            for tag in &ca.tags {
+                c.execute(
+                    "INSERT OR IGNORE INTO catalog_tags(catalog, tag) VALUES (?,?)",
+                    duckdb::params![ca.name, tag],
+                )?;
+            }
+            Ok(())
+        })?;
         let _ = c.execute_batch("CHECKPOINT");
         Ok(ca.name.clone())
     }
@@ -568,6 +577,25 @@ impl Registry {
             duckdb::params![key, value],
         )?;
         Ok(())
+    }
+}
+
+/// Run `f` inside an explicit transaction so a multi-statement write is
+/// all-or-nothing: BEGIN → f → COMMIT, or ROLLBACK on any error.
+fn in_txn<F>(c: &Connection, f: F) -> Result<(), ControlPlaneError>
+where
+    F: FnOnce() -> Result<(), ControlPlaneError>,
+{
+    c.execute_batch("BEGIN")?;
+    match f() {
+        Ok(()) => {
+            c.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = c.execute_batch("ROLLBACK");
+            Err(e)
+        }
     }
 }
 
@@ -813,10 +841,46 @@ mod tests {
     #[test]
     fn create_pond_without_node_errors() {
         let r = reg();
+        // No active node → NoNodeAvailable (precondition), NOT NodeNotFound (a
+        // lookup miss) — they carry different gRPC codes (review #13).
         assert!(matches!(
             r.create_pond(None, "x", "{}", "medium", &[]),
-            Err(ControlPlaneError::NodeNotFound(_))
+            Err(ControlPlaneError::NoNodeAvailable(_))
         ));
+    }
+
+    #[test]
+    fn add_dataset_is_atomic_on_duplicate_table() {
+        let r = reg();
+        // Two tables with the same name violate the (dataset, table_name) PK
+        // mid-loop; the whole add must roll back, leaving no partial dataset.
+        let bad = DatasetRow {
+            name: "dup".into(),
+            description: "x".into(),
+            tags: vec![],
+            tables: vec![
+                DatasetTableRow {
+                    table_name: "t".into(),
+                    source_uri: "u1".into(),
+                    format: "auto".into(),
+                },
+                DatasetTableRow {
+                    table_name: "t".into(),
+                    source_uri: "u2".into(),
+                    format: "auto".into(),
+                },
+            ],
+            created_by: "op".into(),
+            created_at: String::new(),
+        };
+        assert!(r.add_dataset(&bad).is_err());
+        assert!(
+            matches!(
+                r.get_dataset("dup"),
+                Err(ControlPlaneError::DatasetNotFound(_))
+            ),
+            "a failed add must not leave a half-written dataset"
+        );
     }
 
     #[test]
