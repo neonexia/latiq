@@ -1,5 +1,5 @@
 //! Full-stack feature tests for the operator Admin gRPC surface (control plane):
-//! node list, pond list (metadata read), policy, audit. Names prefixed by feature.
+//! node list, pond list (metadata read), policy. Names prefixed by feature.
 mod common;
 
 use common::start_stack;
@@ -13,45 +13,6 @@ fn id_req<T>(msg: T, agent: &str) -> Request<T> {
     r.metadata_mut()
         .insert("latiq-agent-id", agent.parse().unwrap());
     r
-}
-
-#[tokio::test]
-async fn audit_tail_records_operations_with_identity() {
-    let s = start_stack().await;
-    let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
-    data.allocate_pond(id_req(
-        AllocatePondRequest {
-            name: "p".into(),
-            policy_json: String::new(),
-            tier: String::new(),
-        },
-        "alice",
-    ))
-    .await
-    .unwrap();
-    data.write_query(id_req(
-        QueryRequest {
-            pond: "p".into(),
-            sql: "CREATE TABLE t(id INTEGER)".into(),
-        },
-        "alice",
-    ))
-    .await
-    .unwrap();
-
-    let mut admin = AdminClient::connect(s.admin_endpoint.clone())
-        .await
-        .unwrap();
-    let entries = admin
-        .audit_tail(AuditTailRequest { limit: 10 })
-        .await
-        .unwrap()
-        .into_inner()
-        .entries;
-    assert!(entries
-        .iter()
-        .any(|e| e.operation == "write_query" && e.agent_identity == "alice"));
-    assert!(entries.iter().any(|e| e.operation == "allocate_pond"));
 }
 
 #[tokio::test]

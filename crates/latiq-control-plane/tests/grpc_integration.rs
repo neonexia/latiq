@@ -100,26 +100,6 @@ async fn control_and_admin_surfaces_work() {
         .unwrap()
         .into_inner();
     assert!(pol.policy_json.contains("\"45\""));
-
-    control
-        .record_audit(RecordAuditRequest {
-            agent_identity: "agent-x".into(),
-            identity_verified: false,
-            operation: "read_query".into(),
-            pond_id: created.pond_id.clone(),
-            request_summary_json: "{}".into(),
-            result_summary_json: "{}".into(),
-            duration_ms: 5,
-        })
-        .await
-        .unwrap();
-    let tail = admin
-        .audit_tail(AuditTailRequest { limit: 10 })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(tail.entries.len(), 1);
-    assert_eq!(tail.entries[0].operation, "read_query");
 }
 
 /// Allocating a pond when no node is registered must surface as a precondition

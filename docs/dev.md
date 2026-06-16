@@ -6,7 +6,7 @@
 
 Latiq is a two-process stack plus a CLI, all from one `latiq` binary:
 
-- **control plane** (`latiq serve`) — the registry (nodes, ponds, policy, audit). Serves **Control gRPC** (pond nodes) and **Admin gRPC** (operators/CLI) on one port. Never in the query path.
+- **control plane** (`latiq serve`) — the registry (nodes, ponds, policy). Serves **Control gRPC** (pond nodes) and **Admin gRPC** (operators/CLI) on one port. Never in the query path.
 - **pond node** (`latiq node add`) — owns storage + the DuckDB/DuckLake engine. Serves **MCP-over-HTTP** (agents only) and the **Data/Query gRPC** (CLI/SDK). Queries run here.
 - **`latiq` CLI** — a **gRPC client, not an agent.** Its single entry point is the **control plane**: the CP assigns a node for new ponds and resolves which node hosts an existing pond, then the CLI runs data ops **node-direct** (the control plane is never in the data path).
 
@@ -296,7 +296,7 @@ latiq stats -f json      # raw snapshot for scripts
 (Per-node CPU/memory and per-pond query metrics are the next pass — a Prometheus
 `/metrics` endpoint. This snapshot is registry state only.)
 
-(Policy and audit commands were trimmed from the CLI for now — the Admin gRPC still serves them; commands return when needed.)
+(Policy commands were trimmed from the CLI for now — the Admin gRPC still serves them; commands return when needed. Access auditing is not a registry capability — each access is a structured trace on the pond node's `latiq::access` log target; operators grep the node log files.)
 
 ---
 
@@ -354,7 +354,7 @@ Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`
 
 ## What works now vs. later
 
-**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, an audit log, **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), and **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads).
+**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, structured access traces (`latiq::access` log target), **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), and **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads).
 
 **Later slices:** external catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, node-liveness reaping (a crashed node currently stays `active`), disk quotas, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
 

@@ -77,21 +77,6 @@ impl Admin for AdminService {
         Ok(Response::new(PolicySetResponse {}))
     }
 
-    async fn audit_tail(
-        &self,
-        req: Request<AuditTailRequest>,
-    ) -> Result<Response<AuditTailResponse>, Status> {
-        let limit = req.into_inner().limit.max(1);
-        let entries = self
-            .registry
-            .audit_tail(limit)
-            .map_err(to_status)?
-            .into_iter()
-            .map(audit_entry)
-            .collect();
-        Ok(Response::new(AuditTailResponse { entries }))
-    }
-
     async fn pond_list(
         &self,
         _req: Request<PondListRequest>,
@@ -117,26 +102,6 @@ impl Admin for AdminService {
             });
         }
         Ok(Response::new(PondListResponse { ponds }))
-    }
-
-    async fn audit_search(
-        &self,
-        req: Request<AuditSearchRequest>,
-    ) -> Result<Response<AuditSearchResponse>, Status> {
-        let r = req.into_inner();
-        let since = if r.since.is_empty() {
-            "1970-01-01".to_string()
-        } else {
-            r.since
-        };
-        let entries = self
-            .registry
-            .audit_search(&r.identity, &since)
-            .map_err(to_status)?
-            .into_iter()
-            .map(audit_entry)
-            .collect();
-        Ok(Response::new(AuditSearchResponse { entries }))
     }
 
     async fn dataset_add(
@@ -261,16 +226,5 @@ fn node_info(n: crate::registry::NodeRow) -> NodeInfo {
         pond_count: n.pond_count,
         last_heartbeat: n.last_heartbeat,
         heartbeat_age_seconds: n.heartbeat_age_seconds.max(0) as u64,
-    }
-}
-
-fn audit_entry(a: crate::registry::AuditRow) -> AuditEntry {
-    AuditEntry {
-        ts: a.ts,
-        agent_identity: a.agent_identity,
-        verified: a.verified,
-        operation: a.operation,
-        pond_id: a.pond_id.unwrap_or_default(),
-        duration_ms: a.duration_ms,
     }
 }

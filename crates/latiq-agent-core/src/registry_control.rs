@@ -2,9 +2,9 @@
 //! Used for single-process operation and tests; M6 adds a gRPC-client impl.
 use crate::control::ControlPlane;
 use crate::error::AgentError;
-use crate::types::{AuditRecord, CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
+use crate::types::{CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_common::ErrorKind;
-use latiq_control_plane::registry::{AuditInsert, PondRow};
+use latiq_control_plane::registry::PondRow;
 use latiq_control_plane::{ControlPlaneError, Registry};
 
 pub struct RegistryControlPlane {
@@ -175,18 +175,6 @@ impl ControlPlane for RegistryControlPlane {
         Ok(catalog_to_info(
             self.registry.get_catalog(name).map_err(cp_err)?,
         ))
-    }
-
-    async fn record_audit(&self, rec: AuditRecord) {
-        let _ = self.registry.record_audit(AuditInsert {
-            agent_identity: rec.agent_identity,
-            identity_verified: rec.verified,
-            operation: rec.operation,
-            pond_id: rec.pond_id,
-            request_summary: rec.request_summary,
-            result_summary: None,
-            duration_ms: rec.duration_ms,
-        });
     }
 }
 
