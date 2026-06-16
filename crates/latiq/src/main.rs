@@ -680,8 +680,11 @@ fn init_tracing() {
 /// start the Prometheus recorder + `/metrics` server. Returns the address logged
 /// in the banner.
 fn start_metrics(bind: &str, main_port: u16, metrics_port: Option<u16>) -> Result<SocketAddr> {
-    let addr: SocketAddr =
-        format!("{bind}:{}", metrics_port.unwrap_or(main_port + 1000)).parse()?;
+    let addr: SocketAddr = format!(
+        "{bind}:{}",
+        metrics_port.unwrap_or(main_port.saturating_add(1000))
+    )
+    .parse()?;
     let handle = latiq_metrics::init_recorder();
     metrics::gauge!("latiq_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
     tokio::spawn(async move {
@@ -718,8 +721,12 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let data_addr = format!("{}:{}", a.bind, a.port);
     let mcp_addr = format!("{}:{}", a.bind, a.port + 1);
-    let metrics_addr: SocketAddr =
-        format!("{}:{}", a.bind, a.metrics_port.unwrap_or(a.port + 1000)).parse()?;
+    let metrics_addr: SocketAddr = format!(
+        "{}:{}",
+        a.bind,
+        a.metrics_port.unwrap_or(a.port.saturating_add(1000))
+    )
+    .parse()?;
     // The endpoint OTHER nodes use to reach us (stored in the registry for
     // forwarding). Defaults to loopback so single-host runs are unchanged; in
     // containers `--advertise-addr pond-node-1:51401` makes forwarding routable.

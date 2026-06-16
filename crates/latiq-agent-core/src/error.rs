@@ -15,6 +15,13 @@ impl AgentError {
         AgentError(ErrorEnvelope::new(kind, message, suggest, see))
     }
 
+    /// Wrap an already-built envelope (e.g. one decoded from a gRPC `Status`'s
+    /// details, or produced by `ControlPlaneError::envelope()`), so every surface
+    /// carries the same guidance rather than re-deriving it.
+    pub fn from_envelope(env: ErrorEnvelope) -> Self {
+        AgentError(env)
+    }
+
     pub fn envelope(&self) -> &ErrorEnvelope {
         &self.0
     }

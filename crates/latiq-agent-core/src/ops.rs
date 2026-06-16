@@ -481,6 +481,7 @@ impl AgentOps {
         let sql2 = sql.to_string();
         let pond_name = info.name.clone();
         tokio::task::spawn_blocking(move || {
+            let t0 = Instant::now();
             let mut sink = ChannelSink {
                 schema_tx: Some(schema_tx),
                 batch_tx,
@@ -497,6 +498,9 @@ impl AgentOps {
                 }
             }
             inflight.complete(&op_id);
+            // Record latency here too — the Arrow stream is the CLI/SDK's primary
+            // read path, so the duration histogram would otherwise miss most reads.
+            record_query_duration(&pond_name, "read", t0.elapsed());
             // Streaming done (or the consumer dropped) → release the live-load gauge.
             metrics::gauge!("latiq_pond_inflight_queries", "pond" => pond_name).decrement(1.0);
         });
@@ -762,7 +766,9 @@ fn record_query(pond: &str, op: &'static str) {
         .increment(1);
 }
 fn record_error(pond: &str, e: &AgentError) {
-    metrics::counter!("latiq_pond_errors_total", "pond" => pond.to_string(), "kind" => format!("{:?}", e.envelope().kind))
+    // Use the snake_case wire name (not Debug's PascalCase) so the label matches
+    // the kind clients/logs see and dashboards can join on it.
+    metrics::counter!("latiq_pond_errors_total", "pond" => pond.to_string(), "kind" => e.envelope().kind.as_str())
         .increment(1);
 }
 /// Query wall-clock latency (engine execution on the owning node), in seconds —
