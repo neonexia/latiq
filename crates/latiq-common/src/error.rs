@@ -14,6 +14,7 @@ pub struct Location {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
     PondNotFound,
+    DatasetNotFound,
     NameConflict,
     ParseError,
     InvalidValue,

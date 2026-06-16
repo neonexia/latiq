@@ -3,7 +3,7 @@
 //! registry remotely. `ControlClient<Channel>` is cheaply cloneable, so each
 //! call clones it (tonic RPC methods take `&mut self`).
 use latiq_agent_core::{AgentError, ControlPlane};
-use latiq_agent_core::{AuditRecord, PondInfo};
+use latiq_agent_core::{AuditRecord, CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::*;
 use tonic::transport::Channel;
@@ -49,6 +49,37 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         node_endpoint: Some(m.node_endpoint).filter(|s| !s.is_empty()),
         tier: m.tier,
         extensions: m.extensions,
+    }
+}
+
+fn dataset_to_info(m: DatasetMsg) -> DatasetInfo {
+    DatasetInfo {
+        name: m.name,
+        description: m.description,
+        tags: m.tags,
+        tables: m
+            .tables
+            .into_iter()
+            .map(|t| DatasetTableInfo {
+                table_name: t.table_name,
+                source_uri: t.source_uri,
+                format: t.format,
+            })
+            .collect(),
+        created_by: m.created_by,
+        created_at: m.created_at,
+    }
+}
+
+fn catalog_to_info(m: CatalogMsg) -> CatalogInfo {
+    CatalogInfo {
+        name: m.name,
+        r#type: m.r#type,
+        params: m.params.into_iter().collect(),
+        description: m.description,
+        tags: m.tags,
+        created_by: m.created_by,
+        created_at: m.created_at,
     }
 }
 
@@ -130,6 +161,61 @@ impl ControlPlane for GrpcControlPlane {
         .await
         .map_err(status_err)?;
         Ok(())
+    }
+
+    async fn list_datasets(&self, query: &str) -> Result<Vec<DatasetInfo>, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .list_datasets(ListDatasetsRequest {
+                query: query.to_string(),
+            })
+            .await
+            .map_err(status_err)?
+            .into_inner();
+        Ok(resp.datasets.into_iter().map(dataset_to_info).collect())
+    }
+
+    async fn get_dataset(&self, name: &str) -> Result<DatasetInfo, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .get_dataset(GetDatasetRequest {
+                name: name.to_string(),
+            })
+            .await
+            .map_err(|s| match s.code() {
+                Code::NotFound => AgentError::dataset_not_found(name),
+                _ => status_err(s),
+            })?
+            .into_inner();
+        resp.dataset
+            .map(dataset_to_info)
+            .ok_or_else(|| AgentError::dataset_not_found(name))
+    }
+
+    async fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogInfo>, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .list_catalogs(ListCatalogsRequest {
+                query: query.to_string(),
+            })
+            .await
+            .map_err(status_err)?
+            .into_inner();
+        Ok(resp.catalogs.into_iter().map(catalog_to_info).collect())
+    }
+
+    async fn get_catalog(&self, name: &str) -> Result<CatalogInfo, AgentError> {
+        let mut c = self.client.clone();
+        let resp = c
+            .get_catalog(GetCatalogRequest {
+                name: name.to_string(),
+            })
+            .await
+            .map_err(status_err)?
+            .into_inner();
+        resp.catalog
+            .map(catalog_to_info)
+            .ok_or_else(|| AgentError::internal(format!("catalog '{name}' not found")))
     }
 
     async fn record_audit(&self, rec: AuditRecord) {

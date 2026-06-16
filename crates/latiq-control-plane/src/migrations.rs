@@ -50,6 +50,71 @@ pub const MIGRATIONS: &[&str] = &[
     // v3: per-pond optional DuckDB extensions, stored comma-separated (empty =
     // none). The engine LOADs them from the deployment image on pond open.
     "ALTER TABLE ponds ADD COLUMN extensions VARCHAR DEFAULT '';",
+    // v4: the data catalog — two first-class, separate concepts.
+    //
+    //  * CATALOG — an external attachable source (iceberg/ducklake/duckdb/…).
+    //    Registered with a `type` + opaque `params` (locator metadata; the
+    //    per-type attacher allowlists them — never credentials). Pulled from
+    //    transiently: attach → query → detach. Its tables are *discovered*.
+    //  * DATASET — a simple file (parquet/csv) or set of files, living in the
+    //    built-in `latiq` catalog. `load`ed into a pond (copied), one table each.
+    //
+    // Seeds the built-in samples as datasets.
+    r#"
+    CREATE TABLE catalogs (
+        name         VARCHAR PRIMARY KEY,
+        type         VARCHAR NOT NULL,
+        params_json  VARCHAR NOT NULL DEFAULT '{}',
+        description  VARCHAR NOT NULL DEFAULT '',
+        created_by   VARCHAR NOT NULL DEFAULT 'anonymous',
+        created_at   TIMESTAMP NOT NULL DEFAULT current_timestamp
+    );
+    CREATE TABLE catalog_tags (
+        catalog VARCHAR NOT NULL,
+        tag     VARCHAR NOT NULL,
+        PRIMARY KEY (catalog, tag)
+    );
+    CREATE TABLE datasets (
+        name         VARCHAR PRIMARY KEY,
+        description  VARCHAR NOT NULL DEFAULT '',
+        created_by   VARCHAR NOT NULL DEFAULT 'anonymous',
+        created_at   TIMESTAMP NOT NULL DEFAULT current_timestamp
+    );
+    CREATE TABLE dataset_tables (
+        dataset      VARCHAR NOT NULL,
+        table_name   VARCHAR NOT NULL,
+        source_uri   VARCHAR NOT NULL,
+        format       VARCHAR NOT NULL DEFAULT 'auto',
+        PRIMARY KEY (dataset, table_name)
+    );
+    CREATE TABLE dataset_tags (
+        dataset VARCHAR NOT NULL,
+        tag     VARCHAR NOT NULL,
+        PRIMARY KEY (dataset, tag)
+    );
+    INSERT INTO datasets(name, description, created_by) VALUES
+      ('startrek','Star Trek Season 1 scripts — CSV, ~2 KB','latiq'),
+      ('holdings','Example stock holdings — CSV, ~300 B','latiq'),
+      ('tpch','TPC-H scale 0.01 — 8 tables, Parquet, a few MB','latiq'),
+      ('taxi','NYC yellow-taxi, Apr 2019 — Parquet, ~127 MB (large)','latiq');
+    INSERT INTO dataset_tables(dataset, table_name, source_uri) VALUES
+      ('startrek','startrek','https://blobs.duckdb.org/data/Star_Trek-Season_1.csv'),
+      ('holdings','holdings','https://duckdb.org/data/holdings.csv'),
+      ('tpch','lineitem','https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet'),
+      ('tpch','orders','https://shell.duckdb.org/data/tpch/0_01/parquet/orders.parquet'),
+      ('tpch','customer','https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet'),
+      ('tpch','part','https://shell.duckdb.org/data/tpch/0_01/parquet/part.parquet'),
+      ('tpch','supplier','https://shell.duckdb.org/data/tpch/0_01/parquet/supplier.parquet'),
+      ('tpch','partsupp','https://shell.duckdb.org/data/tpch/0_01/parquet/partsupp.parquet'),
+      ('tpch','nation','https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet'),
+      ('tpch','region','https://shell.duckdb.org/data/tpch/0_01/parquet/region.parquet'),
+      ('taxi','taxi','https://blobs.duckdb.org/data/taxi_2019_04.parquet');
+    INSERT INTO dataset_tags(dataset, tag) VALUES
+      ('startrek','sample'),
+      ('holdings','sample'),
+      ('tpch','sample'),('tpch','tpch'),
+      ('taxi','sample');
+    "#,
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {

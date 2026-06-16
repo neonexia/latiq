@@ -6,7 +6,10 @@ use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
-use crate::types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
+use crate::types::{
+    AllocateResult, AuditRecord, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult,
+    PondInfo, PullResult,
+};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use latiq_common::ErrorKind;
@@ -276,6 +279,152 @@ impl AgentOps {
         Ok(res)
     }
 
+    // ---- datasets + external catalogs -------------------------------------
+
+    /// Browse/search datasets (in the built-in `latiq` catalog).
+    pub async fn list_datasets(&self, query: &str) -> Result<Vec<DatasetInfo>, AgentError> {
+        self.control.list_datasets(query).await
+    }
+
+    pub async fn get_dataset(&self, name: &str) -> Result<DatasetInfo, AgentError> {
+        self.control.get_dataset(name).await
+    }
+
+    /// Browse/search external catalogs.
+    pub async fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogInfo>, AgentError> {
+        self.control.list_catalogs(query).await
+    }
+
+    pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo, AgentError> {
+        self.control.get_catalog(name).await
+    }
+
+    /// Copy a dataset's tables into a pond — one `CREATE OR REPLACE TABLE … AS
+    /// SELECT * FROM read_*(uri)` per table, routed through the normal write path
+    /// (so forwarding to the owning node is handled).
+    pub async fn load_dataset(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        dataset: &str,
+    ) -> Result<LoadDatasetResult, AgentError> {
+        let ds = self.control.get_dataset(dataset).await?;
+        let mut loaded = Vec::with_capacity(ds.tables.len());
+        for t in &ds.tables {
+            let sql = dataset_load_sql(&t.table_name, &t.source_uri, &t.format);
+            self.write_query(identity, pond_ref, &sql).await?;
+            loaded.push(t.table_name.clone());
+        }
+        Ok(LoadDatasetResult {
+            dataset: ds.name,
+            tables: loaded,
+        })
+    }
+
+    /// Transient pull from an external catalog: resolve it, merge the pull-time
+    /// `params` over its persisted locator params (pull wins), then on the pond's
+    /// engine: attach (with creds) → run `query` (a CREATE TABLE …) → detach. The
+    /// query's result table lands in the pond; nothing about the catalog persists.
+    pub async fn catalog_pull(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        catalog: &str,
+        query: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<PullResult, AgentError> {
+        let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "catalog_pull",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            return fwd
+                .catalog_pull(owner, identity, pond_ref, catalog, query, params)
+                .await;
+        }
+        let (loc, cat, merged) = self.prepare_pull(&info, catalog, params).await?;
+        let engine = self.engine.clone();
+        let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
+        tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        self.audit(
+            identity,
+            "catalog_pull",
+            Some(pond_ref),
+            Some(query.to_string()),
+            0,
+        )
+        .await;
+        Ok(PullResult {
+            catalog: cat.name,
+            query: query.to_string(),
+        })
+    }
+
+    /// Transiently attach a catalog on the pond and list its tables.
+    pub async fn catalog_describe(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        catalog: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, AgentError> {
+        let info = self.control.pond_info(pond_ref).await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "catalog_describe",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            return fwd
+                .catalog_describe(owner, identity, pond_ref, catalog, params)
+                .await;
+        }
+        let (loc, cat, merged) = self.prepare_pull(&info, catalog, params).await?;
+        let engine = self.engine.clone();
+        let (ty, alias) = (cat.r#type.clone(), cat.name.clone());
+        tokio::task::spawn_blocking(move || engine.describe_catalog(&loc, &ty, &alias, &merged))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))?
+            .map_err(Into::into)
+    }
+
+    /// Shared LOCAL setup for pull/describe (the caller has already resolved the
+    /// pond and confirmed this node owns it — remote ponds are forwarded before
+    /// reaching here): resolve the catalog and merge its locator params with the
+    /// pull-time params (pull wins).
+    async fn prepare_pull(
+        &self,
+        info: &PondInfo,
+        catalog: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<
+        (
+            latiq_storage::PondLocation,
+            CatalogInfo,
+            std::collections::BTreeMap<String, String>,
+        ),
+        AgentError,
+    > {
+        let cat = self.control.get_catalog(catalog).await?;
+        let mut merged = cat.params.clone();
+        merged.extend(params);
+        let pid = Self::parse_id(&info.pond_id)?;
+        let mut loc = self
+            .storage
+            .ensure_pond(pid)
+            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        loc.catalog_name = info.name.clone();
+        loc.limits = tier_limits(&info.tier);
+        loc.extensions = info.extensions.clone();
+        Ok((loc, cat, merged))
+    }
+
     /// Stream a read as Arrow batches. Local: drive the engine's `read_arrow` on
     /// the blocking pool, delivering the schema then batches over channels
     /// (bounded mpsc → backpressure). Remote: forward to the owning node. The
@@ -543,6 +692,32 @@ impl AgentOps {
 /// Map a pond's tier name to its resource caps (unknown/empty → medium).
 fn tier_limits(tier: &str) -> Option<ResourceLimits> {
     Some(PondTier::parse(tier).unwrap_or_default().limits())
+}
+
+/// Build the `CREATE OR REPLACE TABLE … AS SELECT * FROM read_*(uri)` for one
+/// dataset table. `format` picks the DuckDB reader; `auto` infers from the URI
+/// extension. The table name is quoted and the URI's single quotes are escaped
+/// (the catalog is operator-curated, but we still don't let a stray quote break
+/// out of the string literal).
+fn dataset_load_sql(table_name: &str, source_uri: &str, format: &str) -> String {
+    let reader = match format.trim().to_lowercase().as_str() {
+        "csv" => "read_csv_auto",
+        "json" => "read_json_auto",
+        "parquet" => "read_parquet",
+        _ => {
+            let u = source_uri.to_lowercase();
+            if u.ends_with(".csv") {
+                "read_csv_auto"
+            } else if u.ends_with(".json") || u.ends_with(".ndjson") {
+                "read_json_auto"
+            } else {
+                "read_parquet"
+            }
+        }
+    };
+    let table = format!("\"{}\"", table_name.replace('"', "\"\""));
+    let uri = source_uri.replace('\'', "''");
+    format!("CREATE OR REPLACE TABLE {table} AS SELECT * FROM {reader}('{uri}')")
 }
 
 /// Per-pond query/error counters — recorded on the node that actually runs the

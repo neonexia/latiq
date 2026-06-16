@@ -1,0 +1,55 @@
+# Local Iceberg REST catalog backed by MinIO (S3), for exercising Latiq's iceberg
+# attacher end-to-end. Brought up by ./up.sh, which also seeds a `demo.widgets`
+# table. Tear down with `docker compose down -v`.
+#
+#   Iceberg REST : http://localhost:8181
+#   MinIO S3     : http://localhost:9000   (console :9001, admin/password)
+services:
+  minio:
+    image: minio/minio
+    # Host ports are overridable (avoid clashes with a host-native MinIO, etc.).
+    ports:
+      - "${LATIQ_S3_PORT:-9000}:9000"
+      - "${LATIQ_S3_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # Create the `warehouse` bucket, then exit.
+  mc:
+    image: minio/mc
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set m http://minio:9000 admin password; do sleep 1; done;
+      mc mb --ignore-existing m/warehouse;
+      exit 0;"
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture
+    ports: ["${LATIQ_ICEBERG_PORT:-8181}:8181"]
+    depends_on: [minio]
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+
+  # One-shot seeder: creates `demo.widgets` and appends a few rows via pyiceberg.
+  # Run via the `seed` profile (./up.sh handles it).
+  seed:
+    image: python:3.11-slim
+    profiles: ["seed"]
+    depends_on: [iceberg-rest, mc]
+    volumes: ["./seed.py:/seed.py:ro"]
+    command: >
+      sh -c "pip install -q 'pyiceberg[pyarrow,s3fs]' && python /seed.py"

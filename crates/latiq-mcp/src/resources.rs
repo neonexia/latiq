@@ -24,6 +24,7 @@ const RESOURCES: &[Res] = &[
 - **Self-describing schemas:** when you CREATE TABLE, add column and table COMMENTs. Other agents discovering your pond rely on them. See latiq://recipes/schema-design.\n\
 - **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message FROM ducklake_snapshots('<pond>')`.\n\
 - **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
+- **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
 - **Plan first:** call explain_query before an expensive query to estimate cost, then refine.\n\
 - **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.",
@@ -70,6 +71,21 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 **Public files (no credentials):** read CSV/Parquet/JSON by URL directly in write_query:\n```sql\nCREATE TABLE raw AS SELECT * FROM read_csv('https://example.com/data.csv');\nINSERT INTO raw SELECT * FROM 's3://public-bucket/more.parquet';\n```\n\
 Only public/anonymous sources work in M1; credentialed databases come with admin-curated catalogs in a later slice.\n\
 **Own data:** `INSERT INTO t VALUES (...)` or `CREATE TABLE t AS SELECT ...`.",
+    },
+    Res {
+        uri: "latiq://recipes/external-data",
+        name: "Recipe: external data (datasets & catalogs)",
+        desc: "Bring outside data into a pond — curated files or external catalogs",
+        body: "# Recipe — bring external data into a pond\n\n\
+Latiq has two paths. Everything ends up as tables IN your pond — external catalogs are never queried live.\n\n\
+## Datasets — curated public files (copy in)\n\
+```\nlist_datasets {query?}            # discover; e.g. query='#sample' or 'tpch'\nload_dataset {pond, dataset}     # copies its tables into the pond\nread_query {pond, sql:'SELECT count(*) FROM orders'}\n```\n\n\
+## Catalogs — external databases/lakehouses (pull a subset in)\n\
+An operator registers a catalog (iceberg today). You discover its tables, then pull what you need:\n\
+```\nlist_catalogs {query?}                                  # find a catalog, e.g. 'lake'\ndescribe_catalog {pond, catalog, set:{token:'<bearer>'}} # list its tables (transient attach)\npull_catalog {pond, catalog, query:'CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region=''us''', set:{token:'<bearer>'}}\nread_query {pond, sql:'SELECT * FROM us LIMIT 10'}\n```\n\
+**Credentials** ride in via `set` (e.g. `{token: '<bearer>'}`) on describe/pull only — used once, never stored. \
+Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB downloads only the columns/rows you SELECT. \
+**Don't** try to query `lake.…` outside a pull — attach is transient. **Do** describe_catalog first so you SELECT real table names.",
     },
     Res {
         uri: "latiq://recipes/attribution-lookup",

@@ -17,4 +17,7 @@ pub use inflight::InFlightRegistry;
 pub use ops::{AgentConfig, AgentOps};
 pub use registry_control::RegistryControlPlane;
 pub use trace::{current_trace_id, new_trace_id, with_trace_id};
-pub use types::{AllocateResult, AuditRecord, DescribeResult, PondInfo};
+pub use types::{
+    AllocateResult, AuditRecord, CatalogInfo, DatasetInfo, DatasetTableInfo, DescribeResult,
+    LoadDatasetResult, PondInfo, PullResult,
+};
