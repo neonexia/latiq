@@ -43,6 +43,28 @@ pub struct ErrorEnvelope {
 }
 
 impl ErrorKind {
+    /// The snake_case wire name (matches the serde `rename_all` serialization) —
+    /// use this for metric labels / logs so they agree with the envelope on the
+    /// wire (`format!("{:?}", kind)` would give PascalCase and not match).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::PondNotFound => "pond_not_found",
+            ErrorKind::DatasetNotFound => "dataset_not_found",
+            ErrorKind::NameConflict => "name_conflict",
+            ErrorKind::ParseError => "parse_error",
+            ErrorKind::InvalidValue => "invalid_value",
+            ErrorKind::MissingArgument => "missing_argument",
+            ErrorKind::WriteToReservedSchema => "write_to_reserved_schema",
+            ErrorKind::ResultCapExceeded => "result_cap_exceeded",
+            ErrorKind::ReadOnlyViolation => "read_only_violation",
+            ErrorKind::UriNotAllowed => "uri_not_allowed",
+            ErrorKind::QueryTimeout => "query_timeout",
+            ErrorKind::QueryCancelled => "query_cancelled",
+            ErrorKind::Storage => "storage",
+            ErrorKind::Internal => "internal",
+        }
+    }
+
     /// The canonical, copy-paste-ready next step for this kind — the single
     /// source of `suggest` text, shared by every surface (agent-core, the
     /// control-plane gRPC, the CLI) so the same kind reads identically wherever
@@ -152,6 +174,31 @@ mod tests {
         assert_eq!(e.message, "Pond 'x' does not exist.");
         assert_eq!(e.suggest, ErrorKind::PondNotFound.default_suggest());
         assert_eq!(e.see, "latiq://troubleshooting/pond-not-found");
+    }
+
+    #[test]
+    fn as_str_matches_serde_snake_case() {
+        // The metric-label name must equal the wire serialization, or dashboards
+        // keyed on the envelope's kind won't match the metric.
+        for kind in [
+            ErrorKind::PondNotFound,
+            ErrorKind::DatasetNotFound,
+            ErrorKind::NameConflict,
+            ErrorKind::ParseError,
+            ErrorKind::InvalidValue,
+            ErrorKind::MissingArgument,
+            ErrorKind::WriteToReservedSchema,
+            ErrorKind::ResultCapExceeded,
+            ErrorKind::ReadOnlyViolation,
+            ErrorKind::UriNotAllowed,
+            ErrorKind::QueryTimeout,
+            ErrorKind::QueryCancelled,
+            ErrorKind::Storage,
+            ErrorKind::Internal,
+        ] {
+            let serde_name = serde_json::to_value(kind).unwrap();
+            assert_eq!(serde_name.as_str().unwrap(), kind.as_str(), "{kind:?}");
+        }
     }
 
     #[test]

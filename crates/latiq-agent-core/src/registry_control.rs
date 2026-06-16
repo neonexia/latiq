@@ -3,7 +3,6 @@
 use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::types::{CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
-use latiq_common::ErrorKind;
 use latiq_control_plane::registry::PondRow;
 use latiq_control_plane::{ControlPlaneError, Registry};
 
@@ -17,31 +16,11 @@ impl RegistryControlPlane {
     }
 }
 
+/// Map a control-plane error to the neutral AgentError using the SAME canonical
+/// envelope the gRPC path decodes from Status details (`ControlPlaneError::
+/// envelope()`), so in-process and over-the-wire surfaces give identical guidance.
 fn cp_err(e: ControlPlaneError) -> AgentError {
-    match e {
-        ControlPlaneError::NameConflict(n) => AgentError::name_conflict(&n),
-        ControlPlaneError::PondNotFound(r) => AgentError::pond_not_found(&r),
-        ControlPlaneError::NodeNotFound(m) => AgentError::new(
-            ErrorKind::Internal,
-            format!("no pond node available: {m}"),
-            "Ensure a pond node is registered with the control plane.",
-            "latiq://troubleshooting",
-        ),
-        ControlPlaneError::DatasetNotFound(r) => AgentError::dataset_not_found(&r),
-        ControlPlaneError::CatalogNotFound(r) => AgentError::new(
-            ErrorKind::DatasetNotFound,
-            format!("Catalog '{r}' is not registered."),
-            "Call list_catalogs to see registered catalogs.",
-            "latiq://catalogs",
-        ),
-        ControlPlaneError::Invalid(m) => AgentError::new(
-            ErrorKind::InvalidValue,
-            m,
-            "Fix the request and retry.",
-            "latiq://guidance",
-        ),
-        ControlPlaneError::Storage(m) => AgentError::internal(m),
-    }
+    AgentError::from_envelope(e.envelope())
 }
 
 fn dataset_to_info(d: latiq_control_plane::registry::DatasetRow) -> DatasetInfo {
