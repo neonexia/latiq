@@ -53,8 +53,9 @@ async fn external_data_tools_discover_and_load_via_mcp() {
     args.insert("dataset".into(), "holdings".into());
     let loaded = c.call_tool("load_dataset", args).await.unwrap();
     assert!(!loaded.is_error, "{:?}", loaded.value);
+    // Datasets load into a schema named after the dataset (holdings.holdings).
     let r = c
-        .query("work", "SELECT count(*) AS n FROM holdings")
+        .query("work", "SELECT count(*) AS n FROM holdings.holdings")
         .await
         .unwrap();
     assert!(r.value["rows"][0][0].as_i64().unwrap() >= 1);
