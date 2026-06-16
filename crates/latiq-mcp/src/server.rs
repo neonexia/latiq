@@ -1,7 +1,8 @@
 //! The Latiq MCP server: exposes the agent tools (pond + query + dataset/catalog)
 //! over rmcp Streamable-HTTP.
-//! Identity is relaxed (Slice 0+): taken from an optional `agent_id` argument,
-//! defaulting to anonymous. (M6 moves this to the `X-Latiq-Agent-Id` header.)
+//! Identity is relaxed (M1): taken from an optional `agent_id` argument,
+//! defaulting to anonymous and `verified:false`. Verifying it from an
+//! authenticated source (OIDC bearer) is tracked in #5.
 use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
 use crate::resources;
 use latiq_agent_core::{AgentError, AgentOps};
