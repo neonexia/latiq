@@ -11,7 +11,7 @@ use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
-use latiq_agent_core::{AgentError, ArrowReadStream, DescribeResult, Forwarder};
+use latiq_agent_core::{AgentError, ArrowReadStream, DescribeResult, Forwarder, PullResult};
 use latiq_common::{ErrorEnvelope, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
 use latiq_proto::v1::data_client::DataClient;
@@ -339,5 +339,72 @@ impl Forwarder for GrpcForwarder {
         );
         c.drop_pond(req).await.map_err(status_to_error)?;
         Ok(())
+    }
+
+    async fn catalog_pull(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        catalog: &str,
+        query: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<PullResult, AgentError> {
+        let mut c = self.client(endpoint).await?;
+        let req = with_identity(
+            CatalogPullRequest {
+                pond: pond.to_string(),
+                catalog: catalog.to_string(),
+                query: query.to_string(),
+                params: params.into_iter().collect(),
+            },
+            identity,
+        );
+        let resp = c
+            .catalog_pull(req)
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+        serde_json::from_value(parse_json(&resp.json)?)
+            .map_err(|e| AgentError::internal(format!("forward decode catalog_pull: {e}")))
+    }
+
+    async fn catalog_describe(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        catalog: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, AgentError> {
+        let mut c = self.client(endpoint).await?;
+        let req = with_identity(
+            CatalogDescribeRequest {
+                pond: pond.to_string(),
+                catalog: catalog.to_string(),
+                params: params.into_iter().collect(),
+            },
+            identity,
+        );
+        let resp = c
+            .catalog_describe(req)
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+        // The Data service encodes describe as {catalog, tables:[{schema,table}]}.
+        // Re-hydrate the (schema, table) pairs the core returns.
+        let v = parse_json(&resp.json)?;
+        let tables = v
+            .get("tables")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| AgentError::internal("forward decode catalog_describe: no tables"))?;
+        Ok(tables
+            .iter()
+            .filter_map(|t| {
+                let schema = t.get("schema")?.as_str()?.to_string();
+                let table = t.get("table")?.as_str()?.to_string();
+                Some((schema, table))
+            })
+            .collect())
     }
 }

@@ -1,6 +1,8 @@
 syntax = "proto3";
 package latiq.v1;
 
+import "latiq/v1/datasets.proto";
+
 service Admin {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc DescribeNode(DescribeNodeRequest) returns (DescribeNodeResponse);
@@ -11,7 +13,30 @@ service Admin {
   // Operators inspect ponds from the control plane (registry) directly, so this
   // works even when pond nodes are down (metadata read, not in the query path).
   rpc PondList(PondListRequest) returns (PondListResponse);
+  // Operators curate the dataset catalog (add/remove); list/search is here too
+  // so operators can browse it from the control plane.
+  rpc DatasetAdd(DatasetAddRequest) returns (DatasetAddResponse);
+  rpc DatasetRemove(DatasetRemoveRequest) returns (DatasetRemoveResponse);
+  rpc DatasetList(DatasetListRequest) returns (DatasetListResponse);
+  rpc CatalogAdd(CatalogAddRequest) returns (CatalogAddResponse);
+  rpc CatalogRemove(CatalogRemoveRequest) returns (CatalogRemoveResponse);
+  rpc CatalogList(CatalogListRequest) returns (CatalogListResponse);
 }
+
+message DatasetAddRequest { DatasetMsg dataset = 1; }
+message DatasetAddResponse { string name = 1; }
+message DatasetRemoveRequest { string name = 1; }
+message DatasetRemoveResponse { }
+// query: empty = all; "#tag" = by tag; "prefix*" = name glob; else a substring.
+message DatasetListRequest { string query = 1; }
+message DatasetListResponse { repeated DatasetMsg datasets = 1; }
+
+message CatalogAddRequest { CatalogMsg catalog = 1; }
+message CatalogAddResponse { string name = 1; repeated string dropped_params = 2; }
+message CatalogRemoveRequest { string name = 1; }
+message CatalogRemoveResponse { }
+message CatalogListRequest { string query = 1; }
+message CatalogListResponse { repeated CatalogMsg catalogs = 1; }
 
 message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; }
 message PondListRequest { }

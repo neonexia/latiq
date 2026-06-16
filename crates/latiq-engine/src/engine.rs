@@ -54,6 +54,26 @@ pub trait QueryEngine: Send + Sync {
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError>;
     /// Summarize the pond's user tables (for describe_pond).
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError>;
+    /// Transient pull from an external catalog: on the pond's instance, LOAD the
+    /// type's extensions + create its secrets, `ATTACH` it as `alias`, run `query`
+    /// (a `CREATE TABLE … AS SELECT … FROM <alias>.…`), then `DETACH` + drop the
+    /// secrets — regardless of success. Nothing about the catalog persists.
+    fn pull_catalog(
+        &self,
+        loc: &PondLocation,
+        catalog_type: &str,
+        alias: &str,
+        params: &std::collections::BTreeMap<String, String>,
+        query: &str,
+    ) -> Result<(), EngineError>;
+    /// Transiently attach a catalog and list its `(schema.table)` entries.
+    fn describe_catalog(
+        &self,
+        loc: &PondLocation,
+        catalog_type: &str,
+        alias: &str,
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, EngineError>;
     /// Number of pond instances currently open/cached (for the node's
     /// `open_ponds` gauge). Cheap; default 0 for engines that don't cache.
     fn open_pond_count(&self) -> usize {

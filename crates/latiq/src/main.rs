@@ -60,9 +60,12 @@ enum Command {
     Pond(PondCmd),
     /// Run a SQL statement (read or write) against a pond.
     Query(QueryArgs),
-    /// Load curated sample datasets (public DuckLake/standard data) into a pond.
+    /// Datasets (simple files in the `latiq` catalog): add/list/load/remove.
     #[command(subcommand)]
     Dataset(DatasetCmd),
+    /// External catalogs (iceberg/…): add/list/describe/pull/remove.
+    #[command(subcommand)]
+    Catalog(CatalogCmd),
     /// System snapshot: nodes (state + heartbeat age), ponds, tiers.
     Stats(StatsArgs),
 }
@@ -78,20 +81,84 @@ struct StatsArgs {
 #[derive(Subcommand)]
 #[command(after_help = SERVER_HELP)]
 enum DatasetCmd {
-    /// List the available sample datasets.
-    List,
-    /// Load a dataset (or --all) into a pond — one CREATE TABLE per table.
+    /// Add (or replace) a dataset. Operator action.
+    Add {
+        /// Dataset name (a bare identifier), e.g. `sales`.
+        name: String,
+        /// A table to include, `name=source_uri` (repeatable).
+        #[arg(short, long = "table", value_name = "NAME=URI", required = true)]
+        tables: Vec<String>,
+        /// Reader format for the tables: parquet | csv | json | auto (inferred).
+        #[arg(short, long, default_value = "auto")]
+        format: String,
+        /// Human description.
+        #[arg(short, long, default_value = "")]
+        description: String,
+        /// Searchable tag (repeatable).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List/search datasets. Query: `#tag`, `prefix*`, or a substring.
+    List { query: Option<String> },
+    /// Remove a dataset. Operator action.
+    Remove { name: String },
+    /// Load a dataset's tables into a pond (one table each).
     Load {
-        /// Dataset name (omit and pass --all to load every dataset).
-        name: Option<String>,
-        /// Load every dataset.
-        #[arg(long)]
-        all: bool,
+        name: String,
         #[arg(short, long)]
         pond: String,
         #[arg(short, long)]
         agent_id: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+#[command(after_help = SERVER_HELP)]
+enum CatalogCmd {
+    /// Register (or replace) an external catalog. Operator action. `--set` carries
+    /// locator params (credentials are dropped here — pass them at pull/describe).
+    Add {
+        /// Catalog name (a bare identifier), e.g. `lake`.
+        name: String,
+        /// Catalog type: iceberg.
+        #[arg(short, long)]
+        r#type: String,
+        /// Config param `key=value` (repeatable), e.g. `--set endpoint=...`.
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(short, long, default_value = "")]
+        description: String,
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+    },
+    /// List/search catalogs. Query: `#tag`, `prefix*`, or a substring.
+    List { query: Option<String> },
+    /// List a catalog's tables (transient attach on a pond). `--set` for creds.
+    Describe {
+        name: String,
+        #[arg(short, long)]
+        pond: String,
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
+    /// Pull from a catalog into a pond: transient attach → run the query → detach.
+    Pull {
+        name: String,
+        #[arg(short, long)]
+        pond: String,
+        /// SQL that materializes into the pond, e.g.
+        /// `CREATE TABLE t AS SELECT * FROM <catalog>.schema.table WHERE …`.
+        #[arg(short, long)]
+        query: String,
+        #[arg(short, long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
+    /// Remove a catalog. Operator action.
+    Remove { name: String },
 }
 
 #[derive(Args)]
@@ -208,155 +275,324 @@ async fn main() -> Result<()> {
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
         Command::Query(a) => run_query(a).await,
         Command::Dataset(cmd) => run_dataset_cmd(cmd).await,
+        Command::Catalog(cmd) => run_catalog_cmd(cmd).await,
         Command::Stats(a) => run_stats(a).await,
     }
 }
 
-// ---- sample datasets ----------------------------------------------------
+// ---- datasets + external catalogs ---------------------------------------
 
-/// A curated sample dataset: one or more tables, each loaded from a public URL.
-/// Data is NOT stored in the repo — these are standard public datasets.
-struct SampleDataset {
-    name: &'static str,
-    description: &'static str,
-    tables: &'static [(&'static str, &'static str)], // (table name, source URL)
-}
-
-const DATASETS: &[SampleDataset] = &[
-    SampleDataset {
-        name: "startrek",
-        description: "Star Trek Season 1 scripts — CSV, ~2 KB",
-        tables: &[(
-            "startrek",
-            "https://blobs.duckdb.org/data/Star_Trek-Season_1.csv",
-        )],
-    },
-    SampleDataset {
-        name: "holdings",
-        description: "Example stock holdings — CSV, ~300 B",
-        tables: &[("holdings", "https://duckdb.org/data/holdings.csv")],
-    },
-    SampleDataset {
-        name: "tpch",
-        description: "TPC-H scale 0.01 — 8 tables, Parquet, a few MB",
-        tables: &[
-            (
-                "lineitem",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/lineitem.parquet",
-            ),
-            (
-                "orders",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/orders.parquet",
-            ),
-            (
-                "customer",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/customer.parquet",
-            ),
-            (
-                "part",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/part.parquet",
-            ),
-            (
-                "supplier",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/supplier.parquet",
-            ),
-            (
-                "partsupp",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/partsupp.parquet",
-            ),
-            (
-                "nation",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/nation.parquet",
-            ),
-            (
-                "region",
-                "https://shell.duckdb.org/data/tpch/0_01/parquet/region.parquet",
-            ),
-        ],
-    },
-    SampleDataset {
-        name: "taxi",
-        description: "NYC yellow-taxi, Apr 2019 — Parquet, ~127 MB (large)",
-        tables: &[("taxi", "https://blobs.duckdb.org/data/taxi_2019_04.parquet")],
-    },
-];
-
-/// The DuckDB reader for a URL, picked by extension.
-fn read_fn(url: &str) -> String {
-    let u = url.to_lowercase();
-    if u.ends_with(".csv") {
-        format!("read_csv_auto('{url}')")
-    } else if u.ends_with(".json") || u.ends_with(".ndjson") {
-        format!("read_json_auto('{url}')")
-    } else {
-        format!("read_parquet('{url}')")
+/// Parse repeatable `key=value` flags into a map (used by `--set`).
+fn parse_kv(items: &[String], flag: &str) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    for it in items {
+        let (k, v) = it
+            .split_once('=')
+            .ok_or_else(|| anyhow!("{flag} must be KEY=VALUE (got '{it}')"))?;
+        out.insert(k.trim().to_string(), v.trim().to_string());
     }
+    Ok(out)
 }
 
 async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
     match cmd {
-        DatasetCmd::List => {
-            for d in DATASETS {
-                let tn = d.tables.len();
-                println!(
-                    "{:<10} {} table{}  {}",
-                    d.name,
-                    tn,
-                    if tn == 1 { " " } else { "s" },
-                    d.description
-                );
+        DatasetCmd::Add {
+            name,
+            tables,
+            format,
+            description,
+            tags,
+        } => {
+            let mut table_msgs = Vec::with_capacity(tables.len());
+            for t in &tables {
+                let (tn, uri) = t
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("--table must be NAME=URI (got '{t}')"))?;
+                table_msgs.push(DatasetTableMsg {
+                    table_name: tn.trim().to_string(),
+                    source_uri: uri.trim().to_string(),
+                    format: format.clone(),
+                });
             }
+            let mut c = admin_client().await?;
+            let r = c
+                .dataset_add(DatasetAddRequest {
+                    dataset: Some(DatasetMsg {
+                        name,
+                        description,
+                        tags,
+                        tables: table_msgs,
+                        created_by: "anonymous".into(),
+                        created_at: String::new(),
+                    }),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner();
+            println!("added {}", r.name);
+            Ok(())
+        }
+        DatasetCmd::List { query } => {
+            let mut c = admin_client().await?;
+            let datasets = c
+                .dataset_list(DatasetListRequest {
+                    query: query.unwrap_or_default(),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner()
+                .datasets;
+            let rows: Vec<[String; 4]> = datasets
+                .iter()
+                .map(|d| {
+                    [
+                        d.name.clone(),
+                        d.tags.join(","),
+                        d.tables.len().to_string(),
+                        d.description.clone(),
+                    ]
+                })
+                .collect();
+            print_kv_table(
+                &["NAME", "TAGS", "TABLES", "DESCRIPTION"],
+                &rows,
+                2,
+                "no datasets",
+            );
+            Ok(())
+        }
+        DatasetCmd::Remove { name } => {
+            let mut c = admin_client().await?;
+            c.dataset_remove(DatasetRemoveRequest { name: name.clone() })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?;
+            println!("removed {name}");
             Ok(())
         }
         DatasetCmd::Load {
             name,
-            all,
             pond,
             agent_id,
         } => {
-            let selected: Vec<&SampleDataset> = if all {
-                DATASETS.iter().collect()
-            } else {
-                let n = name.ok_or_else(|| {
-                    anyhow!("pass a dataset name or --all (see `latiq dataset list`)")
-                })?;
-                vec![DATASETS
-                    .iter()
-                    .find(|d| d.name == n)
-                    .ok_or_else(|| anyhow!("unknown dataset '{n}'; see `latiq dataset list`"))?]
-            };
-            // Resolve the pond's node once; load each table node-direct.
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
-            for d in selected {
-                for (table, url) in d.tables {
-                    let sql = format!(
-                        "CREATE OR REPLACE TABLE \"{table}\" AS SELECT * FROM {}",
-                        read_fn(url)
-                    );
-                    print!("  {} → {table} … ", d.name);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                    match c
-                        .write_query(with_id(
-                            QueryRequest {
-                                pond: pond.clone(),
-                                sql,
-                            },
-                            &agent_id,
-                        ))
-                        .await
-                    {
-                        Ok(_) => println!("ok"),
-                        Err(st) => {
-                            println!("FAILED");
-                            return print_status(&st);
-                        }
-                    }
+            print!("loading {name} into {pond} … ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            match c
+                .load_dataset(with_id(
+                    LoadDatasetRequest {
+                        pond: pond.clone(),
+                        dataset: name,
+                    },
+                    &agent_id,
+                ))
+                .await
+            {
+                Ok(resp) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&resp.into_inner().json).unwrap_or_default();
+                    let n = v
+                        .get("tables")
+                        .and_then(|t| t.as_array())
+                        .map_or(0, |a| a.len());
+                    println!("ok ({n} table{})", if n == 1 { "" } else { "s" });
+                    Ok(())
                 }
+                Err(st) => {
+                    println!("FAILED");
+                    print_status(&st)
+                }
+            }
+        }
+    }
+}
+
+async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
+    match cmd {
+        CatalogCmd::Add {
+            name,
+            r#type,
+            set,
+            description,
+            tags,
+        } => {
+            let params = parse_kv(&set, "--set")?;
+            let mut c = admin_client().await?;
+            let r = c
+                .catalog_add(CatalogAddRequest {
+                    catalog: Some(CatalogMsg {
+                        name,
+                        r#type,
+                        params,
+                        description,
+                        tags,
+                        created_by: "anonymous".into(),
+                        created_at: String::new(),
+                    }),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner();
+            println!("added {}", r.name);
+            if !r.dropped_params.is_empty() {
+                // Credentials never persist — they're dropped here and passed at pull.
+                println!(
+                    "  (not stored, pass at pull: {})",
+                    r.dropped_params.join(", ")
+                );
             }
             Ok(())
         }
+        CatalogCmd::List { query } => {
+            let mut c = admin_client().await?;
+            let catalogs = c
+                .catalog_list(CatalogListRequest {
+                    query: query.unwrap_or_default(),
+                })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?
+                .into_inner()
+                .catalogs;
+            let rows: Vec<[String; 4]> = catalogs
+                .iter()
+                .map(|c| {
+                    [
+                        c.name.clone(),
+                        c.r#type.clone(),
+                        c.tags.join(","),
+                        c.description.clone(),
+                    ]
+                })
+                .collect();
+            print_kv_table(
+                &["NAME", "TYPE", "TAGS", "DESCRIPTION"],
+                &rows,
+                99,
+                "no catalogs",
+            );
+            Ok(())
+        }
+        CatalogCmd::Describe {
+            name,
+            pond,
+            set,
+            agent_id,
+        } => {
+            let params = parse_kv(&set, "--set")?;
+            let node = data_target(&pond).await?;
+            let mut c = data_client(&node).await?;
+            let resp = c
+                .catalog_describe(with_id(
+                    CatalogDescribeRequest {
+                        pond,
+                        catalog: name,
+                        params,
+                    },
+                    &agent_id,
+                ))
+                .await
+                .map_err(|st| {
+                    let _ = print_status(&st);
+                    anyhow!("describe failed")
+                })?
+                .into_inner();
+            println!("{}", resp.json);
+            Ok(())
+        }
+        CatalogCmd::Pull {
+            name,
+            pond,
+            query,
+            set,
+            agent_id,
+        } => {
+            let params = parse_kv(&set, "--set")?;
+            let node = data_target(&pond).await?;
+            let mut c = data_client(&node).await?;
+            print!("pulling from {name} into {pond} … ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            match c
+                .catalog_pull(with_id(
+                    CatalogPullRequest {
+                        pond,
+                        catalog: name,
+                        query,
+                        params,
+                    },
+                    &agent_id,
+                ))
+                .await
+            {
+                Ok(_) => {
+                    println!("ok");
+                    Ok(())
+                }
+                Err(st) => {
+                    println!("FAILED");
+                    print_status(&st)
+                }
+            }
+        }
+        CatalogCmd::Remove { name } => {
+            let mut c = admin_client().await?;
+            c.catalog_remove(CatalogRemoveRequest { name: name.clone() })
+                .await
+                .map_err(|st| anyhow!("{}", st.message()))?;
+            println!("removed {name}");
+            Ok(())
+        }
+    }
+}
+
+/// Render an aligned table. `right_col` is the index to right-align (use a large
+/// number for none); the last column is left unpadded.
+fn print_kv_table<const N: usize>(
+    header: &[&str; N],
+    rows: &[[String; N]],
+    right_col: usize,
+    empty: &str,
+) {
+    use std::io::IsTerminal;
+    let (dim, rst) = if std::io::stdout().is_terminal() {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    if rows.is_empty() {
+        println!("{dim}{empty}{rst}");
+        return;
+    }
+    let mut w = [0usize; N];
+    for (i, h) in header.iter().enumerate() {
+        w[i] = h.len();
+    }
+    for r in rows {
+        for (i, cell) in r.iter().enumerate() {
+            w[i] = w[i].max(cell.len());
+        }
+    }
+    let fmt = |cells: &[String; N]| -> String {
+        let mut s = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                s.push_str("  ");
+            }
+            if i == N - 1 {
+                s.push_str(cell);
+            } else if i == right_col {
+                s.push_str(&format!("{cell:>width$}", width = w[i]));
+            } else {
+                s.push_str(&format!("{cell:<width$}", width = w[i]));
+            }
+        }
+        s
+    };
+    let head: [String; N] = std::array::from_fn(|i| header[i].to_string());
+    println!("{dim}{}{rst}", fmt(&head));
+    for r in rows {
+        println!("{}", fmt(r));
     }
 }
 
@@ -970,28 +1206,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_fn_picks_reader_by_extension() {
-        assert!(read_fn("https://x/a.parquet").starts_with("read_parquet("));
-        assert!(read_fn("https://x/a.csv").starts_with("read_csv_auto("));
-        assert!(read_fn("https://x/a.json").starts_with("read_json_auto("));
-        // unknown extension defaults to parquet
-        assert!(read_fn("https://x/a").starts_with("read_parquet("));
-    }
-
-    #[test]
-    fn dataset_catalog_is_well_formed() {
-        let mut names = std::collections::HashSet::new();
-        for d in DATASETS {
-            assert!(names.insert(d.name), "duplicate dataset name '{}'", d.name);
-            assert!(!d.tables.is_empty(), "dataset '{}' has no tables", d.name);
-            for (table, url) in d.tables {
-                assert!(!table.is_empty(), "{} has an empty table name", d.name);
-                assert!(
-                    url.starts_with("https://"),
-                    "{}.{table} url must be https (public): {url}",
-                    d.name
-                );
-            }
-        }
+    fn parse_kv_splits_on_first_equals() {
+        let m = parse_kv(
+            &[
+                "endpoint=https://x?a=b".to_string(),
+                "warehouse=prod".to_string(),
+            ],
+            "--set",
+        )
+        .unwrap();
+        assert_eq!(m["endpoint"], "https://x?a=b");
+        assert_eq!(m["warehouse"], "prod");
+        assert!(parse_kv(&["noequals".to_string()], "--set").is_err());
     }
 }

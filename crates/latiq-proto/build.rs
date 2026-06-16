@@ -4,6 +4,7 @@ fn main() {
         .build_client(true)
         .compile_protos(
             &[
+                "proto/latiq/v1/datasets.proto",
                 "proto/latiq/v1/control.proto",
                 "proto/latiq/v1/admin.proto",
                 "proto/latiq/v1/data.proto",

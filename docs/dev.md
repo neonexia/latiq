@@ -195,18 +195,29 @@ latiq query --pond demo "CREATE TABLE t AS SELECT * FROM read_csv('https://examp
 latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parquet'"
 ```
 
-### Sample datasets
+### Datasets & catalogs
 
-`latiq dataset` loads curated **public** datasets (DuckLake/standard data — nothing is stored in the repo) into a pond, one `CREATE TABLE` per table:
+Latiq has two ways to get external data into a pond: **datasets** (simple files
+you copy in) and **catalogs** (external databases you pull from once). Full guide:
+[`docs/dataset.md`](dataset.md).
 
 ```bash
-latiq dataset list                       # startrek, holdings, tpch (8 tables), taxi (~127 MB)
-latiq dataset load tpch     -p demo       # loads lineitem, orders, customer, … into `demo`
-latiq dataset load startrek -p demo       # a tiny CSV, good for a quick smoke
-latiq dataset load --all    -p demo       # everything (taxi is large — downloads ~127 MB)
+# datasets — simple files in the built-in `latiq` catalog
+latiq dataset list                                 # samples are seeded (tpch, …)
+latiq dataset add sales --table sales=https://example.com/sales.parquet --tag finance
+latiq dataset load tpch -p demo                     # copy all 8 TPC-H tables into `demo`
+
+# catalogs — external (iceberg/…); credentials ride in at pull, never stored
+latiq catalog add lake --type iceberg \
+  --set endpoint=https://polaris.acme/api/catalog --set warehouse=prod --tag prod
+latiq catalog describe lake -p demo --set token="$BEARER"
+latiq catalog pull lake -p demo --set token="$BEARER" \
+  --query "CREATE TABLE us AS SELECT * FROM lake.sales.orders WHERE region='us'"
 ```
 
-Each table is created via the normal write path, so it's attributed to `--agent-id` and snapshotted like any other write. Needs network (the data is fetched from the public URLs).
+`dataset add`/`catalog add` are operator actions; loading/pulling are available to
+anyone. A `--set token=…` at `add` is **dropped** (credentials never persist) — pass
+it at pull/describe. Credentialed identity integration: issue #26.
 
 ### Targeting a non-default control plane
 

@@ -1,4 +1,5 @@
-//! The Latiq MCP server: exposes the 7 agent tools over rmcp Streamable-HTTP.
+//! The Latiq MCP server: exposes the agent tools (pond + query + dataset/catalog)
+//! over rmcp Streamable-HTTP.
 //! Identity is relaxed (Slice 0+): taken from an optional `agent_id` argument,
 //! defaulting to anonymous. (M6 moves this to the `X-Latiq-Agent-Id` header.)
 use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
@@ -68,6 +69,58 @@ pub struct QueryArgs {
     pub pond: String,
     #[schemars(description = "SQL statement")]
     pub sql: String,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SearchArgs {
+    #[schemars(
+        description = "Optional search: a tag as `#finance`, a name glob as `sal*`, or a plain substring. Omit for all."
+    )]
+    pub query: Option<String>,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LoadDatasetArgs {
+    #[schemars(description = "Pond id or name to load into")]
+    pub pond: String,
+    #[schemars(description = "Dataset name (from list_datasets), e.g. `tpch`")]
+    pub dataset: String,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct CatalogDescribeArgs {
+    #[schemars(description = "Pond id or name (the catalog is attached on it transiently)")]
+    pub pond: String,
+    #[schemars(description = "Catalog name (from list_catalogs), e.g. `lake`")]
+    pub catalog: String,
+    #[schemars(
+        description = "Runtime config + credentials as key→value, e.g. {\"token\":\"<bearer>\"}. Merged over the catalog's stored locator params (these win). NOT stored."
+    )]
+    pub set: Option<std::collections::HashMap<String, String>>,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct CatalogPullArgs {
+    #[schemars(description = "Pond id or name to pull into")]
+    pub pond: String,
+    #[schemars(description = "Catalog name (from list_catalogs), e.g. `lake`")]
+    pub catalog: String,
+    #[schemars(
+        description = "The SQL to materialize, naming the catalog + a target table, e.g. `CREATE TABLE us_orders AS SELECT id,total FROM lake.sales.orders WHERE region='us'`."
+    )]
+    pub query: String,
+    #[schemars(
+        description = "Runtime config + credentials as key→value, e.g. {\"token\":\"<bearer>\"}. NOT stored."
+    )]
+    pub set: Option<std::collections::HashMap<String, String>>,
     pub agent_id: Option<String>,
 }
 
@@ -247,6 +300,135 @@ This makes you thrifty rather than greedy. Read-only and side-effect-free.",
             Err(e) => err_envelope(e.envelope()),
         }
     }
+
+    /// Discover curated datasets (simple public files) you can copy into a pond.
+    #[tool(
+        description = "Browse the catalog of curated DATASETS — simple public files (parquet/CSV) an operator registered. \
+Returns each dataset's `name`, `tables`, `tags`, and `description`. \
+Use this BEFORE load_dataset to find what's available; pass `query` to filter (`#tag`, a `name*` glob, or a substring). \
+Datasets are for ready-made files; for an external database/lakehouse use list_catalogs + pull_catalog instead. See latiq://recipes/external-data.",
+        annotations(
+            title = "List datasets",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn list_datasets(&self, Parameters(a): Parameters<SearchArgs>) -> CallToolResult {
+        match self
+            .ops
+            .list_datasets(a.query.as_deref().unwrap_or(""))
+            .await
+        {
+            Ok(datasets) => ok_value(serde_json::json!({ "datasets": datasets })),
+            Err(e) => err_envelope(e.envelope()),
+        }
+    }
+
+    /// Copy a dataset's tables into a pond (one table each). Pick a name from list_datasets.
+    #[tool(
+        description = "Copy a DATASET's tables into a pond — one real table per file, materialized into the pond's DuckLake. \
+Pass `dataset` (a name from list_datasets) and the target `pond`. After this, query the new tables with read_query like any other table. \
+This is a WRITE (it creates tables, attributed to you). For an external database/lakehouse, use pull_catalog instead. See latiq://recipes/external-data.",
+        annotations(
+            title = "Load dataset",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn load_dataset(&self, Parameters(a): Parameters<LoadDatasetArgs>) -> CallToolResult {
+        let id = Identity::claimed(a.agent_id.as_deref());
+        match self.ops.load_dataset(&id, &a.pond, &a.dataset).await {
+            Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
+            Err(e) => err_envelope(e.envelope()),
+        }
+    }
+
+    /// Discover registered external catalogs (iceberg/…) you can pull data from.
+    #[tool(
+        description = "Browse registered external CATALOGS — databases/lakehouses (iceberg today) an operator registered. \
+Returns each catalog's `name`, `type`, `tags`, and `description`. \
+You don't know a catalog's tables until you look: call describe_catalog next. Then pull_catalog to copy a subset into a pond. \
+Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sources; for ready-made files use list_datasets. See latiq://recipes/external-data.",
+        annotations(
+            title = "List catalogs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn list_catalogs(&self, Parameters(a): Parameters<SearchArgs>) -> CallToolResult {
+        match self
+            .ops
+            .list_catalogs(a.query.as_deref().unwrap_or(""))
+            .await
+        {
+            Ok(catalogs) => ok_value(serde_json::json!({ "catalogs": catalogs })),
+            Err(e) => err_envelope(e.envelope()),
+        }
+    }
+
+    /// List an external catalog's tables (transient attach on a pond). Pass creds via `set`.
+    #[tool(
+        description = "List an external catalog's tables/columns — Latiq transiently attaches it on `pond`, reads its metadata, and detaches. \
+Returns `{catalog, tables:[{schema, table}]}`. Use this to learn what to SELECT before pull_catalog. \
+Credentials and config go in `set` (e.g. {\"token\":\"<bearer>\"}); they're used for this call only and never stored. \
+If a credential is missing the attach fails with a clear error — read it and retry with the right `set`. See latiq://recipes/external-data.",
+        annotations(
+            title = "Describe catalog",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn describe_catalog(
+        &self,
+        Parameters(a): Parameters<CatalogDescribeArgs>,
+    ) -> CallToolResult {
+        let id = Identity::claimed(a.agent_id.as_deref());
+        let set = a.set.unwrap_or_default().into_iter().collect();
+        match self
+            .ops
+            .catalog_describe(&id, &a.pond, &a.catalog, set)
+            .await
+        {
+            Ok(tables) => {
+                let rows: Vec<_> = tables
+                    .into_iter()
+                    .map(|(schema, table)| serde_json::json!({"schema": schema, "table": table}))
+                    .collect();
+                ok_value(serde_json::json!({ "catalog": a.catalog, "tables": rows }))
+            }
+            Err(e) => err_envelope(e.envelope()),
+        }
+    }
+
+    /// Pull a subset of an external catalog into a pond: transient attach → your query → detach.
+    #[tool(
+        description = "Pull data from an external catalog INTO a pond in one shot: Latiq attaches the catalog (with your creds), runs your `query`, then detaches. \
+External catalogs are never queried live — you pull what you need into the pond, then work there. \
+Write `query` as a CREATE TABLE that names the catalog, e.g. `CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region='us'` — DuckDB downloads only the columns/rows you select. \
+Use describe_catalog first to learn the table names. Put credentials in `set` (e.g. {\"token\":\"<bearer>\"}) — used once, never stored. This is a WRITE (creates a table in the pond). See latiq://recipes/external-data.",
+        annotations(
+            title = "Pull from catalog",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false
+        )
+    )]
+    async fn pull_catalog(&self, Parameters(a): Parameters<CatalogPullArgs>) -> CallToolResult {
+        let id = Identity::claimed(a.agent_id.as_deref());
+        let set = a.set.unwrap_or_default().into_iter().collect();
+        match self
+            .ops
+            .catalog_pull(&id, &a.pond, &a.catalog, &a.query, set)
+            .await
+        {
+            Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
+            Err(e) => err_envelope(e.envelope()),
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -260,9 +442,14 @@ impl ServerHandler for LatiqServer {
                 .build(),
         )
         .with_instructions(
-            "Latiq — the agent-native data pond. Allocate a pond, write/read SQL with native \
-attribution. Read latiq://guidance to start; tool errors carry suggest/see links to \
-latiq:// resources. Prompts provide SOPs for common multi-agent workflows.",
+            "Latiq — the agent-native data pond. Allocate a pond (a private DuckLake workspace), \
+write/read SQL with native attribution. \
+FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new one; then write_query/read_query. \
+TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
+pull_catalog for an external database/lakehouse (iceberg) — you pull a subset into the pond, then work there \
+(external catalogs are never queried live). \
+Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow; tool errors carry \
+suggest/see links to latiq:// resources. Prompts provide SOPs for common multi-agent workflows.",
         )
     }
 

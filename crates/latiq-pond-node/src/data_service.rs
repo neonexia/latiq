@@ -197,4 +197,70 @@ impl Data for DataService {
         })
         .await
     }
+
+    async fn load_dataset(
+        &self,
+        req: Request<LoadDatasetRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let id = identity_of(&req);
+        let tid = trace_id_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("load_dataset", tid, async move {
+            let res = ops
+                .load_dataset(&id, &r.pond, &r.dataset)
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(res).unwrap_or_default()))
+        })
+        .await
+    }
+
+    async fn catalog_pull(
+        &self,
+        req: Request<CatalogPullRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let id = identity_of(&req);
+        let tid = trace_id_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("catalog_pull", tid, async move {
+            let res = ops
+                .catalog_pull(
+                    &id,
+                    &r.pond,
+                    &r.catalog,
+                    &r.query,
+                    r.params.into_iter().collect(),
+                )
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(res).unwrap_or_default()))
+        })
+        .await
+    }
+
+    async fn catalog_describe(
+        &self,
+        req: Request<CatalogDescribeRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let id = identity_of(&req);
+        let tid = trace_id_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("catalog_describe", tid, async move {
+            let tables = ops
+                .catalog_describe(&id, &r.pond, &r.catalog, r.params.into_iter().collect())
+                .await
+                .map_err(to_status)?;
+            let rows: Vec<_> = tables
+                .into_iter()
+                .map(|(schema, table)| serde_json::json!({"schema": schema, "table": table}))
+                .collect();
+            Ok(json_resp(
+                serde_json::json!({"catalog": r.catalog, "tables": rows}),
+            ))
+        })
+        .await
+    }
 }
