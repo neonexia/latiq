@@ -9,7 +9,6 @@ service Control {
   rpc CreatePondAssignment(CreatePondAssignmentRequest) returns (CreatePondAssignmentResponse);
   rpc GetPondLocation(GetPondLocationRequest) returns (GetPondLocationResponse);
   rpc DropPondAssignment(DropPondAssignmentRequest) returns (DropPondAssignmentResponse);
-  rpc RecordAudit(RecordAuditRequest) returns (RecordAuditResponse);
   rpc ListPonds(ListPondsRequest) returns (ListPondsResponse);
   rpc GetPondInfo(GetPondInfoRequest) returns (GetPondInfoResponse);
   // A pond node reads the catalog to load datasets / pull from external catalogs.
@@ -54,8 +53,3 @@ message GetPondLocationRequest { string pond_ref = 1; }
 message GetPondLocationResponse { string pond_id = 1; string node_endpoint = 2; }
 message DropPondAssignmentRequest { string pond_id = 1; }
 message DropPondAssignmentResponse { }
-message RecordAuditRequest {
-  string agent_identity = 1; bool identity_verified = 2; string operation = 3;
-  string pond_id = 4; string request_summary_json = 5; string result_summary_json = 6; uint64 duration_ms = 7;
-}
-message RecordAuditResponse { }

@@ -783,6 +783,12 @@ latiq policy set implicit-uri-queries --enabled true
 
 #### Audit access
 
+> **Superseded.** The registry audit log + `latiq audit` commands were removed.
+> Access auditing is now a structured trace on each pond node's `latiq::access`
+> log target (redacted SQL shape; `LATIQ_LOG_FORMAT=json` for structured fields).
+> Operators grep the node log files / ship them to their log stack — there is no
+> audit table and no Admin audit RPC. The commands below are historical.
+
 ```
 latiq audit tail
 latiq audit search --identity "agent-foo" --since 1h

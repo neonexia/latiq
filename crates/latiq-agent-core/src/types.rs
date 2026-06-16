@@ -82,14 +82,3 @@ pub struct DescribeResult {
     pub pond: PondInfo,
     pub schema: SchemaSummary,
 }
-
-/// What AgentOps hands the ControlPlane to record (already shape-summarized).
-#[derive(Debug, Clone)]
-pub struct AuditRecord {
-    pub agent_identity: String,
-    pub verified: bool,
-    pub operation: String,
-    pub pond_id: Option<String>,
-    pub request_summary: Option<String>,
-    pub duration_ms: u64,
-}

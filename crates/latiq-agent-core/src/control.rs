@@ -1,7 +1,7 @@
 //! The control-plane operations AgentOps depends on. Abstracted as a trait so
 //! it can be backed in-process by the Registry (now) or a gRPC client (M6).
 use crate::error::AgentError;
-use crate::types::{AuditRecord, CatalogInfo, DatasetInfo, PondInfo};
+use crate::types::{CatalogInfo, DatasetInfo, PondInfo};
 
 #[async_trait::async_trait]
 pub trait ControlPlane: Send + Sync {
@@ -28,7 +28,4 @@ pub trait ControlPlane: Send + Sync {
     async fn get_dataset(&self, name: &str) -> Result<DatasetInfo, AgentError>;
     async fn list_catalogs(&self, query: &str) -> Result<Vec<CatalogInfo>, AgentError>;
     async fn get_catalog(&self, name: &str) -> Result<CatalogInfo, AgentError>;
-
-    /// Fire-and-forget audit write (errors are swallowed by the impl).
-    async fn record_audit(&self, rec: AuditRecord);
 }

@@ -115,6 +115,12 @@ pub const MIGRATIONS: &[&str] = &[
       ('tpch','sample'),('tpch','tpch'),
       ('taxi','sample');
     "#,
+    // v3: drop the audit_log table. Access auditing moved out of the registry —
+    // each access is now a structured trace on the node's `latiq::access` log
+    // target (operators grep the log files), so there is no audit store.
+    r#"
+    DROP TABLE IF EXISTS audit_log;
+    "#,
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {
