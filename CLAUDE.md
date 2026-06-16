@@ -79,7 +79,7 @@ Tests are categorized by **layer** and **surface/feature** so a given change run
 ## Build commands
 
 - `cargo build` / `cargo test --workspace` (excludes `spike/`); first build compiles DuckDB from source (slow once).
-- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — keep green (run manually; no CI workflow, per direction).
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — keep green (run manually before pushing). CI is **nightly only** (`.github/workflows/nightly.yml`: fmt+clippy+test, iceberg/MinIO catalog e2e, and a dockerized 3-node cluster scale-out), not per-PR, to bound GitHub usage (#28). `release-images.yml` publishes the single-binary image to GHCR; `deploy/` holds the Dockerfile, cluster compose, and the public `latiq-up.sh`.
 
 ## Scope / deferrals (later slices)
 
