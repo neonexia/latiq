@@ -11,11 +11,11 @@
 
 /// Always present and loaded on every pond (informational + validation: a request
 /// naming one of these is a no-op, not an error).
-pub const STANDARD: &[&str] = &["ducklake", "httpfs", "parquet", "json"];
+pub const STANDARD: &[&str] = &["ducklake", "httpfs", "parquet", "json", "icu"];
 
 /// Signed/official extensions an agent may request via `pond create --extensions`.
 /// Anything not here (typos, community/unsigned extensions) is rejected.
-pub const OPTIONAL: &[&str] = &["spatial", "fts", "icu", "inet"];
+pub const OPTIONAL: &[&str] = &["spatial", "fts", "inet"];
 
 /// Validate + normalize a requested extension list against the [`OPTIONAL`]
 /// allowlist: lowercases/trims, drops blanks and standard-set names (already
