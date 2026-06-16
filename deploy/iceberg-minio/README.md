@@ -23,7 +23,7 @@ The iceberg e2e (`crates/latiq/tests/catalogs_iceberg.rs`) is `#[ignore]`d so it
 never runs in the normal suite. With the harness up:
 
 ```bash
-LATIQ_ICEBERG_ENDPOINT=http://localhost:8181/v1/catalog \
+LATIQ_ICEBERG_ENDPOINT=http://localhost:8181 \
 LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
 LATIQ_S3_ENDPOINT=http://localhost:9000 \
 LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
@@ -37,7 +37,26 @@ In CI this is the opt-in `iceberg` job (commit message contains `[iceberg-ci]`,
 or trigger the workflow manually). The deterministic **DuckLake** catalog e2e
 (`tests/catalogs.rs`) covers the attacher path on every push without Docker.
 
-> Note: this harness was authored without a running Docker daemon available, so
-> the compose/seed may need minor version pinning for your environment (the
-> `apache/iceberg-rest-fixture` + `minio` images and `pyiceberg` are the moving
-> parts). The Rust side (`catalogs_iceberg.rs`) is the stable contract.
+## Runtime: Docker or Podman
+
+`up.sh` auto-detects the runtime: it uses **Docker** if its daemon is up, else
+falls back to **Podman** (`podman compose`). Override with
+`LATIQ_COMPOSE="docker compose"` (or `"podman compose"`).
+
+Host ports are overridable to avoid clashes (e.g. a host-native MinIO already on
+9000/9001): set `LATIQ_S3_PORT` / `LATIQ_S3_CONSOLE_PORT` / `LATIQ_ICEBERG_PORT`
+and point the test env at the same ports. Example, fully on alternate ports:
+
+```bash
+LATIQ_S3_PORT=19000 LATIQ_S3_CONSOLE_PORT=19001 LATIQ_ICEBERG_PORT=18181 ./up.sh
+LATIQ_ICEBERG_ENDPOINT=http://localhost:18181 \
+LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
+LATIQ_S3_ENDPOINT=http://localhost:19000 \
+LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
+cargo test -p latiq --test catalogs_iceberg -- --ignored --nocapture
+```
+
+> Verified green under Podman (`podman compose` + `apache/iceberg-rest-fixture` +
+> `minio` + `pyiceberg`). Note: `LATIQ_ICEBERG_ENDPOINT` is the **base** REST URL
+> (`…:8181`) — DuckDB's iceberg client appends `/v1/config` etc. itself; don't
+> add a `/v1/catalog` suffix.

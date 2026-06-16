@@ -61,7 +61,8 @@ jobs:
         run: ./deploy/iceberg-minio/up.sh
       - name: Run the ignored iceberg e2e
         env:
-          LATIQ_ICEBERG_ENDPOINT: http://localhost:8181/v1/catalog
+          # Base REST URL — DuckDB's iceberg client appends /v1/config etc. itself.
+          LATIQ_ICEBERG_ENDPOINT: http://localhost:8181
           LATIQ_ICEBERG_WAREHOUSE: demo
           LATIQ_ICEBERG_TOKEN: dummy
           LATIQ_S3_ENDPOINT: http://localhost:9000
