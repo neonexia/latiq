@@ -83,4 +83,4 @@ Tests are categorized by **layer** and **surface/feature** so a given change run
 
 ## Scope / deferrals (later slices)
 
-External catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, multi-node + proxy hops, Arrow **Flight SQL streaming** for large result sets (M1 Data gRPC is unary + bounded by the inline cap), Kubernetes, DataFusion engine. Don't build these without an explicit decision.
+External-source **credentials** + federation, OIDC verification, rate limiting, OpenTelemetry, multi-node + proxy hops, Arrow **Flight SQL streaming** for large result sets (M1 Data gRPC is unary + bounded by the inline cap), Kubernetes, DataFusion engine. Don't build these without an explicit decision. (External catalogs themselves **shipped** — pull-only/transient, no stored creds; datasets + catalogs are in `docs/dataset.md`.)

@@ -79,7 +79,8 @@ Only public/anonymous sources work in M1; credentialed databases come with admin
         body: "# Recipe — bring external data into a pond\n\n\
 Latiq has two paths. Everything ends up as tables IN your pond — external catalogs are never queried live.\n\n\
 ## Datasets — curated public files (copy in)\n\
-```\nlist_datasets {query?}            # discover; e.g. query='#sample' or 'tpch'\nload_dataset {pond, dataset}     # copies its tables into the pond\nread_query {pond, sql:'SELECT count(*) FROM orders'}\n```\n\n\
+A dataset loads into a SCHEMA named after it — query its tables as `<dataset>.<table>`.\n\
+```\nlist_datasets {query?}            # discover; e.g. query='#sample' or 'tpch'\nload_dataset {pond, dataset:'tpch'}   # -> schema 'tpch'; returns schema-qualified tables\nread_query {pond, sql:'SELECT count(*) FROM tpch.orders'}\n```\n\n\
 ## Catalogs — external databases/lakehouses (pull a subset in)\n\
 An operator registers a catalog (iceberg today). You discover its tables, then pull what you need:\n\
 ```\nlist_catalogs {query?}                                  # find a catalog, e.g. 'lake'\ndescribe_catalog {pond, catalog, set:{token:'<bearer>'}} # list its tables (transient attach)\npull_catalog {pond, catalog, query:'CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region=''us''', set:{token:'<bearer>'}}\nread_query {pond, sql:'SELECT * FROM us LIMIT 10'}\n```\n\

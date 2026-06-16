@@ -309,14 +309,21 @@ impl AgentOps {
         dataset: &str,
     ) -> Result<LoadDatasetResult, AgentError> {
         let ds = self.control.get_dataset(dataset).await?;
+        // Each dataset loads into its own schema (named after the dataset) so its
+        // tables are grouped and never collide with another dataset's tables.
+        // Multi-table datasets (e.g. tpch) become tpch.lineitem, tpch.orders, …
+        let schema = ds.name.clone();
+        self.write_query(identity, pond_ref, &create_schema_sql(&schema))
+            .await?;
         let mut loaded = Vec::with_capacity(ds.tables.len());
         for t in &ds.tables {
-            let sql = dataset_load_sql(&t.table_name, &t.source_uri, &t.format);
+            let sql = dataset_load_sql(&schema, &t.table_name, &t.source_uri, &t.format);
             self.write_query(identity, pond_ref, &sql).await?;
-            loaded.push(t.table_name.clone());
+            loaded.push(format!("{schema}.{}", t.table_name));
         }
         Ok(LoadDatasetResult {
             dataset: ds.name,
+            schema,
             tables: loaded,
         })
     }
@@ -699,7 +706,17 @@ fn tier_limits(tier: &str) -> Option<ResourceLimits> {
 /// extension. The table name is quoted and the URI's single quotes are escaped
 /// (the catalog is operator-curated, but we still don't let a stray quote break
 /// out of the string literal).
-fn dataset_load_sql(table_name: &str, source_uri: &str, format: &str) -> String {
+/// Quote a SQL identifier, doubling embedded `"` so any dataset/table name is a
+/// valid identifier. (Kept local — `agent-core` is engine-neutral.)
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn create_schema_sql(schema: &str) -> String {
+    format!("CREATE SCHEMA IF NOT EXISTS {}", quote_ident(schema))
+}
+
+fn dataset_load_sql(schema: &str, table_name: &str, source_uri: &str, format: &str) -> String {
     let reader = match format.trim().to_lowercase().as_str() {
         "csv" => "read_csv_auto",
         "json" => "read_json_auto",
@@ -715,7 +732,7 @@ fn dataset_load_sql(table_name: &str, source_uri: &str, format: &str) -> String 
             }
         }
     };
-    let table = format!("\"{}\"", table_name.replace('"', "\"\""));
+    let table = format!("{}.{}", quote_ident(schema), quote_ident(table_name));
     let uri = source_uri.replace('\'', "''");
     format!("CREATE OR REPLACE TABLE {table} AS SELECT * FROM {reader}('{uri}')")
 }
