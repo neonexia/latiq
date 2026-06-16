@@ -32,6 +32,24 @@ commands stay quiet.
 Ship stdout to your aggregator (k8s: the container log → Fluent Bit/Vector →
 Loki/ELK). Nothing Latiq-specific to configure.
 
+### Access auditing (the `latiq::access` trail)
+
+There is **no audit table** — every access is a structured `tracing` event on the
+**`latiq::access`** target (one per operation: allocate/describe/list/drop pond,
+read/write/explain, dataset load, catalog pull/describe). Each carries
+`agent`, `verified`, `op`, `pond`, `duration_ms`, and a redacted `summary` (SQL
+shape with literals replaced by `?`). Operators grep the node log files (or query
+them in their log stack); with `LATIQ_LOG_FORMAT=json` the fields are structured.
+
+```bash
+# tail just the access trail
+RUST_LOG=latiq::access=info latiq node add …
+# or filter JSON logs by the target
+jq 'select(.target == "latiq::access")'
+# everything agent-x did
+jq 'select(.target == "latiq::access" and .fields.agent == "agent-x")'
+```
+
 ## 2. Tracing (request correlation)
 
 Each request gets a `trace_id` (from an incoming `latiq-trace-id` gRPC metadata
@@ -74,7 +92,9 @@ snapshot, refreshed by a 5s in-process collector.
 | `latiq_inflight_queries` | gauge | — | pond node | In-flight ops on the node (all ponds) |
 | `latiq_pond_inflight_queries` | gauge | `pond` | pond node | **Live** query load on an owned pond |
 | `latiq_pond_queries_total` | counter | `pond`, `op` | pond node | Query load **over time** |
+| `latiq_pond_query_duration_seconds` | histogram | `pond`, `op` | pond node | Query wall-clock latency (engine exec) → p50/p95/p99 |
 | `latiq_pond_errors_total` | counter | `pond`, `kind` | pond node | Errors **over time**, by `ErrorKind` |
+| `latiq_forwarded_total` | counter | `op` | pond node | Ops forwarded to another node (multi-node path) |
 | `latiq_build_info` | gauge | `version` | both | Always 1; carries the version label |
 
 > **Cardinality:** the `pond` label is intentional (per-pond visibility). Series
@@ -86,6 +106,12 @@ snapshot, refreshed by a 5s in-process collector.
 ```promql
 # Per-pond query rate (per second, 5-minute window)
 rate(latiq_pond_queries_total[5m])
+
+# p95 query latency per pond (5-minute window)
+histogram_quantile(0.95, sum by (pond, le) (rate(latiq_pond_query_duration_seconds_bucket[5m])))
+
+# Fraction of ops crossing node boundaries (forwarded vs total)
+sum(rate(latiq_forwarded_total[5m])) / sum(rate(latiq_pond_queries_total[5m]))
 
 # Errors per minute over the last day, by pond + kind
 increase(latiq_pond_errors_total[1m])
