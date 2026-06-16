@@ -74,12 +74,16 @@ async fn dataset_load_copies_seeded_sample_into_pond() {
         .into_inner(),
     );
     assert_eq!(loaded["dataset"], "holdings");
+    // Datasets load into a schema named after the dataset; tables are reported
+    // schema-qualified (holdings.holdings).
+    assert_eq!(loaded["schema"], "holdings");
+    assert_eq!(loaded["tables"][0], "holdings.holdings");
 
     let r = json(
         data.read_query(req(
             QueryRequest {
                 pond: "work".into(),
-                sql: "SELECT count(*) AS n FROM holdings".into(),
+                sql: "SELECT count(*) AS n FROM holdings.holdings".into(),
             },
             "agent-x",
         ))

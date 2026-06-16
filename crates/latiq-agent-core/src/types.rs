@@ -63,6 +63,10 @@ pub struct CatalogInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadDatasetResult {
     pub dataset: String,
+    /// The schema the dataset's tables were created under (named after the
+    /// dataset). Query them as `<schema>.<table>`.
+    pub schema: String,
+    /// Schema-qualified table names (e.g. `tpch.lineitem`).
     pub tables: Vec<String>,
 }
 

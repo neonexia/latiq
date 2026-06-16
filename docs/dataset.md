@@ -13,7 +13,10 @@ pond. The rule of thumb: a **dataset** is a simple file you *copy in*; a
 ## Datasets — simple files in the `latiq` catalog
 
 A dataset is one or more file tables (parquet/CSV/…), each a public URL. Adding
-one registers it; `load` copies its tables into a pond.
+one registers it; `load` copies its tables into a pond, under a **schema named
+after the dataset** (so a multi-table dataset like `tpch` becomes
+`tpch.lineitem`, `tpch.orders`, … and never collides with another dataset's
+tables). Query them schema-qualified: `SELECT * FROM tpch.orders`.
 
 ```bash
 latiq dataset add sales --table sales=https://example.com/sales.parquet \
@@ -25,7 +28,7 @@ latiq dataset add events \
 latiq dataset list                 # all
 latiq dataset list '#finance'      # by tag
 latiq dataset list sal*            # name glob / substring
-latiq dataset load tpch -p shop    # copy a dataset's tables into pond `shop`
+latiq dataset load tpch -p shop    # -> schema `tpch` in pond `shop` (tpch.lineitem, …)
 latiq dataset remove sales
 ```
 
