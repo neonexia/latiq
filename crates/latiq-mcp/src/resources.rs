@@ -69,7 +69,7 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
         desc: "Loading data into a pond with SQL",
         body: "# Recipe — ingest data (M1)\n\n\
 **Public files (no credentials):** read CSV/Parquet/JSON by URL directly in write_query:\n```sql\nCREATE TABLE raw AS SELECT * FROM read_csv('https://example.com/data.csv');\nINSERT INTO raw SELECT * FROM 's3://public-bucket/more.parquet';\n```\n\
-Only public/anonymous sources work in M1; credentialed databases come with admin-curated catalogs in a later slice.\n\
+For curated/registered sources (incl. external lakehouses like iceberg) use list_datasets/load_dataset and list_catalogs -> describe_catalog -> pull_catalog — see latiq://recipes/external-data. Credentials for those ride in at pull time and are never stored.\n\
 **Own data:** `INSERT INTO t VALUES (...)` or `CREATE TABLE t AS SELECT ...`.",
     },
     Res {

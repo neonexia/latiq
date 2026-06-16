@@ -106,7 +106,7 @@ enum DatasetCmd {
     List { query: Option<String> },
     /// Remove a dataset. Operator action.
     Remove { name: String },
-    /// Load a dataset's tables into a pond (one table each).
+    /// Load a dataset's tables into a pond, under a schema named after the dataset.
     Load {
         name: String,
         #[arg(short, long)]
