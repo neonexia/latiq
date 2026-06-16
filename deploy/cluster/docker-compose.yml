@@ -1,0 +1,131 @@
+# Full Latiq cluster: a control plane + 3 pond nodes, with Prometheus scraping
+# every node and a local MinIO + Iceberg REST catalog for the catalog e2e.
+#
+# pond-node-3 sits behind the `scale` profile so a default `up` starts a 2-node
+# cluster; the scale-out test adds the 3rd at runtime (see scale_out_test.sh).
+#
+# Every node binds 0.0.0.0 inside its own container and advertises its compose
+# hostname (pond-node-N:51401) so the control plane stores a routable endpoint and
+# the CLI/forwarding can reach the owning node. Image is overridable so CI pins a
+# published GHCR tag and local dev builds from source:
+#   LATIQ_IMAGE=ghcr.io/neonexia/latiq:dev docker compose -f deploy/cluster/docker-compose.yml up
+x-latiq: &latiq
+  image: ${LATIQ_IMAGE:-ghcr.io/neonexia/latiq:dev}
+  restart: unless-stopped
+
+services:
+  control-plane:
+    <<: *latiq
+    hostname: control-plane
+    command: ["serve", "--bind", "0.0.0.0", "--port", "51400", "--root", "/var/lib/latiq"]
+    ports: ["51400:51400"]   # Control + Admin gRPC (CLI/operators)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52400/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  pond-node-1:
+    <<: *latiq
+    hostname: pond-node-1
+    command: ["node", "add", "--node-id", "node-1", "--bind", "0.0.0.0",
+              "--port", "51401", "--advertise-addr", "pond-node-1:51401",
+              "--root", "/var/lib/latiq"]
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+    depends_on:
+      control-plane: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52401/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  pond-node-2:
+    <<: *latiq
+    hostname: pond-node-2
+    command: ["node", "add", "--node-id", "node-2", "--bind", "0.0.0.0",
+              "--port", "51401", "--advertise-addr", "pond-node-2:51401",
+              "--root", "/var/lib/latiq"]
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+    depends_on:
+      control-plane: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52401/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  # The 3rd node — started at runtime by the scale-out test to prove dynamic
+  # scale-up (a new pond lands on it and queries route there).
+  pond-node-3:
+    <<: *latiq
+    hostname: pond-node-3
+    profiles: ["scale"]
+    command: ["node", "add", "--node-id", "node-3", "--bind", "0.0.0.0",
+              "--port", "51401", "--advertise-addr", "pond-node-3:51401",
+              "--root", "/var/lib/latiq"]
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+    depends_on:
+      control-plane: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52401/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [control-plane, pond-node-1, pond-node-2]
+
+  # ---- Local Iceberg REST + MinIO (S3) for the catalog e2e -----------------
+  minio:
+    image: minio/minio
+    ports: ["9000:9000", "9001:9001"]
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  mc:
+    image: minio/mc
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set m http://minio:9000 admin password; do sleep 1; done;
+      mc mb --ignore-existing m/warehouse;
+      exit 0;"
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture
+    ports: ["8181:8181"]
+    depends_on: [minio]
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+
+  # One-shot CLI helper: runs inside the network so it can resolve pond-node-N and
+  # talk to the control plane. `docker compose run --rm cli <args>`.
+  cli:
+    <<: *latiq
+    restart: "no"
+    profiles: ["tools"]
+    entrypoint: ["latiq"]
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+    depends_on: [control-plane, pond-node-1, pond-node-2]

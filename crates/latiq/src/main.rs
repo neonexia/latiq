@@ -239,7 +239,11 @@ enum PondCmd {
         agent_id: Option<String>,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
-    List,
+    List {
+        /// Output format. `json` includes each pond's owning `node_id`.
+        #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
+        format: Format,
+    },
     Describe {
         pond: String,
     },
@@ -869,10 +873,24 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 Err(st) => print_status(&st),
             }
         }
-        PondCmd::List => {
+        PondCmd::List { format } => {
             let mut c = admin_client().await?;
             let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
-            print_pond_list_table(&ponds);
+            match format {
+                Format::Json => {
+                    let v: Vec<_> = ponds
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "pond_id": p.pond_id, "name": p.name, "owner": p.owner,
+                                "node_id": p.node_id, "tier": p.tier, "created_at": p.created_at,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                Format::Tabular => print_pond_list_table(&ponds),
+            }
             Ok(())
         }
         PondCmd::Describe { pond } => {
