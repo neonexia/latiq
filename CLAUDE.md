@@ -48,7 +48,7 @@ Plus one internal surface: **Control gRPC** (pond-node → control-plane; routin
 - `latiq-proto` — gRPC contracts: Control, Admin, and **Data/Query** services (tonic codegen).
 - `latiq-agent-core` — **protocol-neutral** `AgentOps` + `ControlPlane` trait + in-flight/abort registry. No transport types (invariant 5).
 - `latiq-mcp` — **inbound adapter**: MCP-over-HTTP (rmcp) → `AgentOps`. Agent-only.
-- *(M8)* the Data/Query gRPC **inbound adapter** → `AgentOps` (in `latiq-pond-node` or its own crate).
+- the Data/Query gRPC **inbound adapter** → `AgentOps` (shipped — `latiq-pond-node/src/data_service.rs` + `stream_service.rs`).
 - `latiq-client` — MCP client. **Agent-sim / MCP tests only** (invariant 1).
 - `latiq-engine` (`QueryEngine` trait) + `latiq-engine-duckdb` (DuckDB/DuckLake adapter, instance-per-pond).
 - `latiq-storage` — `PondStorage`: LocalFs + TempFs.
