@@ -7,7 +7,10 @@
 services:
   minio:
     image: minio/minio
-    ports: ["9000:9000", "9001:9001"]
+    # Host ports are overridable (avoid clashes with a host-native MinIO, etc.).
+    ports:
+      - "${LATIQ_S3_PORT:-9000}:9000"
+      - "${LATIQ_S3_CONSOLE_PORT:-9001}:9001"
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password
@@ -30,7 +33,7 @@ services:
 
   iceberg-rest:
     image: apache/iceberg-rest-fixture
-    ports: ["8181:8181"]
+    ports: ["${LATIQ_ICEBERG_PORT:-8181}:8181"]
     depends_on: [minio]
     environment:
       AWS_ACCESS_KEY_ID: admin
