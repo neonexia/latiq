@@ -71,27 +71,6 @@ pub struct CatalogRow {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuditInsert {
-    pub agent_identity: String,
-    pub identity_verified: bool,
-    pub operation: String,
-    pub pond_id: Option<String>,
-    pub request_summary: Option<String>,
-    pub result_summary: Option<String>,
-    pub duration_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditRow {
-    pub ts: String,
-    pub agent_identity: String,
-    pub verified: bool,
-    pub operation: String,
-    pub pond_id: Option<String>,
-    pub duration_ms: u64,
-}
-
 #[derive(Clone)]
 pub struct Registry {
     conn: Arc<Mutex<Connection>>,
@@ -590,61 +569,6 @@ impl Registry {
         )?;
         Ok(())
     }
-
-    pub fn record_audit(&self, e: AuditInsert) -> Result<(), ControlPlaneError> {
-        let audit_id = PondId::new().to_string();
-        let c = self.lock();
-        c.execute(
-            "INSERT INTO audit_log(audit_id, agent_identity, identity_verified, operation, pond_id, request_summary, result_summary, duration_ms)
-             VALUES (?,?,?,?,?,?,?,?)",
-            duckdb::params![
-                audit_id,
-                e.agent_identity,
-                e.identity_verified,
-                e.operation,
-                e.pond_id,
-                e.request_summary,
-                e.result_summary,
-                e.duration_ms
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn audit_tail(&self, limit: u32) -> Result<Vec<AuditRow>, ControlPlaneError> {
-        let c = self.lock();
-        let mut stmt = c.prepare(
-            "SELECT ts::VARCHAR, agent_identity, identity_verified, operation, pond_id, duration_ms
-             FROM audit_log ORDER BY ts DESC LIMIT ?",
-        )?;
-        let rows = stmt.query_map(duckdb::params![limit], audit_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    pub fn audit_search(
-        &self,
-        identity: &str,
-        since: &str,
-    ) -> Result<Vec<AuditRow>, ControlPlaneError> {
-        let c = self.lock();
-        let mut stmt = c.prepare(
-            "SELECT ts::VARCHAR, agent_identity, identity_verified, operation, pond_id, duration_ms
-             FROM audit_log WHERE agent_identity=? AND ts >= CAST(? AS TIMESTAMP) ORDER BY ts DESC",
-        )?;
-        let rows = stmt.query_map(duckdb::params![identity, since], audit_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-}
-
-fn audit_row(r: &duckdb::Row<'_>) -> duckdb::Result<AuditRow> {
-    Ok(AuditRow {
-        ts: r.get(0)?,
-        agent_identity: r.get(1)?,
-        verified: r.get(2)?,
-        operation: r.get(3)?,
-        pond_id: r.get(4)?,
-        duration_ms: r.get(5)?,
-    })
 }
 
 /// A bare SQL identifier — letters/digits/underscore, starting with a letter or
@@ -922,24 +846,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_and_audit() {
+    fn policy_get_set() {
         let r = reg();
         r.policy_set("query_timeout_seconds", "60").unwrap();
         assert_eq!(r.policy_get().unwrap()["query_timeout_seconds"], "60");
-        r.record_audit(AuditInsert {
-            agent_identity: "agent-x".into(),
-            identity_verified: false,
-            operation: "read_query".into(),
-            pond_id: Some("p1".into()),
-            request_summary: Some("SELECT ?".into()),
-            result_summary: None,
-            duration_ms: 12,
-        })
-        .unwrap();
-        let tail = r.audit_tail(10).unwrap();
-        assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].operation, "read_query");
-        assert_eq!(r.audit_search("agent-x", "1970-01-01").unwrap().len(), 1);
     }
 
     #[test]
