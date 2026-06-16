@@ -72,6 +72,12 @@ impl PondInstance {
             conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
                 .map_err(|e| EngineError::Engine(format!("load {ext}: {e}")))?;
         }
+        // Pin the session timezone. With icu loaded, DuckDB otherwise defaults the
+        // TimeZone setting to the HOST OS zone, making TIMESTAMPTZ rendering and
+        // wall-clock results host-dependent (different per node / after a TZ
+        // change). UTC makes results deterministic across the cluster.
+        conn.execute_batch("SET TimeZone='UTC';")
+            .map_err(|e| EngineError::Engine(format!("set timezone: {e}")))?;
         // Per-pond optional extensions: LOAD-only from the image. autoinstall off
         // so a missing one fails fast — never a download in the pond path.
         if !loc.extensions.is_empty() {
@@ -175,6 +181,19 @@ mod tests {
             )
             .unwrap();
         assert!(loaded, "inet should be LOADed on the pond");
+    }
+
+    #[test]
+    fn pond_session_timezone_is_utc() {
+        // Results must be deterministic regardless of the host OS timezone.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+        let tz: String = inst
+            .conn
+            .query_row("SELECT current_setting('TimeZone')", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tz, "UTC");
     }
 
     #[test]

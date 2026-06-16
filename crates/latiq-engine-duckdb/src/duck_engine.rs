@@ -242,6 +242,23 @@ fn attach_catalog(
     conn: &duckdb::Connection,
     plan: &crate::attachers::AttachPlan,
 ) -> Result<(), EngineError> {
+    // If any step fails AFTER a CREATE SECRET ran (e.g. ATTACH errors on a bad
+    // endpoint), the credential would otherwise linger on the reused per-pond
+    // connection. Tear down on error so no secret survives a failed attach —
+    // Latiq stores zero credentials (invariant 6).
+    match attach_catalog_inner(conn, plan) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            teardown_catalog(conn, plan);
+            Err(e)
+        }
+    }
+}
+
+fn attach_catalog_inner(
+    conn: &duckdb::Connection,
+    plan: &crate::attachers::AttachPlan,
+) -> Result<(), EngineError> {
     for s in &plan.load {
         conn.execute_batch(s)
             .map_err(|e| EngineError::Engine(format!("catalog extensions: {e}")))?;
@@ -268,6 +285,42 @@ mod tests {
     use latiq_common::PondId;
     use latiq_storage::{PondStorage, TempFs};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn failed_attach_does_not_leak_the_secret() {
+        // Regression: attach_catalog creates the credential secret BEFORE ATTACH.
+        // If ATTACH fails, the secret must NOT linger on the reused pond connection
+        // (Latiq stores zero credentials — invariant 6).
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+        let plan = crate::attachers::AttachPlan {
+            alias: "leaktest".into(),
+            load: vec![],
+            secrets: vec![(
+                "leak_sec".into(),
+                "CREATE OR REPLACE SECRET leak_sec (TYPE s3, KEY_ID 'k', SECRET 's')".into(),
+            )],
+            // A ducklake attach under a non-existent directory fails after the
+            // secret is created.
+            attach: "ATTACH 'ducklake:/nonexistent_dir_xyz/meta.duckdb' AS leaktest \
+                     (DATA_PATH '/nonexistent_dir_xyz/data')"
+                .into(),
+        };
+        assert!(
+            attach_catalog(&inst.conn, &plan).is_err(),
+            "attach should fail on a bad path"
+        );
+        let n: i64 = inst
+            .conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_secrets() WHERE name='leak_sec'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "secret must not survive a failed attach");
+    }
 
     #[test]
     fn cancels_long_running_query_and_recovers() {

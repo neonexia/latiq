@@ -110,8 +110,8 @@ rate(latiq_pond_queries_total[5m])
 # p95 query latency per pond (5-minute window)
 histogram_quantile(0.95, sum by (pond, le) (rate(latiq_pond_query_duration_seconds_bucket[5m])))
 
-# Fraction of ops crossing node boundaries (forwarded vs total)
-sum(rate(latiq_forwarded_total[5m])) / sum(rate(latiq_pond_queries_total[5m]))
+# Forwarding rate by op — how much traffic crosses node boundaries (multi-node)
+sum by (op) (rate(latiq_forwarded_total[5m]))
 
 # Errors per minute over the last day, by pond + kind
 increase(latiq_pond_errors_total[1m])
