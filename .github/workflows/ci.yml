@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Linking the bundled DuckDB static lib with full debug info exhausts the
+  # GitHub runner's linker memory (`ld ... signal 7 [Bus error]`). Drop debug
+  # info in CI — we don't debug from CI binaries. (See #28: heavy builds move
+  # to a nightly dockerized suite; PR CI stays lean.)
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   test:
