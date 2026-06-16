@@ -6,11 +6,13 @@ use latiq_storage::PondLocation;
 
 /// **Required** standard extensions, loaded on every pond. The whole of Latiq is
 /// built on these — `ducklake` is the catalog format, `httpfs` reads remote
-/// sources — so a node that can't load them cannot function. `parquet`/`json` are
-/// statically linked into the binary (duckdb cargo features), so they're always
-/// present and omitted here; `ducklake`/`httpfs` have no cargo feature and load
-/// from the deployment image.
-const STANDARD_LOAD: &[&str] = &["ducklake", "httpfs"];
+/// sources, and `icu` provides timezone-aware TIMESTAMPTZ arithmetic (DuckLake's
+/// snapshots/maintenance use `TIMESTAMP WITH TIME ZONE`, and patterns like
+/// `now() - INTERVAL '1 week'` fail to bind without it). A node that can't load
+/// them cannot function. `parquet`/`json` are statically linked into the binary
+/// (duckdb cargo features), so they're always present and omitted here; these
+/// have no cargo feature and load from the deployment image.
+const STANDARD_LOAD: &[&str] = &["ducklake", "httpfs", "icu"];
 
 /// Ensure the required standard extensions ([`STANDARD_LOAD`]) install and load.
 /// The node calls this at **startup** and refuses to serve if it fails — Latiq is
@@ -153,25 +155,43 @@ mod tests {
     #[test]
     fn loads_a_baked_optional_extension() {
         // Simulate image-baking: install the extension into the cache first.
+        // (`inet`, not `icu` — icu is now a STANDARD extension, always loaded.)
         Connection::open_in_memory()
             .unwrap()
-            .execute_batch("INSTALL icu;")
+            .execute_batch("INSTALL inet;")
             .unwrap();
         let fs = TempFs::new();
         let mut loc = fs.create_pond(PondId::new()).unwrap();
-        loc.extensions = vec!["icu".to_string()];
+        loc.extensions = vec!["inet".to_string()];
         let inst = PondInstance::open(&loc).unwrap();
         // Our LOAD plumbing landed it on the instance (test our integration, not
         // DuckDB's enforcement — invariant 10).
         let loaded: bool = inst
             .conn
             .query_row(
-                "SELECT loaded FROM duckdb_extensions() WHERE extension_name='icu'",
+                "SELECT loaded FROM duckdb_extensions() WHERE extension_name='inet'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(loaded, "icu should be LOADed on the pond");
+        assert!(loaded, "inet should be LOADed on the pond");
+    }
+
+    #[test]
+    fn standard_pond_supports_timestamptz_arithmetic() {
+        // icu is standard, so timezone-aware TIMESTAMPTZ math (e.g. DuckLake's
+        // `expire_snapshots(older_than => now() - INTERVAL '1 week')`) binds on a
+        // pond with NO explicitly-requested extensions.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+        let ok: bool = inst
+            .conn
+            .query_row("SELECT (now() - INTERVAL '7 days') < now()", [], |r| {
+                r.get(0)
+            })
+            .expect("TIMESTAMPTZ - INTERVAL must bind (icu loaded)");
+        assert!(ok);
     }
 
     #[test]
