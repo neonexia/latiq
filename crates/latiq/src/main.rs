@@ -353,7 +353,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                     }),
                 })
                 .await
-                .map_err(|st| anyhow!("{}", st.message()))?
+                .map_err(render_status)?
                 .into_inner();
             println!("added {}", r.name);
             Ok(())
@@ -365,7 +365,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                     query: query.unwrap_or_default(),
                 })
                 .await
-                .map_err(|st| anyhow!("{}", st.message()))?
+                .map_err(render_status)?
                 .into_inner()
                 .datasets;
             let rows: Vec<[String; 4]> = datasets
@@ -391,7 +391,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
             let mut c = admin_client().await?;
             c.dataset_remove(DatasetRemoveRequest { name: name.clone() })
                 .await
-                .map_err(|st| anyhow!("{}", st.message()))?;
+                .map_err(render_status)?;
             println!("removed {name}");
             Ok(())
         }
@@ -458,7 +458,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                     }),
                 })
                 .await
-                .map_err(|st| anyhow!("{}", st.message()))?
+                .map_err(render_status)?
                 .into_inner();
             println!("added {}", r.name);
             if !r.dropped_params.is_empty() {
@@ -477,7 +477,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                     query: query.unwrap_or_default(),
                 })
                 .await
-                .map_err(|st| anyhow!("{}", st.message()))?
+                .map_err(render_status)?
                 .into_inner()
                 .catalogs;
             let rows: Vec<[String; 4]> = catalogs
@@ -518,10 +518,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                     &agent_id,
                 ))
                 .await
-                .map_err(|st| {
-                    let _ = print_status(&st);
-                    anyhow!("describe failed")
-                })?
+                .map_err(render_status)?
                 .into_inner();
             println!("{}", resp.json);
             Ok(())
@@ -565,7 +562,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
             let mut c = admin_client().await?;
             c.catalog_remove(CatalogRemoveRequest { name: name.clone() })
                 .await
-                .map_err(|st| anyhow!("{}", st.message()))?;
+                .map_err(render_status)?;
             println!("removed {name}");
             Ok(())
         }
@@ -781,7 +778,7 @@ async fn resolve_node(pond_ref: &str) -> Result<String> {
             pond_ref: pond_ref.to_string(),
         })
         .await
-        .map_err(|st| anyhow!("pond '{pond_ref}': {}", st.message()))?
+        .map_err(render_status)?
         .into_inner();
     Ok(loc.node_endpoint)
 }
@@ -1050,8 +1047,10 @@ fn print_json_result(res: Result<tonic::Response<JsonResponse>, Status>) -> Resu
     }
 }
 
-/// Render a structured error envelope (from Status details) or the raw status.
-fn print_status(st: &Status) -> Result<()> {
+/// Render a gRPC error and exit(1): the structured `ErrorEnvelope` from
+/// `Status.details` (every surface now attaches one) — kind + message + suggest +
+/// see — or the raw status if there's no envelope. Never returns.
+fn print_status(st: &Status) -> ! {
     if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(st.details()) {
         let kind = serde_json::to_value(env.kind)
             .ok()
@@ -1068,6 +1067,13 @@ fn print_status(st: &Status) -> Result<()> {
         eprintln!("error: {}", st.message());
     }
     std::process::exit(1);
+}
+
+/// `.map_err(render_status)` for any gRPC call: render the error's envelope and
+/// exit. Use at every call site so guidance (not a bare status string) reaches
+/// the user. Returns `anyhow::Error` only to satisfy `map_err`; it never returns.
+fn render_status(st: Status) -> anyhow::Error {
+    print_status(&st)
 }
 
 fn node_to_json(n: Option<NodeInfo>) -> serde_json::Value {

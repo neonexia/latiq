@@ -1,5 +1,5 @@
 //! Admin gRPC service (the latiq CLI calls this).
-use crate::error::ControlPlaneError;
+use crate::error::{to_status, ControlPlaneError};
 use crate::registry::Registry;
 use latiq_proto::v1::admin_server::Admin;
 use latiq_proto::v1::*;
@@ -12,18 +12,6 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(registry: Registry) -> Self {
         Self { registry }
-    }
-}
-
-fn to_status(e: ControlPlaneError) -> Status {
-    match e {
-        ControlPlaneError::PondNotFound(m)
-        | ControlPlaneError::NodeNotFound(m)
-        | ControlPlaneError::DatasetNotFound(m)
-        | ControlPlaneError::CatalogNotFound(m) => Status::not_found(m),
-        ControlPlaneError::NameConflict(m) => Status::already_exists(m),
-        ControlPlaneError::Invalid(m) => Status::invalid_argument(m),
-        ControlPlaneError::Storage(m) => Status::internal(m),
     }
 }
 
