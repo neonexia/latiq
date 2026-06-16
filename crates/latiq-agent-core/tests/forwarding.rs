@@ -3,8 +3,8 @@
 //! owner) runs locally. Uses a fake ControlPlane (to pin the owner endpoint) and
 //! a recording Forwarder (to observe delegation) — no real cluster needed.
 use latiq_agent_core::{
-    AgentConfig, AgentError, AgentOps, ArrowReadStream, AuditRecord, ControlPlane, DescribeResult,
-    Forwarder, PondInfo,
+    AgentConfig, AgentError, AgentOps, ArrowReadStream, ControlPlane, DescribeResult, Forwarder,
+    PondInfo,
 };
 use latiq_common::{Identity, QueryMeta};
 use latiq_engine::{ExplainResult, QueryResult, SchemaSummary};
@@ -71,7 +71,6 @@ impl ControlPlane for FixedOwner {
     async fn get_catalog(&self, r: &str) -> Result<latiq_agent_core::CatalogInfo, AgentError> {
         Err(AgentError::internal(format!("no catalog {r}")))
     }
-    async fn record_audit(&self, _: AuditRecord) {}
 }
 
 #[derive(Default)]

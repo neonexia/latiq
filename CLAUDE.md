@@ -20,20 +20,22 @@ An agent-native data system. Agents allocate ephemeral **ponds** (DuckLake works
 |---|---|---|---|
 | **MCP-over-HTTP** | **Agents only** (frontier LLMs) | pond node | the agent tools + resources + prompts + guidance |
 | **Data/Query gRPC** | **CLI + SDK** (not agents) | pond node | allocate / drop / read / write / explain |
-| **Admin gRPC** | **Operators** | control plane | node / policy / audit + pond list/describe (metadata reads) |
+| **Admin gRPC** | **Operators** | control plane | node / policy + pond list/describe (metadata reads) |
 
-Plus one internal surface: **Control gRPC** (pond-node → control-plane; routing/registry/audit writes).
+Plus one internal surface: **Control gRPC** (pond-node → control-plane; routing/registry writes).
+
+**Access auditing** is NOT a registry capability: each access is a structured trace on the pond node's `latiq::access` log target (redacted SQL shape; `LATIQ_LOG_FORMAT=json` for structured fields). Operators grep the node log files — there is no audit table and no Admin audit RPC.
 
 ## Design invariants (DO NOT DRIFT)
 
 1. **MCP is the agent layer ONLY.** The CLI and SDK are **not agents** and must **never** use MCP. `latiq-client` (the MCP client) is for agent-simulation + MCP integration tests only.
-2. **CLI/SDK speak gRPC.** Data ops (allocate/drop/read/write/explain) → **Data/Query gRPC on the pond node**. Metadata reads (pond list/describe) + admin (node/policy/audit) → **Admin gRPC on the control plane**.
-3. **The control plane is NEVER in the query data path.** Queries execute on the **pond node** only. The control plane holds the registry/routing/policy/audit — metadata, never data.
+2. **CLI/SDK speak gRPC.** Data ops (allocate/drop/read/write/explain) → **Data/Query gRPC on the pond node**. Metadata reads (pond list/describe) + admin (node/policy) → **Admin gRPC on the control plane**.
+3. **The control plane is NEVER in the query data path.** Queries execute on the **pond node** only. The control plane holds the registry/routing/policy — metadata, never data.
 4. **Split by ownership.** The pond node owns storage + engine (so allocate/drop/queries go there). The control plane owns the registry (so pure metadata reads go there, and work even when pond nodes are down).
 5. **`latiq-agent-core` is PROTOCOL-NEUTRAL.** No MCP / gRPC / HTTP / transport types may appear in `latiq-agent-core`. Every surface (MCP, Data gRPC, future A2A) is an **inbound adapter** that maps its protocol onto `AgentOps`. **A new surface is a new adapter, never a change to the core.**
 6. **Pure DuckLake — nothing on top.** Attribution rides DuckLake's native `set_commit_message`; callers read history via native `pond.snapshots()` and tables/columns via `SHOW TABLES`/`information_schema`. **No Latiq objects in the pond catalog** (no `_latiq` schema, views, or macros) and no shadow store of pond data/snapshots/attribution. (The DuckDB adapter may use `duckdb_tables()` *internally* for `describe_schema`; governance/policy metadata in the control-plane registry is a *different plane*. Both allowed.)
 7. **One DuckDB instance per pond** (mutex-guarded, reused across queries) — the unit of **resource isolation** (per-pond memory/CPU caps live on the instance; DuckDB's `memory_limit`/`threads` are instance-global) and of concurrency ownership (one process owns each catalog file; independent instances racing on one catalog lose writes). Never go back to instance-per-query.
-8. **Hard separation of surfaces.** Agents (MCP) cannot do admin; operators (Admin gRPC) are not agents; data clients (Data gRPC) are not agents. Different transports, different audiences, different audit attribution.
+8. **Hard separation of surfaces.** Agents (MCP) cannot do admin; operators (Admin gRPC) are not agents; data clients (Data gRPC) are not agents. Different transports, different audiences, different attribution.
 9. **Identity is relaxed in M1** (claimed, default `anonymous`, `verified:false`), carried by a header (MCP) / gRPC metadata (gRPC). OIDC verification is M2.
 10. **Don't test DuckDB; test our integration with it.** DuckDB is a production engine. Test *our* code and *our* boundary: cell→JSON conversion (incl. nested/temporal types), the read/write/explain guards, cancellation + prompt resource release, concurrency correctness, attribution plumbing (native `pond.snapshots()`). Never assert DuckDB SQL semantics.
 11. **Single binary** (`latiq`) for all roles. `protoc` required to build (`brew install protobuf`).
@@ -64,7 +66,7 @@ Tests are categorized by **layer** and **surface/feature** so a given change run
 
 **Conventions (keep these so targeting works):**
 - One e2e file per **surface**: `tests/mcp.rs`, `tests/query_grpc.rs`, `tests/admin.rs`. (`tests/common/mod.rs` = the shared harness.)
-- Test fn names start with the **feature**: `pond_lifecycle_*`, `sql_read_write_*`, `attribution_*`, `result_encoding_*`, `inline_cap_*`, `cancellation_*`, `concurrency_*`, `ingestion_*`, `audit_*`, `policy_*`, `error_contract_*`. Both a `_happy` and the relevant `_edge`/error cases exist for every feature.
+- Test fn names start with the **feature**: `pond_lifecycle_*`, `sql_read_write_*`, `attribution_*`, `result_encoding_*`, `inline_cap_*`, `cancellation_*`, `concurrency_*`, `ingestion_*`, `policy_*`, `error_contract_*`. Both a `_happy` and the relevant `_edge`/error cases exist for every feature.
 - **Run a feature across surfaces:** `cargo test <feature_prefix>` (name filter), e.g. `cargo test attribution`.
 - **Run a surface:** `cargo test -p latiq --test query_grpc`.
 - Every feature add/change ships with its tests **in the same commit** (interleaved, not deferred).

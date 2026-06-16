@@ -1,6 +1,6 @@
 //! Control gRPC service (pond-nodes call this).
 use crate::error::ControlPlaneError;
-use crate::registry::{AuditInsert, Registry};
+use crate::registry::Registry;
 use latiq_proto::v1::control_server::Control;
 use latiq_proto::v1::*;
 use tonic::{Request, Response, Status};
@@ -162,37 +162,6 @@ impl Control for ControlService {
                 extensions: row.extensions,
             }),
         }))
-    }
-
-    async fn record_audit(
-        &self,
-        req: Request<RecordAuditRequest>,
-    ) -> Result<Response<RecordAuditResponse>, Status> {
-        let r = req.into_inner();
-        self.registry
-            .record_audit(AuditInsert {
-                agent_identity: r.agent_identity,
-                identity_verified: r.identity_verified,
-                operation: r.operation,
-                pond_id: if r.pond_id.is_empty() {
-                    None
-                } else {
-                    Some(r.pond_id)
-                },
-                request_summary: if r.request_summary_json.is_empty() {
-                    None
-                } else {
-                    Some(r.request_summary_json)
-                },
-                result_summary: if r.result_summary_json.is_empty() {
-                    None
-                } else {
-                    Some(r.result_summary_json)
-                },
-                duration_ms: r.duration_ms,
-            })
-            .map_err(to_status)?;
-        Ok(Response::new(RecordAuditResponse {}))
     }
 
     async fn get_dataset(

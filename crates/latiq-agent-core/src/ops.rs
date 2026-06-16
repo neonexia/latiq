@@ -7,8 +7,8 @@ use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
 use crate::types::{
-    AllocateResult, AuditRecord, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult,
-    PondInfo, PullResult,
+    AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult, PondInfo,
+    PullResult,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -668,6 +668,14 @@ impl AgentOps {
         Ok(res)
     }
 
+    /// Emit one access record as a structured trace on the `latiq::access`
+    /// target. There is no audit store — operators grep the node log files (or
+    /// ship them to their log stack; `LATIQ_LOG_FORMAT=json` makes the fields
+    /// structured). Filter with e.g. `RUST_LOG=latiq::access=info` or by grepping
+    /// the `latiq::access` target / the `agent=`/`op=` fields.
+    ///
+    /// Kept `async` so the (many) call sites are unchanged; the body is a
+    /// non-blocking trace emit (no store, no await).
     async fn audit(
         &self,
         identity: &Identity,
@@ -676,16 +684,16 @@ impl AgentOps {
         request_summary: Option<String>,
         duration_ms: u64,
     ) {
-        self.control
-            .record_audit(AuditRecord {
-                agent_identity: identity.agent_id.clone(),
-                verified: identity.verified,
-                operation: operation.to_string(),
-                pond_id: pond_id.map(|s| s.to_string()),
-                request_summary,
-                duration_ms,
-            })
-            .await;
+        info!(
+            target: "latiq::access",
+            agent = %identity.agent_id,
+            verified = identity.verified,
+            op = operation,
+            pond = pond_id.unwrap_or("-"),
+            duration_ms,
+            summary = request_summary.as_deref().unwrap_or(""),
+            "access",
+        );
     }
 }
 

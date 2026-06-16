@@ -3,7 +3,7 @@
 //! registry remotely. `ControlClient<Channel>` is cheaply cloneable, so each
 //! call clones it (tonic RPC methods take `&mut self`).
 use latiq_agent_core::{AgentError, ControlPlane};
-use latiq_agent_core::{AuditRecord, CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
+use latiq_agent_core::{CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::*;
 use tonic::transport::Channel;
@@ -216,20 +216,5 @@ impl ControlPlane for GrpcControlPlane {
         resp.catalog
             .map(catalog_to_info)
             .ok_or_else(|| AgentError::internal(format!("catalog '{name}' not found")))
-    }
-
-    async fn record_audit(&self, rec: AuditRecord) {
-        let mut c = self.client.clone();
-        let _ = c
-            .record_audit(RecordAuditRequest {
-                agent_identity: rec.agent_identity,
-                identity_verified: rec.verified,
-                operation: rec.operation,
-                pond_id: rec.pond_id.unwrap_or_default(),
-                request_summary_json: rec.request_summary.unwrap_or_default(),
-                result_summary_json: String::new(),
-                duration_ms: rec.duration_ms,
-            })
-            .await;
     }
 }
