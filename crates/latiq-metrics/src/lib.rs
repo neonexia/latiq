@@ -13,10 +13,19 @@ static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 /// Install the global Prometheus recorder once and return its handle. Idempotent:
 /// in single-process setups (e.g. the full-stack tests run control plane + node
 /// together) the first call installs, later calls return the same handle.
+/// Latency buckets (seconds) for our histograms. Explicit buckets make histograms
+/// render as Prometheus `_bucket` series (not summaries), so `histogram_quantile`
+/// works AND aggregates **across nodes** — summaries can't be merged across pods.
+const LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 pub fn init_recorder() -> PrometheusHandle {
     HANDLE
         .get_or_init(|| {
             PrometheusBuilder::new()
+                .set_buckets(LATENCY_BUCKETS)
+                .expect("set histogram buckets")
                 .install_recorder()
                 .expect("install prometheus recorder")
         })
@@ -89,9 +98,16 @@ mod tests {
         let h = init_recorder();
         metrics::counter!("latiq_test_total", "k" => "v").increment(3);
         metrics::gauge!("latiq_test_gauge").set(7.0);
+        metrics::histogram!("latiq_test_seconds").record(0.5);
         let out = h.render();
         assert!(out.contains("latiq_test_total"), "counter missing:\n{out}");
         assert!(out.contains("latiq_test_gauge"), "gauge missing");
+        // Histograms render as Prometheus _bucket/_sum/_count series — the type
+        // our query-latency metric uses (latiq_pond_query_duration_seconds).
+        assert!(
+            out.contains("latiq_test_seconds_bucket"),
+            "histogram buckets missing:\n{out}"
+        );
     }
 
     #[test]

@@ -175,6 +175,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("describe");
             return fwd.describe(owner, identity, pond_ref).await;
         }
         info!(op = "describe_pond", pond = pond_ref, "processing locally");
@@ -231,6 +232,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("drop");
             return fwd.drop_pond(owner, identity, pond_ref, confirm).await;
         }
         info!(op = "drop_pond", pond = pond_ref, "processing locally");
@@ -348,6 +350,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("catalog_pull");
             return fwd
                 .catalog_pull(owner, identity, pond_ref, catalog, query, params)
                 .await;
@@ -388,6 +391,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("catalog_describe");
             return fwd
                 .catalog_describe(owner, identity, pond_ref, catalog, params)
                 .await;
@@ -452,6 +456,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("read_arrow");
             return fwd.read_arrow(owner, identity, pond_ref, sql).await;
         }
         info!(op = "read_arrow", pond = pond_ref, "processing locally");
@@ -566,6 +571,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("query");
             return if write {
                 fwd.write(owner, identity, pond_ref, sql).await
             } else {
@@ -619,13 +625,15 @@ impl AgentOps {
             record_error(&info.name, &ae);
             return Err(ae);
         }
+        let elapsed = t0.elapsed();
+        record_query_duration(&info.name, if write { "write" } else { "read" }, elapsed);
         let op = if write { "write_query" } else { "read_query" };
         self.audit(
             identity,
             op,
             Some(&pond_id),
             Some(redact_sql(sql)),
-            t0.elapsed().as_millis() as u64,
+            elapsed.as_millis() as u64,
         )
         .await;
         Ok(qr)
@@ -645,6 +653,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
+            record_forward("explain");
             return fwd.explain(owner, identity, pond_ref, sql).await;
         }
         info!(op = "explain_query", pond = pond_ref, "processing locally");
@@ -755,6 +764,18 @@ fn record_query(pond: &str, op: &'static str) {
 fn record_error(pond: &str, e: &AgentError) {
     metrics::counter!("latiq_pond_errors_total", "pond" => pond.to_string(), "kind" => format!("{:?}", e.envelope().kind))
         .increment(1);
+}
+/// Query wall-clock latency (engine execution on the owning node), in seconds —
+/// the histogram for p50/p95/p99 (`histogram_quantile` in Prometheus). Recorded
+/// where the query actually ran, labeled by pond + op.
+fn record_query_duration(pond: &str, op: &'static str, elapsed: std::time::Duration) {
+    metrics::histogram!("latiq_pond_query_duration_seconds", "pond" => pond.to_string(), "op" => op)
+        .record(elapsed.as_secs_f64());
+}
+/// Count an operation forwarded to another node (multi-node path), by op. Lets
+/// operators see how much traffic crosses node boundaries vs. runs locally.
+fn record_forward(op: &'static str) {
+    metrics::counter!("latiq_forwarded_total", "op" => op).increment(1);
 }
 
 /// Convert one Arrow `RecordBatch` to positional JSON rows aligned to `columns`.
