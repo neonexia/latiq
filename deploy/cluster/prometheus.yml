@@ -1,0 +1,19 @@
+# Scrapes the control plane + each pond node's /metrics (port = service port +
+# 1000). In a real deployment this is replaced by a Prometheus Operator
+# PodMonitor (see issue #23); here it's static targets on the compose network.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: latiq-control-plane
+    static_configs:
+      - targets: ["control-plane:52400"]
+        labels: { role: control-plane }
+
+  - job_name: latiq-pond-nodes
+    static_configs:
+      - targets:
+          - "pond-node-1:52401"
+          - "pond-node-2:52401"
+          - "pond-node-3:52401"   # only up once scaled; DOWN until then (expected)
+        labels: { role: pond-node }

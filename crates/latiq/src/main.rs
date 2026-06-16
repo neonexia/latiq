@@ -68,6 +68,10 @@ enum Command {
     Catalog(CatalogCmd),
     /// System snapshot: nodes (state + heartbeat age), ponds, tiers.
     Stats(StatsArgs),
+    /// Pre-install DuckDB extensions into the local cache (image-bake step, run at
+    /// container build so nodes start offline). Not a day-to-day command.
+    #[command(hide = true)]
+    WarmExtensions,
 }
 
 #[derive(Args)]
@@ -166,6 +170,10 @@ struct ServeArgs {
     /// Port for the Control + Admin gRPC surfaces.
     #[arg(short, long, default_value_t = 51400)]
     port: u16,
+    /// Host/interface to bind. Defaults to loopback; use 0.0.0.0 in containers so
+    /// pond nodes and Prometheus on other hosts can reach it.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
     /// Data root; the registry lives at <root>/registry.duckdb (default ~/.latiq).
     #[arg(short, long)]
     root: Option<PathBuf>,
@@ -193,6 +201,15 @@ struct NodeAddArgs {
     /// Data/Query gRPC port. MCP (agents) is served on port + 1.
     #[arg(short, long, default_value_t = 51401)]
     port: u16,
+    /// Host/interface to bind. Defaults to loopback; use 0.0.0.0 in containers.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: String,
+    /// host:port other nodes/agents use to reach this node, advertised to the
+    /// control plane for query forwarding. Defaults to 127.0.0.1:<port>; set it to
+    /// this node's container/pod hostname (e.g. pond-node-1:51401) in multi-host
+    /// deployments, or forwarding lands on the wrong host.
+    #[arg(long)]
+    advertise_addr: Option<String>,
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
     #[arg(short, long)]
     root: Option<PathBuf>,
@@ -222,7 +239,11 @@ enum PondCmd {
         agent_id: Option<String>,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
-    List,
+    List {
+        /// Output format. `json` includes each pond's owning `node_id`.
+        #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
+        format: Format,
+    },
     Describe {
         pond: String,
     },
@@ -277,6 +298,11 @@ async fn main() -> Result<()> {
         Command::Dataset(cmd) => run_dataset_cmd(cmd).await,
         Command::Catalog(cmd) => run_catalog_cmd(cmd).await,
         Command::Stats(a) => run_stats(a).await,
+        Command::WarmExtensions => {
+            latiq_pond_node::warm_extensions().map_err(|e| anyhow!("warm extensions: {e}"))?;
+            println!("DuckDB extensions warmed into the local cache.");
+            Ok(())
+        }
     }
 }
 
@@ -613,6 +639,23 @@ fn control_addr() -> String {
     std::env::var("LATIQ_SERVER").unwrap_or_else(|_| DEFAULT_CONTROL.to_string())
 }
 
+/// The `internal_endpoint` a pond node advertises to the control plane for query
+/// forwarding. `--advertise-addr` takes a host or host:port (a bare host gets the
+/// data `port` appended); `http://` is added if absent. Without the flag we keep
+/// the historical loopback default so single-host runs are unchanged.
+fn advertise_endpoint(advertise_addr: Option<&str>, port: u16) -> String {
+    let raw = match advertise_addr {
+        Some(a) if a.contains(':') => a.to_string(),
+        Some(host) => format!("{host}:{port}"),
+        None => format!("127.0.0.1:{port}"),
+    };
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw
+    } else {
+        format!("http://{raw}")
+    }
+}
+
 // ---- server roles -------------------------------------------------------
 
 /// Initialize structured logging for the long-running server roles (serve /
@@ -639,9 +682,9 @@ fn init_tracing() {
 /// Resolve the metrics address (`--metrics-port`, default main port + 1000) and
 /// start the Prometheus recorder + `/metrics` server. Returns the address logged
 /// in the banner.
-fn start_metrics(main_port: u16, metrics_port: Option<u16>) -> Result<SocketAddr> {
+fn start_metrics(bind: &str, main_port: u16, metrics_port: Option<u16>) -> Result<SocketAddr> {
     let addr: SocketAddr =
-        format!("127.0.0.1:{}", metrics_port.unwrap_or(main_port + 1000)).parse()?;
+        format!("{bind}:{}", metrics_port.unwrap_or(main_port + 1000)).parse()?;
     let handle = latiq_metrics::init_recorder();
     metrics::gauge!("latiq_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
     tokio::spawn(async move {
@@ -659,8 +702,8 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let db = root.join("registry.duckdb");
     let registry = Registry::open(Some(db.as_path()))?;
-    let addr: SocketAddr = format!("127.0.0.1:{}", a.port).parse()?;
-    let metrics_addr = start_metrics(a.port, a.metrics_port)?;
+    let addr: SocketAddr = format!("{}:{}", a.bind, a.port).parse()?;
+    let metrics_addr = start_metrics(&a.bind, a.port, a.metrics_port)?;
     latiq_control_plane::spawn_system_collector(registry.clone());
     println!("control plane: Control + Admin gRPC on {addr}");
     println!("  registry: {}", db.display());
@@ -676,15 +719,19 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
-    let data_addr = format!("127.0.0.1:{}", a.port);
-    let mcp_addr = format!("127.0.0.1:{}", a.port + 1);
+    let data_addr = format!("{}:{}", a.bind, a.port);
+    let mcp_addr = format!("{}:{}", a.bind, a.port + 1);
     let metrics_addr: SocketAddr =
-        format!("127.0.0.1:{}", a.metrics_port.unwrap_or(a.port + 1000)).parse()?;
+        format!("{}:{}", a.bind, a.metrics_port.unwrap_or(a.port + 1000)).parse()?;
+    // The endpoint OTHER nodes use to reach us (stored in the registry for
+    // forwarding). Defaults to loopback so single-host runs are unchanged; in
+    // containers `--advertise-addr pond-node-1:51401` makes forwarding routable.
+    let advertise = advertise_endpoint(a.advertise_addr.as_deref(), a.port);
     run_pond_node(PondNodeConfig {
         node_id: a.node_id,
         mcp_addr: mcp_addr.parse()?,
         data_addr: data_addr.parse()?,
-        internal_endpoint: format!("http://{data_addr}"),
+        internal_endpoint: advertise,
         control_endpoint: control_addr(),
         data_dir: root.join("ponds"),
         metrics_addr: Some(metrics_addr),
@@ -826,10 +873,24 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 Err(st) => print_status(&st),
             }
         }
-        PondCmd::List => {
+        PondCmd::List { format } => {
             let mut c = admin_client().await?;
             let ponds = c.pond_list(PondListRequest {}).await?.into_inner().ponds;
-            print_pond_list_table(&ponds);
+            match format {
+                Format::Json => {
+                    let v: Vec<_> = ponds
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "pond_id": p.pond_id, "name": p.name, "owner": p.owner,
+                                "node_id": p.node_id, "tier": p.tier, "created_at": p.created_at,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                }
+                Format::Tabular => print_pond_list_table(&ponds),
+            }
             Ok(())
         }
         PondCmd::Describe { pond } => {
@@ -1218,5 +1279,26 @@ mod tests {
         assert_eq!(m["endpoint"], "https://x?a=b");
         assert_eq!(m["warehouse"], "prod");
         assert!(parse_kv(&["noequals".to_string()], "--set").is_err());
+    }
+
+    #[test]
+    fn advertise_endpoint_defaults_and_overrides() {
+        // No flag → historical loopback default (single-host behavior unchanged).
+        assert_eq!(advertise_endpoint(None, 51401), "http://127.0.0.1:51401");
+        // Bare host → the data port is appended (the container case).
+        assert_eq!(
+            advertise_endpoint(Some("pond-node-1"), 51401),
+            "http://pond-node-1:51401"
+        );
+        // host:port is taken verbatim (different advertised port than bound).
+        assert_eq!(
+            advertise_endpoint(Some("10.0.0.5:9000"), 51401),
+            "http://10.0.0.5:9000"
+        );
+        // An explicit scheme is preserved.
+        assert_eq!(
+            advertise_endpoint(Some("http://node-a:51401"), 51401),
+            "http://node-a:51401"
+        );
     }
 }

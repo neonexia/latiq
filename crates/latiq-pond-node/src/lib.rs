@@ -42,6 +42,16 @@ pub struct PondNodeConfig {
     pub metrics_addr: Option<SocketAddr>,
 }
 
+/// Install the standard + optional DuckDB extensions into the local cache so a
+/// node can run offline. Used to **bake** extensions into the container image at
+/// build time (`latiq warm-extensions`): INSTALL hits the network here, once, so
+/// the runtime node never needs it. Errors if a required extension can't install.
+pub fn warm_extensions() -> Result<(), Box<dyn std::error::Error>> {
+    latiq_engine_duckdb::ensure_standard_extensions()?;
+    latiq_engine_duckdb::warm_optional_extensions();
+    Ok(())
+}
+
 /// Periodically refresh this node's resource + load gauges. The per-pond
 /// in-flight gauge is maintained inline in AgentOps; this samples the node-level
 /// gauges + process CPU/memory.

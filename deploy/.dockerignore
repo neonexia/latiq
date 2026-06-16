@@ -1,0 +1,10 @@
+# Keep the build context small/cache-friendly. target/ is huge and rebuilt in the
+# image; local data, git, and editor cruft don't belong in the image.
+target/
+**/target/
+.git/
+.github/
+spike/
+*.log
+.claude/
+deploy/cluster/data/
