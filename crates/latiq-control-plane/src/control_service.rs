@@ -1,5 +1,5 @@
 //! Control gRPC service (pond-nodes call this).
-use crate::error::ControlPlaneError;
+use crate::error::{to_status, ControlPlaneError};
 use crate::registry::Registry;
 use latiq_proto::v1::control_server::Control;
 use latiq_proto::v1::*;
@@ -12,22 +12,6 @@ pub struct ControlService {
 impl ControlService {
     pub fn new(registry: Registry) -> Self {
         Self { registry }
-    }
-}
-
-fn to_status(e: ControlPlaneError) -> Status {
-    match e {
-        ControlPlaneError::NameConflict(m) => Status::already_exists(m),
-        ControlPlaneError::PondNotFound(m) => Status::not_found(m),
-        // No node available to host the pond is an availability/precondition
-        // failure, NOT "pond not found" — collapsing them mislabels allocate-with-
-        // no-node as a missing pond (review #13).
-        ControlPlaneError::NodeNotFound(m) => Status::failed_precondition(m),
-        ControlPlaneError::DatasetNotFound(m) | ControlPlaneError::CatalogNotFound(m) => {
-            Status::not_found(m)
-        }
-        ControlPlaneError::Invalid(m) => Status::invalid_argument(m),
-        ControlPlaneError::Storage(m) => Status::internal(m),
     }
 }
 
