@@ -7,9 +7,9 @@
 //! db = latiq.connect("local")                 # in-process cluster (~/.latiq/local)
 //! # db = latiq.connect("grpc://host:51400")   # or a remote control plane
 //! db.create_pond("work")
-//! db.write("work", "CREATE TABLE t(id INT)")
-//! db.write("work", "INSERT INTO t VALUES (1),(2)")
-//! print(db.read("work", "SELECT count(*) FROM t"))   # {"columns": [...], "rows": [[2]]}
+//! db.query("work", "CREATE TABLE t(id INT)")
+//! db.query("work", "INSERT INTO t VALUES (1),(2)")
+//! print(db.query("work", "SELECT count(*) FROM t"))   # {"columns": [...], "rows": [[2]]}
 //! ```
 use latiq_sdk::Latiq;
 use pyo3::exceptions::PyRuntimeError;
@@ -90,21 +90,16 @@ impl PyDatabase {
             .map_err(err)
     }
 
-    /// Run a read-only query; returns `{columns, rows, …}`.
-    fn read(&self, py: Python<'_>, pond: &str, sql: &str) -> PyResult<PyObject> {
+    /// Run SQL against `pond`. One verb — reads return rows (and are rejected if
+    /// they mutate); writes (INSERT/UPDATE/DELETE/DDL) are attributed to this
+    /// client. Returns `{columns, rows, …}`.
+    fn query(&self, py: Python<'_>, pond: &str, sql: &str) -> PyResult<PyObject> {
         let inner = self.inner.clone();
-        let v = py.allow_threads(|| inner.read(pond, sql)).map_err(err)?;
+        let v = py.allow_threads(|| inner.query(pond, sql)).map_err(err)?;
         json_to_py(py, &v)
     }
 
-    /// Run a write (INSERT/UPDATE/DELETE/DDL), attributed to this client.
-    fn write(&self, py: Python<'_>, pond: &str, sql: &str) -> PyResult<PyObject> {
-        let inner = self.inner.clone();
-        let v = py.allow_threads(|| inner.write(pond, sql)).map_err(err)?;
-        json_to_py(py, &v)
-    }
-
-    /// A lazy handle to one pond — `db.pond("work").read("SELECT …")`.
+    /// A lazy handle to one pond — `db.pond("work").query("SELECT …")`.
     fn pond(&self, name: &str) -> PyPond {
         PyPond {
             inner: self.inner.clone(),
@@ -131,19 +126,9 @@ impl PyPond {
         self.name.clone()
     }
 
-    fn read(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+    fn query(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
         let (inner, pond) = (self.inner.clone(), self.name.clone());
-        let v = py
-            .allow_threads(|| inner.read(&pond, sql))
-            .map_err(err)?;
-        json_to_py(py, &v)
-    }
-
-    fn write(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
-        let (inner, pond) = (self.inner.clone(), self.name.clone());
-        let v = py
-            .allow_threads(|| inner.write(&pond, sql))
-            .map_err(err)?;
+        let v = py.allow_threads(|| inner.query(&pond, sql)).map_err(err)?;
         json_to_py(py, &v)
     }
 

@@ -166,27 +166,21 @@ impl Latiq {
         })
     }
 
-    /// Run a read-only query; returns the `{columns, rows, …}` result as JSON.
-    pub fn read(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
-        self.query(pond, sql, false)
-    }
-
-    /// Run a write (INSERT/UPDATE/DELETE/DDL), attributed to this client.
-    pub fn write(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
-        self.query(pond, sql, true)
-    }
-
-    fn query(&self, pond: &str, sql: &str, write: bool) -> Result<serde_json::Value> {
+    /// Run a SQL statement against `pond`. One verb: reads ride the read path
+    /// (and are rejected if they mutate), writes are attributed + snapshotted —
+    /// the client classifies by statement (same as the CLI's `query`), so callers
+    /// don't pick read-vs-write. Returns the `{columns, rows, …}` result as JSON.
+    pub fn query(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
         self.rt.block_on(async {
             let mut d = self.data_for(pond).await?;
             let req = self.with_id(QueryRequest {
                 pond: pond.to_string(),
                 sql: sql.to_string(),
             });
-            let resp = if write {
-                d.write_query(req).await
-            } else {
+            let resp = if latiq_engine::is_read_only(sql) {
                 d.read_query(req).await
+            } else {
+                d.write_query(req).await
             }?
             .into_inner();
             parse_json(&resp.json)
