@@ -1713,6 +1713,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "latiq-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "latiq-common",
+ "latiq-control-plane",
+ "latiq-pond-node",
+ "latiq-proto",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "latiq-storage"
 version = "0.1.0"
 dependencies = [
