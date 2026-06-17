@@ -14,15 +14,15 @@ db = latiq.connect("local", root="/tmp/x")  # or a specific path
 db = latiq.connect("grpc://host:51400")
 
 db.create_pond("work", tier="medium")
-db.write("work", "CREATE TABLE t(id INT)")
-db.write("work", "INSERT INTO t VALUES (1),(2)")
-db.read("work", "SELECT count(*) FROM t")    # → {"columns": [...], "rows": [[2]], ...}
+db.query("work", "CREATE TABLE t(id INT)")
+db.query("work", "INSERT INTO t VALUES (1),(2)")
+db.query("work", "SELECT count(*) FROM t")   # → {"columns": [...], "rows": [[2]], ...}  (one verb; reads vs writes routed for you)
 db.describe_pond("work")
 
 # Lazy per-pond handle.
 pond = db.pond("work")
-pond.write("INSERT INTO t VALUES (3)")
-pond.read("SELECT * FROM t")
+pond.query("INSERT INTO t VALUES (3)")
+pond.query("SELECT * FROM t")
 pond.drop()                                  # confirm=True by default on .drop()
 ```
 
@@ -34,7 +34,7 @@ Uses [maturin](https://www.maturin.rs/). With [uv](https://docs.astral.sh/uv/):
 cd sdk/python
 uv venv && uv pip install maturin pytest
 uv run maturin develop            # builds the extension into the venv (first build compiles DuckDB — slow)
-uv run pytest -v
+uv run --no-sync pytest -v        # --no-sync: keep maturin's fresh build (plain `uv run` would reinstall a cached wheel)
 ```
 
 The extension links the whole server stack (so embedded mode can spawn a cluster

@@ -17,29 +17,24 @@ fn embedded_pond_lifecycle_and_query_round_trip() {
     assert!(!p.pond_id.is_empty());
     assert!(db.list_ponds().unwrap().iter().any(|x| x.name == "work"));
 
-    // Write then read (node-direct; materializes the pond's DuckLake on first use).
-    db.write("work", "CREATE TABLE t(id INTEGER, note VARCHAR)")
+    // One `query` verb — the client routes by statement (reads stream, writes are
+    // attributed). Materializes the pond's DuckLake on first use.
+    db.query("work", "CREATE TABLE t(id INTEGER, note VARCHAR)")
         .unwrap();
-    db.write("work", "INSERT INTO t VALUES (1,'a'),(2,'b')")
+    db.query("work", "INSERT INTO t VALUES (1,'a'),(2,'b')")
         .unwrap();
-    let r = db.read("work", "SELECT count(*) AS n FROM t").unwrap();
+    let r = db.query("work", "SELECT count(*) AS n FROM t").unwrap();
     assert_eq!(r["rows"][0][0], 2, "round-tripped rows: {r}");
 
     // Describe surfaces the pond + its schema.
     let d = db.describe_pond("work").unwrap();
     assert_eq!(d["pond"]["name"], "work");
 
-    // A read is rejected as a write guard check (the engine classifies).
-    assert!(
-        db.read("work", "INSERT INTO t VALUES (3,'c')").is_err(),
-        "read_query must reject a write"
-    );
-
     // Drop requires confirm; after it, the pond no longer resolves.
     assert!(db.drop_pond("work", false).is_err(), "drop needs confirm");
     db.drop_pond("work", true).unwrap();
     assert!(
-        db.read("work", "SELECT 1").is_err(),
+        db.query("work", "SELECT 1").is_err(),
         "pond must be gone after drop"
     );
 }

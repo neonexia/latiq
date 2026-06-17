@@ -8,6 +8,7 @@ edition.workspace = true
 # by a local directory. The Python SDK (sdk/python) is a thin PyO3 wrapper over this.
 [dependencies]
 latiq-common = { path = "../latiq-common" }
+latiq-engine = { path = "../latiq-engine" }
 latiq-proto = { path = "../latiq-proto" }
 latiq-control-plane = { path = "../latiq-control-plane" }
 latiq-pond-node = { path = "../latiq-pond-node" }
