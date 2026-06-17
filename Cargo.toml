@@ -15,6 +15,9 @@ members = [
   "crates/latiq-metrics",
   "crates/latiq-sdk",
 ]
+# The PyO3 wheel is its own workspace (built by maturin) so its extension-module
+# linkage never breaks `cargo test --workspace`.
+exclude = ["sdk/python"]
 
 [workspace.package]
 version = "0.1.0"
