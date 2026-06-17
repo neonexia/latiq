@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "latiq"
+version = "0.1.0"
+description = "Python SDK for Latiq — agent-native data ponds"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# The cdylib is named `latiq`; build it as the top-level module.
+module-name = "latiq"
+features = ["pyo3/extension-module"]
