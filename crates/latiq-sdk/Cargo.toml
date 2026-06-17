@@ -1,0 +1,20 @@
+[package]
+name = "latiq-sdk"
+version.workspace = true
+edition.workspace = true
+
+# Reusable Rust client for Latiq (CLI/SDK audience — gRPC, never MCP). Two ways to
+# get a cluster: connect to a remote control plane, or start one in-process backed
+# by a local directory. The Python SDK (sdk/python) is a thin PyO3 wrapper over this.
+[dependencies]
+latiq-common = { path = "../latiq-common" }
+latiq-proto = { path = "../latiq-proto" }
+latiq-control-plane = { path = "../latiq-control-plane" }
+latiq-pond-node = { path = "../latiq-pond-node" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
