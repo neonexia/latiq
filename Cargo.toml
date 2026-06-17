@@ -13,6 +13,7 @@ members = [
   "crates/latiq-pond-node",
   "crates/latiq-control-plane",
   "crates/latiq-metrics",
+  "crates/latiq-sdk",
 ]
 
 [workspace.package]
