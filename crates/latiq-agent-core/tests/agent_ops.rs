@@ -157,7 +157,7 @@ async fn lazy_materialize_pond_assigned_without_eager_storage() {
         .unwrap();
     // Registry-only allocation — deliberately NOT ops.allocate_pond (no storage).
     registry
-        .create_pond(Some("lazy".into()), "agent-x", "{}", "medium", &[])
+        .create_pond(Some("lazy".into()), "agent-x", "{}", "medium", &[], "")
         .unwrap();
 
     let control = Arc::new(RegistryControlPlane::new(registry));

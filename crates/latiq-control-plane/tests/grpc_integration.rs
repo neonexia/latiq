@@ -65,6 +65,7 @@ async fn control_and_admin_surfaces_work() {
             policy_json: "{}".into(),
             tier: "medium".into(),
             extensions: vec![],
+            description: String::new(),
         })
         .await
         .unwrap()
@@ -133,6 +134,7 @@ async fn error_contract_allocate_with_no_node_is_precondition_not_notfound() {
             policy_json: "{}".into(),
             tier: "medium".into(),
             extensions: vec![],
+            description: String::new(),
         })
         .await
         .expect_err("allocate with no node must fail");
