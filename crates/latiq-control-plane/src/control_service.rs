@@ -121,6 +121,7 @@ impl Control for ControlService {
                 node_endpoint: endpoint.unwrap_or_default(),
                 tier: row.tier,
                 extensions: row.extensions,
+                description: row.description,
             });
         }
         Ok(Response::new(ListPondsResponse { ponds }))
@@ -144,6 +145,7 @@ impl Control for ControlService {
                 node_endpoint: endpoint.unwrap_or_default(),
                 tier: row.tier,
                 extensions: row.extensions,
+                description: row.description,
             }),
         }))
     }
