@@ -34,6 +34,8 @@ pub struct PondRow {
     pub tier: String,
     /// Optional DuckDB extensions the pond loads on open (empty = none).
     pub extensions: Vec<String>,
+    /// Optional agent-discovery text: what this pond is for. Empty = none.
+    pub description: String,
 }
 
 /// One external table in a dataset (the table created in the pond + its source).
@@ -193,6 +195,7 @@ impl Registry {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        description: &str,
     ) -> Result<PondRow, ControlPlaneError> {
         let pond_id = PondId::new().to_string();
         let name = name.unwrap_or_else(|| pond_id.clone());
@@ -216,8 +219,8 @@ impl Registry {
         }
         let ext_csv = extensions.join(",");
         c.execute(
-            "INSERT INTO ponds(pond_id, name, owner_identity, node_id, policy_json, tier, extensions) VALUES (?,?,?,?,?,?,?)",
-            duckdb::params![pond_id, name, owner_identity, node_id, policy_json, tier, ext_csv],
+            "INSERT INTO ponds(pond_id, name, owner_identity, node_id, policy_json, tier, extensions, description) VALUES (?,?,?,?,?,?,?,?)",
+            duckdb::params![pond_id, name, owner_identity, node_id, policy_json, tier, ext_csv, description],
         )?;
         // Persist immediately so the pond survives a lost .wal (see register_node).
         let _ = c.execute_batch("CHECKPOINT");
@@ -229,6 +232,7 @@ impl Registry {
             node_id,
             tier: tier.to_string(),
             extensions: extensions.to_vec(),
+            description: description.to_string(),
         })
     }
 
@@ -247,7 +251,7 @@ impl Registry {
         let c = self.lock();
         let mut stmt = c.prepare(
             "SELECT pond_id, name, owner_identity, node_id, coalesce(tier, 'medium'),
-                    coalesce(extensions, '') FROM ponds ORDER BY created_at",
+                    coalesce(extensions, ''), coalesce(description, '') FROM ponds ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(PondRow {
@@ -257,6 +261,7 @@ impl Registry {
                 node_id: r.get(3)?,
                 tier: r.get(4)?,
                 extensions: latiq_common::extensions::parse_csv(&r.get::<_, String>(5)?),
+                description: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -273,7 +278,8 @@ impl Registry {
         c.query_row(
             "SELECT p.pond_id, p.name, p.owner_identity, p.node_id,
                     p.created_at::VARCHAR, p.policy_json, n.internal_endpoint,
-                    coalesce(p.tier, 'medium'), coalesce(p.extensions, '')
+                    coalesce(p.tier, 'medium'), coalesce(p.extensions, ''),
+                    coalesce(p.description, '')
              FROM ponds p LEFT JOIN nodes n ON n.node_id = p.node_id
              WHERE p.pond_id=? OR p.name=? LIMIT 1",
             duckdb::params![pond_ref, pond_ref],
@@ -286,6 +292,7 @@ impl Registry {
                         node_id: r.get(3)?,
                         tier: r.get::<_, String>(7)?,
                         extensions: latiq_common::extensions::parse_csv(&r.get::<_, String>(8)?),
+                        description: r.get::<_, String>(9)?,
                     },
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
@@ -635,9 +642,9 @@ mod tests {
         let r = reg();
         r.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 100)
             .unwrap();
-        r.create_pond(Some("p-one".into()), "agent-x", "{\"k\":1}", "medium", &[])
+        r.create_pond(Some("p-one".into()), "agent-x", "{\"k\":1}", "medium", &[], "")
             .unwrap();
-        r.create_pond(Some("p-two".into()), "agent-y", "{}", "medium", &[])
+        r.create_pond(Some("p-two".into()), "agent-y", "{}", "medium", &[], "")
             .unwrap();
         let ponds = r.list_ponds().unwrap();
         assert_eq!(ponds.len(), 2);
@@ -740,6 +747,20 @@ mod tests {
     }
 
     #[test]
+    fn create_pond_round_trips_description() {
+        let r = reg();
+        r.register_node("n1", "http://m", "http://i", 10).unwrap();
+        let row = r
+            .create_pond(Some("docs".into()), "owner", "{}", "medium", &[], "raw events 2024")
+            .unwrap();
+        assert_eq!(row.description, "raw events 2024");
+        let listed = r.list_ponds().unwrap();
+        assert_eq!(listed[0].description, "raw events 2024");
+        let (info, ..) = r.pond_info("docs").unwrap();
+        assert_eq!(info.description, "raw events 2024");
+    }
+
+    #[test]
     fn create_pond_round_trips_extensions() {
         let r = reg();
         r.register_node("node-a", "http://n/mcp", "http://n:9092", 100)
@@ -751,6 +772,7 @@ mod tests {
                 "{}",
                 "large",
                 &["spatial".to_string()],
+                "",
             )
             .unwrap();
         assert_eq!(row.extensions, vec!["spatial".to_string()]);
@@ -760,7 +782,7 @@ mod tests {
         let listed = r.list_ponds().unwrap();
         assert_eq!(listed[0].extensions, vec!["spatial".to_string()]);
         // A pond created with no extensions reads back as empty.
-        r.create_pond(Some("plain".into()), "x", "{}", "medium", &[])
+        r.create_pond(Some("plain".into()), "x", "{}", "medium", &[], "")
             .unwrap();
         let (plain, ..) = r.pond_info("plain").unwrap();
         assert!(plain.extensions.is_empty());
@@ -774,14 +796,14 @@ mod tests {
         r.heartbeat("node-a", 3).unwrap();
         assert_eq!(r.list_nodes().unwrap().len(), 1);
         let p = r
-            .create_pond(Some("incident-1".into()), "agent-x", "{}", "medium", &[])
+            .create_pond(Some("incident-1".into()), "agent-x", "{}", "medium", &[], "")
             .unwrap();
         assert_eq!(p.name, "incident-1");
         let (pid, endpoint) = r.get_pond_location("incident-1").unwrap();
         assert_eq!(pid, p.pond_id);
         assert_eq!(endpoint, "http://n:9092");
         assert!(matches!(
-            r.create_pond(Some("incident-1".into()), "y", "{}", "medium", &[]),
+            r.create_pond(Some("incident-1".into()), "y", "{}", "medium", &[], ""),
             Err(ControlPlaneError::NameConflict(_))
         ));
         r.drop_pond(&p.pond_id).unwrap();
@@ -828,7 +850,7 @@ mod tests {
         // create_pond must pick the only active node (node-b), repeatedly.
         for i in 0..5 {
             let p = r
-                .create_pond(Some(format!("p{i}")), "x", "{}", "medium", &[])
+                .create_pond(Some(format!("p{i}")), "x", "{}", "medium", &[], "")
                 .unwrap();
             assert_eq!(p.node_id, "node-b", "placement skipped down node-a");
         }
@@ -844,7 +866,7 @@ mod tests {
         // No active node → NoNodeAvailable (precondition), NOT NodeNotFound (a
         // lookup miss) — they carry different gRPC codes (review #13).
         assert!(matches!(
-            r.create_pond(None, "x", "{}", "medium", &[]),
+            r.create_pond(None, "x", "{}", "medium", &[], ""),
             Err(ControlPlaneError::NoNodeAvailable(_))
         ));
     }
@@ -895,7 +917,7 @@ mod tests {
         let r = Registry::open(Some(&path)).unwrap();
         r.register_node("node-a", "http://n/mcp", "http://n:9092", 10)
             .unwrap();
-        r.create_pond(Some("durable".into()), "agent-x", "{}", "medium", &[])
+        r.create_pond(Some("durable".into()), "agent-x", "{}", "medium", &[], "")
             .unwrap();
 
         let copy = dir.join("copy.duckdb");
