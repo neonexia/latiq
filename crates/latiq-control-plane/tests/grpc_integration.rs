@@ -80,11 +80,17 @@ async fn control_and_admin_surfaces_work() {
         .into_inner()
         .ponds;
     assert_eq!(
-        summary.iter().find(|p| p.name == "incident-1").unwrap().description,
+        summary
+            .iter()
+            .find(|p| p.name == "incident-1")
+            .unwrap()
+            .description,
         "incident triage scratch"
     );
     let info = control
-        .get_pond_info(GetPondInfoRequest { pond_ref: "incident-1".into() })
+        .get_pond_info(GetPondInfoRequest {
+            pond_ref: "incident-1".into(),
+        })
         .await
         .unwrap()
         .into_inner()

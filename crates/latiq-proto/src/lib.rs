@@ -13,6 +13,7 @@ mod tests {
             policy_json: "{}".into(),
             tier: "medium".into(),
             extensions: vec![],
+            description: String::new(),
         };
     }
 }

@@ -61,7 +61,14 @@ impl Control for ControlService {
         };
         let pond = self
             .registry
-            .create_pond(name, &r.owner_identity, &r.policy_json, tier, &r.extensions, &r.description)
+            .create_pond(
+                name,
+                &r.owner_identity,
+                &r.policy_json,
+                tier,
+                &r.extensions,
+                &r.description,
+            )
             .map_err(to_status)?;
         let (_pid, endpoint) = self
             .registry
