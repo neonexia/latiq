@@ -237,6 +237,10 @@ enum PondCmd {
         /// Owner identity recorded for the pond (relaxed; defaults to anonymous).
         #[arg(short, long)]
         agent_id: Option<String>,
+        /// Free-text description of what this pond is for, so other agents can
+        /// discover it (shown in `pond list`/`describe`).
+        #[arg(short, long)]
+        description: Option<String>,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
     List {
@@ -834,6 +838,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             tier,
             extensions,
             agent_id,
+            description,
         } => {
             // Validate the requested extensions against the allowlist before we
             // call the control plane, so a typo/community name fails locally.
@@ -854,6 +859,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                     policy_json: "{}".into(),
                     tier,
                     extensions: exts,
+                    description: description.unwrap_or_default(),
                 })
                 .await
             {
@@ -888,6 +894,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                             serde_json::json!({
                                 "pond_id": p.pond_id, "name": p.name, "owner": p.owner,
                                 "node_id": p.node_id, "tier": p.tier, "created_at": p.created_at,
+                                "description": p.description,
                             })
                         })
                         .collect();
@@ -1167,9 +1174,9 @@ fn print_pond_list_table(ponds: &[PondSummary]) {
 
     // Header + each row's cells, so column widths fit the actual content.
     let header = [
-        "NAME", "TIER", "MEMORY", "CORES", "NODE", "OWNER", "POND ID",
+        "NAME", "TIER", "MEMORY", "CORES", "NODE", "OWNER", "POND ID", "DESCRIPTION",
     ];
-    let rows: Vec<[String; 7]> = ponds
+    let rows: Vec<[String; 8]> = ponds
         .iter()
         .map(|p| {
             let tier = PondTier::parse(&p.tier).unwrap_or_default();
@@ -1182,6 +1189,7 @@ fn print_pond_list_table(ponds: &[PondSummary]) {
                 p.node_id.clone(),
                 p.owner.clone(),
                 p.pond_id.clone(),
+                p.description.clone(),
             ]
         })
         .collect();
@@ -1193,7 +1201,7 @@ fn print_pond_list_table(ponds: &[PondSummary]) {
         }
     }
 
-    let fmt_row = |cells: &[String; 7]| {
+    let fmt_row = |cells: &[String; 8]| {
         cells
             .iter()
             .enumerate()
@@ -1203,7 +1211,7 @@ fn print_pond_list_table(ponds: &[PondSummary]) {
             .trim_end()
             .to_string()
     };
-    let header_strs: [String; 7] = header.map(|h| h.to_string());
+    let header_strs: [String; 8] = header.map(|h| h.to_string());
     println!("{dim}{}{rst}", fmt_row(&header_strs));
     for r in &rows {
         println!("{}", fmt_row(r));
