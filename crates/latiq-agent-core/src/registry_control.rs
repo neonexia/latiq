@@ -69,6 +69,7 @@ fn to_info(
         node_endpoint,
         tier: row.tier,
         extensions: row.extensions,
+        description: row.description,
     }
 }
 

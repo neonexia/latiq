@@ -20,6 +20,9 @@ pub struct PondInfo {
     /// Optional DuckDB extensions the pond loads on open (LOADed from the image).
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Agent-discovery text: what this pond is for (empty = none).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
