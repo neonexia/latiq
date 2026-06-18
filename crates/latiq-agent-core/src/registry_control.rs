@@ -182,7 +182,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..40 {
             let info = cp
-                .create_pond(Some(format!("p{i}")), "agent-x", "{}", "medium", &[], "")
+                .create_pond(Some(format!("p{i}")), "agent-x", "{}", "medium", &[])
                 .await
                 .unwrap();
             ids.push(info.pond_id);

@@ -1174,7 +1174,14 @@ fn print_pond_list_table(ponds: &[PondSummary]) {
 
     // Header + each row's cells, so column widths fit the actual content.
     let header = [
-        "NAME", "TIER", "MEMORY", "CORES", "NODE", "OWNER", "POND ID", "DESCRIPTION",
+        "NAME",
+        "TIER",
+        "MEMORY",
+        "CORES",
+        "NODE",
+        "OWNER",
+        "POND ID",
+        "DESCRIPTION",
     ];
     let rows: Vec<[String; 8]> = ponds
         .iter()

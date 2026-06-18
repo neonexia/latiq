@@ -642,8 +642,15 @@ mod tests {
         let r = reg();
         r.register_node("node-a", "http://n:8080/mcp", "http://n:9092", 100)
             .unwrap();
-        r.create_pond(Some("p-one".into()), "agent-x", "{\"k\":1}", "medium", &[], "")
-            .unwrap();
+        r.create_pond(
+            Some("p-one".into()),
+            "agent-x",
+            "{\"k\":1}",
+            "medium",
+            &[],
+            "",
+        )
+        .unwrap();
         r.create_pond(Some("p-two".into()), "agent-y", "{}", "medium", &[], "")
             .unwrap();
         let ponds = r.list_ponds().unwrap();
@@ -751,7 +758,14 @@ mod tests {
         let r = reg();
         r.register_node("n1", "http://m", "http://i", 10).unwrap();
         let row = r
-            .create_pond(Some("docs".into()), "owner", "{}", "medium", &[], "raw events 2024")
+            .create_pond(
+                Some("docs".into()),
+                "owner",
+                "{}",
+                "medium",
+                &[],
+                "raw events 2024",
+            )
             .unwrap();
         assert_eq!(row.description, "raw events 2024");
         let listed = r.list_ponds().unwrap();
@@ -796,7 +810,14 @@ mod tests {
         r.heartbeat("node-a", 3).unwrap();
         assert_eq!(r.list_nodes().unwrap().len(), 1);
         let p = r
-            .create_pond(Some("incident-1".into()), "agent-x", "{}", "medium", &[], "")
+            .create_pond(
+                Some("incident-1".into()),
+                "agent-x",
+                "{}",
+                "medium",
+                &[],
+                "",
+            )
             .unwrap();
         assert_eq!(p.name, "incident-1");
         let (pid, endpoint) = r.get_pond_location("incident-1").unwrap();

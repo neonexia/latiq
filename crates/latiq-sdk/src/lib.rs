@@ -102,6 +102,7 @@ impl Latiq {
                     policy_json: "{}".into(),
                     tier: tier.to_string(),
                     extensions: vec![],
+                    description: String::new(),
                 })
                 .await?
                 .into_inner();

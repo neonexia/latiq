@@ -48,6 +48,7 @@ impl ControlPlane for FixedOwner {
             node_endpoint: self.endpoint.clone(),
             tier: "medium".to_string(),
             extensions: vec![],
+            description: String::new(),
         })
     }
     async fn drop_pond(&self, _: &str) -> Result<(), AgentError> {
@@ -168,6 +169,7 @@ impl Forwarder for RecordingForwarder {
                 node_endpoint: Some(e.to_string()),
                 tier: "medium".to_string(),
                 extensions: vec![],
+                description: String::new(),
             },
             schema: SchemaSummary::default(),
         })
