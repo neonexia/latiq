@@ -1717,6 +1717,7 @@ name = "latiq-sdk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "latiq-common",
  "latiq-control-plane",
  "latiq-engine",
