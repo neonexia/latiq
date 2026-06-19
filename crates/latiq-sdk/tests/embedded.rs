@@ -37,7 +37,10 @@ fn embedded_handle_lifecycle_and_arrow_query() {
     assert_eq!(col.value(0), 2, "round-tripped row count");
 
     // get_pond re-fetches metadata as a handle.
-    assert_eq!(db.get_pond("work").unwrap().description(), "round-trip test");
+    assert_eq!(
+        db.get_pond("work").unwrap().description(),
+        "round-trip test"
+    );
 
     // Drop requires confirm; after it, the pond no longer resolves.
     assert!(db.drop_pond("work", false).is_err(), "drop needs confirm");

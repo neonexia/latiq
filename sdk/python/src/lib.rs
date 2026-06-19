@@ -11,6 +11,10 @@
 //! work.query(sql="INSERT INTO t VALUES (1),(2)")
 //! print(work.query(sql="SELECT count(*) FROM t"))    # → pyarrow.Table
 //! ```
+// pyo3 0.22's #[pymethods]/#[pyfunction] macros emit a PyErr→PyErr `.into()` in
+// the generated wrappers, which newer clippy flags as useless_conversion. It's
+// macro-generated, not our code; allow it crate-wide.
+#![allow(clippy::useless_conversion)]
 use latiq_sdk::{Latiq, PondInfo};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -179,7 +183,11 @@ impl PyPond {
 /// from `server` (else `server` is used; the greeter forwards by pond).
 #[pyfunction]
 #[pyo3(signature = (server="local", root=None, query_gateway=None))]
-fn connect(server: &str, root: Option<PathBuf>, query_gateway: Option<&str>) -> PyResult<PyDatabase> {
+fn connect(
+    server: &str,
+    root: Option<PathBuf>,
+    query_gateway: Option<&str>,
+) -> PyResult<PyDatabase> {
     let inner = Latiq::connect_with(server, root, query_gateway).map_err(err)?;
     Ok(PyDatabase {
         inner: Arc::new(inner),
