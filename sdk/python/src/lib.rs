@@ -138,10 +138,6 @@ impl PyPond {
         self.info.tier.clone()
     }
     #[getter]
-    fn node(&self) -> String {
-        self.info.node_id.clone()
-    }
-    #[getter]
     fn description(&self) -> String {
         self.info.description.clone()
     }

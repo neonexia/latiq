@@ -81,9 +81,6 @@ impl Pond<'_> {
     pub fn tier(&self) -> &str {
         &self.info.tier
     }
-    pub fn node(&self) -> &str {
-        &self.info.node_id
-    }
     pub fn description(&self) -> &str {
         &self.info.description
     }
@@ -265,31 +262,20 @@ impl Latiq {
         })
     }
 
-    /// Run a SQL statement against `pond`. One verb: reads ride the read path
-    /// Run SQL against `pond`. Reads stream over `ReadArrow` and return Arrow
-    /// batches (uncapped); writes go unary (attributed/snapshotted server-side)
-    /// and return no rows. The client classifies by statement — callers don't
-    /// pick read vs write.
+    /// Run SQL against `pond`. One verb: reads stream over `ReadArrow` and return
+    /// Arrow batches (uncapped); writes go unary (attributed/snapshotted
+    /// server-side) and return no rows. The client classifies by statement —
+    /// callers don't pick read vs write.
     pub fn query(&self, pond: &str, sql: &str) -> Result<Vec<RecordBatch>> {
-        self.rt.block_on(async {
-            if latiq_engine::is_read_only(sql) {
-                self.read_arrow(pond, sql).await
-            } else {
-                let mut d = self.data().await?;
-                d.write_query(self.with_id(QueryRequest {
-                    pond: pond.to_string(),
-                    sql: sql.to_string(),
-                }))
-                .await
-                .map_err(|s| anyhow!("write: {}", s.message()))?;
-                Ok(Vec::new())
-            }
-        })
+        decode_ipc(&self.query_ipc(pond, sql)?)
     }
 
-    /// Reads only: the full Arrow IPC stream bytes (schema + batches), for FFI
-    /// consumers (Python `pyarrow.ipc.open_stream`). Writes execute unary and
-    /// return empty bytes. Uncapped.
+    /// The single read-or-write path, returning the read's Arrow IPC stream bytes
+    /// (schema + batches) — for FFI consumers (Python `pyarrow.ipc.open_stream`)
+    /// and for `query` to decode. Reads stream over `ReadArrow` (uncapped); writes
+    /// execute unary and return empty bytes (writes yield no rows; their snapshot
+    /// is recorded server-side). `query` and `query_ipc` share this so the
+    /// classify + dispatch logic lives in one place.
     pub fn query_ipc(&self, pond: &str, sql: &str) -> Result<Vec<u8>> {
         self.rt.block_on(async {
             if !latiq_engine::is_read_only(sql) {
@@ -357,35 +343,6 @@ impl Latiq {
         StreamClient::connect(self.data_endpoint.clone())
             .await
             .map_err(|e| anyhow!("stream plane unreachable at {}: {e}", self.data_endpoint))
-    }
-
-    /// Drive `Stream::ReadArrow` and collect all IPC chunks into RecordBatches.
-    /// Uncapped — the node streams; nothing is buffered server-side.
-    async fn read_arrow(&self, pond: &str, sql: &str) -> Result<Vec<RecordBatch>> {
-        let mut sc = self.stream().await?;
-        let mut streaming = sc
-            .read_arrow(self.with_id(QueryRequest {
-                pond: pond.to_string(),
-                sql: sql.to_string(),
-            }))
-            .await
-            .map_err(|s| anyhow!("read: {}", s.message()))?
-            .into_inner();
-        let mut decoder = StreamDecoder::new();
-        let mut batches = Vec::new();
-        while let Some(chunk) = streaming.message().await? {
-            let mut buf = Buffer::from_vec(chunk.ipc);
-            while !buf.is_empty() {
-                match decoder
-                    .decode(&mut buf)
-                    .map_err(|e| anyhow!("arrow ipc: {e}"))?
-                {
-                    Some(batch) => batches.push(batch),
-                    None => break,
-                }
-            }
-        }
-        Ok(batches)
     }
 
     /// Attach the (relaxed) identity header data ops carry.
@@ -464,6 +421,27 @@ fn normalize_endpoint(server: &str) -> String {
     } else {
         format!("http://{s}")
     }
+}
+
+/// Decode an Arrow IPC stream (schema + batches) into RecordBatches. Empty bytes
+/// (a write, or an empty read with no payload) → an empty Vec.
+fn decode_ipc(ipc: &[u8]) -> Result<Vec<RecordBatch>> {
+    if ipc.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut decoder = StreamDecoder::new();
+    let mut buf = Buffer::from_vec(ipc.to_vec());
+    let mut batches = Vec::new();
+    while !buf.is_empty() {
+        match decoder
+            .decode(&mut buf)
+            .map_err(|e| anyhow!("arrow ipc: {e}"))?
+        {
+            Some(batch) => batches.push(batch),
+            None => break,
+        }
+    }
+    Ok(batches)
 }
 
 fn parse_json(s: &str) -> Result<serde_json::Value> {

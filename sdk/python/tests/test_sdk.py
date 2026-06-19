@@ -30,6 +30,15 @@ def test_embedded_handle_lifecycle_and_arrow_query():
         assert isinstance(tbl, pa.Table)
         assert tbl.column("n")[0].as_py() == 3
 
+        # a multi-row read returns every typed value across the streamed batches
+        rows = work.query(sql="SELECT id, note FROM t ORDER BY id")
+        assert rows.num_rows == 3
+        assert rows.column("id").to_pylist() == [1, 2, 3]
+        assert rows.column("note").to_pylist() == ["a", "b", "c"]
+
+        # describe() returns the structured pond/schema
+        assert work.describe()["pond"]["name"] == "work"
+
         # get_pond re-fetches metadata as a handle
         assert db.get_pond(pond="work").description == "raw clickstream 2024"
 

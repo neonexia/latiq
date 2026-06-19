@@ -46,7 +46,7 @@ in-process), so the wheel is large; that's the cost of zero-dependency local mod
 ## Surface (this slice)
 
 `connect(server, root, query_gateway)` · `Database.{server, create_pond, get_pond,
-list_ponds, drop_pond}` · `Pond.{name, id, tier, node, description, query, describe,
+list_ponds, drop_pond}` · `Pond.{name, id, tier, description, query, describe,
 drop}`. Reads return `pyarrow.Table` over the streaming `ReadArrow` RPC; the data
 path uses the front door + greeter forwarding (k8s-safe). Dataset/catalog/stats
 are deferred.
