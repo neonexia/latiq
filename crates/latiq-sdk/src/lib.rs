@@ -376,7 +376,10 @@ impl Latiq {
         while let Some(chunk) = streaming.message().await? {
             let mut buf = Buffer::from_vec(chunk.ipc);
             while !buf.is_empty() {
-                match decoder.decode(&mut buf).map_err(|e| anyhow!("arrow ipc: {e}"))? {
+                match decoder
+                    .decode(&mut buf)
+                    .map_err(|e| anyhow!("arrow ipc: {e}"))?
+                {
                     Some(batch) => batches.push(batch),
                     None => break,
                 }
