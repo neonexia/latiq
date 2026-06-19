@@ -89,3 +89,62 @@ jobs:
         if: always()
         working-directory: deploy/cluster
         run: docker compose --profile scale down -v
+
+  e2e-sdk:
+    name: SDK e2e (gateway + multi-node + Arrow/pandas)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The single-binary image (DuckDB compiles from source — slow).
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:nightly .
+      # The Python SDK wheel, built from this repo (not PyPI). Debug profile +
+      # CARGO_PROFILE_DEV_DEBUG=0 keeps it fast and avoids the linker OOM.
+      - name: Build + install the latiq wheel
+        run: |
+          python3 -m venv .e2e
+          . .e2e/bin/activate
+          pip install -U pip maturin
+          maturin build -m sdk/python/Cargo.toml -o dist
+          pip install dist/*.whl -r e2e/sdk/requirements.txt
+      - name: Bring up the 3-node cluster + gateway
+        working-directory: deploy/cluster
+        run: |
+          LATIQ_IMAGE=latiq:nightly docker compose --profile scale up -d \
+            control-plane pond-node-1 pond-node-2 pond-node-3 gateway
+      - name: Wait for control plane + 3 nodes healthy
+        working-directory: deploy/cluster
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 4 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      - name: Run the SDK e2e against the gateway (remote, multi-node)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: |
+          . .e2e/bin/activate
+          pytest e2e/sdk -v
+      - name: Cluster logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        run: docker compose logs --tail=300
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        run: docker compose --profile scale down -v

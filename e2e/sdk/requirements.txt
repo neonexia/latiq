@@ -1,0 +1,5 @@
+# Runtime deps for the SDK e2e suite. The `latiq` wheel is built from this repo
+# (maturin) and installed alongside these — it is NOT pulled from PyPI here.
+pyarrow>=14
+pandas>=2
+pytest>=8
