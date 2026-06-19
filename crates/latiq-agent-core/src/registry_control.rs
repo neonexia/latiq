@@ -69,6 +69,7 @@ fn to_info(
         node_endpoint,
         tier: row.tier,
         extensions: row.extensions,
+        description: row.description,
     }
 }
 
@@ -84,7 +85,7 @@ impl ControlPlane for RegistryControlPlane {
     ) -> Result<PondInfo, AgentError> {
         let row = self
             .registry
-            .create_pond(name, owner, policy_json, tier, extensions)
+            .create_pond(name, owner, policy_json, tier, extensions, "")
             .map_err(cp_err)?;
         let (row, created_at, policy, endpoint) =
             self.registry.pond_info(&row.pond_id).map_err(cp_err)?;

@@ -1,0 +1,5 @@
+cargo:rerun-if-changed=proto/latiq/v1/datasets.proto
+cargo:rerun-if-changed=proto/latiq/v1/control.proto
+cargo:rerun-if-changed=proto/latiq/v1/admin.proto
+cargo:rerun-if-changed=proto/latiq/v1/data.proto
+cargo:rerun-if-changed=proto

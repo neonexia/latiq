@@ -4,6 +4,7 @@ mod common;
 
 use common::start_stack;
 use latiq_proto::v1::admin_client::AdminClient;
+use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::*;
 use tonic::Request;
@@ -45,6 +46,42 @@ async fn pond_list_reads_from_control_plane() {
         .expect("alpha listed");
     assert_eq!(p.owner, "alice");
     assert!(!p.created_at.is_empty());
+}
+
+#[tokio::test]
+async fn pond_lifecycle_description_shown_in_list() {
+    // The CLI/SDK create path (Control gRPC create_pond_assignment) carries a
+    // description; it surfaces on the admin pond_list metadata read.
+    let s = start_stack().await;
+    let mut control = ControlClient::connect(s.control_endpoint.clone())
+        .await
+        .unwrap();
+    control
+        .create_pond_assignment(CreatePondAssignmentRequest {
+            name: "described".into(),
+            owner_identity: "alice".into(),
+            policy_json: "{}".into(),
+            tier: "medium".into(),
+            extensions: vec![],
+            description: "nightly etl scratch".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+        .await
+        .unwrap();
+    let ponds = admin
+        .pond_list(PondListRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .ponds;
+    let p = ponds
+        .iter()
+        .find(|p| p.name == "described")
+        .expect("described listed");
+    assert_eq!(p.description, "nightly etl scratch");
 }
 
 #[tokio::test]

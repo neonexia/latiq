@@ -121,6 +121,9 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     DROP TABLE IF EXISTS audit_log;
     "#,
+    // Optional agent-discovery description (what the pond is for, so other agents
+    // can find it). Nullable + default so existing rows read as empty.
+    "ALTER TABLE ponds ADD COLUMN description VARCHAR DEFAULT '';",
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {

@@ -56,6 +56,7 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         node_endpoint: Some(m.node_endpoint).filter(|s| !s.is_empty()),
         tier: m.tier,
         extensions: m.extensions,
+        description: m.description,
     }
 }
 
@@ -108,6 +109,10 @@ impl ControlPlane for GrpcControlPlane {
                 policy_json: policy_json.to_string(),
                 tier: tier.to_string(),
                 extensions: extensions.to_vec(),
+                // The ControlPlane trait's create_pond doesn't carry a description
+                // (MCP/agent allocate defaults empty); the CLI/SDK set it via the
+                // Control gRPC create_pond_assignment directly.
+                description: String::new(),
             })
             .await
             .map_err(status_err)?
