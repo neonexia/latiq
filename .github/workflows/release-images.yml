@@ -1,7 +1,7 @@
 name: Release images
 
-# Build and publish the single-binary Latiq image to GHCR so deployments (and the
-# public bring-up script, deploy/latiq-up.sh) pull a versioned artifact instead of
+# Build and publish the single-binary Latiq image to GHCR so deployments
+# (`deploy/cluster/docker-compose.yml`, k8s) pull a versioned artifact instead of
 # building from source. Runs on main pushes, version tags, and on demand.
 on:
   push:
