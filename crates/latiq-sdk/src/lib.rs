@@ -33,6 +33,10 @@ type RtClient<T> = Result<T>;
 pub struct Latiq {
     rt: Arc<tokio::runtime::Runtime>,
     control_endpoint: String,
+    /// The Data+Stream front door: the in-process node (embedded) or the query
+    /// gateway / control front door (remote). Data ops dial THIS and rely on the
+    /// greeter to forward by pond — never node-direct (unroutable behind a LB).
+    data_endpoint: String,
     identity: String,
     /// Keeps the embedded control-plane + pond-node alive (None in remote mode).
     _local: Option<LocalCluster>,
@@ -51,6 +55,17 @@ impl Latiq {
     /// Connect. `server == "local"` starts an in-process cluster backed by `root`
     /// (default `~/.latiq/local`); any other value is a remote control-plane URL.
     pub fn connect(server: &str, root: Option<PathBuf>) -> Result<Self> {
+        Self::connect_with(server, root, None)
+    }
+
+    /// `query_gateway`: the Data/Stream front door when it differs from `server`
+    /// (e.g. nginx exposes Control/Admin and Data/Stream on separate addresses).
+    /// `None` → reuse `server` (unified front door). Ignored for `"local"`.
+    pub fn connect_with(
+        server: &str,
+        root: Option<PathBuf>,
+        query_gateway: Option<&str>,
+    ) -> Result<Self> {
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -61,19 +76,25 @@ impl Latiq {
             let root = root.unwrap_or_else(default_local_root);
             let local = rt.block_on(LocalCluster::start(&rt, &root))?;
             let control_endpoint = local.control_endpoint.clone();
+            let data_endpoint = local.data_endpoint.clone();
             Ok(Self {
                 rt,
                 control_endpoint,
+                data_endpoint,
                 identity: "sdk".into(),
                 _local: Some(local),
             })
         } else {
             let control_endpoint = normalize_endpoint(server);
+            let data_endpoint = query_gateway
+                .map(normalize_endpoint)
+                .unwrap_or_else(|| control_endpoint.clone());
             rt.block_on(wait_connectable(&control_endpoint))
                 .with_context(|| format!("connecting to control plane at {server}"))?;
             Ok(Self {
                 rt,
                 control_endpoint,
+                data_endpoint,
                 identity: "sdk".into(),
                 _local: None,
             })
@@ -143,7 +164,7 @@ impl Latiq {
     /// Describe a pond's schema (node-direct).
     pub fn describe_pond(&self, pond: &str) -> Result<serde_json::Value> {
         self.rt.block_on(async {
-            let mut d = self.data_for(pond).await?;
+            let mut d = self.data().await?;
             let resp = d
                 .describe_pond(self.with_id(DescribePondRequest {
                     pond: pond.to_string(),
@@ -157,7 +178,7 @@ impl Latiq {
     /// Drop a pond and all its data (`confirm` must be true).
     pub fn drop_pond(&self, pond: &str, confirm: bool) -> Result<()> {
         self.rt.block_on(async {
-            let mut d = self.data_for(pond).await?;
+            let mut d = self.data().await?;
             d.drop_pond(self.with_id(DropPondRequest {
                 pond: pond.to_string(),
                 confirm,
@@ -173,7 +194,7 @@ impl Latiq {
     /// don't pick read-vs-write. Returns the `{columns, rows, …}` result as JSON.
     pub fn query(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
         self.rt.block_on(async {
-            let mut d = self.data_for(pond).await?;
+            let mut d = self.data().await?;
             let req = self.with_id(QueryRequest {
                 pond: pond.to_string(),
                 sql: sql.to_string(),
@@ -212,20 +233,12 @@ impl Latiq {
             })
     }
 
-    /// Resolve `pond`'s owning node via the control plane, then dial its Data gRPC
-    /// directly (the control plane is never in the data path).
-    async fn data_for(&self, pond: &str) -> RtClient<DataClient<Channel>> {
-        let mut c = self.control().await?;
-        let loc = c
-            .get_pond_location(GetPondLocationRequest {
-                pond_ref: pond.to_string(),
-            })
+    /// A Data gRPC client on the front door. The greeter forwards by pond — we do
+    /// NOT resolve the owner node directly (its address is unroutable behind a LB).
+    async fn data(&self) -> RtClient<DataClient<Channel>> {
+        DataClient::connect(self.data_endpoint.clone())
             .await
-            .map_err(|s| anyhow!("pond '{pond}': {}", s.message()))?
-            .into_inner();
-        DataClient::connect(loc.node_endpoint.clone())
-            .await
-            .map_err(|e| anyhow!("pond node unreachable at {}: {e}", loc.node_endpoint))
+            .map_err(|e| anyhow!("data plane unreachable at {}: {e}", self.data_endpoint))
     }
 
     /// Attach the (relaxed) identity header data ops carry.
@@ -241,6 +254,7 @@ impl Latiq {
 /// An in-process control-plane + pond-node, alive for the life of a local `Latiq`.
 struct LocalCluster {
     control_endpoint: String,
+    data_endpoint: String,
 }
 
 impl LocalCluster {
@@ -273,7 +287,10 @@ impl LocalCluster {
             let _ = run_pond_node(cfg).await;
         });
         wait_for_active_node(&control_endpoint).await?;
-        Ok(Self { control_endpoint })
+        Ok(Self {
+            control_endpoint,
+            data_endpoint: format!("http://127.0.0.1:{data_port}"),
+        })
     }
 }
 
