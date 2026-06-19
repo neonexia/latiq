@@ -9,16 +9,22 @@
 //!   - `Latiq::connect("<url>", _)` — `<url>` is a remote control-plane endpoint
 //!     (the `LATIQ_SERVER` semantics the CLI uses).
 //!
-//! Routing mirrors the CLI: pond create/resolve via the **control plane**, pond
-//! list via **admin**, and data ops (describe/drop/read/write) **node-direct**
-//! against the owning node's Data gRPC.
+//! Routing: pond create/resolve via the **control plane**, pond list via
+//! **admin**, and data ops (query/describe/drop) via the **Data/Stream front
+//! door** — the greeter forwards by pond (never node-direct, which is unroutable
+//! behind a k8s LB). Reads stream over `ReadArrow` → Arrow `RecordBatch`es.
 use anyhow::{anyhow, Context, Result};
+use arrow::buffer::Buffer;
+use arrow::ipc::reader::StreamDecoder;
+use arrow::record_batch::RecordBatch;
 use latiq_control_plane::{serve_control_plane, Registry};
 use latiq_pond_node::{run_pond_node, PondNodeConfig};
 use latiq_proto::v1::admin_client::AdminClient;
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
+use latiq_proto::v1::stream_client::StreamClient;
 use latiq_proto::v1::*;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,13 +48,45 @@ pub struct Latiq {
     _local: Option<LocalCluster>,
 }
 
-/// One pond's identity, returned by create/list.
+/// One pond's metadata (from create/get/list).
 #[derive(Debug, Clone)]
-pub struct Pond {
+pub struct PondInfo {
     pub pond_id: String,
     pub name: String,
     pub node_id: String,
     pub tier: String,
+    pub description: String,
+}
+
+/// A handle to a pond: metadata + SQL. `db.get_pond("x").query("SELECT …")`.
+pub struct Pond<'a> {
+    latiq: &'a Latiq,
+    pub info: PondInfo,
+}
+
+impl Pond<'_> {
+    /// Run SQL. Reads stream → Arrow batches (uncapped); writes return no rows.
+    pub fn query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        self.latiq.query(&self.info.name, sql)
+    }
+    pub fn describe(&self) -> Result<serde_json::Value> {
+        self.latiq.describe_pond(&self.info.name)
+    }
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
+    pub fn id(&self) -> &str {
+        &self.info.pond_id
+    }
+    pub fn tier(&self) -> &str {
+        &self.info.tier
+    }
+    pub fn node(&self) -> &str {
+        &self.info.node_id
+    }
+    pub fn description(&self) -> &str {
+        &self.info.description
+    }
 }
 
 impl Latiq {
@@ -112,9 +150,14 @@ impl Latiq {
         &self.control_endpoint
     }
 
-    /// Allocate a pond (pure control-plane op; the registry assigns a node).
-    pub fn create_pond(&self, name: Option<&str>, tier: &str) -> Result<Pond> {
-        self.rt.block_on(async {
+    /// Allocate a pond and return a handle. `description` is agent-discovery text.
+    pub fn create_pond(
+        &self,
+        name: Option<&str>,
+        tier: &str,
+        description: &str,
+    ) -> Result<Pond<'_>> {
+        let info = self.rt.block_on(async {
             let mut c = self.control().await?;
             let r = c
                 .create_pond_assignment(CreatePondAssignmentRequest {
@@ -123,39 +166,73 @@ impl Latiq {
                     policy_json: "{}".into(),
                     tier: tier.to_string(),
                     extensions: vec![],
-                    description: String::new(),
+                    description: description.to_string(),
                 })
                 .await?
                 .into_inner();
-            let info = c
+            let pond = c
                 .get_pond_info(GetPondInfoRequest {
                     pond_ref: r.pond_id.clone(),
                 })
                 .await?
                 .into_inner()
                 .pond;
-            Ok(Pond {
-                pond_id: r.pond_id,
-                name: info.as_ref().map(|p| p.name.clone()).unwrap_or_default(),
-                node_id: String::new(),
-                tier: info.map(|p| p.tier).unwrap_or_default(),
-            })
+            Self::info_from_msg(pond, r.pond_id)
+        })?;
+        Ok(Pond { latiq: self, info })
+    }
+
+    /// Fetch a pond's metadata and return a handle (one round-trip).
+    pub fn get_pond(&self, pond: &str) -> Result<Pond<'_>> {
+        let info = self.rt.block_on(async {
+            let mut c = self.control().await?;
+            let resp = c
+                .get_pond_info(GetPondInfoRequest {
+                    pond_ref: pond.to_string(),
+                })
+                .await
+                .map_err(|s| anyhow!("pond '{pond}': {}", s.message()))?
+                .into_inner();
+            Self::info_from_msg(resp.pond, pond.to_string())
+        })?;
+        Ok(Pond { latiq: self, info })
+    }
+
+    fn info_from_msg(msg: Option<PondInfoMsg>, fallback_id: String) -> Result<PondInfo> {
+        let m = msg.ok_or_else(|| anyhow!("pond not found"))?;
+        Ok(PondInfo {
+            pond_id: if m.pond_id.is_empty() {
+                fallback_id
+            } else {
+                m.pond_id
+            },
+            name: m.name,
+            // PondInfoMsg carries node_endpoint, not node_id; node_id comes via list.
+            node_id: String::new(),
+            tier: m.tier,
+            description: m.description,
         })
     }
 
-    /// List ponds (control-plane metadata read; works even if nodes are down).
-    pub fn list_ponds(&self) -> Result<Vec<Pond>> {
+    /// List ponds keyed by name (admin metadata read; works if nodes are down).
+    pub fn list_ponds(&self) -> Result<BTreeMap<String, PondInfo>> {
         self.rt.block_on(async {
             let mut a = self.admin().await?;
             let resp = a.pond_list(PondListRequest {}).await?.into_inner();
             Ok(resp
                 .ponds
                 .into_iter()
-                .map(|p| Pond {
-                    pond_id: p.pond_id,
-                    name: p.name,
-                    node_id: p.node_id,
-                    tier: p.tier,
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        PondInfo {
+                            pond_id: p.pond_id,
+                            name: p.name,
+                            node_id: p.node_id,
+                            tier: p.tier,
+                            description: p.description,
+                        },
+                    )
                 })
                 .collect())
         })
@@ -189,23 +266,56 @@ impl Latiq {
     }
 
     /// Run a SQL statement against `pond`. One verb: reads ride the read path
-    /// (and are rejected if they mutate), writes are attributed + snapshotted —
-    /// the client classifies by statement (same as the CLI's `query`), so callers
-    /// don't pick read-vs-write. Returns the `{columns, rows, …}` result as JSON.
-    pub fn query(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
+    /// Run SQL against `pond`. Reads stream over `ReadArrow` and return Arrow
+    /// batches (uncapped); writes go unary (attributed/snapshotted server-side)
+    /// and return no rows. The client classifies by statement — callers don't
+    /// pick read vs write.
+    pub fn query(&self, pond: &str, sql: &str) -> Result<Vec<RecordBatch>> {
         self.rt.block_on(async {
-            let mut d = self.data().await?;
-            let req = self.with_id(QueryRequest {
-                pond: pond.to_string(),
-                sql: sql.to_string(),
-            });
-            let resp = if latiq_engine::is_read_only(sql) {
-                d.read_query(req).await
+            if latiq_engine::is_read_only(sql) {
+                self.read_arrow(pond, sql).await
             } else {
-                d.write_query(req).await
-            }?
-            .into_inner();
-            parse_json(&resp.json)
+                let mut d = self.data().await?;
+                d.write_query(self.with_id(QueryRequest {
+                    pond: pond.to_string(),
+                    sql: sql.to_string(),
+                }))
+                .await
+                .map_err(|s| anyhow!("write: {}", s.message()))?;
+                Ok(Vec::new())
+            }
+        })
+    }
+
+    /// Reads only: the full Arrow IPC stream bytes (schema + batches), for FFI
+    /// consumers (Python `pyarrow.ipc.open_stream`). Writes execute unary and
+    /// return empty bytes. Uncapped.
+    pub fn query_ipc(&self, pond: &str, sql: &str) -> Result<Vec<u8>> {
+        self.rt.block_on(async {
+            if !latiq_engine::is_read_only(sql) {
+                let mut d = self.data().await?;
+                d.write_query(self.with_id(QueryRequest {
+                    pond: pond.to_string(),
+                    sql: sql.to_string(),
+                }))
+                .await
+                .map_err(|s| anyhow!("write: {}", s.message()))?;
+                return Ok(Vec::new());
+            }
+            let mut sc = self.stream().await?;
+            let mut streaming = sc
+                .read_arrow(self.with_id(QueryRequest {
+                    pond: pond.to_string(),
+                    sql: sql.to_string(),
+                }))
+                .await
+                .map_err(|s| anyhow!("read: {}", s.message()))?
+                .into_inner();
+            let mut out = Vec::new();
+            while let Some(chunk) = streaming.message().await? {
+                out.extend_from_slice(&chunk.ipc);
+            }
+            Ok(out)
         })
     }
 
@@ -239,6 +349,40 @@ impl Latiq {
         DataClient::connect(self.data_endpoint.clone())
             .await
             .map_err(|e| anyhow!("data plane unreachable at {}: {e}", self.data_endpoint))
+    }
+
+    /// A Stream gRPC client on the front door (served alongside Data on the same
+    /// endpoint). Reads ride `ReadArrow`; the greeter forwards by pond.
+    async fn stream(&self) -> RtClient<StreamClient<Channel>> {
+        StreamClient::connect(self.data_endpoint.clone())
+            .await
+            .map_err(|e| anyhow!("stream plane unreachable at {}: {e}", self.data_endpoint))
+    }
+
+    /// Drive `Stream::ReadArrow` and collect all IPC chunks into RecordBatches.
+    /// Uncapped — the node streams; nothing is buffered server-side.
+    async fn read_arrow(&self, pond: &str, sql: &str) -> Result<Vec<RecordBatch>> {
+        let mut sc = self.stream().await?;
+        let mut streaming = sc
+            .read_arrow(self.with_id(QueryRequest {
+                pond: pond.to_string(),
+                sql: sql.to_string(),
+            }))
+            .await
+            .map_err(|s| anyhow!("read: {}", s.message()))?
+            .into_inner();
+        let mut decoder = StreamDecoder::new();
+        let mut batches = Vec::new();
+        while let Some(chunk) = streaming.message().await? {
+            let mut buf = Buffer::from_vec(chunk.ipc);
+            while !buf.is_empty() {
+                match decoder.decode(&mut buf).map_err(|e| anyhow!("arrow ipc: {e}"))? {
+                    Some(batch) => batches.push(batch),
+                    None => break,
+                }
+            }
+        }
+        Ok(batches)
     }
 
     /// Attach the (relaxed) identity header data ops carry.
