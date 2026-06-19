@@ -90,8 +90,8 @@ jobs:
         working-directory: deploy/cluster
         run: docker compose --profile scale down -v
 
-  e2e-sdk:
-    name: SDK e2e (gateway + multi-node + Arrow/pandas)
+  e2e-suite:
+    name: e2e — SDK + agent (MCP) + perf, gateway + multi-node
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,6 +99,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       # The single-binary image (DuckDB compiles from source — slow).
       - name: Build latiq image
         run: docker build -f deploy/Dockerfile -t latiq:nightly .
@@ -111,6 +114,8 @@ jobs:
           pip install -U pip maturin
           maturin build -m sdk/python/Cargo.toml -o dist
           pip install dist/*.whl -r e2e/sdk/requirements.txt
+      - name: Install the agent harness deps
+        run: npm ci --prefix e2e/agent
       - name: Bring up the 3-node cluster + gateway
         working-directory: deploy/cluster
         run: |
@@ -133,13 +138,27 @@ jobs:
               sleep 1
             done
           done
-      - name: Run the SDK e2e against the gateway (remote, multi-node)
+      # 1) SDK (data) — all surfaces, multi-node forwarding, Arrow→pandas, streaming.
+      - name: SDK e2e (Python, against the gateway)
         env:
           LATIQ_CONTROL: http://localhost:51400
           LATIQ_GATEWAY: http://localhost:51500
         run: |
           . .e2e/bin/activate
           pytest e2e/sdk -v
+      # 2) Agent (MCP) — every tool + resources + prompts, through the MCP gateway.
+      - name: Agent harness (Vercel AI SDK MCP, against the gateway)
+        env:
+          LATIQ_MCP: http://localhost:51510/mcp
+        run: npm --prefix e2e/agent test
+      # 3) Perf — mid-size ingest/read/latency + cross-node fan, recorded + floored.
+      - name: Perf (Python SDK, against the gateway)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: |
+          . .e2e/bin/activate
+          python e2e/perf/run_perf.py
       - name: Cluster logs on failure
         if: failure()
         working-directory: deploy/cluster

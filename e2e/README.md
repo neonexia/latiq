@@ -7,8 +7,8 @@ nightly CI suite (see `.github/workflows/nightly.yml`).
 | Dir | Driver | Audience | What it proves |
 |---|---|---|---|
 | `sdk/` | Python `latiq` wheel + `pyarrow`/`pandas` | SDK / data | all SDK surfaces, multi-node + greeter forwarding via the gateway, **Arrow→pandas analysis**, uncapped Arrow streaming |
-| `agent/` | TypeScript, Vercel AI SDK MCP client | agents | every MCP tool + `latiq://` resources + prompt SOPs *(phase 2)* |
-| `perf/` | Python perf driver | — | mid-size ingest + read throughput + query latency *(phase 3)* |
+| `agent/` | TypeScript, Vercel AI SDK MCP client | agents | every MCP tool (lifecycle, read/write/explain, datasets, catalogs) + read-only guard + structured errors + `latiq://` resources + prompt SOPs |
+| `perf/` | Python perf driver | — | mid-size write/read/pandas throughput + aggregate-query latency + cross-node fan, recorded + floored |
 
 ## Topology
 Clients hit the **gateway** (`deploy/cluster`, nginx) — a single front door per
