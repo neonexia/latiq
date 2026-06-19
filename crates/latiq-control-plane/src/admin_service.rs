@@ -87,6 +87,7 @@ impl Admin for AdminService {
                 created_at,
                 node_id: row.node_id,
                 tier: row.tier,
+                description: row.description,
             });
         }
         Ok(Response::new(PondListResponse { ponds }))

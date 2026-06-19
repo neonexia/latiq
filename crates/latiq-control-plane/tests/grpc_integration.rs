@@ -65,11 +65,38 @@ async fn control_and_admin_surfaces_work() {
             policy_json: "{}".into(),
             tier: "medium".into(),
             extensions: vec![],
+            description: "incident triage scratch".into(),
         })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(created.assigned_node_endpoint, "http://n:9092");
+
+    // Description round-trips through both read surfaces (admin pond_list + control info).
+    let summary = admin
+        .pond_list(PondListRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .ponds;
+    assert_eq!(
+        summary
+            .iter()
+            .find(|p| p.name == "incident-1")
+            .unwrap()
+            .description,
+        "incident triage scratch"
+    );
+    let info = control
+        .get_pond_info(GetPondInfoRequest {
+            pond_ref: "incident-1".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .pond
+        .unwrap();
+    assert_eq!(info.description, "incident triage scratch");
 
     let loc = control
         .get_pond_location(GetPondLocationRequest {
@@ -133,6 +160,7 @@ async fn error_contract_allocate_with_no_node_is_precondition_not_notfound() {
             policy_json: "{}".into(),
             tier: "medium".into(),
             extensions: vec![],
+            description: String::new(),
         })
         .await
         .expect_err("allocate with no node must fail");

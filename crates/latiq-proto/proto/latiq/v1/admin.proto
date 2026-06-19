@@ -36,7 +36,7 @@ message CatalogRemoveResponse { }
 message CatalogListRequest { string query = 1; }
 message CatalogListResponse { repeated CatalogMsg catalogs = 1; }
 
-message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; }
+message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; string description = 7; }
 message PondListRequest { }
 message PondListResponse { repeated PondSummary ponds = 1; }
 

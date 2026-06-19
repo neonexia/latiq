@@ -61,7 +61,14 @@ impl Control for ControlService {
         };
         let pond = self
             .registry
-            .create_pond(name, &r.owner_identity, &r.policy_json, tier, &r.extensions)
+            .create_pond(
+                name,
+                &r.owner_identity,
+                &r.policy_json,
+                tier,
+                &r.extensions,
+                &r.description,
+            )
             .map_err(to_status)?;
         let (_pid, endpoint) = self
             .registry
@@ -121,6 +128,7 @@ impl Control for ControlService {
                 node_endpoint: endpoint.unwrap_or_default(),
                 tier: row.tier,
                 extensions: row.extensions,
+                description: row.description,
             });
         }
         Ok(Response::new(ListPondsResponse { ponds }))
@@ -144,6 +152,7 @@ impl Control for ControlService {
                 node_endpoint: endpoint.unwrap_or_default(),
                 tier: row.tier,
                 extensions: row.extensions,
+                description: row.description,
             }),
         }))
     }
