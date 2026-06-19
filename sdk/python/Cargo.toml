@@ -1,0 +1,20 @@
+# Standalone workspace (excluded from the main one) so maturin builds the
+# extension-module wheel without breaking `cargo test --workspace`.
+[workspace]
+
+[package]
+name = "latiq-py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Python SDK for Latiq (PyO3 bindings over latiq-sdk)"
+
+[lib]
+name = "latiq"
+crate-type = ["cdylib"]
+
+[dependencies]
+latiq-sdk = { path = "../../crates/latiq-sdk" }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+pythonize = "0.22"
+serde_json = "1"
