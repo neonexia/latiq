@@ -1,54 +1,66 @@
 """End-to-end tests of the Latiq Python SDK against a real in-process cluster
-(`connect("local")` spawns control-plane + pond-node). Everything is driven
+(`connect(server="local")` spawns control-plane + pond-node). Everything is driven
 through the Python API — the same surface a user gets."""
 import tempfile
+
+import pyarrow as pa
 
 import latiq
 
 
-def test_embedded_pond_lifecycle_and_query():
+def test_embedded_handle_lifecycle_and_arrow_query():
     with tempfile.TemporaryDirectory() as root:
-        db = latiq.connect("local", root=root)
+        db = latiq.connect(server="local", root=root)
         assert db.server.startswith("http://127.0.0.1:")
 
-        # Create → shows up in the control-plane list.
-        p = db.create_pond("work", tier="medium")
-        assert p["name"] == "work"
-        assert p["pond_id"]
-        assert any(x["name"] == "work" for x in db.list_ponds())
+        work = db.create_pond(name="work", tier="medium",
+                              description="raw clickstream 2024")
+        assert work.name == "work" and work.id
+        assert work.description == "raw clickstream 2024"
 
-        # One `query` verb — the client routes reads vs writes by statement.
-        db.query("work", "CREATE TABLE t(id INTEGER, note VARCHAR)")
-        db.query("work", "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
-        r = db.query("work", "SELECT count(*) AS n FROM t")
-        assert r["rows"][0][0] == 3
+        # list_ponds → dict keyed by name, carrying description
+        ponds = db.list_ponds()
+        assert "work" in ponds
+        assert ponds["work"]["description"] == "raw clickstream 2024"
 
-        # Describe surfaces the pond + schema.
-        d = db.describe_pond("work")
-        assert d["pond"]["name"] == "work"
+        # one query verb; reads → pyarrow.Table, writes execute
+        work.query(sql="CREATE TABLE t(id INTEGER, note VARCHAR)")
+        work.query(sql="INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        tbl = work.query(sql="SELECT count(*) AS n FROM t")
+        assert isinstance(tbl, pa.Table)
+        assert tbl.column("n")[0].as_py() == 3
 
-        # Drop requires confirm; afterwards the pond is gone.
+        # a multi-row read returns every typed value across the streamed batches
+        rows = work.query(sql="SELECT id, note FROM t ORDER BY id")
+        assert rows.num_rows == 3
+        assert rows.column("id").to_pylist() == [1, 2, 3]
+        assert rows.column("note").to_pylist() == ["a", "b", "c"]
+
+        # describe() returns the structured pond/schema
+        assert work.describe()["pond"]["name"] == "work"
+
+        # get_pond re-fetches metadata as a handle
+        assert db.get_pond(pond="work").description == "raw clickstream 2024"
+
+        # drop requires confirm; gone afterwards
         try:
-            db.drop_pond("work", confirm=False)
+            db.drop_pond(pond="work", confirm=False)
             assert False, "drop must require confirm"
         except RuntimeError:
             pass
-        db.drop_pond("work", confirm=True)
+        db.drop_pond(pond="work", confirm=True)
         try:
-            db.query("work", "SELECT 1")
-            assert False, "pond must be gone after drop"
+            work.query(sql="SELECT 1")
+            assert False, "pond gone after drop"
         except RuntimeError:
             pass
 
 
-def test_pond_handle_ergonomics():
+def test_arrow_types_and_handle_repr():
     with tempfile.TemporaryDirectory() as root:
-        db = latiq.connect("local", root=root)
-        db.create_pond("shop")
-        pond = db.pond("shop")                       # lazy handle, no round-trip
-        assert pond.name == "shop"
-        pond.query("CREATE TABLE items AS SELECT 1 AS id, 'gear' AS name")
-        rows = pond.query("SELECT name FROM items")["rows"]
-        assert rows[0][0] == "gear"
-        assert pond.describe()["pond"]["name"] == "shop"
-        pond.drop()
+        db = latiq.connect(server="local", root=root)
+        shop = db.create_pond(name="shop")
+        tbl = shop.query(sql="SELECT 1 AS id, 'gear' AS name")
+        assert tbl.schema.field("id").type == pa.int32()
+        assert tbl.column("name")[0].as_py() == "gear"
+        assert "shop" in repr(shop)
