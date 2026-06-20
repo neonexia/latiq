@@ -1,11 +1,11 @@
 name: Release images
 
-# Build and publish the single-binary Latiq image to GHCR so deployments
-# (`deploy/cluster/docker-compose.yml`, k8s) pull a versioned artifact instead of
-# building from source. Runs on main pushes, version tags, and on demand.
+# Publish the single-binary Latiq image to GHCR for a DELIBERATE release: a `v*`
+# version tag, or a manual run. Rolling (test-gated, change-gated) nightly images
+# are published by `nightly.yml`'s publish job instead — so main pushes no longer
+# ship an UNtested `latest` image.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 

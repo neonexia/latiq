@@ -167,3 +167,116 @@ jobs:
         if: always()
         working-directory: deploy/cluster
         run: docker compose --profile scale down -v
+
+  # ---- Versioned publish: only if (a) enabled, (b) something changed since the
+  # last publish, and (c) every test/e2e job above is green. Inert until the repo
+  # variable PUBLISH_NIGHTLY=true is set (after the one-time PyPI trusted-publisher
+  # setup). Ships TWO artifacts — the Python wheel (PyPI) + the image (GHCR) — with
+  # ONE version. No Rust crates, no source (wheels are binaries). -----------------
+  gate:
+    name: publish gate (enabled? changed?)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      wheel_version: ${{ steps.decide.outputs.wheel_version }}
+      image_stamp: ${{ steps.decide.outputs.image_stamp }}
+      stamp: ${{ steps.decide.outputs.stamp }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        run: |
+          if [ "${{ vars.PUBLISH_NIGHTLY }}" != "true" ]; then
+            echo "publishing disabled (set repo variable PUBLISH_NIGHTLY=true to enable)"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          last=$(git tag -l 'nightly-*' --sort=-creatordate | head -1)
+          if [ -n "$last" ] && [ "$(git rev-list "$last"..HEAD --count)" = "0" ]; then
+            echo "no commits since $last — nothing to publish"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base=$(grep -m1 -E '^version' sdk/python/pyproject.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
+          stamp=$(date -u +%Y%m%d%H%M)
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          echo "wheel_version=${base}.dev${stamp}" >> "$GITHUB_OUTPUT"
+          echo "image_stamp=nightly-${stamp}" >> "$GITHUB_OUTPUT"
+          echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
+
+  build-wheels:
+    name: build wheels (${{ matrix.os }})
+    needs: [gate, checks, iceberg, cluster-scale-out, e2e-suite]
+    if: needs.gate.outputs.should_publish == 'true'
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: macos-14, target: aarch64, manylinux: "off" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stamp the wheel version
+        run: |
+          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/python/pyproject.toml
+          rm -f sdk/python/pyproject.toml.bak
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release -m sdk/python/Cargo.toml -o dist
+          before-script-linux: |
+            (apt-get update && apt-get install -y protobuf-compiler) || \
+            (yum install -y protobuf-compiler) || (dnf install -y protobuf-compiler)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  publish:
+    name: publish (PyPI wheel + GHCR image), versioned
+    needs: [gate, build-wheels]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the nightly-<stamp> tag (the change-gate marker)
+      packages: write    # GHCR
+      id-token: write    # PyPI trusted publishing (OIDC; no stored token)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - name: Publish wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push the image (same version as the wheel)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.gate.outputs.image_stamp }}
+            ghcr.io/${{ github.repository_owner }}/latiq:nightly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Mark this commit as published
+        run: |
+          git tag "nightly-${{ needs.gate.outputs.stamp }}"
+          git push origin "nightly-${{ needs.gate.outputs.stamp }}"
