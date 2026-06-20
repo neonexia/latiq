@@ -114,6 +114,12 @@ jobs:
           pip install -U pip maturin
           maturin build -m sdk/python/Cargo.toml -o dist
           pip install dist/*.whl -r e2e/sdk/requirements.txt
+      # The `pip install latiq` + connect("local") path: a real single-node Latiq
+      # in-process, no cluster. Multi-node tests self-skip. (No LATIQ_GATEWAY.)
+      - name: SDK e2e (EMBEDDED — the pip-install standalone path)
+        run: |
+          . .e2e/bin/activate
+          pytest e2e/sdk -v
       - name: Install the agent harness deps
         run: npm ci --prefix e2e/agent
       - name: Bring up the 3-node cluster + gateway
@@ -280,3 +286,27 @@ jobs:
         run: |
           git tag "nightly-${{ needs.gate.outputs.stamp }}"
           git push origin "nightly-${{ needs.gate.outputs.stamp }}"
+
+  # Post-publish: prove `pip install latiq` actually works for an end user by
+  # installing the JUST-PUBLISHED wheel FROM PyPI (not the local build) and running
+  # the embedded suite against it — single-node in-process + Arrow→pandas.
+  verify-published:
+    name: verify pip install latiq (from PyPI, embedded)
+    needs: [gate, publish]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip install latiq==<version> from PyPI (retry for propagation)
+        run: |
+          v="${{ needs.gate.outputs.wheel_version }}"
+          for i in $(seq 1 12); do
+            python -m pip install "latiq==${v}" && break
+            echo "waiting for PyPI to serve ${v} (attempt $i)"; sleep 15
+          done
+          python -m pip install -r e2e/sdk/requirements.txt
+      - name: Embedded smoke against the installed wheel
+        run: pytest e2e/sdk -v
