@@ -391,9 +391,15 @@ impl LocalCluster {
             let _ = run_pond_node(cfg).await;
         });
         wait_for_active_node(&control_endpoint).await?;
+        // The node registers as `active` (heartbeat) BEFORE its Data/Stream gRPC
+        // server is necessarily accepting connections — so also wait for the data
+        // port to be dialable, or the first query races and fails "data plane
+        // unreachable".
+        let data_endpoint = format!("http://127.0.0.1:{data_port}");
+        wait_connectable(&data_endpoint).await?;
         Ok(Self {
             control_endpoint,
-            data_endpoint: format!("http://127.0.0.1:{data_port}"),
+            data_endpoint,
         })
     }
 }
