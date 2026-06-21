@@ -210,42 +210,9 @@ jobs:
           echo "image_stamp=nightly-${stamp}" >> "$GITHUB_OUTPUT"
           echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
 
-  build-wheels:
-    name: build wheels (${{ matrix.os }})
-    needs: [gate, checks, iceberg, cluster-scale-out, e2e-suite]
-    if: needs.gate.outputs.should_publish == 'true'
-    strategy:
-      matrix:
-        include:
-          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
-          - { os: macos-14, target: aarch64, manylinux: "off" }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Stamp the wheel version
-        run: |
-          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/python/pyproject.toml
-          rm -f sdk/python/pyproject.toml.bak
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-      - uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
-          args: --release -m sdk/python/Cargo.toml -o dist
-          before-script-linux: |
-            (apt-get update && apt-get install -y protobuf-compiler) || \
-            (yum install -y protobuf-compiler) || (dnf install -y protobuf-compiler)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}
-          path: dist/*.whl
-
   publish:
     name: publish (PyPI wheel + GHCR image), versioned
-    needs: [gate, build-wheels]
+    needs: [gate, checks, iceberg, cluster-scale-out, e2e-suite]
     if: needs.gate.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -256,12 +223,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - name: Stamp the wheel version
+        run: |
+          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/python/pyproject.toml
+          rm -f sdk/python/pyproject.toml.bak
+      # Build the manylinux wheel IN this job and publish from it — no cross-job
+      # artifact handoff (the wheel statically links the whole server and is large;
+      # artifacts blow the storage quota). Nightly ships the Linux/manylinux wheel
+      # (the SDK's real consumers: servers, CI, Docker, Colab). macOS/other-platform
+      # wheels are a tagged-release concern, not nightly.
+      - uses: PyO3/maturin-action@v1
         with:
-          path: dist
-          pattern: wheels-*
-          merge-multiple: true
-      - name: Publish wheels to PyPI
+          command: build
+          target: x86_64
+          manylinux: auto
+          args: --release -m sdk/python/Cargo.toml -o dist
+          before-script-linux: |
+            (apt-get update && apt-get install -y protobuf-compiler) || \
+            (yum install -y protobuf-compiler) || (dnf install -y protobuf-compiler)
+      - name: Publish the wheel to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist

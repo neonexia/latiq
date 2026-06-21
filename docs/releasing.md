@@ -19,12 +19,12 @@ Every night (and on `workflow_dispatch`):
 1. The test + e2e jobs run (`checks`, `iceberg`, `cluster-scale-out`, `e2e-suite`).
 2. **`gate`** decides whether to publish: only if **`PUBLISH_NIGHTLY=true`** AND
    there are **new commits since the last `nightly-*` tag**. Otherwise it stops.
-3. **`build-wheels`** runs only if the gate said yes *and every test job is green*
-   (it `needs` all of them) — builds the wheel for Linux (manylinux x86_64) and
-   macOS (arm64), stamped with one version.
-4. **`publish`** uploads the wheels to **PyPI** (trusted publishing, no stored
-   token) and builds + pushes the **image** to GHCR with the **same version**, then
-   tags the commit `nightly-<stamp>` (the marker the next run's change-gate reads).
+3. **`publish`** runs only if the gate said yes *and every test job is green* (it
+   `needs` all of them). It builds the **Linux/manylinux x86_64 wheel** in-job,
+   uploads it to **PyPI** (trusted publishing, no stored token), builds + pushes
+   the **image** to GHCR with the **same version**, then tags the commit
+   `nightly-<stamp>` (the marker the next run's change-gate reads). macOS/other
+   platform wheels are a tagged-release concern, not nightly.
 
 So: **unchanged → nothing publishes; changed + tests green → both artifacts publish,
 same version.** A failing test publishes nothing.
