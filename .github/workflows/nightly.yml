@@ -62,11 +62,11 @@ jobs:
       # Build the single-binary image once (DuckDB compiles from source — slow).
       - name: Build latiq image
         run: docker build -f deploy/Dockerfile -t latiq:nightly .
-      - name: Bring up the 2-node cluster (+ Prometheus, MinIO/Iceberg)
+      - name: Bring up the 2-node cluster
         working-directory: deploy/cluster
         run: |
           LATIQ_IMAGE=latiq:nightly docker compose up -d \
-            control-plane pond-node-1 pond-node-2 prometheus
+            control-plane pond-node-1 pond-node-2
       - name: Wait for the control plane + nodes to be healthy
         working-directory: deploy/cluster
         run: |
