@@ -1,9 +1,10 @@
 # Latiq cluster (Docker / Podman)
 
-A full multi-node Latiq deployment: a **control plane** + **pond nodes**, with
-**Prometheus** scraping every node and a local **MinIO + Iceberg REST** catalog.
-This is what the nightly CI (`.github/workflows/nightly.yml`) exercises, and the
-basis for the public one-command bring-up (`../latiq-up.sh`).
+A full multi-node Latiq deployment: a **control plane** + **pond nodes** behind an
+**nginx gateway** (the single MCP + Data/Stream front door), with **Prometheus**
+scraping every node and a local **MinIO + Iceberg REST** catalog. This is what the
+nightly CI (`.github/workflows/nightly.yml`) exercises, and the compose external
+users run (agents → the MCP endpoint; SDK/CLI → the gRPC endpoints).
 
 > Runs under **Docker** or **Podman** (`podman compose`). The compose auto-uses
 > whichever is running; in scripts override with `LATIQ_COMPOSE`.
@@ -52,10 +53,9 @@ docker compose run --rm --no-deps -T cli query --pond demo "SELECT * FROM t"
 docker compose run --rm --no-deps -T cli stats
 ```
 
-A native CLI on your laptop works too **iff** it can reach the advertised node
-addresses (same network / a gateway). Point it at the control plane with
-`export LATIQ_SERVER=http://localhost:51400`. For a laptop-only experience use
-`../latiq-up.sh`, which drops a `./latiq` wrapper that runs the CLI in-network.
+A native CLI on your laptop works too: point it at the control plane with
+`export LATIQ_SERVER=http://localhost:51400` (it reaches pond nodes through the
+gateway / forwarding). Or run it in-network: `docker compose run --rm cli <args>`.
 
 ## Scale-out e2e
 

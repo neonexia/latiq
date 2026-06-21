@@ -89,3 +89,224 @@ jobs:
         if: always()
         working-directory: deploy/cluster
         run: docker compose --profile scale down -v
+
+  e2e-suite:
+    name: e2e — SDK + agent (MCP) + perf, gateway + multi-node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The single-binary image (DuckDB compiles from source — slow).
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:nightly .
+      # The Python SDK wheel, built from this repo (not PyPI). Debug profile +
+      # CARGO_PROFILE_DEV_DEBUG=0 keeps it fast and avoids the linker OOM.
+      - name: Build + install the latiq wheel
+        run: |
+          python3 -m venv .e2e
+          . .e2e/bin/activate
+          pip install -U pip maturin
+          maturin build -m sdk/python/Cargo.toml -o dist
+          pip install dist/*.whl -r e2e/sdk/requirements.txt
+      # The `pip install latiq` + connect("local") path: a real single-node Latiq
+      # in-process, no cluster. Multi-node tests self-skip. (No LATIQ_GATEWAY.)
+      - name: SDK e2e (EMBEDDED — the pip-install standalone path)
+        run: |
+          . .e2e/bin/activate
+          pytest e2e/sdk -v
+      - name: Install the agent harness deps
+        run: npm ci --prefix e2e/agent
+      - name: Bring up the 3-node cluster + gateway
+        working-directory: deploy/cluster
+        run: |
+          LATIQ_IMAGE=latiq:nightly docker compose --profile scale up -d \
+            control-plane pond-node-1 pond-node-2 pond-node-3 gateway
+      - name: Wait for control plane + 3 nodes healthy
+        working-directory: deploy/cluster
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 4 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      # 1) SDK (data) — all surfaces, multi-node forwarding, Arrow→pandas, streaming.
+      - name: SDK e2e (Python, against the gateway)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: |
+          . .e2e/bin/activate
+          pytest e2e/sdk -v
+      # 2) Agent (MCP) — every tool + resources + prompts, through the MCP gateway.
+      - name: Agent harness (Vercel AI SDK MCP, against the gateway)
+        env:
+          LATIQ_MCP: http://localhost:51510/mcp
+        run: npm --prefix e2e/agent test
+      # 3) Perf — mid-size ingest/read/latency + cross-node fan, recorded + floored.
+      - name: Perf (Python SDK, against the gateway)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: |
+          . .e2e/bin/activate
+          python e2e/perf/run_perf.py
+      - name: Cluster logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        run: docker compose logs --tail=300
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        run: docker compose --profile scale down -v
+
+  # ---- Versioned publish: only if (a) enabled, (b) something changed since the
+  # last publish, and (c) every test/e2e job above is green. Inert until the repo
+  # variable PUBLISH_NIGHTLY=true is set (after the one-time PyPI trusted-publisher
+  # setup). Ships TWO artifacts — the Python wheel (PyPI) + the image (GHCR) — with
+  # ONE version. No Rust crates, no source (wheels are binaries). -----------------
+  gate:
+    name: publish gate (enabled? changed?)
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.decide.outputs.should_publish }}
+      wheel_version: ${{ steps.decide.outputs.wheel_version }}
+      image_stamp: ${{ steps.decide.outputs.image_stamp }}
+      stamp: ${{ steps.decide.outputs.stamp }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        run: |
+          if [ "${{ vars.PUBLISH_NIGHTLY }}" != "true" ]; then
+            echo "publishing disabled (set repo variable PUBLISH_NIGHTLY=true to enable)"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          last=$(git tag -l 'nightly-*' --sort=-creatordate | head -1)
+          if [ -n "$last" ] && [ "$(git rev-list "$last"..HEAD --count)" = "0" ]; then
+            echo "no commits since $last — nothing to publish"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          base=$(grep -m1 -E '^version' sdk/python/pyproject.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
+          stamp=$(date -u +%Y%m%d%H%M)
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          echo "wheel_version=${base}.dev${stamp}" >> "$GITHUB_OUTPUT"
+          echo "image_stamp=nightly-${stamp}" >> "$GITHUB_OUTPUT"
+          echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
+
+  build-wheels:
+    name: build wheels (${{ matrix.os }})
+    needs: [gate, checks, iceberg, cluster-scale-out, e2e-suite]
+    if: needs.gate.outputs.should_publish == 'true'
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: macos-14, target: aarch64, manylinux: "off" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stamp the wheel version
+        run: |
+          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/python/pyproject.toml
+          rm -f sdk/python/pyproject.toml.bak
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release -m sdk/python/Cargo.toml -o dist
+          before-script-linux: |
+            (apt-get update && apt-get install -y protobuf-compiler) || \
+            (yum install -y protobuf-compiler) || (dnf install -y protobuf-compiler)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist/*.whl
+
+  publish:
+    name: publish (PyPI wheel + GHCR image), versioned
+    needs: [gate, build-wheels]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the nightly-<stamp> tag (the change-gate marker)
+      packages: write    # GHCR
+      id-token: write    # PyPI trusted publishing (OIDC; no stored token)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - name: Publish wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push the image (same version as the wheel)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.gate.outputs.image_stamp }}
+            ghcr.io/${{ github.repository_owner }}/latiq:nightly
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Mark this commit as published
+        run: |
+          git tag "nightly-${{ needs.gate.outputs.stamp }}"
+          git push origin "nightly-${{ needs.gate.outputs.stamp }}"
+
+  # Post-publish: prove `pip install latiq` actually works for an end user by
+  # installing the JUST-PUBLISHED wheel FROM PyPI (not the local build) and running
+  # the embedded suite against it — single-node in-process + Arrow→pandas.
+  verify-published:
+    name: verify pip install latiq (from PyPI, embedded)
+    needs: [gate, publish]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip install latiq==<version> from PyPI (retry for propagation)
+        run: |
+          v="${{ needs.gate.outputs.wheel_version }}"
+          for i in $(seq 1 12); do
+            python -m pip install "latiq==${v}" && break
+            echo "waiting for PyPI to serve ${v} (attempt $i)"; sleep 15
+          done
+          python -m pip install -r e2e/sdk/requirements.txt
+      - name: Embedded smoke against the installed wheel
+        run: pytest e2e/sdk -v
