@@ -91,16 +91,21 @@ services:
       pond-node-1: { condition: service_healthy }
       pond-node-2: { condition: service_healthy }
 
+  # ---- Internal testing/observability only: Prometheus + a local Iceberg REST +
+  # MinIO (S3) catalog. Behind the `test` profile, so a plain `docker compose up`
+  # (the external-user path) is just control plane + pond nodes + gateway. Bring
+  # these up with `--profile test` (or by naming them) for the catalog/obs e2e.
   prometheus:
     image: prom/prometheus:latest
+    profiles: ["test"]
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports: ["9090:9090"]
     depends_on: [control-plane, pond-node-1, pond-node-2]
 
-  # ---- Local Iceberg REST + MinIO (S3) for the catalog e2e -----------------
   minio:
     image: minio/minio
+    profiles: ["test"]
     ports: ["9000:9000", "9001:9001"]
     environment:
       MINIO_ROOT_USER: admin
@@ -114,6 +119,7 @@ services:
 
   mc:
     image: minio/mc
+    profiles: ["test"]
     depends_on: [minio]
     entrypoint: >
       /bin/sh -c "
@@ -123,6 +129,7 @@ services:
 
   iceberg-rest:
     image: apache/iceberg-rest-fixture
+    profiles: ["test"]
     ports: ["8181:8181"]
     depends_on: [minio]
     environment:
