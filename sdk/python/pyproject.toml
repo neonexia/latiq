@@ -14,6 +14,8 @@ classifiers = [
 ]
 
 [tool.maturin]
-# The cdylib is named `latiq`; build it as the top-level module.
+# The cdylib is named `latiq`; build it as the top-level module. maturin
+# auto-detects `latiq.pyi` and ships PEP 561 type info (the package layout +
+# py.typed) so editors/mypy/pyright see signatures.
 module-name = "latiq"
 features = ["pyo3/extension-module"]
