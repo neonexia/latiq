@@ -233,14 +233,25 @@ jobs:
       # (the SDK's real consumers: servers, CI, Docker, Colab). macOS/other-platform
       # wheels are a tagged-release concern, not nightly.
       - uses: PyO3/maturin-action@v1
+        env:
+          # DuckDB's release (-O3) compile is memory-heavy; cap parallelism so it
+          # doesn't OOM the runner inside the manylinux container.
+          CARGO_BUILD_JOBS: "2"
         with:
           command: build
           target: x86_64
-          manylinux: auto
+          # 2_28 = AlmaLinux 8 toolchain: modern GCC + the C++11 CXX ABI DuckDB
+          # requires. The default (manylinux2014/CentOS 7) has the legacy ABI
+          # (DuckDB refuses) AND a proto2-only protoc (can't parse our proto3).
+          manylinux: "2_28"
           args: --release -m sdk/python/Cargo.toml -o dist
           before-script-linux: |
-            (apt-get update && apt-get install -y protobuf-compiler) || \
-            (yum install -y protobuf-compiler) || (dnf install -y protobuf-compiler)
+            # The container's distro protoc is too old (proto2-only) — install a
+            # modern protoc binary so latiq-proto's proto3 compiles.
+            curl -sSLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
+            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
+            unzip -o /tmp/protoc.zip -d /usr/local
+            protoc --version
       - name: Publish the wheel to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
