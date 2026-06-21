@@ -27,19 +27,27 @@ source the first time — slow; extensions are baked in via `latiq warm-extensio
 
 ## Bring it up
 
+A plain `up` is **lean** — control plane + pond nodes + the gateway, nothing else:
+
 ```bash
 # from this directory; pin a published tag or use a locally-built image
-LATIQ_IMAGE=ghcr.io/neonexia/latiq:latest docker compose up -d \
-    control-plane pond-node-1 pond-node-2 prometheus
+LATIQ_IMAGE=ghcr.io/neonexia/latiq:nightly docker compose up -d
 docker compose ps
 ```
 
-- Control + Admin gRPC (CLI/operators): `localhost:51400`
-- Prometheus: `localhost:9090` (scrapes `control-plane:52400`, `pond-node-N:52401`)
-- MinIO console: `localhost:9001` (`admin`/`password`), Iceberg REST: `localhost:8181`
+- **Agents → MCP**: `localhost:51510/mcp` (the gateway; no SDK needed)
+- **SDK / CLI → Data+Stream gRPC**: `localhost:51500` (the gateway)
+- **Control + Admin gRPC** (operators): `localhost:51400`
 
-`pond-node-3` is behind the `scale` profile (not started by default) so the
-scale-out test can add it at runtime.
+Optional profiles (internal testing/observability — **not** part of the
+external-user bring-up):
+
+```bash
+docker compose --profile test up -d   # + Prometheus (:9090), MinIO (:9001), Iceberg REST (:8181)
+docker compose --profile scale up -d   # + a 3rd pond node (scale-out test)
+```
+
+`pond-node-3` (`scale`) and Prometheus/MinIO/Iceberg (`test`) are off by default.
 
 ## Use the CLI
 
