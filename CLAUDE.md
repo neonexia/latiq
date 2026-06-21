@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `docs/product.md` - Product Spec for latiq
 - `docs/dev.md` — how to build, run, and manually test the current system (`./dev.sh` + CLI).
 - Per-crate `crates/*/CLAUDE.md` — local invariants for that crate.
+- Per-area `e2e/CLAUDE.md`, `deploy/CLAUDE.md` — the nightly e2e suite and deployment/packaging (+ `docs/releasing.md` for publishing).
 - `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs.
 
 ## What Latiq is
@@ -81,7 +82,7 @@ Tests are categorized by **layer** and **surface/feature** so a given change run
 ## Build commands
 
 - `cargo build` / `cargo test --workspace` (excludes `spike/`); first build compiles DuckDB from source (slow once).
-- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — keep green (run manually before pushing). CI is **nightly only** (`.github/workflows/nightly.yml`: fmt+clippy+test, iceberg/MinIO catalog e2e, and a dockerized 3-node cluster scale-out), not per-PR, to bound GitHub usage (#28). `release-images.yml` publishes the single-binary image to GHCR; `deploy/cluster/` holds the Dockerfile + the cluster compose (control plane + pond nodes behind an **nginx gateway** = the single MCP + Data/Stream front door) that CI and external users run. `e2e/` is the nightly end-to-end suite (SDK, MCP agent harness, perf) against that cluster.
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — keep green (run manually before pushing). CI is **nightly only** (`.github/workflows/nightly.yml`), not per-PR, to bound GitHub usage (#28): fmt+clippy+test, the iceberg/MinIO catalog e2e, a dockerized cluster scale-out, the **`e2e/` end-to-end suite** (SDK + MCP agent harness + perf, against a gatewayed multi-node cluster), and a **test-gated + change-gated versioned publish** (PyPI wheel + GHCR image — `deploy/CLAUDE.md`, `docs/releasing.md`). `deploy/cluster/` holds the Dockerfile + the cluster compose (pond nodes behind an **nginx gateway** = the single MCP + Data/Stream front door) that CI and external users run.
 
 ## Scope / deferrals (later slices)
 
