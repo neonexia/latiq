@@ -101,6 +101,68 @@ def test_large_read_streams_uncapped_past_the_json_cap(db):
     db.drop_pond(pond=p.name, confirm=True)
 
 
+def test_explain_returns_a_plan(db):
+    p = db.create_pond(name=_name("explain"))
+    p.query(sql="CREATE TABLE t(id INT)")
+    plan = p.explain(sql="SELECT * FROM t WHERE id > 1")
+    assert plan, "explain returned a plan"
+    assert len(str(plan)) > 0
+    db.drop_pond(pond=p.name, confirm=True)
+
+
+def test_writes_are_visible_via_snapshots(db):
+    """A write commits a DuckLake snapshot; `snapshots()` surfaces the history
+    (who wrote what) — the SDK's window onto write attribution."""
+    p = db.create_pond(name=_name("snaps"))
+    p.query(sql="CREATE TABLE t(id INT)")
+    p.query(sql="INSERT INTO t VALUES (1),(2)")
+    snaps = p.snapshots()
+    assert isinstance(snaps, pa.Table)
+    assert snaps.num_rows >= 1, "the write(s) produced snapshot(s)"
+    assert "snapshot_id" in snaps.schema.names
+    db.drop_pond(pond=p.name, confirm=True)
+
+
+def test_streaming_read_yields_batches(db):
+    """`query(stream=True)` returns a RecordBatchReader to iterate batches rather
+    than materializing the whole table."""
+    p = db.create_pond(name=_name("stream"))
+    n = 30_000
+    p.query(sql=f"CREATE TABLE t AS SELECT range AS i FROM range({n})")
+    reader = p.query(sql="SELECT i FROM t", stream=True)
+    assert isinstance(reader, pa.RecordBatchReader)
+    rows = sum(batch.num_rows for batch in reader)
+    assert rows == n, "all rows arrived across the streamed batches"
+    db.drop_pond(pond=p.name, confirm=True)
+
+
+def test_datasets_list_load_and_query(db):
+    """List the curated dataset catalog, load one into a pond, and query it.
+    `load_dataset` pulls from the dataset's source URL (a real network flow)."""
+    datasets = db.list_datasets()
+    assert "tpch" in datasets, "curated catalog lists tpch"
+    assert datasets["tpch"]["tables"], "tpch advertises its tables"
+
+    p = db.create_pond(name=_name("ds"))
+    p.load_dataset(dataset="tpch")
+    # Datasets load into their own schema (schema-per-dataset).
+    n = p.query(sql="SELECT count(*) AS n FROM tpch.nation")
+    assert n.column("n")[0].as_py() == 25
+    db.drop_pond(pond=p.name, confirm=True)
+
+
+def test_catalogs_surface_reachable(db):
+    """A fresh cluster has no external catalogs registered (that's an operator
+    action via the CLI), so list_catalogs is empty and describing an unknown one
+    errors — full pull/describe is covered by the iceberg e2e."""
+    cats = db.list_catalogs()
+    assert isinstance(cats, dict)
+    p = db.create_pond(name=_name("cat"))
+    with pytest.raises(RuntimeError):
+        p.describe_catalog(catalog="does-not-exist")
+    db.drop_pond(pond=p.name, confirm=True)
+
+
 def test_error_contract_surfaces_failures(db):
     p = db.create_pond(name=_name("errs"))
     # A read against a missing table must raise, not return empty.

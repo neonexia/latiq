@@ -1,7 +1,7 @@
 """Type stubs for `latiq` — the Python SDK (a compiled PyO3 extension). Keep in
 sync with `src/lib.rs`."""
 import os
-from typing import Any
+from typing import Any, Literal, overload
 
 import pyarrow
 
@@ -19,7 +19,8 @@ def connect(
     """
 
 class Database:
-    """A connection handle. Mints/derives pond handles and drops ponds."""
+    """A connection handle. Mints/derives pond handles, drops ponds, and reads the
+    dataset/catalog metadata."""
 
     @property
     def server(self) -> str:
@@ -39,11 +40,18 @@ class Database:
     def list_ponds(self) -> dict[str, dict[str, Any]]:
         """Ponds keyed by name: `{name: {pond_id, tier, node_id, description}}`."""
 
+    def list_datasets(self, query: str | None = ...) -> dict[str, dict[str, Any]]:
+        """Curated datasets keyed by name. `query`: None/`""` = all, `"#tag"`,
+        `"prefix*"`, or a substring."""
+
+    def list_catalogs(self, query: str | None = ...) -> dict[str, dict[str, Any]]:
+        """External catalogs keyed by name (same `query` filter as `list_datasets`)."""
+
     def drop_pond(self, pond: str, confirm: bool = ...) -> None:
         """Drop a pond and all its data (`confirm` must be true)."""
 
 class Pond:
-    """A handle to one pond: metadata attributes + SQL."""
+    """A handle to one pond: metadata attributes + SQL + datasets/catalogs."""
 
     @property
     def name(self) -> str: ...
@@ -53,9 +61,32 @@ class Pond:
     def tier(self) -> str: ...
     @property
     def description(self) -> str: ...
-    def query(self, sql: str) -> pyarrow.Table:
+    @overload
+    def query(self, sql: str, stream: Literal[False] = ...) -> pyarrow.Table:
         """Run SQL. Reads stream back as a `pyarrow.Table` (uncapped); writes
         execute (attributed/snapshotted server-side) and return an empty table."""
+    @overload
+    def query(self, sql: str, stream: Literal[True]) -> pyarrow.RecordBatchReader:
+        """`stream=True` returns a `pyarrow.RecordBatchReader` over the batches."""
+
+    def explain(self, sql: str) -> Any:
+        """Explain a query plan (no execution)."""
+
+    def snapshots(self) -> pyarrow.Table:
+        """This pond's DuckLake snapshot history (who wrote what) as a Table."""
+
+    def load_dataset(self, dataset: str) -> Any:
+        """Load a curated dataset (by name, from `db.list_datasets()`) into this pond."""
+
+    def describe_catalog(self, catalog: str, set: dict[str, str] | None = ...) -> Any:
+        """Describe an external catalog's tables. `set`: runtime config +
+        credentials (e.g. `{"token": "…"}`); never stored."""
+
+    def pull_catalog(
+        self, catalog: str, query: str, set: dict[str, str] | None = ...
+    ) -> Any:
+        """Pull a subset of an external catalog into a pond table. `query` is the
+        materialization SQL. `set`: runtime config + credentials; never stored."""
 
     def describe(self) -> Any:
         """The pond's structured schema (tables/columns) as JSON."""

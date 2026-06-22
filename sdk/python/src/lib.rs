@@ -19,11 +19,35 @@ use latiq_sdk::{Latiq, PondInfo};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 fn err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+/// Convert SDK JSON (datasets/catalogs/explain/describe results) to a Python object.
+fn json_to_py(py: Python<'_>, v: &serde_json::Value) -> PyResult<PyObject> {
+    pythonize::pythonize(py, v).map(|b| b.into()).map_err(err)
+}
+
+/// Build a streaming `pyarrow.RecordBatchReader` from Arrow IPC bytes (yields
+/// batches lazily; empty bytes → an empty reader).
+fn ipc_to_reader(py: Python<'_>, ipc: Vec<u8>) -> PyResult<PyObject> {
+    let pa = py.import_bound("pyarrow")?;
+    if ipc.is_empty() {
+        let schema = pa.call_method1("schema", (pyo3::types::PyList::empty_bound(py),))?;
+        let empty = pyo3::types::PyList::empty_bound(py);
+        return Ok(pa
+            .getattr("RecordBatchReader")?
+            .call_method1("from_batches", (schema, empty))?
+            .into());
+    }
+    Ok(pa
+        .getattr("ipc")?
+        .call_method1("open_stream", (PyBytes::new_bound(py, &ipc),))?
+        .into())
 }
 
 /// Build a `pyarrow.Table` from Arrow IPC stream bytes. Empty bytes (writes /
@@ -103,6 +127,27 @@ impl PyDatabase {
         Ok(d)
     }
 
+    /// Curated datasets keyed by name. `query`: `""`/None = all, `"#tag"`,
+    /// `"prefix*"`, or a substring.
+    #[pyo3(signature = (query=None))]
+    fn list_datasets(&self, py: Python<'_>, query: Option<&str>) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let v = py
+            .allow_threads(|| inner.list_datasets(query.unwrap_or_default()))
+            .map_err(err)?;
+        json_to_py(py, &v)
+    }
+
+    /// External catalogs keyed by name (same `query` filter as `list_datasets`).
+    #[pyo3(signature = (query=None))]
+    fn list_catalogs(&self, py: Python<'_>, query: Option<&str>) -> PyResult<PyObject> {
+        let inner = self.inner.clone();
+        let v = py
+            .allow_threads(|| inner.list_catalogs(query.unwrap_or_default()))
+            .map_err(err)?;
+        json_to_py(py, &v)
+    }
+
     /// Drop a pond and all its data (`confirm` must be true).
     #[pyo3(signature = (pond, confirm=true))]
     fn drop_pond(&self, py: Python<'_>, pond: &str, confirm: bool) -> PyResult<()> {
@@ -144,13 +189,80 @@ impl PyPond {
 
     /// Run SQL. Reads → `pyarrow.Table` (streamed, uncapped); writes execute and
     /// return an empty table. `pond.query(sql="SELECT …")`.
-    #[pyo3(signature = (sql))]
-    fn query(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+    /// Run SQL. Reads → `pyarrow.Table` (streamed, uncapped); writes execute and
+    /// return an empty table. `stream=True` returns a `pyarrow.RecordBatchReader`
+    /// to iterate batches instead of materializing the whole table.
+    #[pyo3(signature = (sql, stream=false))]
+    fn query(&self, py: Python<'_>, sql: &str, stream: bool) -> PyResult<PyObject> {
         let (inner, pond) = (self.inner.clone(), self.info.name.clone());
         let ipc = py
             .allow_threads(|| inner.query_ipc(&pond, sql))
             .map_err(err)?;
+        if stream {
+            ipc_to_reader(py, ipc)
+        } else {
+            ipc_to_table(py, ipc)
+        }
+    }
+
+    /// Explain a query plan (no execution).
+    #[pyo3(signature = (sql))]
+    fn explain(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        let (inner, pond) = (self.inner.clone(), self.info.name.clone());
+        let v = py.allow_threads(|| inner.explain(&pond, sql)).map_err(err)?;
+        json_to_py(py, &v)
+    }
+
+    /// This pond's DuckLake snapshot history (who wrote what) as a `pyarrow.Table`.
+    fn snapshots(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let (inner, pond) = (self.inner.clone(), self.info.name.clone());
+        let ipc = py
+            .allow_threads(|| inner.snapshots_ipc(&pond))
+            .map_err(err)?;
         ipc_to_table(py, ipc)
+    }
+
+    /// Load a curated dataset (by name, from `db.list_datasets()`) into this pond.
+    #[pyo3(signature = (dataset))]
+    fn load_dataset(&self, py: Python<'_>, dataset: &str) -> PyResult<PyObject> {
+        let (inner, pond) = (self.inner.clone(), self.info.name.clone());
+        let v = py
+            .allow_threads(|| inner.load_dataset(&pond, dataset))
+            .map_err(err)?;
+        json_to_py(py, &v)
+    }
+
+    /// Describe an external catalog's tables (attached transiently on this pond).
+    /// `set`: runtime config + credentials (e.g. `{"token": "…"}`); never stored.
+    #[pyo3(signature = (catalog, set=None))]
+    fn describe_catalog(
+        &self,
+        py: Python<'_>,
+        catalog: &str,
+        set: Option<HashMap<String, String>>,
+    ) -> PyResult<PyObject> {
+        let (inner, pond) = (self.inner.clone(), self.info.name.clone());
+        let v = py
+            .allow_threads(|| inner.describe_catalog(&pond, catalog, set.unwrap_or_default()))
+            .map_err(err)?;
+        json_to_py(py, &v)
+    }
+
+    /// Pull a subset of an external catalog into a pond table. `query` is the
+    /// materialization SQL. `set`: runtime config + credentials; never stored.
+    #[pyo3(signature = (catalog, query, set=None))]
+    fn pull_catalog(
+        &self,
+        py: Python<'_>,
+        catalog: &str,
+        query: &str,
+        set: Option<HashMap<String, String>>,
+    ) -> PyResult<PyObject> {
+        let (inner, pond) = (self.inner.clone(), self.info.name.clone());
+        let v = py
+            .allow_threads(|| inner.pull_catalog(&pond, catalog, query, set.unwrap_or_default()))
+            .map_err(err)?;
+        json_to_py(py, &v)
     }
 
     fn describe(&self, py: Python<'_>) -> PyResult<PyObject> {
