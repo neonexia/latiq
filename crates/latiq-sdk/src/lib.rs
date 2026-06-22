@@ -24,7 +24,7 @@ use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::stream_client::StreamClient;
 use latiq_proto::v1::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +71,38 @@ impl Pond<'_> {
     }
     pub fn describe(&self) -> Result<serde_json::Value> {
         self.latiq.describe_pond(&self.info.name)
+    }
+    /// Explain a query plan (no execution).
+    pub fn explain(&self, sql: &str) -> Result<serde_json::Value> {
+        self.latiq.explain(&self.info.name, sql)
+    }
+    /// The pond's DuckLake snapshot history (who wrote what, when) — a read.
+    pub fn snapshots(&self) -> Result<Vec<RecordBatch>> {
+        self.latiq.snapshots(&self.info.name)
+    }
+    /// Load a curated dataset (by name, from `Latiq::list_datasets`) into this pond.
+    pub fn load_dataset(&self, dataset: &str) -> Result<serde_json::Value> {
+        self.latiq.load_dataset(&self.info.name, dataset)
+    }
+    /// Describe an external catalog's tables (attached transiently on this pond).
+    /// `set`: runtime config + credentials (e.g. `{"token": "…"}`); never stored.
+    pub fn describe_catalog(
+        &self,
+        catalog: &str,
+        set: HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        self.latiq.describe_catalog(&self.info.name, catalog, set)
+    }
+    /// Pull a subset of an external catalog into a pond table. `query` is the
+    /// materialization SQL (e.g. `CREATE TABLE us AS SELECT … FROM lake.s.orders`).
+    pub fn pull_catalog(
+        &self,
+        catalog: &str,
+        query: &str,
+        set: HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        self.latiq
+            .pull_catalog(&self.info.name, catalog, query, set)
     }
     pub fn name(&self) -> &str {
         &self.info.name
@@ -305,6 +337,160 @@ impl Latiq {
         })
     }
 
+    /// Explain a query plan against `pond` (no execution). Returns the plan JSON.
+    pub fn explain(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut d = self.data().await?;
+            let resp = d
+                .explain_query(self.with_id(QueryRequest {
+                    pond: pond.to_string(),
+                    sql: sql.to_string(),
+                }))
+                .await
+                .map_err(|s| anyhow!("explain: {}", s.message()))?
+                .into_inner();
+            parse_json(&resp.json)
+        })
+    }
+
+    /// `pond`'s DuckLake snapshot history as Arrow batches (a read on
+    /// `<pond>.snapshots()`). `pond` must be the pond NAME (the catalog name).
+    pub fn snapshots(&self, pond: &str) -> Result<Vec<RecordBatch>> {
+        decode_ipc(&self.snapshots_ipc(pond)?)
+    }
+
+    /// `pond`'s snapshot history as Arrow IPC bytes (the Python boundary).
+    pub fn snapshots_ipc(&self, pond: &str) -> Result<Vec<u8>> {
+        let sql = format!(
+            "SELECT * FROM {}.snapshots() ORDER BY snapshot_id",
+            quote_ident(pond)
+        );
+        self.query_ipc(pond, &sql)
+    }
+
+    /// Curated datasets (control-plane metadata), keyed by name. `query`: `""` =
+    /// all, `"#tag"`, `"prefix*"`, or a substring.
+    pub fn list_datasets(&self, query: &str) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut c = self.control().await?;
+            let resp = c
+                .list_datasets(ListDatasetsRequest {
+                    query: query.to_string(),
+                })
+                .await?
+                .into_inner();
+            let mut map = serde_json::Map::new();
+            for ds in resp.datasets {
+                let tables: Vec<_> = ds
+                    .tables
+                    .into_iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "table_name": t.table_name, "source_uri": t.source_uri, "format": t.format,
+                        })
+                    })
+                    .collect();
+                map.insert(
+                    ds.name,
+                    serde_json::json!({
+                        "description": ds.description, "tags": ds.tags, "tables": tables,
+                        "created_by": ds.created_by, "created_at": ds.created_at,
+                    }),
+                );
+            }
+            Ok(serde_json::Value::Object(map))
+        })
+    }
+
+    /// External catalogs (control-plane metadata), keyed by name.
+    pub fn list_catalogs(&self, query: &str) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut c = self.control().await?;
+            let resp = c
+                .list_catalogs(ListCatalogsRequest {
+                    query: query.to_string(),
+                })
+                .await?
+                .into_inner();
+            let mut map = serde_json::Map::new();
+            for cat in resp.catalogs {
+                map.insert(
+                    cat.name,
+                    serde_json::json!({
+                        "type": cat.r#type, "params": cat.params, "description": cat.description,
+                        "tags": cat.tags, "created_by": cat.created_by, "created_at": cat.created_at,
+                    }),
+                );
+            }
+            Ok(serde_json::Value::Object(map))
+        })
+    }
+
+    /// Load a curated dataset into `pond` (copies its files in; one schema per
+    /// dataset). Returns the load summary.
+    pub fn load_dataset(&self, pond: &str, dataset: &str) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut d = self.data().await?;
+            let resp = d
+                .load_dataset(self.with_id(LoadDatasetRequest {
+                    pond: pond.to_string(),
+                    dataset: dataset.to_string(),
+                }))
+                .await
+                .map_err(|s| anyhow!("load_dataset: {}", s.message()))?
+                .into_inner();
+            parse_json(&resp.json)
+        })
+    }
+
+    /// Describe an external catalog's tables (attached transiently on `pond`).
+    /// `set` carries runtime config + credentials; never stored.
+    pub fn describe_catalog(
+        &self,
+        pond: &str,
+        catalog: &str,
+        set: HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut d = self.data().await?;
+            let resp = d
+                .catalog_describe(self.with_id(CatalogDescribeRequest {
+                    pond: pond.to_string(),
+                    catalog: catalog.to_string(),
+                    params: set,
+                }))
+                .await
+                .map_err(|s| anyhow!("describe_catalog: {}", s.message()))?
+                .into_inner();
+            parse_json(&resp.json)
+        })
+    }
+
+    /// Pull a subset of an external catalog into a pond table. `query` is the
+    /// materialization SQL. `set` carries runtime config + credentials; never stored.
+    pub fn pull_catalog(
+        &self,
+        pond: &str,
+        catalog: &str,
+        query: &str,
+        set: HashMap<String, String>,
+    ) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut d = self.data().await?;
+            let resp = d
+                .catalog_pull(self.with_id(CatalogPullRequest {
+                    pond: pond.to_string(),
+                    catalog: catalog.to_string(),
+                    query: query.to_string(),
+                    params: set,
+                }))
+                .await
+                .map_err(|s| anyhow!("pull_catalog: {}", s.message()))?
+                .into_inner();
+            parse_json(&resp.json)
+        })
+    }
+
     // ── client helpers ──────────────────────────────────────────────
 
     async fn control(&self) -> RtClient<ControlClient<Channel>> {
@@ -427,6 +613,12 @@ fn normalize_endpoint(server: &str) -> String {
     } else {
         format!("http://{s}")
     }
+}
+
+/// Quote a SQL identifier (double-quote, escaping internal quotes) so a pond name
+/// is safe to interpolate, e.g. into `<pond>.snapshots()`.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// Decode an Arrow IPC stream (schema + batches) into RecordBatches. Empty bytes
