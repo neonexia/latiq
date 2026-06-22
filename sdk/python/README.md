@@ -43,10 +43,13 @@ uv run maturin develop            # builds the extension into the venv (first bu
 The extension links the whole server stack (so embedded mode can spawn a cluster
 in-process), so the wheel is large; that's the cost of zero-dependency local mode.
 
-## Surface (this slice)
+## Surface
 
 `connect(server, root, query_gateway)` · `Database.{server, create_pond, get_pond,
-list_ponds, drop_pond}` · `Pond.{name, id, tier, description, query, describe,
-drop}`. Reads return `pyarrow.Table` over the streaming `ReadArrow` RPC; the data
-path uses the front door + greeter forwarding (k8s-safe). Dataset/catalog/stats
-are deferred.
+list_ponds, list_datasets, list_catalogs, drop_pond}` · `Pond.{name, id, tier,
+description, query, explain, snapshots, load_dataset, describe_catalog,
+pull_catalog, describe, drop}`. Reads return a `pyarrow.Table` over the streaming
+`ReadArrow` RPC (`query(sql, stream=True)` → a `RecordBatchReader`); writes are
+visible via `snapshots()`. The data path uses the front door + greeter forwarding
+(k8s-safe). Ships PEP 561 type stubs. Operator surfaces (nodes/policy/stats) stay
+on the CLI.
