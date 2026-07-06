@@ -78,6 +78,13 @@ impl PondInstance {
         // change). UTC makes results deterministic across the cluster.
         conn.execute_batch("SET TimeZone='UTC';")
             .map_err(|e| EngineError::Engine(format!("set timezone: {e}")))?;
+        // Force httpfs to download whole remote files instead of HTTP range reads.
+        // Some CDNs (e.g. Cloudflare in front of shell.duckdb.org, which serves the
+        // curated datasets) don't honor range requests cleanly, so a ranged footer
+        // read returns wrong bytes → "No magic bytes found at end of file". Whole-
+        // file download is correct for the small curated-dataset/pull sources.
+        conn.execute_batch("SET force_download=true;")
+            .map_err(|e| EngineError::Engine(format!("set force_download: {e}")))?;
         // Per-pond optional extensions: LOAD-only from the image. autoinstall off
         // so a missing one fails fast — never a download in the pond path.
         if !loc.extensions.is_empty() {
