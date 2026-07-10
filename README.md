@@ -13,8 +13,8 @@ Run a cluster (no repo clone — pull the published images), then point any MCP 
 
 ```bash
 curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
-docker compose up -d                       # control plane + pond nodes + gateway
-# MCP endpoint:  http://localhost:51510/mcp
+docker compose up -d                       # or:  podman compose up -d
+# control plane + pond nodes + gateway; MCP endpoint: http://localhost:51510/mcp
 ```
 
 The agent gets tools (`allocate_pond`, `read_query`, `write_query`, `load_dataset`,
