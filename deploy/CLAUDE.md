@@ -15,21 +15,25 @@ Control plane + pond nodes behind an **nginx gateway** — the single front door
   found`. Cross-node pond ops still forward.
 - Control + Admin gRPC → control plane `:51400` (node-less).
 
-**Two composes, one topology.** `cluster/docker-compose.yml` is the **repo/CI/dev**
-copy (mounts `./nginx.conf`, has `test`/`scale`/`tools` profiles). `latiq-compose.yml`
-is the **external-user** copy — self-contained (nginx config inlined via
-`configs: content:`, published images only, no repo files), mirrored to the public
-`neonexia/latiq-deploy` repo so users run it clone-free:
-`curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml && docker compose up -d`.
-Keep the two in sync when the topology changes (manual for now). The nightly's
-`verify-deployment` job runs the user copy against the **published** image + PyPI
-wheel — the real "shipped thing works" gate. Requires the GHCR `latiq` package to
-be **public** (org packages setting) so users pull without auth.
+**Two composes, on purpose.**
+- `cluster/docker-compose.yml` — the **repo/CI/dev** stack: mounts `./nginx.conf`,
+  and carries the `test`/`scale`/`tools` **profiles** (Prometheus + MinIO +
+  Iceberg-REST for internal testing; a 3rd node for scale-out; an in-network `cli`).
+- `latiq-compose.yml` — the **minimal external-user** deployment: control plane +
+  2 pond nodes + gateway, **no profiles**, **pure images + ports** (no inline
+  configs, no mounts) so it runs clone-free and **identically under Docker AND
+  Podman**. Mirrored to the public `neonexia/latiq-deploy` repo:
+  `curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml && docker compose up -d` (or `podman compose up -d`).
 
-**Lean by default.** A bare `docker compose up` (either file) = control plane + 2
-pond nodes + gateway (what an agent/SDK user needs). The cluster file's profiles
-gate the rest: `test` = Prometheus + MinIO + Iceberg-REST (internal testing/obs
-only), `scale` = pond-node-3 (scale-out test), `tools` = the in-network `cli` helper.
+**The gateway image.** So the user compose stays pure-images, the gateway is a
+published image — `latiq-gateway` (`deploy/gateway.Dockerfile` = `nginx` + baked
+`cluster/nginx.conf`, the **one** gateway-config source). Built + pushed alongside
+`latiq` by the nightly publish + `release-images.yml`. **Both** GHCR packages
+(`latiq`, `latiq-gateway`) must be **public** for anonymous pulls.
+
+Keep the two composes in sync when the topology changes (manual for now). The
+nightly's `verify-deployment` job runs the **user** compose against the
+**published** images + PyPI wheel — the real "shipped thing works" gate.
 
 `--advertise-addr` must be the node's **routable** hostname (compose service / k8s
 pod) — the control plane stores it and forwarding dials it; a wrong value lands
