@@ -304,3 +304,72 @@ jobs:
           python -m pip install -r e2e/sdk/requirements.txt
       - name: Embedded smoke against the installed wheel
         run: pytest e2e/sdk -v
+
+  # Prove the REAL external-user path against the JUST-PUBLISHED artifacts — no
+  # repo build, no repo compose. Fetch the compose from the public latiq-deploy
+  # repo (as a user would), `docker compose up` pulls the published GHCR image,
+  # `pip install latiq` from PyPI, then run the SDK + agent (MCP) suites against
+  # the gatewayed cluster. Only the TEST CODE comes from this repo (contributors
+  # have it); everything under test is a shipped artifact.
+  verify-deployment:
+    name: verify user path (remote compose + GHCR image + PyPI wheel)
+    needs: [gate, publish]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # for e2e/ test code only
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Fetch the compose exactly as a user does (public repo, no clone of latiq).
+      - name: Fetch the published compose
+        run: curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
+      # NOTE: no `docker login` — this tests the ANONYMOUS pull a real user makes.
+      # Requires the GHCR `latiq` package to be PUBLIC (one-time org setting).
+      - name: Bring up the cluster from the published image (pinned to this run)
+        env:
+          LATIQ_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.gate.outputs.image_stamp }}
+        run: docker compose up -d
+      - name: Wait for control plane + nodes healthy
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      - name: pip install latiq==<version> from PyPI (retry for propagation)
+        run: |
+          v="${{ needs.gate.outputs.wheel_version }}"
+          for i in $(seq 1 12); do
+            python -m pip install "latiq==${v}" && break
+            echo "waiting for PyPI to serve ${v} (attempt $i)"; sleep 15
+          done
+          python -m pip install -r e2e/sdk/requirements.txt
+          npm ci --prefix e2e/agent
+      - name: SDK e2e against the deployed cluster (published wheel + image)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: pytest e2e/sdk -v
+      - name: Agent harness (MCP) against the deployed cluster
+        env:
+          LATIQ_MCP: http://localhost:51510/mcp
+        run: npm --prefix e2e/agent test
+      - name: Cluster logs on failure
+        if: failure()
+        run: docker compose logs --tail=300
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
