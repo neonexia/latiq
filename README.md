@@ -8,12 +8,12 @@ It speaks to three audiences over three surfaces — pick the one that's you.
 
 ## 🤖 Agents — over MCP (no SDK)
 
-Run a cluster, then point any MCP host (Claude Desktop, the Vercel AI SDK, …) at
-the gateway's MCP endpoint:
+Run a cluster (no repo clone — pull the published images), then point any MCP host
+(Claude Desktop, the Vercel AI SDK, …) at the gateway's MCP endpoint:
 
 ```bash
-cd deploy/cluster
-LATIQ_IMAGE=ghcr.io/neonexia/latiq:nightly docker compose up -d   # control plane + pond nodes + gateway
+curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
+docker compose up -d                       # control plane + pond nodes + gateway
 # MCP endpoint:  http://localhost:51510/mcp
 ```
 

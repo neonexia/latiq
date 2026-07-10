@@ -1,0 +1,118 @@
+# Latiq — self-contained deployment for external users. References only PUBLISHED
+# images (GHCR + Docker Hub) and inlines the gateway config, so it runs with NO
+# repo clone and no local files:
+#
+#   curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
+#   docker compose up -d
+#
+# Then:
+#   agents  → http://localhost:51510/mcp   (MCP; no SDK)
+#   sdk/cli → localhost:51500 (Data/Stream gRPC) · localhost:51400 (Control/Admin)
+#   pip install latiq   → db = latiq.connect("grpc://localhost:51400",
+#                                             query_gateway="grpc://localhost:51500")
+#
+# Pin a version with LATIQ_IMAGE=ghcr.io/neonexia/latiq:<tag> (default: :nightly).
+# This mirrors the topology of the repo's deploy/cluster/docker-compose.yml (used
+# by CI + contributors); this file is the one users run.
+x-latiq: &latiq
+  image: ${LATIQ_IMAGE:-ghcr.io/neonexia/latiq:nightly}
+  restart: unless-stopped
+
+configs:
+  # The gateway (nginx) config, inlined so there's no ./nginx.conf to mount.
+  gateway_nginx:
+    content: |
+      worker_processes auto;
+      events { worker_connections 1024; }
+      http {
+        resolver 127.0.0.11 valid=10s;
+        # Data + Stream gRPC front door (round-robin; the greeter forwards by pond).
+        upstream latiq_data {
+          server pond-node-1:51401;
+          server pond-node-2:51401;
+        }
+        server {
+          listen 51500;
+          http2 on;
+          grpc_read_timeout  3600s;
+          grpc_send_timeout  3600s;
+          location / { grpc_pass grpc://latiq_data; }
+        }
+        # MCP HTTP front door. Sticky (ip_hash): MCP sessions are node-local, so a
+        # client must reach the same node it initialized on.
+        upstream latiq_mcp {
+          ip_hash;
+          server pond-node-1:51402;
+          server pond-node-2:51402;
+        }
+        server {
+          listen 51510;
+          location / {
+            proxy_pass http://latiq_mcp;
+            proxy_http_version 1.1;
+            proxy_set_header Host $$host;
+            proxy_set_header Connection "";
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_read_timeout 3600s;
+            chunked_transfer_encoding on;
+          }
+        }
+      }
+
+services:
+  control-plane:
+    <<: *latiq
+    hostname: control-plane
+    command: ["serve", "--bind", "0.0.0.0", "--port", "51400", "--root", "/var/lib/latiq"]
+    ports: ["51400:51400"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52400/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  pond-node-1:
+    <<: *latiq
+    hostname: pond-node-1
+    command: ["node", "add", "--node-id", "node-1", "--bind", "0.0.0.0",
+              "--port", "51401", "--advertise-addr", "pond-node-1:51401",
+              "--root", "/var/lib/latiq"]
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+    depends_on:
+      control-plane: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52401/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  pond-node-2:
+    <<: *latiq
+    hostname: pond-node-2
+    command: ["node", "add", "--node-id", "node-2", "--bind", "0.0.0.0",
+              "--port", "51401", "--advertise-addr", "pond-node-2:51401",
+              "--root", "/var/lib/latiq"]
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+    depends_on:
+      control-plane: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:52401/metrics"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  gateway:
+    image: nginx:1.27
+    hostname: gateway
+    configs:
+      - source: gateway_nginx
+        target: /etc/nginx/nginx.conf
+    ports:
+      - "51500:51500"   # Data + Stream gRPC (SDK/CLI front door)
+      - "51510:51510"   # MCP HTTP (agent front door)
+    depends_on:
+      pond-node-1: { condition: service_healthy }
+      pond-node-2: { condition: service_healthy }
