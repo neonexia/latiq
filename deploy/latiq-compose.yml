@@ -1,9 +1,9 @@
-# Latiq — self-contained deployment for external users. References only PUBLISHED
-# images (GHCR + Docker Hub) and inlines the gateway config, so it runs with NO
-# repo clone and no local files:
+# Latiq — the minimal, self-contained deployment for external users. References
+# only PUBLISHED images (GHCR + Docker Hub) — no inline configs, no file mounts —
+# so it runs with NO repo clone and identically under Docker AND Podman:
 #
 #   curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
-#   docker compose up -d
+#   docker compose up -d      # (or: podman compose up -d)
 #
 # Then:
 #   agents  → http://localhost:51510/mcp   (MCP; no SDK)
@@ -11,54 +11,12 @@
 #   pip install latiq   → db = latiq.connect("grpc://localhost:51400",
 #                                             query_gateway="grpc://localhost:51500")
 #
-# Pin a version with LATIQ_IMAGE=ghcr.io/neonexia/latiq:<tag> (default: :nightly).
-# This mirrors the topology of the repo's deploy/cluster/docker-compose.yml (used
-# by CI + contributors); this file is the one users run.
+# Pin versions with LATIQ_IMAGE / LATIQ_GATEWAY_IMAGE (default :nightly). This is
+# the lean topology (control plane + 2 pond nodes + gateway); the full test/dev
+# stack (Prometheus/MinIO/Iceberg, scale-out) lives in deploy/cluster (repo only).
 x-latiq: &latiq
   image: ${LATIQ_IMAGE:-ghcr.io/neonexia/latiq:nightly}
   restart: unless-stopped
-
-configs:
-  # The gateway (nginx) config, inlined so there's no ./nginx.conf to mount.
-  gateway_nginx:
-    content: |
-      worker_processes auto;
-      events { worker_connections 1024; }
-      http {
-        resolver 127.0.0.11 valid=10s;
-        # Data + Stream gRPC front door (round-robin; the greeter forwards by pond).
-        upstream latiq_data {
-          server pond-node-1:51401;
-          server pond-node-2:51401;
-        }
-        server {
-          listen 51500;
-          http2 on;
-          grpc_read_timeout  3600s;
-          grpc_send_timeout  3600s;
-          location / { grpc_pass grpc://latiq_data; }
-        }
-        # MCP HTTP front door. Sticky (ip_hash): MCP sessions are node-local, so a
-        # client must reach the same node it initialized on.
-        upstream latiq_mcp {
-          ip_hash;
-          server pond-node-1:51402;
-          server pond-node-2:51402;
-        }
-        server {
-          listen 51510;
-          location / {
-            proxy_pass http://latiq_mcp;
-            proxy_http_version 1.1;
-            proxy_set_header Host $$host;
-            proxy_set_header Connection "";
-            proxy_buffering off;
-            proxy_cache off;
-            proxy_read_timeout 3600s;
-            chunked_transfer_encoding on;
-          }
-        }
-      }
 
 services:
   control-plane:
@@ -105,11 +63,8 @@ services:
       retries: 30
 
   gateway:
-    image: nginx:1.27
+    image: ${LATIQ_GATEWAY_IMAGE:-ghcr.io/neonexia/latiq-gateway:nightly}
     hostname: gateway
-    configs:
-      - source: gateway_nginx
-        target: /etc/nginx/nginx.conf
     ports:
       - "51500:51500"   # Data + Stream gRPC (SDK/CLI front door)
       - "51510:51510"   # MCP HTTP (agent front door)

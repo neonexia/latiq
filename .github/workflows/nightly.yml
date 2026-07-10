@@ -276,6 +276,17 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/latiq:nightly
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # The gateway image (nginx + baked front-door config) — so the user compose
+      # is pure images (docker + podman). Tiny; context is deploy/cluster (nginx.conf).
+      - name: Build + push the gateway image (same version)
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/cluster
+          file: deploy/gateway.Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/latiq-gateway:${{ needs.gate.outputs.image_stamp }}
+            ghcr.io/${{ github.repository_owner }}/latiq-gateway:nightly
       - name: Mark this commit as published
         run: |
           git tag "nightly-${{ needs.gate.outputs.stamp }}"
@@ -329,9 +340,10 @@ jobs:
         run: curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
       # NOTE: no `docker login` — this tests the ANONYMOUS pull a real user makes.
       # Requires the GHCR `latiq` package to be PUBLIC (one-time org setting).
-      - name: Bring up the cluster from the published image (pinned to this run)
+      - name: Bring up the cluster from the published images (pinned to this run)
         env:
           LATIQ_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.gate.outputs.image_stamp }}
+          LATIQ_GATEWAY_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq-gateway:${{ needs.gate.outputs.image_stamp }}
         run: docker compose up -d
       - name: Wait for control plane + nodes healthy
         run: |

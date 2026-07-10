@@ -46,3 +46,22 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # The gateway image (nginx + baked front-door config), same tags, so the
+      # user compose stays pure-images on a tagged release too.
+      - name: Gateway image metadata
+        id: gwmeta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/latiq-gateway
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and push the gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/cluster
+          file: deploy/gateway.Dockerfile
+          push: true
+          tags: ${{ steps.gwmeta.outputs.tags }}
+          labels: ${{ steps.gwmeta.outputs.labels }}
