@@ -7,14 +7,24 @@ edition.workspace = true
 name = "latiq"
 path = "src/main.rs"
 
+[features]
+# `server` bundles the server roles (`serve`, `node add`, `warm-extensions`) and
+# their heavy deps — control-plane + pond-node, which embed DuckDB. On by default
+# (the container/dev binary is all-roles). A client-only build
+# (`--no-default-features`) drops DuckDB entirely and keeps just the CLI client
+# commands (pond/query/dataset/catalog/stats/node list) — tiny, cross-compiles to
+# any platform in seconds. That's the artifact admins install on their laptops.
+default = ["server"]
+server = ["dep:latiq-control-plane", "dep:latiq-pond-node", "dep:latiq-metrics", "dep:metrics"]
+
 [dependencies]
-latiq-control-plane = { path = "../latiq-control-plane" }
-latiq-pond-node = { path = "../latiq-pond-node" }
+latiq-control-plane = { path = "../latiq-control-plane", optional = true }
+latiq-pond-node = { path = "../latiq-pond-node", optional = true }
 latiq-proto = { path = "../latiq-proto" }
 latiq-common = { path = "../latiq-common" }
 latiq-engine = { path = "../latiq-engine" }
-latiq-metrics = { path = "../latiq-metrics" }
-metrics = { workspace = true }
+latiq-metrics = { path = "../latiq-metrics", optional = true }
+metrics = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
