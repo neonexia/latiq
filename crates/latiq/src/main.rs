@@ -8,13 +8,17 @@ use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
 use latiq_common::tier::{PondTier, ResourceLimits};
 use latiq_common::ErrorEnvelope;
+#[cfg(feature = "server")]
 use latiq_control_plane::{serve_control_plane, Registry};
+#[cfg(feature = "server")]
 use latiq_pond_node::{run_pond_node, PondNodeConfig};
 use latiq_proto::v1::admin_client::AdminClient;
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::*;
+#[cfg(feature = "server")]
 use std::net::SocketAddr;
+#[cfg(feature = "server")]
 use std::path::PathBuf;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
@@ -51,6 +55,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the control plane (registry + Control/Admin gRPC on one port).
+    #[cfg(feature = "server")]
     Serve(ServeArgs),
     /// Pond nodes: run one (`add`) or inspect registered ones (`list`/`describe`).
     #[command(subcommand)]
@@ -70,6 +75,7 @@ enum Command {
     Stats(StatsArgs),
     /// Pre-install DuckDB extensions into the local cache (image-bake step, run at
     /// container build so nodes start offline). Not a day-to-day command.
+    #[cfg(feature = "server")]
     #[command(hide = true)]
     WarmExtensions,
 }
@@ -165,6 +171,7 @@ enum CatalogCmd {
     Remove { name: String },
 }
 
+#[cfg(feature = "server")]
 #[derive(Args)]
 struct ServeArgs {
     /// Port for the Control + Admin gRPC surfaces.
@@ -186,6 +193,7 @@ struct ServeArgs {
 #[command(after_help = SERVER_HELP)]
 enum NodeCmd {
     /// Start a pond node and register it with the control plane.
+    #[cfg(feature = "server")]
     Add(NodeAddArgs),
     /// List registered pond nodes.
     List,
@@ -193,6 +201,7 @@ enum NodeCmd {
     Describe { node_id: String },
 }
 
+#[cfg(feature = "server")]
 #[derive(Args)]
 #[command(after_help = SERVER_HELP)]
 struct NodeAddArgs {
@@ -293,7 +302,9 @@ struct QueryArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "server")]
         Command::Serve(a) => run_serve(a).await,
+        #[cfg(feature = "server")]
         Command::Node(NodeCmd::Add(a)) => run_node_add(a).await,
         Command::Node(NodeCmd::List) => node_list().await,
         Command::Node(NodeCmd::Describe { node_id }) => node_describe(node_id).await,
@@ -302,6 +313,7 @@ async fn main() -> Result<()> {
         Command::Dataset(cmd) => run_dataset_cmd(cmd).await,
         Command::Catalog(cmd) => run_catalog_cmd(cmd).await,
         Command::Stats(a) => run_stats(a).await,
+        #[cfg(feature = "server")]
         Command::WarmExtensions => {
             latiq_pond_node::warm_extensions().map_err(|e| anyhow!("warm extensions: {e}"))?;
             println!("DuckDB extensions warmed into the local cache.");
@@ -626,6 +638,7 @@ fn print_kv_table<const N: usize>(
 /// Default data root when `--root` is not given: ~/.latiq. The registry lives at
 /// `<root>/registry.duckdb` and pond storage under `<root>/ponds`. Pass `--root`
 /// to override.
+#[cfg(feature = "server")]
 fn default_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -644,6 +657,7 @@ fn control_addr() -> String {
 /// forwarding. `--advertise-addr` takes a host or host:port (a bare host gets the
 /// data `port` appended); `http://` is added if absent. Without the flag we keep
 /// the historical loopback default so single-host runs are unchanged.
+#[cfg(feature = "server")]
 fn advertise_endpoint(advertise_addr: Option<&str>, port: u16) -> String {
     let raw = match advertise_addr {
         Some(a) if a.contains(':') => a.to_string(),
@@ -663,6 +677,7 @@ fn advertise_endpoint(advertise_addr: Option<&str>, port: u16) -> String {
 /// node add). Honors `$RUST_LOG` (e.g. `RUST_LOG=latiq_agent_core=debug`),
 /// defaulting to `info`. Idempotent and only for servers — CLI client commands
 /// stay quiet. dev.sh redirects each node's output to `<root>/logs/node-N.log`.
+#[cfg(feature = "server")]
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -683,6 +698,7 @@ fn init_tracing() {
 /// Resolve the metrics address (`--metrics-port`, default main port + 1000) and
 /// start the Prometheus recorder + `/metrics` server. Returns the address logged
 /// in the banner.
+#[cfg(feature = "server")]
 fn start_metrics(bind: &str, main_port: u16, metrics_port: Option<u16>) -> Result<SocketAddr> {
     let addr: SocketAddr = format!(
         "{bind}:{}",
@@ -699,6 +715,7 @@ fn start_metrics(bind: &str, main_port: u16, metrics_port: Option<u16>) -> Resul
     Ok(addr)
 }
 
+#[cfg(feature = "server")]
 async fn run_serve(a: ServeArgs) -> Result<()> {
     init_tracing();
     let root = a.root.unwrap_or_else(default_root);
@@ -718,6 +735,7 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "server")]
 async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     init_tracing();
     let root = a.root.unwrap_or_else(default_root);
@@ -1309,6 +1327,7 @@ mod tests {
         assert!(parse_kv(&["noequals".to_string()], "--set").is_err());
     }
 
+    #[cfg(feature = "server")]
     #[test]
     fn advertise_endpoint_defaults_and_overrides() {
         // No flag → historical loopback default (single-host behavior unchanged).
