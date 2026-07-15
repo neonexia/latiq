@@ -48,8 +48,15 @@ Reads stream back as Arrow (uncapped); writes are attributed and snapshotted. Se
 
 The whole system is one binary; the role is the command (`serve`, `node add`, or
 the CLI). Deploy with the cluster compose
-([`deploy/cluster`](deploy/cluster/README.md)) or k8s; administer with the `latiq`
-CLI against the control plane (`LATIQ_SERVER=http://localhost:51400`).
+([`deploy/cluster`](deploy/cluster/README.md)) or k8s. Install the admin CLI
+natively (a small client-only build — no server/DuckDB) and point it at the
+control plane:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/neonexia/latiq-deploy/main/install.sh | sh
+export LATIQ_SERVER=http://your-control-plane:51400
+latiq stats          # nodes, ponds, tiers   ·   latiq pond list · latiq dataset list
+```
 
 ## How it fits together
 
