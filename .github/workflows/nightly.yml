@@ -7,6 +7,11 @@ on:
   schedule:
     - cron: "0 7 * * *"   # 07:00 UTC nightly
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Publish even if nothing changed since the last publish (bypasses the change-gate). Still requires all tests to pass."
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -199,7 +204,9 @@ jobs:
             echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           last=$(git tag -l 'nightly-*' --sort=-creatordate | head -1)
-          if [ -n "$last" ] && [ "$(git rev-list "$last"..HEAD --count)" = "0" ]; then
+          if [ "${{ inputs.force_publish }}" = "true" ]; then
+            echo "force_publish requested — publishing regardless of changes"
+          elif [ -n "$last" ] && [ "$(git rev-list "$last"..HEAD --count)" = "0" ]; then
             echo "no commits since $last — nothing to publish"
             echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
