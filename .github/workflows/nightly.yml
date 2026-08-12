@@ -254,9 +254,15 @@ jobs:
           args: --release -m sdk/python/Cargo.toml -o dist
           before-script-linux: |
             # The container's distro protoc is too old (proto2-only) — install a
-            # modern protoc binary so latiq-proto's proto3 compiles.
-            curl -sSLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
+            # modern protoc binary so latiq-proto's proto3 compiles. `-f` makes curl
+            # fail (non-zero) on an HTTP error instead of writing an error page to the
+            # file (which then fails unzip with "end-of-central-directory not found");
+            # retries ride out transient GitHub blips. Verify the zip before using it.
+            set -e
             command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
+            curl -fsSL --retry 5 --retry-all-errors -o /tmp/protoc.zip \
+              https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
+            unzip -t /tmp/protoc.zip >/dev/null
             unzip -o /tmp/protoc.zip -d /usr/local
             protoc --version
       - name: Publish the wheel to PyPI
