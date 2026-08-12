@@ -260,7 +260,8 @@ jobs:
             # retries ride out transient GitHub blips. Verify the zip before using it.
             set -e
             command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
-            curl -fsSL --retry 5 --retry-all-errors -o /tmp/protoc.zip \
+            # (--retry-all-errors is unavailable on the container's older curl.)
+            curl -fsSL --retry 5 -o /tmp/protoc.zip \
               https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
             unzip -t /tmp/protoc.zip >/dev/null
             unzip -o /tmp/protoc.zip -d /usr/local
