@@ -128,10 +128,70 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
-/// Whether a statement is a no-op for the write path (a read routed to
-/// write_query): run it without creating a snapshot/attribution.
-fn is_read_for_write(sql: &str) -> bool {
-    is_read_only(sql)
+/// The pond's current max snapshot id, or `None` if the catalog has none. Used to
+/// detect — authoritatively, from DuckLake — whether a statement actually created
+/// a snapshot (i.e. changed data), instead of guessing read-vs-write from the SQL
+/// text. `set_commit_message` on a transaction that changes nothing produces no
+/// snapshot (verified), so a read run through the write path is a harmless no-op.
+fn max_snapshot(inst: &PondInstance, cat_quoted: &str) -> Option<i64> {
+    inst.conn
+        .query_row(
+            &format!("SELECT max(snapshot_id) FROM {cat_quoted}.snapshots()"),
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// Execute a statement and materialize its result rows aligned to column names.
+/// Works for any statement — a SELECT yields its rows; a write/DDL executes and
+/// yields DuckDB's summary row (which write callers drop). Multi-statement input
+/// executes every statement and returns the last one's result.
+fn materialize(
+    inst: &PondInstance,
+    sql: &str,
+) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>), EngineError> {
+    let mut stmt = inst
+        .conn
+        .prepare(sql)
+        .map_err(|e| EngineError::Parse(e.to_string()))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| EngineError::Engine(e.to_string()))?;
+    let mut out: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
+    let mut have_columns = false;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| EngineError::Engine(e.to_string()))?
+    {
+        let stmt_ref = row.as_ref();
+        if !have_columns {
+            columns = stmt_ref
+                .column_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            have_columns = true;
+        }
+        let mut cells = Vec::with_capacity(columns.len());
+        for i in 0..columns.len() {
+            cells.push(cell_to_json(
+                row.get_ref(i)
+                    .map_err(|e| EngineError::Engine(e.to_string()))?,
+            ));
+        }
+        out.push(cells);
+    }
+    if !have_columns {
+        // Zero rows: column names are available from the executed statement.
+        columns = rows
+            .as_ref()
+            .map(|s| s.column_names().iter().map(|c| c.to_string()).collect())
+            .unwrap_or_default();
+    }
+    Ok((columns, out))
 }
 
 /// Stream a read-only query's results as Arrow batches into `sink` (schema first,
@@ -171,84 +231,52 @@ pub fn run_read_arrow(
 }
 
 /// Run a read-only query, materializing rows aligned to column names.
+///
+/// The `is_read_only` guard here is the read surface's "won't mutate" contract.
+/// It is a text heuristic (interim) — the authoritative, engine-enforced version
+/// (a read-only transaction) is deferred to the authorization work, since that is
+/// where read-only *enforcement* as a permission belongs. Its remaining failure
+/// mode is benign: at worst it rejects an unusual read, never lets a write slip
+/// through unattributed.
 pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineError> {
     if !is_read_only(sql) {
         return Err(EngineError::ReadOnlyViolation);
     }
     let t0 = Instant::now();
-    let mut stmt = inst
-        .conn
-        .prepare(sql)
-        .map_err(|e| EngineError::Parse(e.to_string()))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| EngineError::Engine(e.to_string()))?;
-
-    let mut out: Vec<Vec<serde_json::Value>> = Vec::new();
-    let mut columns: Vec<String> = Vec::new();
-    let mut have_columns = false;
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| EngineError::Engine(e.to_string()))?
-    {
-        let stmt_ref = row.as_ref();
-        if !have_columns {
-            columns = stmt_ref
-                .column_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            have_columns = true;
-        }
-        let mut cells = Vec::with_capacity(columns.len());
-        for i in 0..columns.len() {
-            cells.push(cell_to_json(
-                row.get_ref(i)
-                    .map_err(|e| EngineError::Engine(e.to_string()))?,
-            ));
-        }
-        out.push(cells);
-    }
-    if !have_columns {
-        // Zero rows: column names are available from the executed statement.
-        columns = rows
-            .as_ref()
-            .map(|s| s.column_names().iter().map(|c| c.to_string()).collect())
-            .unwrap_or_default();
-    }
+    let (columns, rows) = materialize(inst, sql)?;
     let meta = QueryMeta {
-        rows: out.len() as u64,
+        rows: rows.len() as u64,
         duration_ms: t0.elapsed().as_millis() as u64,
         ..Default::default()
     };
     Ok(QueryResult {
         columns,
-        rows: out,
+        rows,
         meta,
     })
 }
 
-/// Run a write/DDL statement and stamp native DuckLake attribution.
+/// Run a statement in a transaction with native DuckLake attribution.
 ///
-/// The user's SQL is executed as its OWN statement (not concatenated into a
-/// single `BEGIN; … ; COMMIT;` string), so a trailing comment or embedded `;`
-/// in user SQL cannot comment out / shift our COMMIT or attribution call. Our
-/// `set_commit_message` is issued LAST so a user-supplied one can't override it,
-/// and any failure rolls the transaction back (the per-pond connection is
-/// reused, so a dangling open transaction would wedge the pond).
+/// We do NOT pre-classify the SQL as read-vs-write. Every statement runs inside
+/// `BEGIN … COMMIT` with `set_commit_message` issued LAST (so a user-supplied one
+/// can't override it, and a trailing comment or embedded `;` can't shift our
+/// COMMIT/attribution). DuckLake creates a snapshot only when data actually
+/// changed, so a read run through this path is a harmless no-op — no snapshot, no
+/// attribution — and simply returns its rows. Whether a write happened is decided
+/// **authoritatively** by whether the pond's snapshot id advanced, never by
+/// scanning the SQL text. Any failure rolls the transaction back (the per-pond
+/// connection is reused, so a dangling open transaction would wedge the pond).
 pub fn run_write(
     inst: &PondInstance,
     sql: &str,
     identity: &Identity,
     catalog: &str,
 ) -> Result<QueryResult, EngineError> {
-    // A read routed to write_query: run it without creating a snapshot or
-    // attribution (no history pollution), returning its rows gracefully.
-    if is_read_for_write(sql) {
-        return run_read(inst, sql);
-    }
-
     let t0 = Instant::now();
+    // Attribution is a DuckLake method on THIS pond's catalog (named after the
+    // pond), so qualify + quote the catalog name.
+    let cat = crate::instance::quote_ident(catalog);
     let exec = |s: &str| {
         inst.conn
             .execute_batch(s)
@@ -258,14 +286,16 @@ pub fn run_write(
         let _ = inst.conn.execute_batch("ROLLBACK");
     };
 
+    let before = max_snapshot(inst, &cat);
     exec("BEGIN")?;
-    if let Err(e) = exec(sql) {
-        rollback();
-        return Err(e);
-    }
-    // Attribution is a DuckLake method on THIS pond's catalog (named after the
-    // pond), so qualify + quote the catalog name.
-    let cat = crate::instance::quote_ident(catalog);
+    // Execute + materialize the user's statement (executes writes and DDL too).
+    let (columns, rows) = match materialize(inst, sql) {
+        Ok(v) => v,
+        Err(e) => {
+            rollback();
+            return Err(e);
+        }
+    };
     let agent = identity.agent_id.replace('\'', "''");
     let extra = format!("{{\"verified\":{}}}", identity.verified);
     let call =
@@ -278,25 +308,34 @@ pub fn run_write(
         rollback();
         return Err(e);
     }
+    let after = max_snapshot(inst, &cat);
+    let snapshot_id = if after > before { after } else { None };
 
-    let snapshot_id: Option<i64> = inst
-        .conn
-        .query_row(
-            &format!("SELECT max(snapshot_id) FROM {cat}.snapshots()"),
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    let meta = QueryMeta {
-        snapshot_id,
-        duration_ms: t0.elapsed().as_millis() as u64,
-        ..Default::default()
-    };
-    Ok(QueryResult {
-        columns: vec![],
-        rows: vec![],
-        meta,
-    })
+    if snapshot_id.is_some() {
+        // A snapshot advanced → this was a write. Return the write shape (no rows +
+        // the new snapshot id); DuckDB's summary row is not meaningful to callers.
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            meta: QueryMeta {
+                snapshot_id,
+                duration_ms: t0.elapsed().as_millis() as u64,
+                ..Default::default()
+            },
+        })
+    } else {
+        // Nothing changed → this was a read routed here. Return its rows.
+        let n = rows.len() as u64;
+        Ok(QueryResult {
+            columns,
+            rows,
+            meta: QueryMeta {
+                rows: n,
+                duration_ms: t0.elapsed().as_millis() as u64,
+                ..Default::default()
+            },
+        })
+    }
 }
 
 /// Wrap DuckDB `EXPLAIN`, returning the raw plan text. Richer estimate parsing
@@ -474,6 +513,78 @@ mod tests {
             snapshot_count(&inst),
             before,
             "a FROM-first read must not add a snapshot"
+        );
+    }
+
+    #[test]
+    fn commented_read_through_write_path_returns_rows_and_no_snapshot() {
+        // The exact #53 failure: a leading comment made the old keyword heuristic
+        // treat this SELECT as a write → empty rows + a spurious snapshot. With
+        // authoritative (snapshot-advance) detection it returns rows and adds no
+        // snapshot — no text classification involved.
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (10)", &id, "pond").unwrap();
+        let before = snapshot_count(&inst);
+        let res = run_write(&inst, "-- fetch it\nSELECT id FROM t", &id, "pond").unwrap();
+        assert_eq!(res.rows.len(), 1, "commented SELECT must return its rows");
+        assert_eq!(res.rows[0][0], serde_json::json!(10));
+        assert_eq!(
+            snapshot_count(&inst),
+            before,
+            "a commented read must not add a snapshot"
+        );
+    }
+
+    #[test]
+    fn string_literal_write_word_read_through_write_path_is_a_read() {
+        // The other #53 case: a write keyword inside a string literal. Authoritative
+        // detection doesn't care about the text — nothing changed, so no snapshot.
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        run_write(&inst, "CREATE TABLE t(note VARCHAR)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (' update me ')", &id, "pond").unwrap();
+        let before = snapshot_count(&inst);
+        let res = run_write(
+            &inst,
+            "SELECT note FROM t WHERE note = ' update me '",
+            &id,
+            "pond",
+        )
+        .unwrap();
+        assert_eq!(
+            res.rows.len(),
+            1,
+            "SELECT with 'update' in a literal is a read"
+        );
+        assert_eq!(snapshot_count(&inst), before, "must not add a snapshot");
+    }
+
+    #[test]
+    fn multi_statement_write_persists_and_adds_one_snapshot() {
+        // A multi-statement write is one transaction → one snapshot, and every
+        // statement executes (was supported by the old execute_batch path).
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        let before = snapshot_count(&inst);
+        run_write(
+            &inst,
+            "CREATE TABLE m(x INTEGER); INSERT INTO m VALUES (1),(2),(3)",
+            &id,
+            "pond",
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_count(&inst) - before,
+            1,
+            "one transaction must add exactly one snapshot"
+        );
+        let n = run_read(&inst, "SELECT count(*) AS c FROM m").unwrap();
+        assert_eq!(
+            n.rows[0][0],
+            serde_json::json!(3),
+            "all statements must run"
         );
     }
 
