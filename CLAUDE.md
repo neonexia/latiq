@@ -1,17 +1,14 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. It holds the **technical + design invariants** for writing code.
+
+**Product spec + positioning lives in [`docs/product.md`](docs/product.md)** — what Latiq is, who it's for, why, and what's shipped/next. **Consult it when in doubt about product intent or scope; don't reload it every call.** In one line: agents allocate ephemeral **ponds** (DuckLake workspaces — https://ducklake.select/docs/stable/ — on DuckDB, the M1 engine), read/write SQL, collaborate, and release them.
 
 **Read first, in order:**
-- `docs/product.md` - Product Spec for latiq
 - `docs/dev.md` — how to build, run, and manually test the current system (`./dev.sh` + CLI).
 - Per-crate `crates/*/CLAUDE.md` — local invariants for that crate.
 - Per-area `e2e/CLAUDE.md`, `deploy/CLAUDE.md` — the nightly e2e suite and deployment/packaging (+ `docs/releasing.md` for publishing).
 - `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs.
-
-## What Latiq is
-
-An agent-native data system. Agents allocate ephemeral **ponds** (DuckLake workspaces- https://ducklake.select/docs/stable/), write/read SQL, collaborate, and release them. Operators administer the deployment; humans/programs (CLI, SDK) drive it programmatically. DuckLake is the storage spec; DuckDB is the M1 engine.
 
 ## Surfaces & audiences (the spine of the design)
 
@@ -23,9 +20,7 @@ An agent-native data system. Agents allocate ephemeral **ponds** (DuckLake works
 | **Data/Query gRPC** | **CLI + SDK** (not agents) | pond node | allocate / drop / read / write / explain |
 | **Admin gRPC** | **Operators** | control plane | node / policy + pond list/describe (metadata reads) |
 
-Plus one internal surface: **Control gRPC** (pond-node → control-plane; routing/registry writes).
-
-**Access auditing** is NOT a registry capability: each access is a structured trace on the pond node's `latiq::access` log target (redacted SQL shape; `LATIQ_LOG_FORMAT=json` for structured fields). Operators grep the node log files — there is no audit table and no Admin audit RPC.
+Plus one internal surface: **Control gRPC** (pond-node → control-plane; routing/registry writes). **Access auditing** is a structured `latiq::access` log trace — no audit table, no audit RPC (details in product.md).
 
 ## Design invariants (DO NOT DRIFT)
 
@@ -84,6 +79,6 @@ Tests are categorized by **layer** and **surface/feature** so a given change run
 - `cargo build` / `cargo test --workspace` (excludes `spike/`); first build compiles DuckDB from source (slow once).
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all` — keep green (run manually before pushing). CI is **nightly only** (`.github/workflows/nightly.yml`), not per-PR, to bound GitHub usage (#28): fmt+clippy+test, the iceberg/MinIO catalog e2e, a dockerized cluster scale-out, the **`e2e/` end-to-end suite** (SDK + MCP agent harness + perf, against a gatewayed multi-node cluster), and a **test-gated + change-gated versioned publish** (PyPI wheel + GHCR image — `deploy/CLAUDE.md`, `docs/releasing.md`). `deploy/cluster/` holds the Dockerfile + the cluster compose (pond nodes behind an **nginx gateway** = the single MCP + Data/Stream front door) that CI and external users run.
 
-## Scope / deferrals (later slices)
+## Scope / deferrals
 
-External-source **credentials** + federation, OIDC verification, rate limiting, OpenTelemetry, multi-node + proxy hops, Arrow **Flight SQL streaming** for large result sets (M1 Data gRPC is unary + bounded by the inline cap), Kubernetes, DataFusion engine. Don't build these without an explicit decision. (External catalogs themselves **shipped** — pull-only/transient, no stored creds; datasets + catalogs are in `docs/dataset.md`.)
+The deferral list (identity/auth, rate limiting, OTLP, k8s, Flight SQL streaming, DataFusion, …) lives in product.md *What's next*. **Don't build any of it without an explicit decision.** Coding notes: M1 Data gRPC is unary, bounded by the inline cap (Flight SQL streaming deferred); external catalogs **shipped** (pull-only/transient, no stored creds — see `docs/dataset.md`).
