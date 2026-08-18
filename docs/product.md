@@ -8,147 +8,159 @@
 
 Latiq is a data system built for AI agents, not for people. Traditional data systems are administered by humans for humans: provisioned by an admin, populated by a data team, queried by an analyst, governed by a committee. Their lifecycle is measured in fiscal years. Their setup takes weeks.
 
-Agents work differently. A reasoning agent — or a team of agents collaborating on a task — needs a workspace they can create on intent, fill with the data they need, query at the speed of thought, share with peers, and dispose of when the work is done. They don't need a database, a data warehouse, or a data lake. They need a *pond*: small enough to spin up in seconds, smart enough to plug into existing enterprise data, capable enough to handle real analytical work.
+Agents work differently. A workflow kicks off, spawns a graph of agents — sometimes hundreds, in parallel stages — and those agents need a shared workspace they can create on intent, fill with the data they need, query at the speed of thought, read each other's work in, and dispose of when the work is done. They don't need a database, a data warehouse, or a data lake. They need a *pond*: small enough to spin up in seconds, smart enough to pull in existing enterprise data, capable enough to handle real analytical work.
 
-Latiq is that. An operator installs Latiq once. From that point on, agents allocate their own ponds, write data, query data, collaborate with other agents, plug into enterprise databases the operator has registered, and release ponds when finished. The operator sets the boundaries. The agents do the work.
+Latiq is that. An operator installs Latiq once, into the cluster where the agents already run. From that point on, agents allocate ponds, write data, query data, collaborate with the other agents in their workflow, pull from enterprise sources the operator has registered, and release ponds when finished. The operator sets the boundaries. The agents do the work.
+
+---
+
+## Where Latiq runs — and why that's the point
+
+The dominant assumption in data infrastructure is that analytics happens *somewhere else*. You produce data here; you ship it to a warehouse there; you ask questions of the warehouse and wait. That arrangement was built for humans, who ask questions occasionally and can tolerate a wait.
+
+Agents can't. An agent in a loop asks constantly, about data it produced seconds ago, and has to act on the answer before its next tool call. Round-tripping that to an external warehouse doesn't make it slow — it makes it impossible, which is why agents today do retrieval and hope rather than analysis. And every such round trip copies working data out of the boundary the agent was granted, into a third-party processor, where it has to be governed all over again.
+
+**Latiq inverts the arrangement: the analytics runs where the agent runs.** Not as a metaphor — as a deployment fact, in one of two topologies.
+
+**Embedded — in the agent's own process.** `latiq.connect(server="local")` gives a real single-node Latiq in-process. Same memory, same lifetime, no network at all. This is the single-agent case, the notebook, the CI run, and the local harness.
+
+**Cluster-resident — in the agent cluster.** The production shape. Enterprise agents don't run on a laptop terminal; they run as workloads on a cluster. Latiq deploys into that same cluster: same network, same trust boundary, no egress, latency in milliseconds rather than internet round trips. One Latiq deployment serves every workflow and every agent on that cluster.
+
+What makes cluster residency possible is a deliberate architectural choice: **Latiq scales out, it does not distribute processing.** There is no shuffle, no exchange operator, no distributed planner. A pond is owned by exactly one node, and every query for that pond executes on that node. Multiple nodes exist so that many ponds can be served at once and the deployment can grow — not so that one query can be split across machines. The gateway is a single front door; the control plane holds routing and policy and is never in the query data path.
+
+That choice is what keeps a node small enough to live next to the agents rather than in a platform of its own. It's a feature, and the boundary it implies is stated plainly under *Declared limits* below.
+
+The compute story follows from this, and it's narrower than "free analytics": you are not paying to move the data. No extract pipeline, no second copy in a vendor's storage, no egress, no always-on warehouse waiting for a question. And agent harness workloads are CPU-and-memory shaped and mostly idle between model calls — which is exactly the shape of compute an embedded analytical engine wants, on exactly the nodes that already have it.
+
+---
+
+## The shape of the workload
+
+A single agent with a scratch table is the easy case. The case Latiq is designed for is the production one:
+
+- A workflow starts and spawns a **graph of agents** — parallel branches, sequential stages, sometimes hundreds of agents over the life of one run.
+- Those agents **share a working set**. Stage two reads what stage one's forty parallel agents wrote. The pond is the workflow's shared memory, and it outlives every individual agent in the graph.
+- **Multiple workflows run concurrently on the same cluster**, because a cluster you keep busy is a cluster you're using well. Latiq is shared infrastructure for all of them, under one management plane.
+
+Three consequences run through the rest of this spec:
+
+**The pond belongs to the run, not to an agent.** Agents are the ephemeral things. If any agent can drop a pond, a 300-agent graph either leaks ponds forever or tears down a workspace its siblings are still using. Pond ownership, TTL, and release authority belong to the workflow run.
+
+**Scale is measured in working sets, not in agents.** Three hundred agents can share one pond on one node. Node count tracks concurrent ponds and data size, decoupled from fleet size — which is a very different cost curve from per-agent infrastructure.
+
+**Authorization has to be hierarchical.** Nobody is going to pre-register three hundred ephemeral agent identities on an access list. The principal has to be the workflow run, with agents carrying scoped identities beneath it. This is the single most consequential open design question in the system, and it has its own note: [`docs/identity.md`](identity.md).
 
 ---
 
 ## Who it's for
 
-**The agent is the customer.** This isn't marketing language; it's a design constraint. The interfaces are written for AI agents to read and use directly. Tool descriptions teach agents how to use the system well. Errors suggest next actions, not just diagnoses. The system trusts agents with capability and gives them what they need to succeed.
+**The agent is the customer.** This isn't marketing language; it's a design constraint. The interfaces are written for AI agents to read and use directly. Tool descriptions teach agents how to use the system well. Errors suggest next actions, not just diagnoses. `latiq://` guidance resources teach dialect, schema design, and recovery from conflicts. The system trusts agents with capability and gives them what they need to succeed.
 
-**Operators are the supporting audience.** Admins, platform teams, and SREs install Latiq, register the external data sources agents should be allowed to use, configure identity verification, and watch the system run. They never use the agent-facing surface; they have their own command-line tool and observability stack.
+**Operators are the supporting audience.** Platform teams install Latiq into the agent cluster, register the data sources agents may use, set policy, and watch it run. They never touch the agent-facing surface; they have their own CLI and their existing observability stack.
 
-**Two clear separations:**
-- Agents talk to Latiq through one interface (MCP, the emerging standard for AI agent tooling)
-- Operators talk to Latiq through a different interface (a CLI command-line tool)
-- These two surfaces don't overlap. Agents can't perform admin operations; operators don't get caught in agent workflows.
+**Programs are a third audience.** Notebooks, CI, harnesses, and framework glue drive Latiq through a Python SDK over gRPC — the same operations, no MCP involved.
+
+**Three surfaces, three audiences, no overlap:**
+
+| Surface | Audience | Carries |
+|---|---|---|
+| MCP-over-HTTP (gateway) | agents | tools + `latiq://` resources + prompts |
+| Data/Query + Stream gRPC (gateway) | SDK, CLI | allocate / read / write / explain / stream |
+| Admin gRPC (control plane) | operators | nodes / policy / pond + catalog metadata |
+
+Agents can't perform admin operations; operators don't get caught in agent workflows; the SDK is not an agent and never speaks MCP.
 
 ---
 
 ## What it does (the agent experience)
 
-An agent connected to Latiq can do the following, using only SQL and a handful of simple tool calls:
+An agent connected to Latiq can do the following, using only SQL and a handful of tool calls:
 
 **Create a workspace.** "Give me a pond called `incident-2026-001` for analyzing this outage." Done in milliseconds. No tickets, no provisioning queue, no schema-up-front decisions.
 
-**Plug into existing enterprise data.** The operator has pre-registered the company's CRM database, data warehouse, and analytical tables. The agent picks from a curated list ("Production CRM — customers, orders, leads"), attaches what it needs to its pond, and queries that data using normal SQL. No credentials, no connection strings, no extract-transform-load pipelines. The data isn't copied — the agent queries it where it lives.
+**Bring in curated data.** Operators pre-register two kinds of source. A **dataset** is a curated file or set of files (parquet/CSV) that `load_dataset` copies into the pond under its own schema. A **catalog** is an external database or lakehouse — Iceberg today — that the agent `pull`s from: a transient attach, one query, detach, with the result materialized into the pond. Agents pick from a described menu and never see a credential or a connection string.
 
-**Combine data freely.** The agent's own working data, the CRM database, the warehouse, and ad-hoc public files (a Parquet file on a public bucket, a CSV at a URL) all coexist as queryable sources. One SQL query can join across all of them. This is the moment when an agent stops feeling like a chatbot with database access and starts feeling like a colleague with the full toolkit.
+**Then work locally.** This is the important half. Latiq does not proxy live queries to external systems — a catalog is a tap you open, pull through, and close. Everything after that runs on the pond, on the node, next to the agent. Pushdown means the pull downloads only the columns and row groups the query touches, not the whole table.
 
-**Plan before running.** Before issuing an expensive query, the agent can ask Latiq to estimate the cost. "This would scan 2 million rows and take 4 seconds — consider filtering on the date column first." The agent refines, asks again, and only runs when it's happy. This makes agents thrifty rather than greedy.
+**Combine data freely.** The agents' own working data, pulled enterprise subsets, and loaded datasets all coexist as ordinary tables in one pond. One SQL query joins across all of them.
 
-**Collaborate with other agents.** Multiple agents can work in the same pond. Each agent's writes are attributed to its identity. Other agents can see who wrote what and when. Conflicts between concurrent writes are handled automatically. The pond becomes a shared workspace where agents coordinate by reading each other's work, not by interrupting each other.
+**Plan before running.** Before an expensive query, the agent can ask Latiq to explain it — what it will scan, what it will cost — refine, and only run when it's satisfied. This makes agents thrifty rather than greedy, and it works because the estimate is a local call, not a network round trip.
 
-**Discover what's available.** Agents can list existing ponds in the deployment, look at their schemas, and decide whether to join an existing collaboration or start fresh. Agent-friendly descriptions and column comments — encouraged by Latiq's guidance — make this discovery natural.
+**Collaborate with the rest of the graph.** Multiple agents in one pond is the common case, not the edge case. Writes serialize and conflicts auto-retry. Every write is attributed to the identity that made it, riding DuckLake's native commit messages, so history is readable through ordinary SQL against `pond.snapshots()` — no Latiq objects in the pond catalog. Agents coordinate by reading each other's work, not by interrupting each other.
 
-**Release the workspace.** When the work is done, "drop pond" tears it down. Storage reclaimed, audit trail preserved.
+**Discover what's available.** Agents can list ponds, inspect schemas, and decide whether to join an existing collaboration or start fresh. Column and table comments — which the guidance resources push agents to write — make that discovery natural.
+
+**Stream results.** Reads come back as Arrow. Inline tool results are capped so an agent isn't drowned in rows; the SDK path streams uncapped for programs that want the whole set.
+
+**Release the workspace.** When the work is done, drop the pond. Storage reclaimed, access trail preserved.
 
 ---
 
 ## What it does (the operator experience)
 
-An operator running Latiq has a simple, focused job: register the data sources the organization wants agents to use, configure identity verification, set policy limits, and watch the system.
+**Install once, into the agent cluster.** One binary, one role per command (`serve`, `node add`, or the CLI). A compose deployment runs control plane, pond nodes, and an nginx gateway — the single MCP and Data/Stream front door — and the same topology scales from a laptop to a cluster unchanged. The admin CLI installs as a small client-only build with no engine in it.
 
-**Install once.** Latiq ships as a single binary. One command in development; a Docker Compose configuration for multi-machine simulation; future Kubernetes support for production scale.
+**Register the data agents may use.** `latiq dataset add` for curated files; `latiq catalog add` for external sources, with a type and locator params. Credential-shaped params are *dropped* at registration by a per-type allowlist — Latiq stores no credentials, ever. Credentials ride in at pull time, build a temporary secret for that one operation, and are dropped on detach.
 
-**Register catalogs.** A catalog is a named, curated connection to external data — a database, a data warehouse, a set of files in object storage. The operator gives it a name, a description (what's in it, what it's for), and connects it to credentials stored in the organization's existing secrets infrastructure (HashiCorp Vault, etc.). Agents never see credentials or connection strings; they see a curated menu.
+**Size ponds.** Each pond has a resource tier (small / medium / large / x-large) that maps to hard `memory_limit` and `threads` caps on its DuckDB instance. This is what keeps one workflow's scan from starving its neighbors on a busy shared cluster.
 
-**Control who can use what.** Each catalog has an allow-list of agent identities that can attach it. The operator grants and revokes access through the CLI. Restricted catalogs don't appear to agents who can't use them.
+**Watch it run.** Every process serves a Prometheus `/metrics` endpoint: ponds by tier, per-pond query rate, p95 latency, errors by kind, in-flight load, cross-node forwarding, node liveness. Logs are structured `tracing`, JSON on request, with a `trace_id` propagated across the node hop so one request correlates across the cluster. Latiq ships no dashboards and stores no time series — you point your existing Prometheus, Grafana, and log pipeline at it.
 
-**Configure identity verification.** Optional but recommended for production. Latiq integrates with the organization's existing identity provider (Keycloak, Auth0, Okta, Google Workspace, etc.) and verifies agent identities at the boundary. When disabled (for development or trusted networks), Latiq still tracks claimed identities for audit purposes — identity is mandatory for accountability even when verification is optional.
-
-**Set policy limits.** Default lifetime for ponds, query timeouts, rate limits per agent identity. Defaults work; customization is per-deployment.
-
-**Monitor through standard tools.** Latiq emits the full set of operational signals — metrics, traces, structured logs — through OpenTelemetry, the open observability standard. Operators connect their existing Grafana, Datadog, Honeycomb, or whatever they run, and Latiq fits into their existing dashboards and alerting.
-
-**Audit everything.** Every action — every pond creation, every query, every catalog attachment, every admin operation — produces an audit log entry tied to the identity that performed it. Operators can search, export, and analyze the audit log. Sensitive data (literal values in SQL, query results) is never recorded; only the shape of operations.
+**Read the access trail.** Every operation emits a structured event on the `latiq::access` target carrying the identity, whether it was verified, the operation, the pond, the duration, and a redacted SQL shape with literals replaced. There is no audit table and no audit RPC by design — the trail lives in your log stack, where you already search, retain, and alert.
 
 ---
 
 ## What makes it different
 
-Five things that distinguish Latiq from any database, data warehouse, or data lake aimed at humans.
+**Analytics is co-resident with the agents.** Embedded in the process, or deployed in the same cluster — not in a warehouse across the internet. Latency low enough to sit inside an agent's reasoning loop, and no copy of the working set outside the boundary the agents already run in.
 
-**Lifecycle is the agent's, not the operator's.** Agents allocate and release ponds. Operators set the boundaries (rate limits, allowed catalogs, identity policy) and otherwise stay out of the way. The mental model is closer to "a process that an agent spawns" than "an asset that someone administers."
+**Scale-out, not distributed processing.** One owner per pond, one engine instance per pond, queries always local to the owner. Growth comes from more ponds on more nodes under one management plane, not from splitting a query across machines. This is why a node is small enough to live where the agents live.
 
-**Interfaces are written for AI agents.** Tool descriptions are mini-tutorials, not API docs. Errors suggest next actions, with examples and fuzzy-matched alternatives. Warnings teach agents to do better next time without failing the current call. Every query response carries forward signal — how much data was scanned, which tables were touched, whether the query could have been better. The surface treats agents as colleagues, not as untrusted clients.
+**Lifecycle is the workflow's, not the operator's.** Agents allocate and release ponds; operators set boundaries and stay out of the way. The mental model is closer to "memory a workflow allocates" than "an asset someone administers."
 
-**Federation by curation.** The operator builds a curated menu of enterprise data sources; agents pick from it. This is the right boundary for governance — operators decide what data is in scope; agents decide which of those sources to use for a given task. Agents query enterprise data without ever seeing credentials or connection details.
+**Interfaces are written for AI agents.** Tool descriptions are mini-tutorials. Errors are structured — kind, message, suggestion, reference — and suggest next actions with examples and fuzzy-matched alternatives. Every query response carries forward signal: what was scanned, what was touched, whether it could have been better. The surface treats agents as colleagues, not as untrusted clients.
 
-**Multi-agent collaboration is a first-class concern.** Multiple agents in one pond is the common case, not the edge case. Writes are attributed. Conflicts are handled. Other agents' work is discoverable through standard SQL queries against a reserved metadata schema. Agents can pair up, hand off work, divide and conquer — all without coordination overhead Latiq has to specifically handle.
+**Federation by curation, then locality.** Operators publish a curated menu of sources; agents pull the subset they need and work on it locally. Governance sits at the menu, not at every query, and no credential ever reaches an agent.
 
-**Hard separation of concerns.** Two surfaces, two audiences. Agents and operators have completely distinct interfaces, identities, audit trails. An agent cannot escalate to admin operations; an admin cannot accidentally appear as an agent. This separation makes both surfaces simpler and the security story far easier to reason about.
+**Multi-agent collaboration is the base case.** Attribution on every write, automatic conflict handling, discoverable history through native DuckLake snapshots. Built for a graph of agents sharing a workspace, not for one agent with a database.
 
----
-
-## What it doesn't do (in M1)
-
-Setting clear expectations:
-
-- **No streaming ingestion.** Agents load data into ponds via SQL — `INSERT`, `CREATE TABLE AS SELECT` from attached catalogs, or implicit reads of public files. Native streaming connectors (Kafka, change-data-capture) come in M2.
-
-- **No Python SDK.** Agents talk to Latiq through MCP only. Frameworks like LangGraph, CrewAI, AutoGen integrate by using their built-in MCP clients. A Python SDK with high-performance streaming arrives in M2 for code that processes very large result sets.
-
-- **No multi-machine production deployment out of the box.** M1 ships with a single-binary developer mode and a Docker Compose deployment for simulating multi-node topologies on one machine. Production Kubernetes deployment ships in M2.
-
-- **No full federation governance.** M1 supports admin-curated catalogs as the primary federation mechanism. Richer governance — per-pond ACLs, column-level security, masked queries — comes in M2 and M3.
-
-- **No disk quotas.** M1 trusts the operator to provision adequate disk; M2 adds quota enforcement.
-
-- **No management UI.** The CLI is the surface for M1. A web UI is a future product.
-
-These aren't permanent constraints; they're scope discipline. Each one has a clear plan for when it shows up.
+**Hard separation of concerns.** Three surfaces, three audiences, distinct identities and trails. An agent cannot escalate to admin; an admin cannot appear as an agent; the SDK is not an agent. This makes each surface simpler and the security story far easier to reason about.
 
 ---
 
-## The bigger story
+## Declared limits
 
-The world of AI agents is moving from "agents that chat" to "agents that do work." Work means producing artifacts, transforming data, collaborating with other agents, and reaching into the systems the rest of the organization runs.
+Stating these is what makes the rest credible.
 
-Traditional data infrastructure wasn't built for this. Spinning up a database for a 20-minute reasoning task is absurd; setting up a data warehouse pipeline for a one-off analysis is overkill; asking an agent to maintain credentials and connection strings is a security disaster.
+**A pond fits on one node.** No distributed execution means a pond's working set is bounded by its node's memory and disk. This is by design: ponds are task-scoped working sets, and heavy reduction stays pushed down to the source at pull time. A workflow whose working set genuinely exceeds a node is not a Latiq workload.
 
-Latiq fits the shape of agent work. Lightweight when the work is light, durable when the work matters. Curated when governance is needed, exploratory when the source is public. Collaborative when agents pair up, isolated when they don't. Built for the way agents actually operate — not retrofitted from a tool designed for humans.
+**External sources are pulled, not queried live.** Latiq is not a federated query engine and does not want to be. If the answer requires scanning a petabyte in place, scan it in place and pull the result.
 
-**The premise that all of this rests on:** agents are real customers now. Their constraints, ergonomics, and failure modes are different from human users' constraints. Building for them means starting from those differences, not adapting human tools and hoping the seams don't show.
+**Result sets are capped on the agent path.** Inline tool results are bounded so an agent isn't flooded; large results are for the SDK's streaming path, or for `CREATE TABLE AS SELECT` and a follow-up query.
 
-Latiq starts there.
+**Identity is claimed, not verified, today.** The agent asserts who it is and Latiq records it. This is adequate for trusted-cluster deployments and inadequate for real multi-tenancy — see [`docs/identity.md`](identity.md).
 
 ---
 
-## What we're shipping in M1
+## Feature status & roadmap
 
-The first release of Latiq, targeted at 90 days from project start, includes:
-
-- The core pond primitive — allocate, query, collaborate, release
-- Admin-curated catalog system with credential-store integration (Vault)
-- Cross-catalog query (combine pond data with attached enterprise data in one SQL query)
-- Cost estimation (the `explain_query` capability)
-- Multi-agent collaboration with attribution and conflict handling
-- MCP surface with tools, resources, and prompts following current MCP best practices
-- Admin CLI for catalog registration, credential management, audit access, policy
-- Single-binary distribution with developer mode and Docker Compose multi-node simulation
-- OpenTelemetry observability with metrics, traces, and structured logs
-- Optional OIDC identity verification with major identity providers
-- Audit log of every operation
-- Rate limiting per agent identity
-
-The goal for the first six months after launch is open-source momentum — frameworks adopting Latiq, agent communities trying it, the demo getting shared without our pushing it. Revenue and enterprise contracts come later. M1 is for proving the shape is right.
+Where each feature stands — shipped, next, later, with releases and status — lives in **[`docs/roadmap.md`](roadmap.md)**, kept separate from this spec on purpose: positioning is stable, feature status evolves.
 
 ---
 
 ## Why we think this works
 
-Three bets, each testable:
+Four bets, each testable.
 
-**Bet 1: AI agents are a real customer category.** Not just an interface for human users, but distinct entities whose ergonomics, error tolerance, and trust model are different. If this bet is wrong, Latiq is a niche product. If it's right, agent-native infrastructure becomes a category — and Latiq is the data system within it.
+**Bet 1: AI agents are a real customer category.** Not an interface for human users, but distinct entities whose ergonomics, error tolerance, and trust model differ. If this is wrong, Latiq is a niche product. If it's right, agent-native infrastructure becomes a category.
 
-**Bet 2: Lightweight, lifecycle-driven workspaces beat heavyweight, provision-once infrastructure for agent workloads.** A pond an agent creates for a 30-minute task and discards is fundamentally a different product than a data lake an enterprise stands up for a multi-year initiative. If this bet is wrong, agents end up using existing data warehouses badly. If it's right, "pond" becomes a primitive in the way "container" became a primitive after Docker.
+**Bet 2: Lightweight, lifecycle-driven workspaces beat provision-once infrastructure for agent workloads.** A pond a workflow creates and discards is a fundamentally different product from a lake an enterprise stands up for a multi-year initiative. If this is right, "pond" becomes a primitive the way "container" did.
 
-**Bet 3: Federation by curation is the right governance boundary.** Operators decide what enterprise data is in scope; agents decide which curated sources to use for a task. If this bet is wrong, enterprises won't let agents touch real data. If it's right, this is the model that makes agentic data access tractable for compliance teams.
+**Bet 3: Federation by curation is the right governance boundary.** Operators decide what's in scope; agents choose among curated sources and pull what they need. If this is wrong, enterprises won't let agents touch real data.
 
-The 90-day M1 is built to test bet 2 directly and bet 1 indirectly. Bet 3 plays out over months as enterprises start adopting.
+**Bet 4: Co-residency beats remote analytics for agent workloads.** Analytics in the agent's process or the agent's cluster wins on the only three axes that matter here — latency inside the reasoning loop, no working-set copy outside the trust boundary, and no pipeline to build or pay for. If this is wrong, agents keep using remote warehouses badly. If it's right, this is the reason a team picks Latiq over pointing an agent at the warehouse they already have.
+
+Bet 4 is the newest and the one to pressure-test first, because it's the one a skeptical platform team will challenge directly.
 
 ---
 
@@ -157,19 +169,20 @@ The 90-day M1 is built to test bet 2 directly and bet 1 indirectly. Bet 3 plays 
 At six months:
 
 - Open-source momentum on GitHub: stars, contributors, third-party integrations
-- At least one major agent framework with first-class Latiq integration
-- The first incident-response or analytical demo gets shared organically — not pushed by us
-- Working group / RFC process for the agent-facing API with non-Latiq contributors participating
-- Early conversations with enterprise design partners for M2-onwards
+- At least one major agent framework or workflow orchestrator with first-class Latiq integration
+- A workflow-scale demo — a real agent graph sharing a pond — that gets shared without our pushing it
+- An RFC process for the agent-facing API with non-Latiq contributors participating
+- Early design partners running Latiq in the same cluster as their agents
 
 Revenue, paying customers, managed offerings — all later. Six months is for proving the category exists and that Latiq owns the right shape of it.
 
 ---
 
-## Three phrases worth tattooing on the team
+## Four phrases worth tattooing on the team
 
 - **The agent is the customer.**
-- **The lake is an agent primitive, not an admin artifact.**
-- **Make it boring.** (For M1 specifically — predictable, well-documented, rock-solid. The magic comes in M2 and M3.)
+- **The pond is a workflow primitive, not an admin artifact.**
+- **Scale out, don't distribute.**
+- **Make it boring.** Predictable, well-documented, rock-solid.
 
-If a decision is hard, one of these three is in tension with something else. Resolve in favor of the agent.
+If a decision is hard, one of these four is in tension with something else. Resolve in favor of the agent.
