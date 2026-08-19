@@ -23,6 +23,10 @@ use std::path::PathBuf;
 use tonic::transport::Channel;
 use tonic::{Request, Status};
 
+/// Shown in the memory/cores columns for the `none` tier: Latiq applies no caps,
+/// so the engine's defaults apply rather than a number we could print.
+const UNCAPPED: &str = "engine default";
+
 const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 
 /// Shown in `--help` for every client command that talks to the control plane.
@@ -271,7 +275,10 @@ enum PondCmd {
     SetTier {
         /// Pond name or id.
         pond: String,
-        /// x-small | small | medium | large | x-large.
+        /// x-small | small | medium | large | x-large, or `none` to apply no caps
+        /// at all (the engine's own defaults then govern the pond — DuckDB uses
+        /// every core and ~80% of RAM). `none` is operator-only and cannot be
+        /// requested when the pond is created.
         #[arg(short, long)]
         tier: String,
     },
@@ -1165,12 +1172,13 @@ async fn run_stats(a: StatsArgs) -> Result<()> {
     }
     // Tier rows in canonical size order (smallest → largest), only tiers in use,
     // each carrying its resource caps.
-    let tier_rows: Vec<(PondTier, usize, ResourceLimits)> = [
+    let tier_rows: Vec<(PondTier, usize, Option<ResourceLimits>)> = [
         PondTier::XSmall,
         PondTier::Small,
         PondTier::Medium,
         PondTier::Large,
         PondTier::XLarge,
+        PondTier::None,
     ]
     .into_iter()
     .filter_map(|t| counts.get(&t).map(|&n| (t, n, t.limits())))
@@ -1185,8 +1193,10 @@ async fn run_stats(a: StatsArgs) -> Result<()> {
                     "by_tier": tier_rows.iter().map(|(t, n, l)| serde_json::json!({
                         "tier": t.as_str(),
                         "count": n,
-                        "memory_bytes": l.memory_bytes,
-                        "cores": l.cores,
+                        // null for the `none` tier: Latiq applies no caps, so
+                        // the engine's own defaults are in force.
+                        "memory_bytes": l.map(|x| x.memory_bytes),
+                        "cores": l.map(|x| x.cores),
                     })).collect::<Vec<_>>(),
                 },
                 "node_detail": nodes.iter().map(|n| serde_json::json!({
@@ -1236,8 +1246,8 @@ fn print_pond_list_table(ponds: &[PondSummary]) {
             [
                 p.name.clone(),
                 tier.as_str().to_string(),
-                fmt_bytes(l.memory_bytes),
-                l.cores.to_string(),
+                l.map_or_else(|| UNCAPPED.into(), |l| fmt_bytes(l.memory_bytes)),
+                l.map_or_else(|| UNCAPPED.into(), |l| l.cores.to_string()),
                 p.node_id.clone(),
                 p.owner.clone(),
                 p.pond_id.clone(),
@@ -1288,7 +1298,7 @@ fn print_stats_dashboard(
     ponds: &[PondSummary],
     active: usize,
     down: usize,
-    tier_rows: &[(PondTier, usize, ResourceLimits)],
+    tier_rows: &[(PondTier, usize, Option<ResourceLimits>)],
 ) {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
@@ -1318,8 +1328,8 @@ fn print_stats_dashboard(
                 "   {:<10} {:>5}  {:>7}  {:>5}",
                 tier.as_str(),
                 n,
-                fmt_bytes(limits.memory_bytes),
-                limits.cores
+                limits.map_or_else(|| UNCAPPED.into(), |l| fmt_bytes(l.memory_bytes)),
+                limits.map_or_else(|| UNCAPPED.into(), |l| l.cores.to_string())
             );
         }
     }

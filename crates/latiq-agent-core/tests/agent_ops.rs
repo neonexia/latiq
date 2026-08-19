@@ -203,3 +203,35 @@ async fn unknown_pond_is_pond_not_found() {
     let err = ops.read_query(&id, "ghost", "SELECT 1").await.unwrap_err();
     assert_eq!(err.envelope().kind, latiq_common::ErrorKind::PondNotFound);
 }
+
+/// The `none` (uncapped) tier is an operator grant, not something a workload can
+/// assign itself: an uncapped pond can starve every other pond on its node. It is
+/// rejected on the allocate path — which is the agent (MCP) and SDK surface — and
+/// set afterwards over Admin instead.
+#[tokio::test]
+async fn pond_lifecycle_allocate_rejects_the_uncapped_tier() {
+    let ops = ops();
+    let id = Identity::claimed(Some("greedy-agent"));
+
+    let err = ops
+        .allocate_pond(&id, Some("grabby".into()), "{}", "none", &[])
+        .await
+        .expect_err("an agent must not be able to allocate an uncapped pond");
+    let msg = err.envelope().message.to_lowercase();
+    assert!(msg.contains("none"), "unhelpful message: {msg}");
+    assert!(
+        msg.contains("set-tier") || msg.contains("operator"),
+        "the error should point at the operator path: {msg}"
+    );
+
+    // The alias is refused too, so it can't be smuggled in under another name.
+    assert!(ops
+        .allocate_pond(&id, Some("grabby2".into()), "{}", "uncapped", &[])
+        .await
+        .is_err());
+
+    // A normal tier still allocates.
+    ops.allocate_pond(&id, Some("fine".into()), "{}", "large", &[])
+        .await
+        .unwrap();
+}
