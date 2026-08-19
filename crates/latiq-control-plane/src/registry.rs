@@ -197,6 +197,17 @@ impl Registry {
         extensions: &[String],
         description: &str,
     ) -> Result<PondRow, ControlPlaneError> {
+        // The uncapped tier is an operator grant, never self-assigned: an uncapped
+        // pond can starve every other pond on its node. Enforced HERE rather than
+        // at each caller because the registry is the one choke point every create
+        // path funnels through — the agent/SDK path (AgentOps::allocate_pond) and
+        // the CLI's direct Control::CreatePondAssignment alike.
+        if latiq_common::PondTier::parse(tier) == Some(latiq_common::PondTier::None) {
+            return Err(ControlPlaneError::Invalid(
+                "tier 'none' (uncapped) is operator-only: set it after creation with `latiq pond set-tier <pond> --tier none`"
+                    .into(),
+            ));
+        }
         let pond_id = PondId::new().to_string();
         let name = name.unwrap_or_else(|| pond_id.clone());
         let c = self.lock();

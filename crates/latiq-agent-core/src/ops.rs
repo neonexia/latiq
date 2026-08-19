@@ -717,9 +717,11 @@ impl AgentOps {
     }
 }
 
-/// Map a pond's tier name to its resource caps (unknown/empty → medium).
+/// Map a pond's tier name to its resource caps (unknown/empty → medium). `None`
+/// means "apply nothing" — either the `none` tier, or a tier with no caps — and
+/// the engine leaves its own defaults in force.
 fn tier_limits(tier: &str) -> Option<ResourceLimits> {
-    Some(PondTier::parse(tier).unwrap_or_default().limits())
+    PondTier::parse(tier).unwrap_or_default().limits()
 }
 
 /// Build the `CREATE OR REPLACE TABLE … AS SELECT * FROM read_*(uri)` for one
