@@ -265,6 +265,16 @@ enum PondCmd {
         #[arg(long)]
         confirm: bool,
     },
+    /// Change a pond's resource tier after creation (its memory + CPU caps).
+    /// Takes effect on the pond's next query — in-flight queries finish under
+    /// the old caps.
+    SetTier {
+        /// Pond name or id.
+        pond: String,
+        /// x-small | small | medium | large | x-large.
+        #[arg(short, long)]
+        tier: String,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -929,6 +939,23 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 c.describe_pond(Request::new(DescribePondRequest { pond }))
                     .await,
             )
+        }
+        PondCmd::SetTier { pond, tier } => {
+            let mut c = admin_client().await?;
+            let r = c
+                .pond_set_tier(PondSetTierRequest {
+                    pond: pond.clone(),
+                    tier: tier.clone(),
+                })
+                .await
+                .map_err(render_status)?
+                .into_inner();
+            println!(
+                "{}",
+                serde_json::json!({"pond": r.pond, "tier": r.tier,
+                                   "note": "applies on the pond's next query"})
+            );
+            Ok(())
         }
         PondCmd::Drop { pond, confirm } => {
             let node = data_target(&pond).await?;
