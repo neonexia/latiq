@@ -93,6 +93,23 @@ impl Admin for AdminService {
         Ok(Response::new(PondListResponse { ponds }))
     }
 
+    async fn pond_set_tier(
+        &self,
+        req: Request<PondSetTierRequest>,
+    ) -> Result<Response<PondSetTierResponse>, Status> {
+        let r = req.into_inner();
+        if r.pond.trim().is_empty() {
+            return Err(Status::invalid_argument("pond is required"));
+        }
+        self.registry
+            .set_pond_tier(&r.pond, &r.tier)
+            .map_err(to_status)?;
+        Ok(Response::new(PondSetTierResponse {
+            pond: r.pond,
+            tier: r.tier,
+        }))
+    }
+
     async fn dataset_add(
         &self,
         req: Request<DatasetAddRequest>,

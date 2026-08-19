@@ -11,6 +11,10 @@ service Admin {
   // Operators inspect ponds from the control plane (registry) directly, so this
   // works even when pond nodes are down (metadata read, not in the query path).
   rpc PondList(PondListRequest) returns (PondListResponse);
+  // Re-tier a pond after creation (its memory/CPU caps). Registry-only: the
+  // owning node resolves a pond's tier on every operation, so the new caps take
+  // effect on that pond's next use, when its engine instance is re-opened.
+  rpc PondSetTier(PondSetTierRequest) returns (PondSetTierResponse);
   // Operators curate the dataset catalog (add/remove); list/search is here too
   // so operators can browse it from the control plane.
   rpc DatasetAdd(DatasetAddRequest) returns (DatasetAddResponse);
@@ -39,6 +43,10 @@ message CatalogListResponse { repeated CatalogMsg catalogs = 1; }
 message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; string description = 7; }
 message PondListRequest { }
 message PondListResponse { repeated PondSummary ponds = 1; }
+// pond: name or id. tier: x-small|small|medium|large|x-large (rejected if unknown
+// — we do NOT silently fall back to medium, which would resize the wrong way).
+message PondSetTierRequest { string pond = 1; string tier = 2; }
+message PondSetTierResponse { string pond = 1; string tier = 2; }
 
 message NodeInfo {
   string node_id = 1; string mcp_endpoint = 2; string state = 3; uint32 pond_count = 4;

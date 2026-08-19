@@ -7,7 +7,15 @@ unit tests of our code. Lives in `.github/workflows/nightly.yml`'s `e2e-suite` j
 ## Three drivers (one per audience)
 - **`sdk/`** — Python (`latiq` wheel + `pyarrow`/`pandas`). All SDK surfaces, **Arrow→pandas analysis asserted == SQL**, uncapped Arrow streaming past the 10k cap, multi-node placement + greeter forwarding.
 - **`agent/`** — TypeScript, **Vercel AI SDK MCP client** (the same client an `ai` agent uses), driven by a *scripted* sequence (no live LLM → deterministic, no API key). Every MCP tool + read-only guard + structured-error contract; resources + prompt SOPs via the raw MCP SDK client (the AI SDK client doesn't surface those).
-- **`perf/`** — Python SDK; mid-size write/read/pandas throughput + aggregate p50/p95 + cross-node fan, recorded + floored.
+- **`perf/`** — Python SDK. `run_perf.py` is the nightly smoke gate (mid-size write/read/pandas
+  throughput + aggregate p50/p95 + cross-node fan, recorded + floored). `read_bench.py` +
+  `report.py` are a **characterization** benchmark, not a gate: read concurrency on a shared
+  pond vs a pond per reader, a mixed reader+writer case, noisy-neighbour isolation, and a soak
+  (RSS/fd/latency drift), rendered to a self-contained HTML report (`--baseline` gives
+  before/after). Run it **manually** via the `Read benchmark (manual)` workflow, or locally —
+  it needs a quiet machine to mean anything, so it is deliberately out of the nightly. Run it
+  before/after any change to the engine's concurrency model. **Build the wheel `--release`** —
+  a debug wheel measures the compiler, not the engine.
 
 ## Two modes, same assertions
 - **REMOTE** (CI): set `LATIQ_CONTROL` + `LATIQ_GATEWAY` (+ `LATIQ_MCP` for the agent harness) → drives the dockerized cluster through the gateway. Proves multi-node + forwarding + the front door.

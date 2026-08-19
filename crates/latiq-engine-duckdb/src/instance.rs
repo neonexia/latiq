@@ -43,6 +43,10 @@ pub fn warm_optional_extensions() {
 
 pub struct PondInstance {
     pub conn: Connection,
+    /// Quoted catalog alias for this pond. Kept so [`PondInstance::clone_for_read`]
+    /// can re-apply `USE` — that is *session* state and is not inherited by a
+    /// cloned connection (the `ATTACH` itself is database-level and is shared).
+    alias: String,
 }
 
 /// Quote a SQL identifier (the catalog alias), doubling embedded `"` so any pond
@@ -112,7 +116,36 @@ impl PondInstance {
         .map_err(|e| EngineError::Engine(format!("attach: {e}")))?;
         // Make it the default catalog so unqualified table names resolve there.
         conn.execute_batch(&format!("USE {alias};")).ok();
-        Ok(Self { conn })
+        Ok(Self { conn, alias })
+    }
+
+    /// A second connection to the **same already-opened database**, for concurrent
+    /// reads (`Connection::try_clone` = "creates a new connection to the
+    /// already-opened database").
+    ///
+    /// This keeps invariant 7 intact: still **one DuckDB database per pond**, so
+    /// `memory_limit`/`threads` tier caps stay instance-global and one process
+    /// still owns the catalog file — only the *connection* multiplies, which is
+    /// what lets reads run concurrently instead of serializing behind one handle.
+    ///
+    /// Database-level state (the `ATTACH`, loaded extensions) is shared with the
+    /// clone; **session** state is not inherited and must be re-applied here, or
+    /// the clone resolves unqualified names against the wrong catalog and renders
+    /// timestamps in the host timezone.
+    pub fn clone_for_read(&self) -> Result<Self, EngineError> {
+        let conn = self
+            .conn
+            .try_clone()
+            .map_err(|e| EngineError::Engine(format!("clone read connection: {e}")))?;
+        // Same determinism guarantees the primary gets at open().
+        conn.execute_batch("SET TimeZone='UTC'; SET force_download=true;")
+            .map_err(|e| EngineError::Engine(format!("read connection settings: {e}")))?;
+        conn.execute_batch(&format!("USE {};", self.alias))
+            .map_err(|e| EngineError::Engine(format!("read connection USE: {e}")))?;
+        Ok(Self {
+            conn,
+            alias: self.alias.clone(),
+        })
     }
 }
 
