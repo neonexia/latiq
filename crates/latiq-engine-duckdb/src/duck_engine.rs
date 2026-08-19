@@ -46,6 +46,11 @@ pub struct DuckEngine {
 /// under read load) and shared-pond read throughput rises ~2.5x at a 4-thread
 /// tier. Per-pond parallelism is still capped by the tier — as intended.
 struct Pond {
+    /// The tier caps this instance was opened with. A pond can be re-tiered after
+    /// creation, and `memory_limit`/`threads` are applied when the instance is
+    /// opened — so if the resolved limits no longer match, the instance is stale
+    /// and must be re-opened for the new caps to take effect.
+    limits: Option<latiq_common::ResourceLimits>,
     writer: Mutex<PondInstance>,
     /// Clone source for growing the read pool. Never runs queries, so growing the
     /// pool never has to wait behind a long-running write.
@@ -117,6 +122,7 @@ impl Pond {
         // a tiny pond keeps some concurrency and a big one can't hoard handles.
         let cores = loc.limits.as_ref().map(|l| l.cores).unwrap_or(4) as usize;
         Ok(Self {
+            limits: loc.limits,
             writer: Mutex::new(writer),
             source: Mutex::new(source),
             reads: ReadPool {
@@ -172,7 +178,13 @@ impl DuckEngine {
     fn pond(&self, loc: &PondLocation) -> Result<Arc<Pond>, EngineError> {
         let mut map = lock_recover(&self.ponds);
         if let Some(p) = map.get(&loc.catalog_uri) {
-            return Ok(p.clone());
+            if p.limits == loc.limits {
+                return Ok(p.clone());
+            }
+            // Re-tiered: drop the cached instance so the next open applies the new
+            // caps. In-flight queries hold their own Arc and finish under the old
+            // ones (same lifetime rule as forget_pond).
+            map.remove(&loc.catalog_uri);
         }
         let p = Arc::new(Pond::open(loc)?);
         map.insert(loc.catalog_uri.clone(), p.clone());
@@ -725,6 +737,51 @@ mod tests {
         for h in hs {
             assert_eq!(h.join().unwrap().unwrap(), serde_json::json!(50000));
         }
+    }
+
+    #[test]
+    fn retiering_a_pond_reopens_it_with_the_new_caps() {
+        // A pond can be re-tiered after creation. Limits are applied when the
+        // instance opens, so a cached instance must be re-opened when the
+        // resolved limits change — otherwise the new tier silently does nothing.
+        use latiq_common::ResourceLimits;
+        let fs = TempFs::new();
+        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        loc.limits = Some(ResourceLimits {
+            memory_bytes: 1024 * 1024 * 1024,
+            cores: 2,
+        });
+        let eng = DuckEngine::new();
+        let threads = |l: &latiq_storage::PondLocation| -> String {
+            eng.read_query(
+                l,
+                "SELECT current_setting('threads')::VARCHAR AS t",
+                AbortToken::new(),
+            )
+            .unwrap()
+            .rows[0][0]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(threads(&loc), "2");
+        assert_eq!(instance_count(&eng), 1);
+
+        // Re-tier upward: same pond (same catalog uri), new caps.
+        loc.limits = Some(ResourceLimits {
+            memory_bytes: 16 * 1024 * 1024 * 1024,
+            cores: 8,
+        });
+        assert_eq!(threads(&loc), "8", "new tier must reach the engine");
+        assert_eq!(instance_count(&eng), 1, "re-opened in place, not leaked");
+
+        // Unchanged limits must NOT churn the instance — the pool would be lost.
+        let pond_before = eng.pond(&loc).unwrap();
+        let _ = threads(&loc);
+        assert!(
+            Arc::ptr_eq(&pond_before, &eng.pond(&loc).unwrap()),
+            "identical limits must reuse the cached instance"
+        );
     }
 
     #[test]

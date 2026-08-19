@@ -303,6 +303,34 @@ impl Registry {
         .map_err(|_| ControlPlaneError::PondNotFound(pond_ref.to_string()))
     }
 
+    /// Change a pond's resource tier after creation, by name or id.
+    ///
+    /// Registry-only on purpose: the owning node resolves a pond's tier on every
+    /// operation, so the new caps reach the engine on that pond's next use (it
+    /// re-opens the pond's DuckDB instance when the limits differ). In-flight
+    /// queries finish under the old caps.
+    ///
+    /// An unknown tier is rejected rather than parsed with a default — silently
+    /// falling back to `medium` could resize a pond the opposite way the operator
+    /// intended.
+    pub fn set_pond_tier(&self, pond_ref: &str, tier: &str) -> Result<(), ControlPlaneError> {
+        let parsed = latiq_common::PondTier::parse(tier).ok_or_else(|| {
+            ControlPlaneError::Invalid(format!(
+                "unknown tier '{tier}' (expected x-small, small, medium, large, or x-large)"
+            ))
+        })?;
+        let c = self.lock();
+        let n = c.execute(
+            "UPDATE ponds SET tier=? WHERE pond_id=? OR name=?",
+            duckdb::params![parsed.as_str(), pond_ref, pond_ref],
+        )?;
+        if n == 0 {
+            return Err(ControlPlaneError::PondNotFound(pond_ref.to_string()));
+        }
+        let _ = c.execute_batch("CHECKPOINT");
+        Ok(())
+    }
+
     pub fn drop_pond(&self, pond_id: &str) -> Result<(), ControlPlaneError> {
         let c = self.lock();
         let n = c.execute(
@@ -635,6 +663,34 @@ mod tests {
 
     fn reg() -> Registry {
         Registry::open(None).unwrap()
+    }
+
+    #[test]
+    fn set_pond_tier_changes_the_tier_and_validates_it() {
+        let r = Registry::open(None).unwrap();
+        r.register_node("n1", "http://m", "http://i", 10).unwrap();
+        r.create_pond(Some("p".into()), "agent-x", "{}", "medium", &[], "")
+            .unwrap();
+        let tier_of = |r: &Registry| r.pond_info("p").unwrap().0.tier;
+        assert_eq!(tier_of(&r), "medium");
+
+        r.set_pond_tier("p", "large").unwrap();
+        assert_eq!(tier_of(&r), "large", "re-tier by name");
+
+        // An unknown tier is rejected — NOT silently defaulted to medium, which
+        // would resize the pond the opposite way the operator asked for.
+        let err = r.set_pond_tier("p", "enormous").unwrap_err();
+        assert!(matches!(err, ControlPlaneError::Invalid(_)), "got {err:?}");
+        assert_eq!(tier_of(&r), "large", "a rejected tier must not change it");
+
+        // Aliases normalize to the canonical name.
+        r.set_pond_tier("p", "xlarge").unwrap();
+        assert_eq!(tier_of(&r), "x-large");
+
+        assert!(matches!(
+            r.set_pond_tier("nope", "small").unwrap_err(),
+            ControlPlaneError::PondNotFound(_)
+        ));
     }
 
     #[test]
