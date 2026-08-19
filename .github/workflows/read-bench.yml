@@ -1,0 +1,102 @@
+name: Read benchmark (manual)
+
+# Read concurrency + isolation + soak, on demand. NOT part of the nightly: it
+# needs a quiet machine to mean anything, and a GitHub runner is small (a few
+# cores) next to a workstation — so treat the numbers as RELATIVE, and compare
+# runs on the same runner class rather than against local results. The report
+# records the machine profile so any comparison is honest about the box.
+#
+# Run it before/after any change to the engine's concurrency model. To get a
+# before/after, run it once on `main`, download the JSON, then run it on the
+# branch with `baseline_run_id` set to the first run.
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Rows seeded per pond"
+        default: "500000"
+      duration:
+        description: "Seconds per concurrency point"
+        default: "4"
+      soak:
+        description: "Soak seconds"
+        default: "30"
+      baseline_run_id:
+        description: "Optional: a previous run of this workflow to diff against (renders a before/after report)"
+        default: ""
+
+jobs:
+  bench:
+    name: read concurrency + isolation + soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Report the runner (numbers are meaningless without the box)
+        run: |
+          echo "cores: $(nproc)"; echo "mem: $(free -g | awk '/Mem:/{print $2}') GB"
+          lscpu | grep -E "Model name|CPU\(s\):" | head -3
+      # Release build: a debug wheel measures the compiler, not the engine.
+      - name: Build + install the SDK (release)
+        run: |
+          python -m pip install -U pip maturin psutil pyarrow
+          maturin build --release -m sdk/python/Cargo.toml -o dist
+          pip install --force-reinstall --no-deps dist/*.whl
+      - name: Fetch the baseline run, if one was given
+        if: inputs.baseline_run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download "${{ inputs.baseline_run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --name read-bench-results --dir baseline || {
+              echo "::warning::could not download baseline ${{ inputs.baseline_run_id }} — rendering without it"; }
+      - name: Run the benchmark
+        run: |
+          python e2e/perf/read_bench.py \
+            --rows "${{ inputs.rows }}" \
+            --duration "${{ inputs.duration }}" \
+            --soak "${{ inputs.soak }}" \
+            --out e2e/perf/results_after.json
+      - name: Render the HTML report
+        run: |
+          if [ -f baseline/results_after.json ]; then
+            python e2e/perf/report.py e2e/perf/results_after.json \
+              --baseline baseline/results_after.json -o e2e/perf/read_bench_report.html
+          else
+            python e2e/perf/report.py e2e/perf/results_after.json \
+              -o e2e/perf/read_bench_report.html
+          fi
+      - name: Summarize into the run page
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("e2e/perf/results_after.json"))
+          m, s = d["machine"], d["scenarios"]
+          print(f"## Read benchmark\n\n**{m['cpu']}** — {m['logical_cores']} cores, {m['memory_gb']} GB\n")
+          print("| readers | shared pond q/s | shared p95 ms | cores | pond-per-reader q/s | errors |")
+          print("|---|---|---|---|---|---|")
+          for a, b in zip(s["shared_pond"]["points"], s["pond_per_reader"]["points"]):
+              print(f"| {a['concurrency']} | {a['ops_per_s']:.1f} | {a['p95_ms']:.1f} | "
+                    f"{a['resources']['cores_busy_mean']:.2f} | {b['ops_per_s']:.1f} | {a['errors']} |")
+          sk = s["soak"]
+          print(f"\n**Soak** — p95 drift {sk['p95_drift_x']:.2f}x · RSS growth {sk['rss_growth_mb']:.1f} MB · "
+                f"fd growth {sk['fd_growth']}")
+          print(f"\n**Isolation** — p95 degradation under a greedy neighbour: "
+                f"{s['isolation']['p95_degradation_x']:.2f}x")
+          print("\nDownload the **read-bench-report** artifact for the charts.")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: read-bench-report
+          path: e2e/perf/read_bench_report.html
+      # Kept as its own artifact so a later run can use it as --baseline.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: read-bench-results
+          path: e2e/perf/results_after.json
