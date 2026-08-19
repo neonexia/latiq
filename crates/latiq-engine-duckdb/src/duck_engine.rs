@@ -1,10 +1,15 @@
 //! `DuckEngine` — the DuckDB + DuckLake implementation of `QueryEngine`.
 //!
-//! **One DuckDB instance per pond** (spec §5, Decision 3): a single connection
-//! per pond, reused across queries and guarded by a mutex. This is what makes
-//! concurrent multi-agent writes correct — all commits to a pond's DuckLake
-//! catalog go through one DuckDB handle, so DuckLake's transactional model
-//! serializes them (instead of independent instances racing on the catalog file).
+//! **One DuckDB instance (database) per pond** (spec §5, Decision 3), reached
+//! through a *serialized writer* connection plus a *bounded pool of read
+//! connections* to that same database. All commits to a pond's DuckLake catalog
+//! still go through one writer handle, so DuckLake's transactional model
+//! serializes them (instead of independent instances racing on the catalog file),
+//! while reads run concurrently rather than queueing behind the writer.
+//!
+//! The invariant that matters is unchanged: one *database* per pond, so the tier's
+//! `memory_limit`/`threads` caps stay instance-global and one process owns the
+//! catalog file. Only the connection count varies — never the instance count.
 //!
 //! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
 //! watcher thread interrupts the running statement when the `AbortToken` is
@@ -19,14 +24,85 @@ use latiq_engine::{
 use latiq_storage::PondLocation;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 #[derive(Default)]
 pub struct DuckEngine {
-    /// Per-pond DuckDB instances, keyed by catalog URI. Each is mutex-guarded so
-    /// queries on a pond serialize through its single connection.
-    instances: Mutex<HashMap<String, Arc<Mutex<PondInstance>>>>,
+    /// Per-pond engine resources, keyed by catalog URI.
+    ponds: Mutex<HashMap<String, Arc<Pond>>>,
+}
+
+/// One pond's engine resources. Still **one DuckDB database per pond**
+/// (invariant 7) — tier `memory_limit`/`threads` caps stay instance-global and
+/// one process owns the catalog file — but reached through two handles:
+///
+/// * `writer` — writes/DDL and session-scoped work, serialized. One writer per
+///   pond is what keeps this pond's DuckLake commits ordered.
+/// * `reads` — a bounded pool of additional connections to that same database,
+///   so concurrent reads run concurrently instead of queueing behind one handle.
+///
+/// Measured: reads no longer block the writer (it keeps ~98% of its solo rate
+/// under read load) and shared-pond read throughput rises ~2.5x at a 4-thread
+/// tier. Per-pond parallelism is still capped by the tier — as intended.
+struct Pond {
+    /// The tier caps this instance was opened with. A pond can be re-tiered after
+    /// creation, and `memory_limit`/`threads` are applied when the instance is
+    /// opened — so if the resolved limits no longer match, the instance is stale
+    /// and must be re-opened for the new caps to take effect.
+    limits: Option<latiq_common::ResourceLimits>,
+    writer: Mutex<PondInstance>,
+    /// Clone source for growing the read pool. Never runs queries, so growing the
+    /// pool never has to wait behind a long-running write.
+    source: Mutex<PondInstance>,
+    reads: ReadPool,
+}
+
+/// A bounded, lazily-grown pool of read connections to one pond's database.
+/// Bounded because unbounded growth would mean one DuckDB connection per
+/// in-flight agent request; when every connection is busy a reader waits, which
+/// is backpressure at the pond's tier, not an error.
+struct ReadPool {
+    state: Mutex<PoolState>,
+    returned: Condvar,
+    max: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    idle: Vec<PondInstance>,
+    created: usize,
+}
+
+/// A checked-out read connection, returned to the pool on drop.
+struct ReadGuard<'a> {
+    pool: &'a ReadPool,
+    inst: Option<PondInstance>,
+    reusable: bool,
+}
+
+impl std::ops::Deref for ReadGuard<'_> {
+    type Target = PondInstance;
+    fn deref(&self) -> &PondInstance {
+        self.inst.as_ref().expect("checked out")
+    }
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(inst) = self.inst.take() {
+            let mut st = lock_recover(&self.pool.state);
+            if self.reusable {
+                st.idle.push(inst);
+            } else {
+                // Errored/cancelled: discard rather than hand a connection with a
+                // stale interrupt or open transaction to the next reader.
+                st.created -= 1;
+            }
+            drop(st);
+            self.pool.returned.notify_one();
+        }
+    }
 }
 
 /// Lock a mutex, recovering the guard if a prior holder panicked. A poisoned
@@ -37,20 +113,96 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+impl Pond {
+    fn open(loc: &PondLocation) -> Result<Self, EngineError> {
+        let writer = PondInstance::open(loc)?;
+        let source = writer.clone_for_read()?;
+        // Read concurrency allowed per pond. Scaled off the tier's core budget —
+        // measurably still worth ~2x the serial rate at 2x cores — and clamped so
+        // a tiny pond keeps some concurrency and a big one can't hoard handles.
+        let cores = loc.limits.as_ref().map(|l| l.cores).unwrap_or(4) as usize;
+        Ok(Self {
+            limits: loc.limits,
+            writer: Mutex::new(writer),
+            source: Mutex::new(source),
+            reads: ReadPool {
+                state: Mutex::new(PoolState::default()),
+                returned: Condvar::new(),
+                max: (cores * 2).clamp(4, 16),
+            },
+        })
+    }
+
+    /// Check out a read connection, growing the pool up to `max`, else waiting
+    /// for one to come back.
+    fn checkout_read(&self) -> Result<ReadGuard<'_>, EngineError> {
+        let mut st = lock_recover(&self.reads.state);
+        loop {
+            if let Some(inst) = st.idle.pop() {
+                return Ok(ReadGuard {
+                    pool: &self.reads,
+                    inst: Some(inst),
+                    reusable: true,
+                });
+            }
+            if st.created < self.reads.max {
+                st.created += 1;
+                drop(st); // clone outside the pool lock
+                return match lock_recover(&self.source).clone_for_read() {
+                    Ok(inst) => Ok(ReadGuard {
+                        pool: &self.reads,
+                        inst: Some(inst),
+                        reusable: true,
+                    }),
+                    Err(e) => {
+                        lock_recover(&self.reads.state).created -= 1;
+                        Err(e)
+                    }
+                };
+            }
+            st = self
+                .reads
+                .returned
+                .wait(st)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 impl DuckEngine {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Get the pond's instance, opening (and caching) it on first use.
-    fn instance(&self, loc: &PondLocation) -> Result<Arc<Mutex<PondInstance>>, EngineError> {
-        let mut map = lock_recover(&self.instances);
-        if let Some(inst) = map.get(&loc.catalog_uri) {
-            return Ok(inst.clone());
+    /// Get the pond's resources, opening (and caching) them on first use.
+    fn pond(&self, loc: &PondLocation) -> Result<Arc<Pond>, EngineError> {
+        let mut map = lock_recover(&self.ponds);
+        if let Some(p) = map.get(&loc.catalog_uri) {
+            if p.limits == loc.limits {
+                return Ok(p.clone());
+            }
+            // Re-tiered: drop the cached instance so the next open applies the new
+            // caps. In-flight queries hold their own Arc and finish under the old
+            // ones (same lifetime rule as forget_pond).
+            map.remove(&loc.catalog_uri);
         }
-        let inst = Arc::new(Mutex::new(PondInstance::open(loc)?));
-        map.insert(loc.catalog_uri.clone(), inst.clone());
-        Ok(inst)
+        let p = Arc::new(Pond::open(loc)?);
+        map.insert(loc.catalog_uri.clone(), p.clone());
+        Ok(p)
+    }
+
+    /// Run a read on a pooled connection. The connection is dropped rather than
+    /// reused if the read failed.
+    fn with_read<T>(
+        &self,
+        loc: &PondLocation,
+        f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
+    ) -> Result<T, EngineError> {
+        let pond = self.pond(loc)?;
+        let mut g = pond.checkout_read()?;
+        let out = f(&g);
+        g.reusable = out.is_ok();
+        out
     }
 
     /// Run a blocking engine operation with an interrupt watcher bound to `abort`.
@@ -93,7 +245,7 @@ impl QueryEngine for DuckEngine {
         // Opening the instance attaches the pond's DuckLake catalog (creating the
         // catalog file on first open) and validates it's usable. No Latiq objects
         // are created on top — the pond is pure DuckLake.
-        let _ = self.instance(loc)?;
+        let _ = self.pond(loc)?;
         Ok(())
     }
 
@@ -103,9 +255,9 @@ impl QueryEngine for DuckEngine {
         sql: &str,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
-        Self::run_with_abort(&guard, &abort, |i| run_read(i, sql))
+        self.with_read(loc, |i| {
+            Self::run_with_abort(i, &abort, |i| run_read(i, sql))
+        })
     }
 
     fn read_arrow(
@@ -115,9 +267,9 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
         sink: &mut dyn ArrowSink,
     ) -> Result<(), EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
-        Self::run_with_abort(&guard, &abort, |i| run_read_arrow(i, sql, &abort, sink))
+        self.with_read(loc, |i| {
+            Self::run_with_abort(i, &abort, |i| run_read_arrow(i, sql, &abort, sink))
+        })
     }
 
     fn write_query(
@@ -127,21 +279,19 @@ impl QueryEngine for DuckEngine {
         identity: &Identity,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
+        let pond = self.pond(loc)?;
+        let guard = lock_recover(&pond.writer);
         Self::run_with_abort(&guard, &abort, |i| {
             run_write(i, sql, identity, &loc.catalog_name)
         })
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
-        run_explain(&guard, sql)
+        self.with_read(loc, |i| run_explain(i, sql))
     }
 
     fn open_pond_count(&self) -> usize {
-        lock_recover(&self.instances).len()
+        lock_recover(&self.ponds).len()
     }
 
     fn forget_pond(&self, loc: &PondLocation) {
@@ -149,25 +299,25 @@ impl QueryEngine for DuckEngine {
         // the pond's catalog file) is closed before storage deletes those files.
         // No-op if the pond was never opened. The Arc is dropped when the last
         // in-flight query on it finishes, closing the connection then.
-        let mut map = lock_recover(&self.instances);
+        let mut map = lock_recover(&self.ponds);
         map.remove(&loc.catalog_uri);
     }
 
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
         // Native DuckDB catalog introspection on the attached pond catalog — no
         // Latiq view in between. (This lives in the DuckDB adapter, so using
         // duckdb_tables() here is fine; a DataFusion adapter would use its own.)
         // Scope to this pond's catalog (its name); escape `'` for the literal.
         let cat = loc.catalog_name.replace('\'', "''");
-        let res = run_read(
-            &guard,
-            &format!(
-                "SELECT table_name AS name, estimated_size AS row_count, comment \
-                 FROM duckdb_tables() WHERE database_name = '{cat}'"
-            ),
-        )?;
+        let res = self.with_read(loc, |i| {
+            run_read(
+                i,
+                &format!(
+                    "SELECT table_name AS name, estimated_size AS row_count, comment \
+                     FROM duckdb_tables() WHERE database_name = '{cat}'"
+                ),
+            )
+        })?;
         let tables = res
             .rows
             .iter()
@@ -189,8 +339,11 @@ impl QueryEngine for DuckEngine {
         params: &std::collections::BTreeMap<String, String>,
         query: &str,
     ) -> Result<(), EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
+        // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
+        // write into the pond — must run on the writer connection, not a pooled
+        // read one whose session state other readers would then observe.
+        let pond = self.pond(loc)?;
+        let guard = lock_recover(&pond.writer);
         let plan = crate::attachers::plan(catalog_type, alias, params)?;
         attach_catalog(&guard.conn, &plan)?;
         // Run the pull query (a CREATE TABLE … in the pond's default catalog),
@@ -210,8 +363,11 @@ impl QueryEngine for DuckEngine {
         alias: &str,
         params: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, String)>, EngineError> {
-        let inst = self.instance(loc)?;
-        let guard = lock_recover(&inst);
+        // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
+        // write into the pond — must run on the writer connection, not a pooled
+        // read one whose session state other readers would then observe.
+        let pond = self.pond(loc)?;
+        let guard = lock_recover(&pond.writer);
         let plan = crate::attachers::plan(catalog_type, alias, params)?;
         attach_catalog(&guard.conn, &plan)?;
         let cat = alias.replace('\'', "''");
@@ -358,7 +514,7 @@ mod tests {
     }
 
     fn instance_count(eng: &DuckEngine) -> usize {
-        eng.instances.lock().unwrap().len()
+        eng.ponds.lock().unwrap().len()
     }
 
     #[test]
@@ -369,18 +525,24 @@ mod tests {
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
 
-        // Poison the instances map: panic while holding its guard.
+        // Poison the pond map: panic while holding its guard.
         let r = catch_unwind(AssertUnwindSafe(|| {
-            let _g = eng.instances.lock().unwrap();
-            panic!("boom while holding the instances lock");
+            let _g = eng.ponds.lock().unwrap();
+            panic!("boom while holding the ponds lock");
         }));
         assert!(r.is_err());
 
-        // Poison the per-pond instance mutex too (the query-path lock).
-        let inst = eng.instance(&loc).unwrap();
+        // Poison the per-pond writer mutex AND the read-pool state — both are on
+        // the query path now.
+        let pond = eng.pond(&loc).unwrap();
         let r = catch_unwind(AssertUnwindSafe(|| {
-            let _g = inst.lock().unwrap();
-            panic!("boom while holding the pond instance lock");
+            let _g = pond.writer.lock().unwrap();
+            panic!("boom while holding the pond writer lock");
+        }));
+        assert!(r.is_err());
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let _g = pond.reads.state.lock().unwrap();
+            panic!("boom while holding the read pool lock");
         }));
         assert!(r.is_err());
 
@@ -446,6 +608,180 @@ mod tests {
             eng.read_arrow(&loc, "INSERT INTO t VALUES (1)", AbortToken::new(), &mut c2),
             Err(EngineError::ReadOnlyViolation)
         ));
+    }
+
+    // ---- read connection pool -------------------------------------------
+    // Reads run on pooled connections to the SAME database while writes stay on
+    // the serialized writer. These pin the properties that makes safe.
+
+    #[test]
+    fn pooled_read_sees_writes_committed_on_the_writer() {
+        // THE correctness question for a multi-connection pond: a read on a
+        // different connection must observe committed writes. Checked on a fresh
+        // pooled connection AND on a reused one.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        let id = Identity::claimed(Some("writer"));
+        eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
+            .unwrap();
+        for n in 1..=3 {
+            eng.write_query(
+                &loc,
+                &format!("INSERT INTO t VALUES ({n})"),
+                &id,
+                AbortToken::new(),
+            )
+            .unwrap();
+            // Unqualified name also proves the pooled connection re-applied `USE`.
+            let got = eng
+                .read_query(&loc, "SELECT count(*) AS c FROM t", AbortToken::new())
+                .unwrap();
+            assert_eq!(
+                got.rows[0][0],
+                serde_json::json!(n),
+                "pooled read must see writes committed on the writer"
+            );
+        }
+    }
+
+    #[test]
+    fn readers_do_not_hold_the_writer_lock() {
+        // The Scenario B fix: a checked-out reader must not block a write. If
+        // reads still took the writer mutex this would deadlock.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        let id = Identity::claimed(Some("w"));
+        eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
+            .unwrap();
+        let pond = eng.pond(&loc).unwrap();
+        let held = pond.checkout_read().unwrap(); // a reader is in flight
+        eng.write_query(&loc, "INSERT INTO t VALUES (1)", &id, AbortToken::new())
+            .expect("a write must proceed while a read connection is checked out");
+        drop(held);
+    }
+
+    #[test]
+    fn pool_hands_out_distinct_connections_and_respects_its_bound() {
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap();
+        let pond = eng.pond(&loc).unwrap();
+
+        // Concurrent checkouts grow the pool rather than queueing on one handle.
+        let a = pond.checkout_read().unwrap();
+        let b = pond.checkout_read().unwrap();
+        assert_eq!(lock_recover(&pond.reads.state).created, 2);
+        drop(a);
+        drop(b);
+        // Returned, not leaked — and reused rather than re-cloned.
+        assert_eq!(lock_recover(&pond.reads.state).idle.len(), 2);
+        let c = pond.checkout_read().unwrap();
+        assert_eq!(
+            lock_recover(&pond.reads.state).created,
+            2,
+            "reuse, not grow"
+        );
+        drop(c);
+
+        // The bound is honored: never more connections than `max`.
+        let held: Vec<_> = (0..pond.reads.max)
+            .map(|_| pond.checkout_read().unwrap())
+            .collect();
+        assert_eq!(lock_recover(&pond.reads.state).created, pond.reads.max);
+        drop(held);
+    }
+
+    #[test]
+    fn pooled_connections_are_utc_like_the_primary() {
+        // Session state is not inherited by a clone; if we failed to re-apply it,
+        // pooled reads would render timestamps in the host timezone.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = DuckEngine::new();
+        let tz = eng
+            .read_query(
+                &loc,
+                "SELECT current_setting('TimeZone') AS z",
+                AbortToken::new(),
+            )
+            .unwrap();
+        assert_eq!(tz.rows[0][0], serde_json::json!("UTC"));
+    }
+
+    #[test]
+    fn concurrent_reads_on_one_pond_all_succeed() {
+        // Many readers on a shared pond — the product's "agents share a pond" case.
+        use std::sync::Arc as StdArc;
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new()).unwrap();
+        let eng = StdArc::new(DuckEngine::new());
+        eng.write_query(
+            &loc,
+            "CREATE TABLE t AS SELECT i FROM range(0,50000) tbl(i)",
+            &Identity::claimed(Some("w")),
+            AbortToken::new(),
+        )
+        .unwrap();
+        let hs: Vec<_> = (0..12)
+            .map(|_| {
+                let (e, l) = (eng.clone(), loc.clone());
+                std::thread::spawn(move || {
+                    e.read_query(&l, "SELECT count(*) AS c FROM t", AbortToken::new())
+                        .map(|r| r.rows[0][0].clone())
+                })
+            })
+            .collect();
+        for h in hs {
+            assert_eq!(h.join().unwrap().unwrap(), serde_json::json!(50000));
+        }
+    }
+
+    #[test]
+    fn retiering_a_pond_reopens_it_with_the_new_caps() {
+        // A pond can be re-tiered after creation. Limits are applied when the
+        // instance opens, so a cached instance must be re-opened when the
+        // resolved limits change — otherwise the new tier silently does nothing.
+        use latiq_common::ResourceLimits;
+        let fs = TempFs::new();
+        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        loc.limits = Some(ResourceLimits {
+            memory_bytes: 1024 * 1024 * 1024,
+            cores: 2,
+        });
+        let eng = DuckEngine::new();
+        let threads = |l: &latiq_storage::PondLocation| -> String {
+            eng.read_query(
+                l,
+                "SELECT current_setting('threads')::VARCHAR AS t",
+                AbortToken::new(),
+            )
+            .unwrap()
+            .rows[0][0]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(threads(&loc), "2");
+        assert_eq!(instance_count(&eng), 1);
+
+        // Re-tier upward: same pond (same catalog uri), new caps.
+        loc.limits = Some(ResourceLimits {
+            memory_bytes: 16 * 1024 * 1024 * 1024,
+            cores: 8,
+        });
+        assert_eq!(threads(&loc), "8", "new tier must reach the engine");
+        assert_eq!(instance_count(&eng), 1, "re-opened in place, not leaked");
+
+        // Unchanged limits must NOT churn the instance — the pool would be lost.
+        let pond_before = eng.pond(&loc).unwrap();
+        let _ = threads(&loc);
+        assert!(
+            Arc::ptr_eq(&pond_before, &eng.pond(&loc).unwrap()),
+            "identical limits must reuse the cached instance"
+        );
     }
 
     #[test]

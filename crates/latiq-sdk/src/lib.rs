@@ -43,6 +43,13 @@ pub struct Latiq {
     /// gateway / control front door (remote). Data ops dial THIS and rely on the
     /// greeter to forward by pond — never node-direct (unroutable behind a LB).
     data_endpoint: String,
+    /// Long-lived gRPC channels, created once. tonic's `Channel` is cheap to
+    /// clone and multiplexes concurrent RPCs over ONE HTTP/2 connection, and
+    /// `connect_lazy` reconnects on its own. Dialing per call instead (the old
+    /// behaviour) opened a fresh TCP connection for every query, which collapses
+    /// with `transport error` under sustained concurrent load.
+    control_channel: Channel,
+    data_channel: Channel,
     identity: String,
     /// Keeps the embedded control-plane + pond-node alive (None in remote mode).
     _local: Option<LocalCluster>,
@@ -144,10 +151,18 @@ impl Latiq {
             let local = rt.block_on(LocalCluster::start(&rt, &root))?;
             let control_endpoint = local.control_endpoint.clone();
             let data_endpoint = local.data_endpoint.clone();
+            // `connect_lazy` registers with the reactor, so it must be built
+            // inside the runtime context.
+            let _guard = rt.enter();
+            let control_channel = lazy_channel(&control_endpoint)?;
+            let data_channel = lazy_channel(&data_endpoint)?;
+            drop(_guard);
             Ok(Self {
                 rt,
                 control_endpoint,
                 data_endpoint,
+                control_channel,
+                data_channel,
                 identity: "sdk".into(),
                 _local: Some(local),
             })
@@ -158,10 +173,18 @@ impl Latiq {
                 .unwrap_or_else(|| control_endpoint.clone());
             rt.block_on(wait_connectable(&control_endpoint))
                 .with_context(|| format!("connecting to control plane at {server}"))?;
+            // `connect_lazy` registers with the reactor, so it must be built
+            // inside the runtime context.
+            let _guard = rt.enter();
+            let control_channel = lazy_channel(&control_endpoint)?;
+            let data_channel = lazy_channel(&data_endpoint)?;
+            drop(_guard);
             Ok(Self {
                 rt,
                 control_endpoint,
                 data_endpoint,
+                control_channel,
+                data_channel,
                 identity: "sdk".into(),
                 _local: None,
             })
@@ -177,6 +200,12 @@ impl Latiq {
     /// The control-plane endpoint this client is bound to.
     pub fn server(&self) -> &str {
         &self.control_endpoint
+    }
+
+    /// The Data+Stream front door this client sends queries to — the in-process
+    /// node (embedded) or the query gateway (remote).
+    pub fn query_gateway(&self) -> &str {
+        &self.data_endpoint
     }
 
     /// Allocate a pond and return a handle. `description` is agent-discovery text.
@@ -494,41 +523,23 @@ impl Latiq {
     // ── client helpers ──────────────────────────────────────────────
 
     async fn control(&self) -> RtClient<ControlClient<Channel>> {
-        ControlClient::connect(self.control_endpoint.clone())
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "control plane unreachable at {}: {e}",
-                    self.control_endpoint
-                )
-            })
+        Ok(ControlClient::new(self.control_channel.clone()))
     }
 
     async fn admin(&self) -> RtClient<AdminClient<Channel>> {
-        AdminClient::connect(self.control_endpoint.clone())
-            .await
-            .map_err(|e| {
-                anyhow!(
-                    "control plane unreachable at {}: {e}",
-                    self.control_endpoint
-                )
-            })
+        Ok(AdminClient::new(self.control_channel.clone()))
     }
 
     /// A Data gRPC client on the front door. The greeter forwards by pond — we do
     /// NOT resolve the owner node directly (its address is unroutable behind a LB).
     async fn data(&self) -> RtClient<DataClient<Channel>> {
-        DataClient::connect(self.data_endpoint.clone())
-            .await
-            .map_err(|e| anyhow!("data plane unreachable at {}: {e}", self.data_endpoint))
+        Ok(DataClient::new(self.data_channel.clone()))
     }
 
     /// A Stream gRPC client on the front door (served alongside Data on the same
     /// endpoint). Reads ride `ReadArrow`; the greeter forwards by pond.
     async fn stream(&self) -> RtClient<StreamClient<Channel>> {
-        StreamClient::connect(self.data_endpoint.clone())
-            .await
-            .map_err(|e| anyhow!("stream plane unreachable at {}: {e}", self.data_endpoint))
+        Ok(StreamClient::new(self.data_channel.clone()))
     }
 
     /// Attach the (relaxed) identity header data ops carry.
@@ -670,4 +681,13 @@ async fn wait_for_active_node(control_endpoint: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(anyhow!("local pond node did not register in time"))
+}
+
+/// A lazily-connecting, auto-reconnecting channel to `endpoint`. Built once per
+/// endpoint and cloned per RPC: tonic multiplexes concurrent calls over one
+/// HTTP/2 connection, so a busy client no longer opens a TCP connection per query.
+fn lazy_channel(endpoint: &str) -> Result<Channel> {
+    Ok(Channel::from_shared(endpoint.to_string())
+        .with_context(|| format!("invalid endpoint {endpoint}"))?
+        .connect_lazy())
 }

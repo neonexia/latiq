@@ -28,6 +28,16 @@ const GB: u64 = 1024 * MB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum PondTier {
+    /// **No Latiq caps.** Nothing is applied to the pond's engine instance, so the
+    /// engine's own defaults govern it (DuckDB: `threads` = every core,
+    /// `memory_limit` ~80% of RAM). Explicitly named `none` rather than
+    /// "unlimited" because Latiq isn't granting anything — it is declining to cap,
+    /// and what that means is the engine's business.
+    ///
+    /// Operator-assignable only (`latiq pond set-tier … --tier none`): an uncapped
+    /// pond can starve every other pond on its node, so it must not be something a
+    /// workload assigns itself at allocate time.
+    None,
     XSmall,
     Small,
     #[default]
@@ -39,6 +49,7 @@ pub enum PondTier {
 impl PondTier {
     pub fn as_str(&self) -> &'static str {
         match self {
+            PondTier::None => "none",
             PondTier::XSmall => "x-small",
             PondTier::Small => "small",
             PondTier::Medium => "medium",
@@ -50,6 +61,7 @@ impl PondTier {
     /// Parse a tier name; unknown/empty falls back to the default (`medium`).
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
+            "none" | "uncapped" => Some(PondTier::None),
             "x-small" | "xsmall" => Some(PondTier::XSmall),
             "small" => Some(PondTier::Small),
             "medium" => Some(PondTier::Medium),
@@ -59,29 +71,32 @@ impl PondTier {
         }
     }
 
-    /// Resource caps for this tier. Tweak here to retune all ponds at a tier.
-    pub fn limits(&self) -> ResourceLimits {
+    /// Resource caps for this tier, or `None` for [`PondTier::None`] — which the
+    /// engine reads as "apply nothing", leaving its own defaults in force.
+    /// Tweak here to retune all ponds at a tier.
+    pub fn limits(&self) -> Option<ResourceLimits> {
         match self {
-            PondTier::XSmall => ResourceLimits {
+            PondTier::None => None,
+            PondTier::XSmall => Some(ResourceLimits {
                 memory_bytes: 512 * MB,
                 cores: 1,
-            },
-            PondTier::Small => ResourceLimits {
+            }),
+            PondTier::Small => Some(ResourceLimits {
                 memory_bytes: GB,
                 cores: 2,
-            },
-            PondTier::Medium => ResourceLimits {
+            }),
+            PondTier::Medium => Some(ResourceLimits {
                 memory_bytes: 4 * GB,
                 cores: 4,
-            },
-            PondTier::Large => ResourceLimits {
+            }),
+            PondTier::Large => Some(ResourceLimits {
                 memory_bytes: 16 * GB,
                 cores: 8,
-            },
-            PondTier::XLarge => ResourceLimits {
+            }),
+            PondTier::XLarge => Some(ResourceLimits {
                 memory_bytes: 32 * GB,
                 cores: 8,
-            },
+            }),
         }
     }
 }
@@ -115,8 +130,34 @@ mod tests {
 
     #[test]
     fn limits_increase_with_tier() {
-        assert!(PondTier::XSmall.limits().memory_bytes < PondTier::Small.limits().memory_bytes);
-        assert!(PondTier::Small.limits().memory_bytes < PondTier::Medium.limits().memory_bytes);
-        assert!(PondTier::Large.limits().cores > PondTier::Medium.limits().cores);
+        let mem = |t: PondTier| t.limits().unwrap().memory_bytes;
+        let cores = |t: PondTier| t.limits().unwrap().cores;
+        assert!(mem(PondTier::XSmall) < mem(PondTier::Small));
+        assert!(mem(PondTier::Small) < mem(PondTier::Medium));
+        assert!(cores(PondTier::Large) > cores(PondTier::Medium));
+    }
+
+    #[test]
+    fn none_tier_applies_no_caps() {
+        // `none` is the ONLY tier without limits: the engine then applies nothing
+        // and its own defaults govern the pond. Every other tier must cap.
+        assert_eq!(PondTier::None.limits(), None);
+        for t in [
+            PondTier::XSmall,
+            PondTier::Small,
+            PondTier::Medium,
+            PondTier::Large,
+            PondTier::XLarge,
+        ] {
+            assert!(t.limits().is_some(), "{} must cap", t.as_str());
+        }
+        // Round-trips by its explicit name (not "unlimited" — Latiq grants
+        // nothing, it declines to cap).
+        assert_eq!(PondTier::parse("none"), Some(PondTier::None));
+        assert_eq!(PondTier::parse(" NONE "), Some(PondTier::None));
+        assert_eq!(PondTier::None.as_str(), "none");
+        assert_eq!(PondTier::parse("unlimited"), None);
+        // ...and is never the default: a pond you don't think about stays capped.
+        assert_ne!(PondTier::default(), PondTier::None);
     }
 }
