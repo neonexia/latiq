@@ -95,7 +95,7 @@ impl PondTier {
             }),
             PondTier::XLarge => Some(ResourceLimits {
                 memory_bytes: 32 * GB,
-                cores: 8,
+                cores: 16,
             }),
         }
     }
@@ -128,13 +128,28 @@ mod tests {
         assert_eq!(PondTier::parse("huge"), None);
     }
 
+    /// Every rung must be strictly bigger than the one below it in **both**
+    /// dimensions. x-large once had the same core count as large, so asking for
+    /// the top tier bought memory but no extra compute — a ladder that is
+    /// monotonic in one dimension only is a silent trap for whoever picks a tier.
     #[test]
     fn limits_increase_with_tier() {
-        let mem = |t: PondTier| t.limits().unwrap().memory_bytes;
-        let cores = |t: PondTier| t.limits().unwrap().cores;
-        assert!(mem(PondTier::XSmall) < mem(PondTier::Small));
-        assert!(mem(PondTier::Small) < mem(PondTier::Medium));
-        assert!(cores(PondTier::Large) > cores(PondTier::Medium));
+        let ladder = [
+            PondTier::XSmall,
+            PondTier::Small,
+            PondTier::Medium,
+            PondTier::Large,
+            PondTier::XLarge,
+        ];
+        for pair in ladder.windows(2) {
+            let (lo, hi) = (pair[0].limits().unwrap(), pair[1].limits().unwrap());
+            let (ln, hn) = (pair[0].as_str(), pair[1].as_str());
+            assert!(
+                hi.memory_bytes > lo.memory_bytes,
+                "{hn} must have more memory than {ln}"
+            );
+            assert!(hi.cores > lo.cores, "{hn} must have more cores than {ln}");
+        }
     }
 
     #[test]
