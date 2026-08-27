@@ -16,10 +16,16 @@ use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
-/// How long after a fetch we refuse to fetch again. Caps IdP traffic at ~1
-/// req/min regardless of attacker volume, while still picking up a genuine key
-/// rotation within a minute.
+/// How long after a SUCCESSFUL fetch we refuse to fetch again. Caps IdP traffic
+/// at ~1 req/min regardless of attacker volume, while still picking up a genuine
+/// key rotation within a minute.
 pub const DEFAULT_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The floor after a FAILED fetch, doubling per consecutive failure up to the
+/// success interval. Retrying a down IdP once per request is the same
+/// amplification aimed at a sick endpoint; but a transient blip must not lock
+/// auth out for a full minute, so failures start far shorter than successes.
+pub const DEFAULT_FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(1);
 
 /// Real JWKS documents are single-digit KiB. This is the guard against a
 /// `jwks_uri` misconfigured to point at a log file or an object-store listing.
@@ -45,9 +51,30 @@ pub struct JwksCache {
     /// wholesale, so two interleaved refreshes could otherwise discard a freshly
     /// rotated key.
     refreshing: Mutex<()>,
-    /// `None` until the first fetch. Guarded by a std mutex: no await inside.
-    last_refresh: StdMutex<Option<Instant>>,
+    /// Guarded by a std mutex: no await is taken inside it.
+    state: StdMutex<RefreshState>,
     min_refresh_interval: Duration,
+    failure_backoff_base: Duration,
+}
+
+/// What the last refresh did, which decides both how long we wait before the
+/// next one and which error a suppressed refresh owes the caller.
+#[derive(Default)]
+struct RefreshState {
+    /// When the last refresh FINISHED. `None` until one has. Stamping on
+    /// completion rather than on entry is load-bearing: stamped on entry, every
+    /// request concurrent with the very first fetch sees the floor as already
+    /// running, skips the single-flight guard it should have queued on, and is
+    /// rejected -- a cold start would reject nearly every valid token.
+    completed_at: Option<Instant>,
+    /// 0 means the last refresh succeeded.
+    consecutive_failures: u32,
+}
+
+impl RefreshState {
+    fn last_failed(&self) -> bool {
+        self.consecutive_failures > 0
+    }
 }
 
 impl JwksCache {
@@ -75,9 +102,17 @@ impl JwksCache {
             fetches: AtomicUsize::new(0),
             refreshes_completed: AtomicUsize::new(0),
             refreshing: Mutex::new(()),
-            last_refresh: StdMutex::new(None),
+            state: StdMutex::new(RefreshState::default()),
             min_refresh_interval,
+            failure_backoff_base: DEFAULT_FAILURE_BACKOFF_BASE,
         }
+    }
+
+    /// Override the post-failure floor. Tests use this to exercise recovery
+    /// from a transient IdP blip without sleeping out the real backoff.
+    pub fn with_failure_backoff_base(mut self, failure_backoff_base: Duration) -> Self {
+        self.failure_backoff_base = failure_backoff_base;
+        self
     }
 
     /// Number of times the JWKS document has been fetched. Test observability.
@@ -88,28 +123,39 @@ impl JwksCache {
     /// Look up a signing key by `kid`.
     ///
     /// A hit is served from memory. A miss triggers at most one fetch, and only
-    /// if no fetch has completed within `min_refresh_interval` -- so a genuine
-    /// key rotation is picked up within that interval, while a flood of tokens
+    /// if no fetch has *completed* within the current floor -- so a genuine key
+    /// rotation is picked up within that interval, while a flood of tokens
     /// bearing unknown `kid`s costs the IdP nothing beyond that one fetch.
-    /// Concurrent misses collapse into a single fetch.
+    /// Requests arriving during an in-flight fetch queue on it and ride its
+    /// result rather than being rejected.
     pub async fn key_for(&self, kid: &str) -> Result<DecodingKey, AuthError> {
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(key.clone());
         }
         self.refresh_once().await?;
-        self.keys
-            .read()
-            .await
-            .get(kid)
-            .cloned()
-            .ok_or_else(|| AuthError::UnknownKid(sanitize_kid(kid)))
+        if let Some(key) = self.keys.read().await.get(kid) {
+            return Ok(key.clone());
+        }
+        // Still missing. Which error we owe the caller depends on whether we
+        // actually know the key is absent, or merely could not ask: reporting
+        // an IdP outage as a bad token sends the operator hunting in entirely
+        // the wrong place.
+        if self.last_refresh_failed() {
+            tracing::debug!(
+                uri = %self.uri,
+                "JWKS refresh suppressed after a recent failure; reporting the IdP as unavailable"
+            );
+            return Err(AuthError::Jwks(IDP_UNAVAILABLE.to_string()));
+        }
+        Err(AuthError::UnknownKid(sanitize_kid(kid)))
     }
 
     /// Refresh on behalf of a miss, subject to the interval floor and the
     /// single-flight guard. Returning `Ok` does NOT mean the key is now known.
     async fn refresh_once(&self) -> Result<(), AuthError> {
-        // Fast path: too soon since the last fetch, so do not even queue behind
-        // an in-flight one.
+        // Fast path: a fetch COMPLETED recently, so there is nothing to wait
+        // for and nothing to gain from asking again. An in-flight fetch does
+        // not trip this -- those callers fall through to the guard below.
         if self.too_soon() {
             return Ok(());
         }
@@ -126,30 +172,60 @@ impl JwksCache {
     }
 
     fn too_soon(&self) -> bool {
-        self.last_refresh
-            .lock()
-            .expect("jwks last_refresh mutex poisoned")
-            .is_some_and(|at| at.elapsed() < self.min_refresh_interval)
+        let state = self.state();
+        match state.completed_at {
+            None => false,
+            Some(at) => at.elapsed() < self.floor(&state),
+        }
     }
 
-    /// Wraps the refresh so the completion generation is bumped on EVERY exit,
-    /// success or failure. A failed refresh still satisfies the waiters behind
-    /// the guard -- retrying it 16 times over is the stampede we are avoiding.
+    /// How long to wait after the last refresh before attempting another.
+    fn floor(&self, state: &RefreshState) -> Duration {
+        if !state.last_failed() {
+            return self.min_refresh_interval;
+        }
+        // Exponential: base, 2x, 4x ... capped at the success interval, so a
+        // sustained outage settles at ~1 req/min while a single blip clears in
+        // about a second.
+        let doublings = state.consecutive_failures.saturating_sub(1).min(16);
+        self.failure_backoff_base
+            .saturating_mul(1u32 << doublings)
+            .min(self.min_refresh_interval)
+    }
+
+    fn last_refresh_failed(&self) -> bool {
+        self.state().last_failed()
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, RefreshState> {
+        self.state
+            .lock()
+            .expect("jwks refresh state mutex poisoned")
+    }
+
+    /// Wraps the refresh so completion is recorded on EVERY exit, success or
+    /// failure. A failed refresh still satisfies the waiters behind the guard --
+    /// retrying it 16 times over is the stampede we are avoiding.
     async fn refresh(&self) -> Result<(), AuthError> {
         let result = self.refresh_inner().await;
+        {
+            let mut state = self.state();
+            // On COMPLETION, so the floor measures dead time rather than
+            // swallowing the fetch's own duration, and so nothing concurrent
+            // with this fetch ever sees the floor as already running.
+            state.completed_at = Some(Instant::now());
+            state.consecutive_failures = if result.is_ok() {
+                0
+            } else {
+                state.consecutive_failures.saturating_add(1)
+            };
+        }
         self.refreshes_completed.fetch_add(1, Ordering::SeqCst);
         result
     }
 
     async fn refresh_inner(&self) -> Result<(), AuthError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        // Stamped regardless of outcome: a failing IdP must not be retried on
-        // every request either.
-        *self
-            .last_refresh
-            .lock()
-            .expect("jwks last_refresh mutex poisoned") = Some(Instant::now());
-
         let set = self.fetch().await?;
 
         // One unusable key must not poison the whole set: an IdP may publish an
@@ -237,7 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_kid_bounds_length() {
-        assert_eq!(sanitize_kid(&"k".repeat(4096)).len(), 64);
+    fn sanitize_kid_bounds_length_in_chars_not_bytes() {
+        // Multi-byte on purpose: with ASCII the two counts coincide and the
+        // assertion would not distinguish char truncation from byte truncation
+        // (which would also risk splitting a code point).
+        let bounded = sanitize_kid(&"é".repeat(4096));
+        assert_eq!(bounded.chars().count(), 64);
+        assert_eq!(bounded.len(), 128);
     }
 }

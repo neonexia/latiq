@@ -60,6 +60,21 @@ pub struct TestIdp {
     state: Arc<RwLock<IdpState>>,
     pub issuer: String,
     pub jwks_uri: String,
+    /// Serves the same document as `jwks_uri`, but chunked and WITHOUT a
+    /// Content-Length. The size cap has two branches -- the cheap check on the
+    /// advertised length, and the one that counts bytes as they arrive -- and
+    /// only this URI reaches the second.
+    pub jwks_stream_uri: String,
+}
+
+/// GET `uri` and report the Content-Length it advertises. Lets a test prove it
+/// is exercising the streaming branch of the size cap rather than the
+/// pre-check.
+pub async fn advertised_content_length(uri: &str) -> Option<u64> {
+    reqwest::get(uri)
+        .await
+        .expect("probe request")
+        .content_length()
 }
 
 /// A one-key JWKS document publishing the shared signing key under `kid`.
@@ -94,22 +109,41 @@ impl TestIdp {
         }));
 
         let handler_state = state.clone();
-        let app = axum::Router::new().route(
-            "/jwks",
-            axum::routing::get(move || {
-                let state = handler_state.clone();
-                async move {
-                    let state = state.read().await;
-                    let status = axum::http::StatusCode::from_u16(state.status)
-                        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-                    (
-                        status,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        state.body.clone(),
-                    )
-                }
-            }),
-        );
+        let stream_state = state.clone();
+        let app = axum::Router::new()
+            .route(
+                "/jwks",
+                axum::routing::get(move || {
+                    let state = handler_state.clone();
+                    async move {
+                        let state = state.read().await;
+                        let status = axum::http::StatusCode::from_u16(state.status)
+                            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                        (
+                            status,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            state.body.clone(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/jwks-stream",
+                axum::routing::get(move || {
+                    let state = stream_state.clone();
+                    async move {
+                        let body = state.read().await.body.clone();
+                        // Handed over as a stream of unknown length, so hyper
+                        // uses chunked encoding and emits no Content-Length.
+                        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = body
+                            .into_bytes()
+                            .chunks(16 * 1024)
+                            .map(|chunk| Ok(chunk.to_vec()))
+                            .collect();
+                        axum::body::Body::from_stream(tokio_stream::iter(chunks))
+                    }
+                }),
+            );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -123,6 +157,7 @@ impl TestIdp {
             state,
             issuer: format!("http://{addr}"),
             jwks_uri: format!("http://{addr}/jwks"),
+            jwks_stream_uri: format!("http://{addr}/jwks-stream"),
         }
     }
 
