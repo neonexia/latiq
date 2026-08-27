@@ -116,26 +116,11 @@ pub(crate) fn trace_id_of<T>(req: &Request<T>) -> String {
         .unwrap_or_else(latiq_agent_core::new_trace_id)
 }
 
-tokio::task_local! {
-    /// The caller's raw bearer token, ambient for the duration of one request.
-    ///
-    /// It exists for exactly one reason: the node-to-node hop. Re-injecting only
-    /// `latiq-agent-id` would hand the owning node a CLAIMED identity, silently
-    /// losing subject/issuer and corrupting its attribution — so the forwarder
-    /// replays the original token and the owner verifies it itself. Deliberately
-    /// NOT an internal "already verified" header: a header the owner trusts
-    /// without checking is exactly the trust laundering this design forbids.
-    static BEARER: String;
-}
-
-/// The caller's bearer token, if this task is handling an authenticated request.
-pub(crate) fn current_bearer() -> Option<String> {
-    BEARER.try_with(|t| t.clone()).ok()
-}
-
 /// Run a handler body under the request's trace id + a span, so AgentOps logs
 /// carry the id and the forwarder can read it for the node-to-node hop. The
-/// caller's bearer token rides the same scope, for the same reason.
+/// caller's bearer token rides the same scope, for the same reason
+/// (`latiq_agent_core::bearer` — shared with the MCP adapter, which forwards
+/// through the same `AgentOps`).
 pub(crate) async fn traced<T>(
     name: &'static str,
     tid: String,
@@ -147,10 +132,7 @@ pub(crate) async fn traced<T>(
         tid.clone(),
         fut.instrument(tracing::info_span!("rpc", name, trace_id = %tid)),
     );
-    match bearer {
-        Some(t) => BEARER.scope(t, inner).await,
-        None => inner.await,
-    }
+    latiq_agent_core::with_bearer(bearer, inner).await
 }
 
 #[tonic::async_trait]
