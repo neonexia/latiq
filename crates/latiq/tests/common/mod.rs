@@ -73,6 +73,18 @@ async fn wait_connectable(endpoint: &str) {
 
 /// Start the control plane (Control + Admin gRPC) and return its endpoints.
 async fn start_control_plane() -> (String, String) {
+    start_control_plane_with_auth(None).await
+}
+
+/// Start the control plane, optionally requiring verified bearer tokens on its
+/// Admin surface. `start_control_plane` stays auth-free so every pre-existing
+/// test keeps exercising the relaxed path.
+pub async fn start_control_plane_with_auth(
+    auth: Option<latiq_auth::AuthConfig>,
+) -> (String, String) {
+    let verifier = auth.map(|cfg| {
+        std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
+    });
     let registry = Registry::open(None).unwrap();
     let (control_l, control_port) = bind().await;
     let (admin_l, admin_port) = bind().await;
@@ -87,7 +99,9 @@ async fn start_control_plane() -> (String, String) {
     });
     tokio::spawn(async move {
         Server::builder()
-            .add_service(AdminServer::new(AdminService::new(registry)))
+            .add_service(AdminServer::new(
+                AdminService::new(registry).with_verifier(verifier),
+            ))
             .serve_with_incoming(TcpListenerStream::new(admin_l))
             .await
             .unwrap();
@@ -101,6 +115,26 @@ async fn start_control_plane() -> (String, String) {
 /// Start one pond node (real GrpcControlPlane + forwarding) against `control`.
 async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     start_node_with_auth(node_id, control_endpoint, None).await
+}
+
+/// Build a cluster NODE BY NODE, so a test can control which node owns a pond:
+/// placement is `ORDER BY random()`, so the only reliable way to pin ownership
+/// is to allocate while just one node exists, then add the peer that will
+/// forward. Returns the (control, admin) endpoints.
+///
+/// This is what makes ASYMMETRIC clusters testable — a greeter and an owner that
+/// trust different issuers, or only one of which requires a token at all.
+pub async fn start_control_plane_only() -> (String, String) {
+    start_control_plane().await
+}
+
+/// Add a pond node to an already-running control plane, with its own auth config.
+pub async fn add_node(
+    node_id: &str,
+    control_endpoint: &str,
+    auth: Option<latiq_auth::AuthConfig>,
+) -> NodeStack {
+    start_node_with_auth(node_id, control_endpoint, auth).await
 }
 
 /// Start one pond node, optionally requiring verified bearer tokens on its Data

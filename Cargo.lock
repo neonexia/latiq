@@ -1816,6 +1816,7 @@ name = "latiq-control-plane"
 version = "0.1.0"
 dependencies = [
  "duckdb",
+ "latiq-auth",
  "latiq-common",
  "latiq-metrics",
  "latiq-proto",

@@ -36,19 +36,14 @@ impl DataService {
 }
 
 /// The raw bearer token from the `authorization` metadata, if one is present.
-/// Both `Bearer ` and the lowercase `bearer ` are accepted — RFC 6750's scheme
-/// name is case-insensitive and real clients send both.
+/// The parsing itself lives in `latiq_auth::bearer` — one copy, shared with the
+/// Admin surface, so this security-relevant parser cannot drift.
 pub(crate) fn bearer_of<T>(req: &Request<T>) -> Option<String> {
     let raw = req
         .metadata()
         .get("authorization")
         .and_then(|v| v.to_str().ok())?;
-    let (scheme, token) = raw.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_string())
+    latiq_auth::bearer(raw).map(String::from)
 }
 
 /// Identity from gRPC metadata. With a verifier configured, an `authorization:

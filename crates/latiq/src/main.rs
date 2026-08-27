@@ -746,7 +746,9 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     println!("control plane: Control + Admin gRPC on {addr}");
     println!("  registry: {}", db.display());
     println!("  metrics:  http://{metrics_addr}/metrics");
-    serve_control_plane(addr, registry)
+    // The CLI-launched control plane stays on the relaxed path; a configured
+    // issuer is a later, explicit flag (same call as `latiq node add`).
+    serve_control_plane(addr, registry, None)
         .await
         .map_err(|e| anyhow!("server error: {e}"))?;
     Ok(())
