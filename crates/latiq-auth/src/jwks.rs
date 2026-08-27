@@ -8,8 +8,8 @@
 //! minimum interval between fetches, a single-flight guard so concurrent misses
 //! collapse into one fetch, and hard timeouts + a body cap on the fetch itself.
 use crate::AuthError;
-use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::DecodingKey;
+use jsonwebtoken::jwk::{JwkSet, PublicKeyUse};
+use jsonwebtoken::{Algorithm, DecodingKey};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -36,6 +36,16 @@ const MAX_JWKS_BYTES: usize = 256 * 1024;
 /// they routinely name internal hosts and addresses.
 const IDP_UNAVAILABLE: &str = "identity provider JWKS endpoint unavailable";
 
+/// A signing key as the issuer published it. The declared `alg` rides along
+/// because it is the ISSUER's statement about what the key may be used for; the
+/// verifier enforces it so a caller cannot pick a weaker algorithm than the one
+/// the key was published for.
+#[derive(Clone)]
+pub struct SigningKey {
+    pub key: DecodingKey,
+    pub alg: Option<Algorithm>,
+}
+
 /// The conventional JWKS location for an issuer. Keycloak and most OIDC
 /// providers serve `<issuer>/protocol/openid-connect/certs`. Deployments whose
 /// issuer identifier is not a reachable address configure `jwks_uri` explicitly
@@ -49,7 +59,7 @@ pub fn discover_uri(issuer: &str) -> String {
 
 pub struct JwksCache {
     uri: String,
-    keys: RwLock<HashMap<String, DecodingKey>>,
+    keys: RwLock<HashMap<String, SigningKey>>,
     http: reqwest::Client,
     fetches: AtomicUsize,
     /// Bumped when a refresh FINISHES. Snapshotting it before queueing on the
@@ -139,7 +149,7 @@ impl JwksCache {
     /// bearing unknown `kid`s costs the IdP nothing beyond that one fetch.
     /// Requests arriving during an in-flight fetch queue on it and ride its
     /// result rather than being rejected.
-    pub async fn key_for(&self, kid: &str) -> Result<DecodingKey, AuthError> {
+    pub async fn key_for(&self, kid: &str) -> Result<SigningKey, AuthError> {
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(key.clone());
         }
@@ -247,9 +257,22 @@ impl JwksCache {
                 tracing::warn!(uri = %self.uri, "skipping JWKS key with no kid");
                 continue;
             };
+            // An IdP routinely publishes encryption keys beside signing keys.
+            // Importing one would let a token be verified against a key its
+            // issuer never intended to sign anything with.
+            if matches!(jwk.common.public_key_use, Some(PublicKeyUse::Encryption)) {
+                tracing::debug!(uri = %self.uri, kid = %sanitize_kid(&kid), "skipping JWKS key marked use=enc");
+                continue;
+            }
             match DecodingKey::from_jwk(jwk) {
                 Ok(key) => {
-                    fresh.insert(kid, key);
+                    fresh.insert(
+                        kid,
+                        SigningKey {
+                            key,
+                            alg: jwk.common.key_algorithm.and_then(as_signing_alg),
+                        },
+                    );
                 }
                 Err(e) => tracing::warn!(
                     uri = %self.uri,
@@ -303,6 +326,29 @@ impl JwksCache {
     }
 }
 
+/// Map a JWKS `alg` to the signature algorithm it names. `None` for anything
+/// that is not a signature algorithm (key-management algs appear here on
+/// encryption keys), which leaves the key unconstrained rather than
+/// mis-constrained.
+fn as_signing_alg(alg: jsonwebtoken::jwk::KeyAlgorithm) -> Option<Algorithm> {
+    use jsonwebtoken::jwk::KeyAlgorithm as K;
+    Some(match alg {
+        K::HS256 => Algorithm::HS256,
+        K::HS384 => Algorithm::HS384,
+        K::HS512 => Algorithm::HS512,
+        K::ES256 => Algorithm::ES256,
+        K::ES384 => Algorithm::ES384,
+        K::RS256 => Algorithm::RS256,
+        K::RS384 => Algorithm::RS384,
+        K::RS512 => Algorithm::RS512,
+        K::PS256 => Algorithm::PS256,
+        K::PS384 => Algorithm::PS384,
+        K::PS512 => Algorithm::PS512,
+        K::EdDSA => Algorithm::EdDSA,
+        _ => return None,
+    })
+}
+
 /// `kid` is an unvalidated, unbounded JWT header field under attacker control.
 /// Anything we put in a message or a log line gets bounded and stripped of
 /// control characters first -- otherwise it is a log-injection and log-volume
@@ -316,7 +362,25 @@ fn sanitize_kid(kid: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_kid;
+    use super::{discover_uri, sanitize_kid};
+
+    #[test]
+    fn discover_uri_appends_the_conventional_path() {
+        assert_eq!(
+            discover_uri("https://idp.example/realms/latiq"),
+            "https://idp.example/realms/latiq/protocol/openid-connect/certs"
+        );
+    }
+
+    #[test]
+    fn discover_uri_does_not_double_the_separator() {
+        // Issuer identifiers are copy-pasted from consoles that sometimes
+        // include the trailing slash; a `//` would 404 on some gateways.
+        assert_eq!(
+            discover_uri("https://idp.example/realms/latiq/"),
+            "https://idp.example/realms/latiq/protocol/openid-connect/certs"
+        );
+    }
 
     #[test]
     fn sanitize_kid_strips_control_characters() {

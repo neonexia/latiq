@@ -106,7 +106,8 @@ fn jwks_document_for(key: &Keypair, kid: &str) -> String {
     .to_string()
 }
 
-fn now_secs() -> i64 {
+/// Unix seconds. Public so a test can build `nbf`/`exp` relative to now.
+pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -231,6 +232,49 @@ impl TestIdp {
         kid: Option<String>,
     ) -> String {
         encode(&self.key.encoding, sub, aud, iss, exp_offset_secs, kid)
+    }
+
+    /// Sign an ARBITRARY claims object with this IdP's key, under the usual
+    /// `kid`. The escape hatch for tokens the typed minters cannot express: an
+    /// array-valued `aud`, a future `nbf`, a missing `sub`.
+    pub fn mint_claims(&self, claims: serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        jsonwebtoken::encode(&header, &claims, &self.key.encoding).expect("mint token")
+    }
+
+    /// An HS256 token signed with `secret`. Symmetric, so it must never verify
+    /// against a resource server -- which holds no signing secrets at all.
+    pub fn mint_hs256(&self, sub: &str, aud: &str, iss: &str, secret: &[u8]) -> String {
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(KID.to_string());
+        let now = now_secs();
+        jsonwebtoken::encode(
+            &header,
+            &json!({ "sub": sub, "aud": aud, "iss": iss, "iat": now, "exp": now + 300 }),
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("mint hs256 token")
+    }
+
+    /// This IdP's RSA modulus, raw. Fed back as an HMAC secret it is the
+    /// classic algorithm-confusion attack: the "secret" is public.
+    pub fn public_modulus(&self) -> Vec<u8> {
+        URL_SAFE_NO_PAD
+            .decode(&self.key.n)
+            .expect("modulus is base64url")
+    }
+
+    /// An `alg: "none"` token: header and claims, empty signature. Assembled by
+    /// hand because `jsonwebtoken` has no way to express it.
+    pub fn mint_alg_none(&self, sub: &str, aud: &str, iss: &str) -> String {
+        let now = now_secs();
+        let header =
+            URL_SAFE_NO_PAD.encode(json!({ "alg": "none", "typ": "JWT", "kid": KID }).to_string());
+        let claims = URL_SAFE_NO_PAD.encode(
+            json!({ "sub": sub, "aud": aud, "iss": iss, "iat": now, "exp": now + 300 }).to_string(),
+        );
+        format!("{header}.{claims}.")
     }
 
     /// A token signed by a key NO fixture publishes, to prove signature
