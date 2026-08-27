@@ -3,7 +3,7 @@
 //! names are prefixed by feature so `cargo test <feature>` targets them.
 mod common;
 
-use common::start_stack;
+use common::{start_stack, start_stack_with_auth};
 use latiq_common::ErrorEnvelope;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::*;
@@ -347,4 +347,151 @@ async fn identity_defaults_to_anonymous_when_metadata_absent() {
         .filter_map(|row| row[0].as_str())
         .collect();
     assert!(authors.contains(&"anonymous"), "got {authors:?}");
+}
+
+// ---------------------------------------------------------------------------
+// auth_* — the Data + Stream gRPC surfaces as an OAuth 2.1 resource server.
+// Verification only: nothing here gates on WHO the caller is.
+// ---------------------------------------------------------------------------
+
+/// A request carrying both the claimed leaf and an `authorization` bearer token.
+fn bearer_req<T>(msg: T, agent: &str, token: &str) -> Request<T> {
+    let mut r = req(msg, agent);
+    r.metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    r
+}
+
+/// The distinct authors recorded in a pond's native DuckLake snapshots.
+fn authors_of(json: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
+    v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row[0].as_str().map(String::from))
+        .collect()
+}
+
+const AUTHORS_SQL: &str = "SELECT DISTINCT author FROM ducklake_snapshots";
+
+#[tokio::test]
+async fn auth_absent_config_keeps_relaxed_identity() {
+    // The embedded/dev path: no issuer configured means behave exactly as
+    // before — no token required, and the claimed leaf is the author. Asserted
+    // rather than assumed: every existing deployment depends on it.
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(req(alloc("noauth"), "dana")).await.unwrap();
+    c.write_query(req(q("noauth", "CREATE TABLE t(i INTEGER)"), "dana"))
+        .await
+        .unwrap();
+    let r = c
+        .read_query(req(
+            q("noauth", &format!("{AUTHORS_SQL}('noauth')")),
+            "dana",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        authors_of(&r.json).iter().any(|a| a == "dana"),
+        "relaxed identity should still attribute to the claimed leaf"
+    );
+}
+
+#[tokio::test]
+async fn auth_rejects_missing_token_when_configured() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = start_stack_with_auth(idp.auth_config()).await;
+    let mut c = client(&s.data_endpoint).await;
+    let err = c.allocate_pond(req(alloc("p"), "dana")).await.unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+    let msg = err.message().to_lowercase();
+    assert!(
+        !msg.contains(&idp.issuer.to_lowercase()) && !msg.contains("jwks"),
+        "the challenge must not leak issuers or the JWKS uri: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn auth_rejects_an_invalid_token_when_configured() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = start_stack_with_auth(idp.auth_config()).await;
+    let mut c = client(&s.data_endpoint).await;
+    let err = c
+        .allocate_pond(bearer_req(alloc("p"), "dana", "not-a-jwt"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+    // An expired token from the real issuer is rejected the same way.
+    let expired = idp.mint("svc-dana", "latiq", &idp.issuer, -60);
+    let err = c
+        .allocate_pond(bearer_req(alloc("p"), "dana", &expired))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn auth_accepts_a_valid_token_and_marks_identity_verified() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = start_stack_with_auth(idp.auth_config()).await;
+    let mut c = client(&s.data_endpoint).await;
+    let token = idp.mint("svc-dana", "latiq", &idp.issuer, 300);
+
+    c.allocate_pond(bearer_req(alloc("ok"), "dana", &token))
+        .await
+        .unwrap();
+    c.write_query(bearer_req(
+        q("ok", "CREATE TABLE t(i INTEGER)"),
+        "dana",
+        &token,
+    ))
+    .await
+    .unwrap();
+    let r = c
+        .read_query(bearer_req(
+            q("ok", &format!("{AUTHORS_SQL}('ok')")),
+            "dana",
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let authors = authors_of(&r.json);
+    // The proof that the identity was VERIFIED and not merely accepted: the
+    // DuckLake commit author is the token's SUBJECT, not the claimed leaf.
+    assert!(
+        authors.iter().any(|a| a == "svc-dana"),
+        "author should be the verified subject, got {authors:?}"
+    );
+    assert!(
+        !authors.iter().any(|a| a == "dana"),
+        "the claimed leaf must not be the author for a verified caller: {authors:?}"
+    );
+}
+
+#[tokio::test]
+async fn auth_stream_surface_requires_a_token_too() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = start_stack_with_auth(idp.auth_config()).await;
+    let token = idp.mint("svc-dana", "latiq", &idp.issuer, 300);
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(bearer_req(alloc("st"), "dana", &token))
+        .await
+        .unwrap();
+
+    let mut sc = latiq_proto::v1::stream_client::StreamClient::connect(s.data_endpoint.clone())
+        .await
+        .unwrap();
+    let err = sc
+        .read_arrow(req(q("st", "SELECT 1"), "dana"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+    // ...and succeeds with one.
+    sc.read_arrow(bearer_req(q("st", "SELECT 1"), "dana", &token))
+        .await
+        .unwrap();
 }

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 latiq-common = { path = "../latiq-common" }
 latiq-agent-core = { path = "../latiq-agent-core" }
+latiq-auth = { path = "../latiq-auth" }
 latiq-proto = { path = "../latiq-proto" }
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-storage = { path = "../latiq-storage" }

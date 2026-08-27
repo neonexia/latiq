@@ -100,6 +100,19 @@ async fn start_control_plane() -> (String, String) {
 
 /// Start one pond node (real GrpcControlPlane + forwarding) against `control`.
 async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
+    start_node_with_auth(node_id, control_endpoint, None).await
+}
+
+/// Start one pond node, optionally requiring verified bearer tokens on its Data
+/// and Stream surfaces.
+async fn start_node_with_auth(
+    node_id: &str,
+    control_endpoint: &str,
+    auth: Option<latiq_auth::AuthConfig>,
+) -> NodeStack {
+    let verifier = auth.map(|cfg| {
+        std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
+    });
     let tmp = tempfile::tempdir().unwrap();
     let (mcp_l, mcp_port) = bind().await;
     let (data_l, data_port) = bind().await;
@@ -120,8 +133,12 @@ async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     let data_ops = ops.clone();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(DataServer::new(DataService::new(data_ops.clone())))
-            .add_service(StreamServer::new(StreamService::new(data_ops)))
+            .add_service(DataServer::new(
+                DataService::new(data_ops.clone()).with_verifier(verifier.clone()),
+            ))
+            .add_service(StreamServer::new(
+                StreamService::new(data_ops).with_verifier(verifier),
+            ))
             .serve_with_incoming(TcpListenerStream::new(data_l))
             .await
             .unwrap();
@@ -150,6 +167,38 @@ pub async fn start_stack() -> TestStack {
         control_endpoint,
         mcp_endpoint: node.mcp_endpoint.clone(),
         _tmp: node._tmp,
+    }
+}
+
+/// Start the full stack with a single pond node whose Data + Stream surfaces
+/// require a verified bearer token. `start_stack` stays auth-free so every
+/// pre-existing test keeps exercising the relaxed path.
+pub async fn start_stack_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
+    let (control_endpoint, admin_endpoint) = start_control_plane().await;
+    let node = start_node_with_auth("node-test", &control_endpoint, Some(auth)).await;
+    TestStack {
+        data_endpoint: node.data_endpoint.clone(),
+        admin_endpoint,
+        control_endpoint,
+        mcp_endpoint: node.mcp_endpoint.clone(),
+        _tmp: node._tmp,
+    }
+}
+
+/// `n` pond nodes, all requiring the same verified bearer token — the shape a
+/// real cluster has, and what makes the forward hop's own auth testable.
+pub async fn start_stack_n_with_auth(n: usize, auth: latiq_auth::AuthConfig) -> MultiStack {
+    let (control_endpoint, admin_endpoint) = start_control_plane().await;
+    let mut nodes = Vec::with_capacity(n);
+    for i in 0..n {
+        nodes.push(
+            start_node_with_auth(&format!("node-{i}"), &control_endpoint, Some(auth.clone())).await,
+        );
+    }
+    MultiStack {
+        control_endpoint,
+        admin_endpoint,
+        nodes,
     }
 }
 

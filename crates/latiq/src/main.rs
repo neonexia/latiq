@@ -778,6 +778,9 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         control_endpoint: control_addr(),
         data_dir: root.join("ponds"),
         metrics_addr: Some(metrics_addr),
+        // CLI-launched nodes stay on the relaxed path; a configured issuer is a
+        // later, explicit flag.
+        auth: None,
     })
     .await
 }

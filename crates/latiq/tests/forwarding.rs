@@ -5,7 +5,7 @@
 //! deliberately drive the *other* node.
 mod common;
 
-use common::{start_stack_n, MultiStack};
+use common::{start_stack_n, start_stack_n_with_auth, MultiStack};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::*;
@@ -205,4 +205,80 @@ async fn forwarding_engine_error_propagates_across_hop() {
         !err.details().is_empty(),
         "structured envelope should cross the hop"
     );
+}
+
+#[tokio::test]
+async fn forwarding_carries_the_verified_subject_across_the_hop() {
+    // The node-to-node hop must not downgrade a verified caller to a claimed
+    // one: the greeter forwards the ORIGINAL bearer token and the owner verifies
+    // it itself, so the owner's DuckLake author is the token's subject. (A hop
+    // that re-injected only `latiq-agent-id` would silently record "dave".)
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let stack = start_stack_n_with_auth(2, idp.auth_config()).await;
+    let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+    let owner = allocate_and_locate_authed(&stack, "fwdauth", &token).await;
+    let mut n = client(&stack.other_than(&owner).data_endpoint).await;
+
+    n.write_query(bearer_req(
+        q("fwdauth", "CREATE TABLE t(i INTEGER)"),
+        "dave",
+        &token,
+    ))
+    .await
+    .unwrap();
+    let r = n
+        .read_query(bearer_req(
+            q(
+                "fwdauth",
+                "SELECT DISTINCT author FROM ducklake_snapshots('fwdauth')",
+            ),
+            "dave",
+            &token,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let authors = rows(&r.json);
+    let list = authors.as_array().unwrap();
+    assert!(
+        list.iter().any(|row| row[0] == "svc-dave"),
+        "forwarded write should keep the verified subject: {authors}"
+    );
+    assert!(
+        !list.iter().any(|row| row[0] == "dave"),
+        "the claimed leaf must not become the author across the hop: {authors}"
+    );
+}
+
+fn bearer_req<T>(msg: T, agent: &str, token: &str) -> Request<T> {
+    let mut r = req(msg, agent);
+    r.metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    r
+}
+
+/// `allocate_and_locate`, but presenting a bearer token on the auth'd stack.
+async fn allocate_and_locate_authed(stack: &MultiStack, name: &str, token: &str) -> String {
+    let mut c0 = client(&stack.nodes[0].data_endpoint).await;
+    c0.allocate_pond(bearer_req(
+        AllocatePondRequest {
+            name: name.into(),
+            policy_json: String::new(),
+            tier: String::new(),
+        },
+        "dave",
+        token,
+    ))
+    .await
+    .unwrap();
+    let mut ctl = ControlClient::connect(stack.control_endpoint.clone())
+        .await
+        .unwrap();
+    ctl.get_pond_location(GetPondLocationRequest {
+        pond_ref: name.into(),
+    })
+    .await
+    .unwrap()
+    .into_inner()
+    .node_endpoint
 }

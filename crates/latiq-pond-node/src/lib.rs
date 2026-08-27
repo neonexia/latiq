@@ -13,6 +13,7 @@ pub use grpc_control::GrpcControlPlane;
 pub use stream_service::StreamService;
 
 use latiq_agent_core::{AgentConfig, AgentOps};
+use latiq_auth::Verifier;
 use latiq_engine_duckdb::DuckEngine;
 use latiq_mcp::serve_mcp;
 use latiq_proto::v1::control_client::ControlClient;
@@ -40,6 +41,9 @@ pub struct PondNodeConfig {
     pub data_dir: PathBuf,
     /// Address to serve Prometheus `/metrics` on (None = metrics off).
     pub metrics_addr: Option<SocketAddr>,
+    /// When set, every surface on this node requires a verified bearer token.
+    /// `None` keeps the relaxed identity of the embedded and dev paths.
+    pub auth: Option<latiq_auth::AuthConfig>,
 }
 
 /// Install the standard + optional DuckDB extensions into the local cache so a
@@ -98,16 +102,23 @@ pub async fn build_ops(
     Ok(Arc::new(ops))
 }
 
-/// Serve the Data/Query gRPC surface on `addr`.
+/// Serve the Data/Query gRPC surface on `addr`. `verifier` is built once at
+/// startup and shared — never per request.
 pub async fn serve_data(
     addr: SocketAddr,
     ops: Arc<AgentOps>,
+    verifier: Option<Arc<Verifier>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Data (unary JSON, CLI/SDK) + Stream (server-streaming Arrow, SDK + the
-    // node-to-node read forward) share one port — both plain tonic.
+    // node-to-node read forward) share one port — both plain tonic. Both get the
+    // same verifier: a surface left unauthenticated is the whole node's auth.
     Server::builder()
-        .add_service(DataServer::new(DataService::new(ops.clone())))
-        .add_service(StreamServer::new(StreamService::new(ops)))
+        .add_service(DataServer::new(
+            DataService::new(ops.clone()).with_verifier(verifier.clone()),
+        ))
+        .add_service(StreamServer::new(
+            StreamService::new(ops).with_verifier(verifier),
+        ))
         .serve(addr)
         .await?;
     Ok(())
@@ -128,6 +139,15 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
                  not load them (bake them into the deployment image): {e}"
             )
         })?;
+
+    // Built ONCE, before anything serves: a bad auth config must stop the node
+    // loudly rather than let it come up accepting unauthenticated callers.
+    let verifier = match cfg.auth.clone() {
+        Some(auth) => Some(Arc::new(Verifier::new(auth).map_err(|e| {
+            anyhow::anyhow!("auth is configured but the verifier could not be built: {e}")
+        })?)),
+        None => None,
+    };
 
     let mcp_endpoint = format!("http://{}/mcp", cfg.mcp_addr);
     let ops = build_ops(
@@ -187,8 +207,9 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     // Serve both surfaces concurrently.
     let data_ops = ops.clone();
     let data_addr = cfg.data_addr;
+    let data_verifier = verifier.clone();
     tokio::spawn(async move {
-        if let Err(e) = serve_data(data_addr, data_ops).await {
+        if let Err(e) = serve_data(data_addr, data_ops, data_verifier).await {
             eprintln!("data gRPC server error: {e}");
         }
     });
