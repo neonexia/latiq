@@ -1739,6 +1739,7 @@ dependencies = [
  "latiq-metrics",
  "latiq-pond-node",
  "latiq-proto",
+ "latiq-sdk",
  "metrics",
  "reqwest 0.13.4",
  "serde_json",

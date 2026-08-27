@@ -88,6 +88,11 @@ pub async fn start_control_plane_with_auth(
     let registry = Registry::open(None).unwrap();
     let (control_l, control_port) = bind().await;
     let (admin_l, admin_port) = bind().await;
+    // Same derivation `serve_control_plane` uses: the well-known path on the
+    // address the Admin surface answers at.
+    let metadata_url = verifier
+        .as_ref()
+        .map(|_| format!("http://127.0.0.1:{admin_port}/.well-known/oauth-protected-resource"));
 
     let r1 = registry.clone();
     tokio::spawn(async move {
@@ -100,7 +105,9 @@ pub async fn start_control_plane_with_auth(
     tokio::spawn(async move {
         Server::builder()
             .add_service(AdminServer::new(
-                AdminService::new(registry).with_verifier(verifier),
+                AdminService::new(registry)
+                    .with_verifier(verifier)
+                    .with_metadata_url(metadata_url.as_deref()),
             ))
             .serve_with_incoming(TcpListenerStream::new(admin_l))
             .await
@@ -139,8 +146,8 @@ pub async fn add_node(
     start_node_with_auth(node_id, control_endpoint, auth).await
 }
 
-/// Start one pond node, optionally requiring verified bearer tokens on its Data
-/// and Stream surfaces.
+/// Start one pond node, optionally requiring verified bearer tokens on its Data,
+/// Stream and MCP surfaces.
 async fn start_node_with_auth(
     node_id: &str,
     control_endpoint: &str,
@@ -157,6 +164,11 @@ async fn start_node_with_auth(
     let internal_endpoint = data_endpoint.clone();
 
     let mcp_verifier = verifier.clone();
+    // Same derivation `run_pond_node` uses: the RFC 9728 document is served by
+    // this node's MCP surface, so the Data/Stream challenge points there.
+    let metadata_url = verifier
+        .as_ref()
+        .map(|_| format!("http://127.0.0.1:{mcp_port}/.well-known/oauth-protected-resource"));
     let ops = build_ops(
         node_id,
         &mcp_endpoint,
@@ -171,10 +183,14 @@ async fn start_node_with_auth(
     tokio::spawn(async move {
         Server::builder()
             .add_service(DataServer::new(
-                DataService::new(data_ops.clone()).with_verifier(verifier.clone()),
+                DataService::new(data_ops.clone())
+                    .with_verifier(verifier.clone())
+                    .with_metadata_url(metadata_url.as_deref()),
             ))
             .add_service(StreamServer::new(
-                StreamService::new(data_ops).with_verifier(verifier),
+                StreamService::new(data_ops)
+                    .with_verifier(verifier)
+                    .with_metadata_url(metadata_url.as_deref()),
             ))
             .serve_with_incoming(TcpListenerStream::new(data_l))
             .await

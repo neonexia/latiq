@@ -123,6 +123,11 @@ enum DatasetCmd {
         pond: String,
         #[arg(short, long)]
         agent_id: Option<String>,
+        /// OAuth bearer token presented to the server (`Authorization: Bearer`).
+        /// Only needed where the deployment configures an issuer; unset means the
+        /// relaxed (claimed-identity) path.
+        #[arg(long, env = "LATIQ_TOKEN")]
+        token: Option<String>,
     },
 }
 
@@ -156,6 +161,11 @@ enum CatalogCmd {
         set: Vec<String>,
         #[arg(short, long)]
         agent_id: Option<String>,
+        /// OAuth bearer token presented to the server (`Authorization: Bearer`).
+        /// Only needed where the deployment configures an issuer; unset means the
+        /// relaxed (claimed-identity) path.
+        #[arg(long, env = "LATIQ_TOKEN")]
+        token: Option<String>,
     },
     /// Pull from a catalog into a pond: transient attach → run the query → detach.
     Pull {
@@ -170,6 +180,11 @@ enum CatalogCmd {
         set: Vec<String>,
         #[arg(short, long)]
         agent_id: Option<String>,
+        /// OAuth bearer token presented to the server (`Authorization: Bearer`).
+        /// Only needed where the deployment configures an issuer; unset means the
+        /// relaxed (claimed-identity) path.
+        #[arg(long, env = "LATIQ_TOKEN")]
+        token: Option<String>,
     },
     /// Remove a catalog. Operator action.
     Remove { name: String },
@@ -191,6 +206,25 @@ struct ServeArgs {
     /// Prometheus /metrics port (default: control port + 1000).
     #[arg(long)]
     metrics_port: Option<u16>,
+    /// Trusted OIDC issuer URL. Repeatable: pass it more than once, or set
+    /// LATIQ_AUTH_ISSUER to a comma-separated list, to trust several IdPs (the
+    /// usual case being a workforce IdP for operators plus a workload IdP for
+    /// agents). Any issuer here turns on verification for every surface on this
+    /// process. None = relaxed claimed identity (dev / embedded).
+    #[arg(long, env = "LATIQ_AUTH_ISSUER", value_delimiter = ',')]
+    auth_issuer: Vec<String>,
+    /// The audience this deployment expects in a token (`aud`). Required
+    /// whenever an issuer is set: without it, a token minted for any other
+    /// service that trusts the same IdP would be accepted here. One value for
+    /// all issuers -- the audience names US, not who vouched for the caller.
+    #[arg(long, env = "LATIQ_AUTH_AUDIENCE")]
+    auth_audience: Option<String>,
+    /// Explicit JWKS URL, overriding the default derived from the issuer. Only
+    /// valid with exactly ONE --auth-issuer, since it cannot be matched to a
+    /// particular issuer otherwise. Needed for split-horizon deployments where
+    /// the issuer identifier is not a reachable address.
+    #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
+    auth_jwks_uri: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -229,6 +263,25 @@ struct NodeAddArgs {
     /// Prometheus /metrics port (default: data port + 1000).
     #[arg(long)]
     metrics_port: Option<u16>,
+    /// Trusted OIDC issuer URL. Repeatable: pass it more than once, or set
+    /// LATIQ_AUTH_ISSUER to a comma-separated list, to trust several IdPs (the
+    /// usual case being a workforce IdP for operators plus a workload IdP for
+    /// agents). Any issuer here turns on verification for every surface on this
+    /// process. None = relaxed claimed identity (dev / embedded).
+    #[arg(long, env = "LATIQ_AUTH_ISSUER", value_delimiter = ',')]
+    auth_issuer: Vec<String>,
+    /// The audience this deployment expects in a token (`aud`). Required
+    /// whenever an issuer is set: without it, a token minted for any other
+    /// service that trusts the same IdP would be accepted here. One value for
+    /// all issuers -- the audience names US, not who vouched for the caller.
+    #[arg(long, env = "LATIQ_AUTH_AUDIENCE")]
+    auth_audience: Option<String>,
+    /// Explicit JWKS URL, overriding the default derived from the issuer. Only
+    /// valid with exactly ONE --auth-issuer, since it cannot be matched to a
+    /// particular issuer otherwise. Needed for split-horizon deployments where
+    /// the issuer identifier is not a reachable address.
+    #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
+    auth_jwks_uri: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -310,6 +363,11 @@ struct QueryArgs {
     /// Identity attributed to your writes (relaxed; defaults to anonymous).
     #[arg(short, long)]
     agent_id: Option<String>,
+    /// OAuth bearer token presented to the server (`Authorization: Bearer`).
+    /// Only needed where the deployment configures an issuer; unset means the
+    /// relaxed (claimed-identity) path.
+    #[arg(long, env = "LATIQ_TOKEN")]
+    token: Option<String>,
     /// Output format for read results.
     #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
     format: Format,
@@ -432,6 +490,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
             name,
             pond,
             agent_id,
+            token,
         } => {
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
@@ -445,6 +504,7 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                         dataset: name,
                     },
                     &agent_id,
+                    &token,
                 ))
                 .await
             {
@@ -537,6 +597,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
             pond,
             set,
             agent_id,
+            token,
         } => {
             let params = parse_kv(&set, "--set")?;
             let node = data_target(&pond).await?;
@@ -549,6 +610,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                         params,
                     },
                     &agent_id,
+                    &token,
                 ))
                 .await
                 .map_err(render_status)?
@@ -562,6 +624,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
             query,
             set,
             agent_id,
+            token,
         } => {
             let params = parse_kv(&set, "--set")?;
             let node = data_target(&pond).await?;
@@ -578,6 +641,7 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                         params,
                     },
                     &agent_id,
+                    &token,
                 ))
                 .await
             {
@@ -732,9 +796,68 @@ fn start_metrics(bind: &str, main_port: u16, metrics_port: Option<u16>) -> Resul
     Ok(addr)
 }
 
+/// A blank value means "not set". Compose always passes the variable through
+/// (possibly empty), so an empty string must mean auth off, not a broken issuer.
+fn non_blank(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Build the auth config the server surfaces verify against, from the three
+/// `--auth-*` flags. `None` = the relaxed (claimed-identity) path this binary
+/// has always taken; there is no partial state in between.
+///
+/// Both errors here are refusals to guess: an issuer without an audience would
+/// accept any token minted for any service that trusts the same IdP, and a JWKS
+/// uri that cannot be matched to one issuer would silently be applied to the
+/// wrong one. Either is a security hole, so neither gets a default.
+#[cfg(feature = "server")]
+fn auth_config(
+    issuers: Vec<String>,
+    audience: Option<String>,
+    jwks_uri: Option<String>,
+) -> Result<Option<latiq_auth::AuthConfig>> {
+    let issuers: Vec<String> = issuers
+        .into_iter()
+        .filter_map(|i| non_blank(Some(i)))
+        .collect();
+    if issuers.is_empty() {
+        return Ok(None);
+    }
+    let Some(audience) = non_blank(audience) else {
+        return Err(anyhow!(
+            "--auth-issuer is set but --auth-audience is not. Without an audience a token minted \
+             for any other service that trusts the same issuer would be accepted here. Set \
+             --auth-audience (or $LATIQ_AUTH_AUDIENCE) to the audience this deployment expects."
+        ));
+    };
+    let jwks_uri = non_blank(jwks_uri);
+    if jwks_uri.is_some() && issuers.len() > 1 {
+        return Err(anyhow!(
+            "--auth-jwks-uri cannot be used with {} issuers: it names ONE issuer's key set and \
+             there is no way to tell which. Configure a single issuer, or drop the flag and let \
+             each issuer's JWKS be discovered from its own URL.",
+            issuers.len()
+        ));
+    }
+    Ok(Some(latiq_auth::AuthConfig {
+        audience,
+        issuers: issuers
+            .into_iter()
+            .map(|issuer| latiq_auth::IssuerConfig {
+                issuer,
+                // Only ever `Some` in the single-issuer case, guarded above.
+                jwks_uri: jwks_uri.clone(),
+            })
+            .collect(),
+    }))
+}
+
 #[cfg(feature = "server")]
 async fn run_serve(a: ServeArgs) -> Result<()> {
     init_tracing();
+    // Resolved BEFORE anything binds: an incoherent auth config must stop the
+    // process, never quietly downgrade it to unauthenticated.
+    let auth = auth_config(a.auth_issuer, a.auth_audience, a.auth_jwks_uri)?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -746,9 +869,21 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     println!("control plane: Control + Admin gRPC on {addr}");
     println!("  registry: {}", db.display());
     println!("  metrics:  http://{metrics_addr}/metrics");
-    // The CLI-launched control plane stays on the relaxed path; a configured
-    // issuer is a later, explicit flag (same call as `latiq node add`).
-    serve_control_plane(addr, registry, None)
+    match &auth {
+        Some(cfg) => println!(
+            "  auth:     verifying tokens for audience '{}' from {}",
+            cfg.audience,
+            cfg.issuers
+                .iter()
+                .map(|i| i.issuer.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // No issuer configured: identity stays relaxed (claimed, anonymous by
+        // default) exactly as it was before the flags existed.
+        None => println!("  auth:     off (relaxed claimed identity)"),
+    }
+    serve_control_plane(addr, registry, auth)
         .await
         .map_err(|e| anyhow!("server error: {e}"))?;
     Ok(())
@@ -757,6 +892,10 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
 #[cfg(feature = "server")]
 async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     init_tracing();
+    // Resolved BEFORE the node registers or serves, for the same reason as
+    // `run_serve`: a node that comes up with a half-configured verifier is a
+    // node accepting unauthenticated callers.
+    let auth = auth_config(a.auth_issuer, a.auth_audience, a.auth_jwks_uri)?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -780,9 +919,9 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         control_endpoint: control_addr(),
         data_dir: root.join("ponds"),
         metrics_addr: Some(metrics_addr),
-        // CLI-launched nodes stay on the relaxed path; a configured issuer is a
-        // later, explicit flag.
-        auth: None,
+        // `None` unless --auth-issuer was given: no flags means the relaxed
+        // (claimed) identity path this node has always run.
+        auth,
     })
     .await
 }
@@ -834,11 +973,28 @@ async fn resolve_node(pond_ref: &str) -> Result<String> {
     Ok(loc.node_endpoint)
 }
 
-fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
+/// The bearer credential to present, if any. Blank is absent for the same reason
+/// as the server flags: `LATIQ_TOKEN=` in a compose file or a `.env` must not
+/// become an `Authorization: Bearer ` header that is rejected as malformed.
+fn bearer_of(token: &Option<String>) -> Option<String> {
+    non_blank(token.clone())
+}
+
+/// The metadata every data op carries: the CLAIMED agent id, and — when the
+/// deployment requires it — the bearer token that actually proves who we are.
+///
+/// The token rides gRPC metadata per request rather than the channel: a `Channel`
+/// is shared and cached, metadata is not.
+fn with_id<T>(msg: T, agent_id: &Option<String>, token: &Option<String>) -> Request<T> {
     let mut r = Request::new(msg);
     if let Some(id) = agent_id {
         if let Ok(v) = id.parse() {
             r.metadata_mut().insert("latiq-agent-id", v);
+        }
+    }
+    if let Some(t) = bearer_of(token) {
+        if let Ok(v) = format!("Bearer {t}").parse() {
+            r.metadata_mut().insert("authorization", v);
         }
     }
     r
@@ -855,6 +1011,7 @@ async fn run_query(a: QueryArgs) -> Result<()> {
             sql: a.sql.clone(),
         },
         &a.agent_id,
+        &a.token,
     );
     // Still one `query` command — but route by statement so reads ride the Arrow
     // streaming hop (ReadQuery) and writes are attributed/snapshotted (WriteQuery).
@@ -1389,5 +1546,100 @@ mod tests {
             advertise_endpoint(Some("http://node-a:51401"), 51401),
             "http://node-a:51401"
         );
+    }
+
+    #[test]
+    fn non_blank_treats_empty_and_whitespace_as_absent() {
+        // Compose interpolation (`${LATIQ_AUTH_ISSUER:-}`) always SETS the
+        // variable, so clap hands us `Some("")`. That must mean "auth off", not
+        // "an issuer named empty string" — otherwise a plain `docker compose up`
+        // comes up rejecting every request.
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some(String::new())), None);
+        assert_eq!(non_blank(Some("   ".into())), None);
+        assert_eq!(non_blank(Some("\t\n".into())), None);
+        // Surrounding whitespace is stripped, not rejected.
+        assert_eq!(
+            non_blank(Some(" https://idp ".into())),
+            Some("https://idp".to_string())
+        );
+        assert_eq!(
+            non_blank(Some("https://idp".into())),
+            Some("https://idp".to_string())
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_is_absent_when_no_issuer_is_set() {
+        // The default path: no flags, no env → no verifier anywhere.
+        assert!(auth_config(vec![], None, None).unwrap().is_none());
+        // An EMPTY issuer env var is the same as an unset one.
+        assert!(auth_config(vec![String::new()], None, None)
+            .unwrap()
+            .is_none());
+        assert!(auth_config(vec!["  ".into()], Some("latiq".into()), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_requires_an_audience_with_an_issuer() {
+        let e = auth_config(vec!["https://idp".into()], None, None)
+            .expect_err("an issuer without an audience must fail fast");
+        assert!(e.to_string().contains("--auth-audience"), "got {e}");
+        // A blank audience is an absent one.
+        assert!(auth_config(vec!["https://idp".into()], Some("  ".into()), None).is_err());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_refuses_a_jwks_uri_with_several_issuers() {
+        let e = auth_config(
+            vec!["https://a".into(), "https://b".into()],
+            Some("latiq".into()),
+            Some("https://a/jwks".into()),
+        )
+        .expect_err("an ambiguous jwks uri must fail fast");
+        assert!(e.to_string().contains("--auth-jwks-uri"), "got {e}");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_builds_issuers_in_order() {
+        let cfg = auth_config(
+            vec!["https://a".into(), " https://b ".into(), String::new()],
+            Some(" latiq ".into()),
+            None,
+        )
+        .unwrap()
+        .expect("issuers configured");
+        assert_eq!(cfg.audience, "latiq");
+        let names: Vec<_> = cfg.issuers.iter().map(|i| i.issuer.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["https://a".to_string(), "https://b".to_string()]
+        );
+        assert!(cfg.issuers.iter().all(|i| i.jwks_uri.is_none()));
+
+        // One issuer + an explicit JWKS uri: unambiguous, so it is attached.
+        let cfg = auth_config(
+            vec!["https://a".into()],
+            Some("latiq".into()),
+            Some("https://a/keys".into()),
+        )
+        .unwrap()
+        .expect("issuers configured");
+        assert_eq!(cfg.issuers[0].jwks_uri.as_deref(), Some("https://a/keys"));
+    }
+
+    #[test]
+    fn token_flag_reads_the_env_var() {
+        // Declarative check that `--token` is wired to LATIQ_TOKEN and that a
+        // blank value is not turned into an empty bearer credential.
+        assert_eq!(bearer_of(&None), None);
+        assert_eq!(bearer_of(&Some("  ".into())), None);
+        assert_eq!(bearer_of(&Some(" abc ".into())), Some("abc".to_string()));
     }
 }

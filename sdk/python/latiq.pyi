@@ -9,13 +9,16 @@ def connect(
     server: str = ...,
     root: str | os.PathLike[str] | None = ...,
     query_gateway: str | None = ...,
+    token: str | None = ...,
 ) -> Database:
     """Connect to Latiq.
 
     `server="local"` starts an in-process single-node cluster backed by `root`
     (default `~/.latiq/local`); any other value is a remote control-plane endpoint
     (e.g. `"grpc://host:51400"`). `query_gateway` overrides the Data/Stream front
-    door when it differs from `server` (else `server` is reused).
+    door when it differs from `server` (else `server` is reused). `token` is the
+    OAuth bearer token sent with every request, defaulting to `$LATIQ_TOKEN`;
+    it is only needed where the deployment configures an issuer.
     """
 
 class Database:

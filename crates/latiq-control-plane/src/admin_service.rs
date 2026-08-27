@@ -20,6 +20,8 @@ use tonic::{Request, Response, Status};
 pub struct AdminService {
     pub registry: Registry,
     verifier: Option<std::sync::Arc<latiq_auth::Verifier>>,
+    /// The `WWW-Authenticate` value handed back on a rejection, built once.
+    challenge: Option<String>,
 }
 
 impl AdminService {
@@ -27,6 +29,7 @@ impl AdminService {
         Self {
             registry,
             verifier: None,
+            challenge: None,
         }
     }
 
@@ -35,6 +38,27 @@ impl AdminService {
     pub fn with_verifier(mut self, verifier: Option<std::sync::Arc<latiq_auth::Verifier>>) -> Self {
         self.verifier = verifier;
         self
+    }
+
+    /// The RFC 9728 protected-resource metadata URL to advertise on a rejection.
+    /// See `serve_control_plane` for what the control plane passes here.
+    pub fn with_metadata_url(mut self, metadata_url: Option<&str>) -> Self {
+        self.challenge = metadata_url.map(latiq_auth::metadata::challenge_header);
+        self
+    }
+
+    /// `Unauthenticated`, carrying the RFC 9728 challenge when we have one.
+    ///
+    /// gRPC has no 401, but a tonic `Status` carries trailing metadata — so the
+    /// same `www-authenticate` value the MCP surface returns on its 401 rides
+    /// along here. Without it an operator whose CLI is turned away knows only
+    /// THAT a token is required, never which authorization server issues one.
+    fn unauthenticated(&self, message: &'static str) -> Status {
+        let mut status = Status::unauthenticated(message);
+        if let Some(value) = self.challenge.as_deref().and_then(|c| c.parse().ok()) {
+            status.metadata_mut().insert("www-authenticate", value);
+        }
+        status
     }
 
     /// Identity from gRPC metadata. With a verifier configured, an
@@ -76,7 +100,7 @@ impl AdminService {
                 ERROR,
                 started,
             );
-            return Err(Status::unauthenticated("a bearer token is required"));
+            return Err(self.unauthenticated("a bearer token is required"));
         };
         verifier.verify(token, claimed).await.map_err(|e| {
             // Logged in full here, summarised on the wire: the detail is for the
@@ -91,7 +115,7 @@ impl AdminService {
                 ERROR,
                 started,
             );
-            Status::unauthenticated("the bearer token was rejected")
+            self.unauthenticated("the bearer token was rejected")
         })
     }
 
