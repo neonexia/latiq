@@ -583,6 +583,8 @@ impl LocalCluster {
             control_endpoint: control_endpoint.clone(),
             data_dir: root.join("ponds"),
             metrics_addr: None,
+            // The embedded stack is in-process and single-user: relaxed identity.
+            auth: None,
         };
         rt.spawn(async move {
             let _ = run_pond_node(cfg).await;

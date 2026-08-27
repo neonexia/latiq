@@ -37,6 +37,8 @@ tracing-subscriber = { workspace = true }
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-agent-core = { path = "../latiq-agent-core" }
 latiq-client = { path = "../latiq-client" }
+# The in-process fake IdP behind the auth_* surface tests.
+latiq-auth = { path = "../latiq-auth", features = ["test-support"] }
 tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 arrow = { workspace = true }

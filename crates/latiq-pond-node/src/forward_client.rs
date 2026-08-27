@@ -66,10 +66,23 @@ impl GrpcForwarder {
 /// Tag the forwarded request with the caller's identity (so the owner attributes
 /// the op to the original agent) and the ambient trace id (so the request's spans
 /// correlate across the node hop).
+///
+/// When the caller presented a bearer token, the ORIGINAL token is replayed so
+/// the owner verifies it itself and reaches the same verified identity. Without
+/// that, only `latiq-agent-id` would cross the hop and a verified caller would
+/// arrive downgraded to claimed — fail-safe for authority, but it silently drops
+/// subject/issuer and makes the owner's attribution wrong. We deliberately do
+/// NOT send an internal header asserting "already verified": a claim the owner
+/// trusts without checking is trust laundering.
 fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
     let mut req = Request::new(msg);
     if let Ok(v) = MetadataValue::try_from(id.agent_id.as_str()) {
         req.metadata_mut().insert("latiq-agent-id", v);
+    }
+    if let Some(token) = crate::data_service::current_bearer() {
+        if let Ok(v) = MetadataValue::try_from(format!("Bearer {token}").as_str()) {
+            req.metadata_mut().insert("authorization", v);
+        }
     }
     if let Some(tid) = latiq_agent_core::current_trace_id() {
         if let Ok(v) = MetadataValue::try_from(tid.as_str()) {
