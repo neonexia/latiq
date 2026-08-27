@@ -39,6 +39,45 @@ nightly's `verify-deployment` job runs the **user** compose against the
 pod) — the control plane stores it and forwarding dials it; a wrong value lands
 forwarding on the wrong host.
 
+## Auth mode (`auth` profile — nightly + container only)
+Identity v0 (OAuth bearer verification on **all three** surfaces: MCP, Data/Stream
+gRPC, Admin gRPC) is exercised **only** in containers, **only** in the nightly.
+`./dev.sh`, `cargo test`, and a plain `docker compose up` are unchanged and
+unauthenticated.
+
+One compose file, driven by env — no override file:
+```bash
+cd deploy/cluster
+docker compose --env-file auth.env up -d     # auth cluster + Keycloak
+docker compose --env-file auth.env run --rm auth-tests-sdk
+docker compose --env-file auth.env run --rm auth-tests-agent
+```
+`auth.env` sets **`COMPOSE_PROFILES=auth`** (Compose reads it from an env file like
+any other setting, so no `--profile` flag) *and* `LATIQ_AUTH_ISSUER` /
+`LATIQ_AUTH_AUDIENCE`. Two mechanisms, two jobs: **`profiles:`** gates whether a
+service *starts* (keycloak, `auth-tests-*`); **`${VAR:-default}`** injects the
+issuer/audience into the **existing** control-plane + pond-node definitions — a
+profile can't do that. Without the env file the issuer renders **empty**, and the
+binary normalizes a blank issuer to "auth off".
+
+**Everything is in-network, on purpose.** `keycloak:8080` resolves via Docker DNS
+for the servers *and* for the two one-shot test runners (`auth-tests-sdk` on
+`python:3.11-slim` → the wheel from `/repo/dist` + `pytest e2e/sdk/test_auth.py`;
+`auth-tests-agent` on `node:22-slim` → `npm ci && npm test` in `e2e/agent`), so
+there is **one** issuer URL and no host-vs-container address split to reconcile.
+`KC_HOSTNAME_URL` pins the `iss` claim to that same URL. Keycloak publishes **no**
+ports (add `ports: ["8080:8080"]` by hand if you want the admin console).
+
+`keycloak-realm.json` carries realm `latiq` + confidential client `latiq-agent`
+(service accounts → `client_credentials`) and — **essential** — an
+`oidc-audience-mapper` adding `aud: latiq`. Keycloak emits no custom `aud` by
+default, and without the mapper every token fails the audience check as an opaque
+rejection. Verified token: `iss=http://keycloak:8080/realms/latiq`,
+`aud=["latiq","account"]`.
+
+`latiq-compose.yml` is **deliberately untouched** by all of this: the external-user
+deployment stays pure images + ports, no profiles, no mounts.
+
 ## Deployment tiers
 1. **Dev** → `./dev.sh` (control plane + N nodes; nginx front door when `--nodes>1`).
 2. **External** → the published compose + GHCR image. Agents → the MCP endpoint

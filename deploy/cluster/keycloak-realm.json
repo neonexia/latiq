@@ -1,0 +1,26 @@
+{
+  "realm": "latiq",
+  "enabled": true,
+  "clients": [
+    {
+      "clientId": "latiq-agent",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "latiq-agent-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "latiq-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "latiq",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ]
+}
