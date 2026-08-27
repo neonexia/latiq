@@ -104,20 +104,30 @@ pub async fn build_ops(
 
 /// Serve the Data/Query gRPC surface on `addr`. `verifier` is built once at
 /// startup and shared — never per request.
+///
+/// `metadata_url` is the RFC 9728 protected-resource document advertised in the
+/// `WWW-Authenticate` challenge on a rejection. On a pond node that document is
+/// served by the MCP surface, so the URL points there (see `run_pond_node`);
+/// `None` means no challenge is attached.
 pub async fn serve_data(
     addr: SocketAddr,
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,
+    metadata_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Data (unary JSON, CLI/SDK) + Stream (server-streaming Arrow, SDK + the
     // node-to-node read forward) share one port — both plain tonic. Both get the
     // same verifier: a surface left unauthenticated is the whole node's auth.
     Server::builder()
         .add_service(DataServer::new(
-            DataService::new(ops.clone()).with_verifier(verifier.clone()),
+            DataService::new(ops.clone())
+                .with_verifier(verifier.clone())
+                .with_metadata_url(metadata_url.as_deref()),
         ))
         .add_service(StreamServer::new(
-            StreamService::new(ops).with_verifier(verifier),
+            StreamService::new(ops)
+                .with_verifier(verifier)
+                .with_metadata_url(metadata_url.as_deref()),
         ))
         .serve(addr)
         .await?;
@@ -208,8 +218,23 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     let data_ops = ops.clone();
     let data_addr = cfg.data_addr;
     let data_verifier = verifier.clone();
+    // ASSUMPTION: the RFC 9728 document lives on this node's MCP surface, which
+    // serves it from the address it binds (`serve_mcp`). So the Data/Stream
+    // challenge points at `http://<mcp_addr>/.well-known/oauth-protected-resource`
+    // — the same scheme + address the MCP 401 advertises. It is derived rather
+    // than configured because a second flag for it would be one more thing to get
+    // wrong, and any TLS/hostname rewriting in front of the node is the gateway's
+    // job. `None` when no verifier is configured: a node that never opted into
+    // auth must not advertise an authorization server.
+    let data_metadata_url = verifier.as_ref().map(|_| {
+        format!(
+            "http://{}{}",
+            cfg.mcp_addr,
+            latiq_mcp::server::PROTECTED_RESOURCE_PATH
+        )
+    });
     tokio::spawn(async move {
-        if let Err(e) = serve_data(data_addr, data_ops, data_verifier).await {
+        if let Err(e) = serve_data(data_addr, data_ops, data_verifier, data_metadata_url).await {
             eprintln!("data gRPC server error: {e}");
         }
     });

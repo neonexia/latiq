@@ -17,6 +17,8 @@ use tonic::{Code, Request, Response, Status};
 pub struct DataService {
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,
+    /// The `WWW-Authenticate` value handed back on a rejection, built once.
+    challenge: Option<String>,
 }
 
 impl DataService {
@@ -24,6 +26,7 @@ impl DataService {
         Self {
             ops,
             verifier: None,
+            challenge: None,
         }
     }
 
@@ -33,6 +36,37 @@ impl DataService {
         self.verifier = verifier;
         self
     }
+
+    /// The RFC 9728 protected-resource metadata URL to advertise on a rejection.
+    /// See `challenge_of` for what a node passes here.
+    pub fn with_metadata_url(mut self, metadata_url: Option<&str>) -> Self {
+        self.challenge = challenge_of(metadata_url);
+        self
+    }
+
+    async fn identity<T>(&self, req: &Request<T>) -> Result<(Identity, Option<String>), Status> {
+        identity_of(self.verifier.as_ref(), self.challenge.as_deref(), req).await
+    }
+}
+
+/// Build the challenge string for a metadata URL, if one was configured. Kept
+/// here so the Data and Stream surfaces cannot disagree about its shape.
+pub(crate) fn challenge_of(metadata_url: Option<&str>) -> Option<String> {
+    metadata_url.map(latiq_auth::metadata::challenge_header)
+}
+
+/// `Unauthenticated`, carrying the RFC 9728 challenge when we have one.
+///
+/// gRPC has no 401 and no header of its own for this, but a tonic `Status`
+/// carries trailing metadata — so the same `www-authenticate` value the MCP
+/// surface returns on a 401 rides along here. Without it a Data/Stream client
+/// that is turned away knows only THAT it needs a token, never where to get one.
+fn unauthenticated(message: &'static str, challenge: Option<&str>) -> Status {
+    let mut status = Status::unauthenticated(message);
+    if let Some(value) = challenge.and_then(|c| c.parse().ok()) {
+        status.metadata_mut().insert("www-authenticate", value);
+    }
+    status
 }
 
 /// The raw bearer token from the `authorization` metadata, if one is present.
@@ -65,6 +99,7 @@ pub(crate) fn bearer_of<T>(req: &Request<T>) -> Option<String> {
 /// goes to the operator's log instead.
 pub(crate) async fn identity_of<T>(
     verifier: Option<&Arc<Verifier>>,
+    challenge: Option<&str>,
     req: &Request<T>,
 ) -> Result<(Identity, Option<String>), Status> {
     let claimed = req
@@ -75,11 +110,11 @@ pub(crate) async fn identity_of<T>(
         return Ok((Identity::claimed(claimed), None));
     };
     let Some(token) = bearer_of(req) else {
-        return Err(Status::unauthenticated("a bearer token is required"));
+        return Err(unauthenticated("a bearer token is required", challenge));
     };
     let identity = verifier.verify(&token, claimed).await.map_err(|e| {
         tracing::debug!(error = %e, "bearer token rejected");
-        Status::unauthenticated("the bearer token was rejected")
+        unauthenticated("the bearer token was rejected", challenge)
     })?;
     Ok((identity, Some(token)))
 }
@@ -147,7 +182,7 @@ impl Data for DataService {
         // plane and returns, without ever calling the forwarder. If it ever does
         // forward, this handler must be wrapped like the rest — otherwise it
         // would reach a peer with no token at all.
-        let (id, _tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, _tok) = self.identity(&req).await?;
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -179,7 +214,7 @@ impl Data for DataService {
         &self,
         req: Request<DropPondRequest>,
     ) -> Result<Response<DropPondResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -196,7 +231,7 @@ impl Data for DataService {
         &self,
         req: Request<DescribePondRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -211,7 +246,7 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -230,7 +265,7 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -248,7 +283,7 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -266,7 +301,7 @@ impl Data for DataService {
         &self,
         req: Request<LoadDatasetRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -284,7 +319,7 @@ impl Data for DataService {
         &self,
         req: Request<CatalogPullRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -308,7 +343,7 @@ impl Data for DataService {
         &self,
         req: Request<CatalogDescribeRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = self.identity(&req).await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();

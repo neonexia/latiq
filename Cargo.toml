@@ -38,7 +38,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tonic = "0.12"
 prost = "0.13"
-clap = { version = "4", features = ["derive"] }
+# `env` lets a flag be set from an environment variable — how the container
+# deployments configure auth (LATIQ_AUTH_ISSUER / LATIQ_TOKEN).
+clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 tokio-util = { version = "0.7", features = ["rt"] }
 # json + parquet are statically linked into the binary (the "standard" set, no

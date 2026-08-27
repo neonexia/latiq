@@ -197,6 +197,60 @@ async fn auth_admin_rejects_missing_token_when_configured() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
+/// An operator whose CLI is turned away needs the same discovery hint an agent
+/// gets from the MCP 401: which authorization server this deployment trusts.
+#[tokio::test]
+async fn auth_admin_rejection_carries_the_discovery_challenge() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let (_control, admin_endpoint) =
+        common::start_control_plane_with_auth(Some(idp.auth_config())).await;
+    let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
+
+    let err = admin.list_nodes(ListNodesRequest {}).await.unwrap_err();
+    let challenge = err
+        .metadata()
+        .get("www-authenticate")
+        .expect("a rejection must advertise where to get a token")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.starts_with(r#"Bearer resource_metadata=""#),
+        "got {challenge}"
+    );
+    assert!(
+        challenge.contains("/.well-known/oauth-protected-resource"),
+        "got {challenge}"
+    );
+
+    // A token that fails verification gets the same challenge.
+    let err = admin
+        .list_nodes(bearer_req(ListNodesRequest {}, "opsbot", "not-a-jwt"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.metadata()
+            .get("www-authenticate")
+            .map(|v| v.to_str().unwrap()),
+        Some(challenge.as_str())
+    );
+}
+
+/// With no verifier there is nothing to discover, and an ordinary error must not
+/// start carrying an auth challenge.
+#[tokio::test]
+async fn auth_admin_absent_config_sends_no_challenge() {
+    let (_control, admin_endpoint) = common::start_control_plane_with_auth(None).await;
+    let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
+    let err = admin
+        .describe_node(DescribeNodeRequest {
+            node_id: "nope".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.metadata().get("www-authenticate").is_none());
+}
+
 #[tokio::test]
 async fn auth_admin_rejects_an_invalid_token_when_configured() {
     let idp = latiq_auth::test_support::TestIdp::start().await;

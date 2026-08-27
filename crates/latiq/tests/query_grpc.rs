@@ -414,6 +414,75 @@ async fn auth_rejects_missing_token_when_configured() {
     );
 }
 
+/// RFC 9728 discovery on gRPC. A Data/Stream client that is turned away has no
+/// other in-band way to learn WHERE to get a token; the challenge in the Status'
+/// metadata is the whole handshake we participate in.
+#[tokio::test]
+async fn auth_rejection_carries_the_discovery_challenge() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = start_stack_with_auth(idp.auth_config()).await;
+    let mut c = client(&s.data_endpoint).await;
+
+    // No token at all.
+    let err = c.allocate_pond(req(alloc("p"), "dana")).await.unwrap_err();
+    let challenge = err
+        .metadata()
+        .get("www-authenticate")
+        .expect("a rejection must advertise where to get a token")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.starts_with(r#"Bearer resource_metadata=""#),
+        "got {challenge}"
+    );
+    assert!(
+        challenge.contains("/.well-known/oauth-protected-resource"),
+        "got {challenge}"
+    );
+
+    // A token that fails verification gets the same challenge — the client's
+    // recovery (go back to the authorization server) is identical.
+    let err = c
+        .allocate_pond(bearer_req(alloc("p"), "dana", "not-a-jwt"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.metadata()
+            .get("www-authenticate")
+            .map(|v| v.to_str().unwrap()),
+        Some(challenge.as_str())
+    );
+
+    // The Stream surface answers the same way.
+    let mut sc = latiq_proto::v1::stream_client::StreamClient::connect(s.data_endpoint.clone())
+        .await
+        .unwrap();
+    let err = sc
+        .read_arrow(req(q("p", "SELECT 1"), "dana"))
+        .await
+        .unwrap_err();
+    assert!(err.metadata().get("www-authenticate").is_some());
+}
+
+/// With no verifier there is nothing to discover, so no challenge is attached —
+/// a node that never opted into auth must not start advertising an auth server.
+#[tokio::test]
+async fn auth_absent_config_sends_no_challenge() {
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    let err = c
+        .describe_pond(req(
+            DescribePondRequest {
+                pond: "nope".into(),
+            },
+            "dana",
+        ))
+        .await
+        .unwrap_err();
+    assert!(err.metadata().get("www-authenticate").is_none());
+}
+
 #[tokio::test]
 async fn auth_rejects_an_invalid_token_when_configured() {
     let idp = latiq_auth::test_support::TestIdp::start().await;

@@ -6,7 +6,7 @@
 //! It encodes `AgentOps::read_arrow`'s `RecordBatch` stream into ONE Arrow IPC
 //! stream (schema message first, then batches), chunked into `ArrowChunk`s —
 //! nothing is buffered: each batch becomes a chunk as it arrives.
-use crate::data_service::{identity_of, to_status};
+use crate::data_service::{challenge_of, identity_of, to_status};
 use arrow::ipc::writer::StreamWriter;
 use latiq_agent_core::{AgentOps, ArrowReadStream};
 use latiq_auth::Verifier;
@@ -22,6 +22,8 @@ use tonic::{Request, Response, Status};
 pub struct StreamService {
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,
+    /// The `WWW-Authenticate` value handed back on a rejection, built once.
+    challenge: Option<String>,
 }
 
 impl StreamService {
@@ -29,6 +31,7 @@ impl StreamService {
         Self {
             ops,
             verifier: None,
+            challenge: None,
         }
     }
 
@@ -36,6 +39,13 @@ impl StreamService {
     /// the easy one to forget, and it reads the same data the Data surface does.
     pub fn with_verifier(mut self, verifier: Option<Arc<Verifier>>) -> Self {
         self.verifier = verifier;
+        self
+    }
+
+    /// The RFC 9728 protected-resource metadata URL to advertise on a rejection —
+    /// the same one the Data surface advertises; they share a port and an issuer.
+    pub fn with_metadata_url(mut self, metadata_url: Option<&str>) -> Self {
+        self.challenge = challenge_of(metadata_url);
         self
     }
 }
@@ -50,7 +60,8 @@ impl StreamSvc for StreamService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<Self::ReadArrowStream>, Status> {
-        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) =
+            identity_of(self.verifier.as_ref(), self.challenge.as_deref(), &req).await?;
         let tid = crate::data_service::trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();

@@ -51,6 +51,10 @@ pub struct Latiq {
     control_channel: Channel,
     data_channel: Channel,
     identity: String,
+    /// The OAuth bearer token presented on every request, when the deployment
+    /// requires one. Held BESIDE the channels, never in them: a `Channel` is
+    /// shared and cached, while tonic metadata is per request.
+    token: Option<String>,
     /// Keeps the embedded control-plane + pond-node alive (None in remote mode).
     _local: Option<LocalCluster>,
 }
@@ -140,6 +144,27 @@ impl Latiq {
         root: Option<PathBuf>,
         query_gateway: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with_token(server, root, query_gateway, None)
+    }
+
+    /// As `connect_with`, plus the OAuth bearer token this client presents.
+    ///
+    /// `token = None` falls back to `$LATIQ_TOKEN`, so a notebook or a job can be
+    /// handed a credential without threading it through the call. Either way a
+    /// blank value means "no token": an empty `Authorization: Bearer ` header is
+    /// worse than none, since it is rejected as malformed rather than as absent.
+    /// Against a deployment with no issuer configured the token is simply unused.
+    pub fn connect_with_token(
+        server: &str,
+        root: Option<PathBuf>,
+        query_gateway: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Self> {
+        let token = token
+            .map(str::to_string)
+            .or_else(|| std::env::var("LATIQ_TOKEN").ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -164,6 +189,7 @@ impl Latiq {
                 control_channel,
                 data_channel,
                 identity: "sdk".into(),
+                token,
                 _local: Some(local),
             })
         } else {
@@ -186,6 +212,7 @@ impl Latiq {
                 control_channel,
                 data_channel,
                 identity: "sdk".into(),
+                token,
                 _local: None,
             })
         }
@@ -542,11 +569,18 @@ impl Latiq {
         Ok(StreamClient::new(self.data_channel.clone()))
     }
 
-    /// Attach the (relaxed) identity header data ops carry.
+    /// The identity this client presents: the CLAIMED leaf, plus the bearer
+    /// token that actually proves who we are where one is configured. Both ride
+    /// per-request metadata — the shared, cached `Channel` carries neither.
     fn with_id<T>(&self, msg: T) -> Request<T> {
         let mut r = Request::new(msg);
         if let Ok(v) = self.identity.parse() {
             r.metadata_mut().insert("latiq-agent-id", v);
+        }
+        if let Some(t) = self.token.as_deref() {
+            if let Ok(v) = format!("Bearer {t}").parse() {
+                r.metadata_mut().insert("authorization", v);
+            }
         }
         r
     }

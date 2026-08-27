@@ -288,15 +288,18 @@ impl PyPond {
 /// Connect to Latiq. `server="local"` starts an in-process cluster backed by
 /// `root` (default `~/.latiq/local`); any other value is a remote control-plane
 /// endpoint. `query_gateway` overrides the Data/Stream front door when it differs
-/// from `server` (else `server` is used; the greeter forwards by pond).
+/// from `server` (else `server` is used; the greeter forwards by pond). `token`
+/// is the OAuth bearer token presented on every request, defaulting to
+/// `$LATIQ_TOKEN`; it is only needed where the deployment configures an issuer.
 #[pyfunction]
-#[pyo3(signature = (server="local", root=None, query_gateway=None))]
+#[pyo3(signature = (server="local", root=None, query_gateway=None, token=None))]
 fn connect(
     server: &str,
     root: Option<PathBuf>,
     query_gateway: Option<&str>,
+    token: Option<&str>,
 ) -> PyResult<PyDatabase> {
-    let inner = Latiq::connect_with(server, root, query_gateway).map_err(err)?;
+    let inner = Latiq::connect_with_token(server, root, query_gateway, token).map_err(err)?;
     Ok(PyDatabase {
         inner: Arc::new(inner),
     })
