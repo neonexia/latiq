@@ -1,9 +1,13 @@
 //! Caller identity. Each field knows whether it was verified: `subject` and
 //! `issuer` come from a validated IdP token; `agent_id` is ALWAYS claimed and
 //! must never carry authority. See docs/identity.md.
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Deserialize`: an `Identity` must never be reconstructed from a wire
+// payload. It is produced by a token verifier or by `claimed()`, never parsed --
+// otherwise attacker-controlled JSON could mint a fully-verified principal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct Identity {
     /// The claimed leaf agent instance. Never verified. Attribution only.
     pub agent_id: String,
@@ -33,6 +37,12 @@ impl Identity {
     /// Build a verified identity from validated token claims. The leaf agent id
     /// stays claimed; absent, it falls back to the subject.
     pub fn verified(subject: &str, issuer: &str, claimed_agent: Option<&str>) -> Self {
+        let subject = subject.trim();
+        let issuer = issuer.trim();
+        debug_assert!(
+            !subject.is_empty(),
+            "verified identity requires a non-empty subject"
+        );
         let agent_id = match claimed_agent.map(str::trim) {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => subject.to_string(),
@@ -90,6 +100,24 @@ mod tests {
         // The leaf is optional; without it the subject is the best attribution
         // we have -- "anonymous" would be a lie for a verified caller.
         let id = Identity::verified("svc-orchestrator", "https://idp.example", None);
+        assert_eq!(id.agent_id, "svc-orchestrator");
+    }
+
+    #[test]
+    fn verified_trims_the_claimed_agent() {
+        let id = Identity::verified(
+            "svc-orchestrator",
+            "https://idp.example",
+            Some("  agent-7  "),
+        );
+        assert_eq!(id.agent_id, "agent-7");
+    }
+
+    #[test]
+    fn verified_trims_subject_and_issuer() {
+        let id = Identity::verified("  svc-orchestrator  ", "  https://idp.example  ", None);
+        assert_eq!(id.subject, "svc-orchestrator");
+        assert_eq!(id.issuer, "https://idp.example");
         assert_eq!(id.agent_id, "svc-orchestrator");
     }
 }
