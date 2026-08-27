@@ -68,3 +68,62 @@ fn pond_lifecycle_end_to_end() {
     fs.drop_pond(id).unwrap();
     assert!(!fs.pond_exists(id));
 }
+
+#[test]
+fn attribution_records_the_verified_subject_not_only_the_claimed_leaf() {
+    // A caller with a valid token for `svc-lowpriv` claims a flattering leaf id.
+    // History must make the verified subject visible so the claim cannot pass
+    // itself off as authenticated identity.
+    let fs = TempFs::new();
+    let eng = DuckEngine::new();
+    let pond = PondId::new();
+    let loc = fs.create_pond(pond).unwrap();
+    eng.init_pond(&loc).unwrap();
+
+    let id = Identity::verified(
+        "svc-lowpriv",
+        "https://idp.example/realms/latiq",
+        Some("svc-admin"),
+    );
+    eng.write_query(
+        &loc,
+        "CREATE TABLE events(id INTEGER)",
+        &id,
+        AbortToken::new(),
+    )
+    .unwrap();
+
+    let attr = eng
+        .read_query(
+            &loc,
+            "SELECT * FROM pond.snapshots() ORDER BY snapshot_id DESC LIMIT 1",
+            AbortToken::new(),
+        )
+        .unwrap();
+    let msg = serde_json::to_string(&attr.rows[0]).unwrap();
+    assert!(
+        msg.contains("svc-lowpriv"),
+        "must carry the verified subject: {msg}"
+    );
+    assert!(
+        msg.contains("https://idp.example/realms/latiq"),
+        "must carry the issuer: {msg}"
+    );
+    // The claimed leaf is still recorded -- but as a claim, never as the author.
+    assert!(
+        msg.contains("svc-admin"),
+        "must keep the claimed leaf: {msg}"
+    );
+    let author_ix = attr
+        .columns
+        .iter()
+        .position(|c| c == "author")
+        .expect("snapshots() must expose an author column");
+    assert_eq!(
+        attr.rows[0][author_ix],
+        serde_json::json!("svc-lowpriv"),
+        "the author must be the verified subject, not the claimed leaf"
+    );
+
+    fs.drop_pond(pond).unwrap();
+}

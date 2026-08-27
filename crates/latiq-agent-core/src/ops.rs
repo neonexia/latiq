@@ -706,8 +706,10 @@ impl AgentOps {
     ) {
         info!(
             target: "latiq::access",
-            agent = %identity.agent_id,
-            verified = identity.verified,
+            agent = %identity.agent_id,          // CLAIMED. never authority.
+            subject = %identity.subject,         // verified, or "" when not
+            issuer = %identity.issuer,
+            verified = identity.verified,        // scopes subject/issuer, NOT agent
             op = operation,
             pond = pond_id.unwrap_or("-"),
             duration_ms,
