@@ -60,7 +60,7 @@ async fn auth_admin_actions_are_attributed_in_the_access_trail() {
     let idp = latiq_auth::test_support::TestIdp::start().await;
     let (_control, admin_endpoint) =
         common::start_control_plane_with_auth(Some(idp.auth_config())).await;
-    let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
+    let mut admin = AdminClient::connect(admin_endpoint.clone()).await.unwrap();
     let token = idp.mint("svc-ops", "latiq", &idp.issuer, 300);
 
     admin
@@ -93,7 +93,36 @@ async fn auth_admin_actions_are_attributed_in_the_access_trail() {
         .await
         .unwrap();
 
+    // A FAILING action, to prove the trail distinguishes it from a real one.
+    admin
+        .dataset_remove(bearer_req(
+            DatasetRemoveRequest {
+                name: "never-existed".into(),
+            },
+            "opsbot",
+            &token,
+        ))
+        .await
+        .unwrap_err();
+
+    // ...and two rejected callers, who leave a record precisely BECAUSE they
+    // were rejected: a surface whose job is "record who tried" must not go
+    // silent on the attempts worth reading.
+    let mut anon = AdminClient::connect(admin_endpoint.clone()).await.unwrap();
+    anon.policy_get(PolicyGetRequest {}).await.unwrap_err();
+    anon.policy_get(bearer_req(PolicyGetRequest {}, "intruder", "not-a-jwt"))
+        .await
+        .unwrap_err();
+
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let access = |needle: &str| -> String {
+        log.lines()
+            .filter(|l| l.contains("latiq::access"))
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no access record matching {needle}: {log}"))
+            .to_string()
+    };
+
     for op in ["policy_set", "catalog_add"] {
         let line = log
             .lines()
@@ -102,6 +131,10 @@ async fn auth_admin_actions_are_attributed_in_the_access_trail() {
             // renders it for agent actions.
             .find(|l| l.contains(&format!("op={op:?}")))
             .unwrap_or_else(|| panic!("operator action {op} must be on the access trail: {log}"));
+        assert!(
+            line.contains("outcome=\"ok\""),
+            "a successful action must be marked as such: {line}"
+        );
         assert!(
             line.contains("agent=opsbot"),
             "the claimed leaf must still be recorded: {line}"
@@ -127,4 +160,35 @@ async fn auth_admin_actions_are_attributed_in_the_access_trail() {
             "operator records must carry the same fields as agent records: {line}"
         );
     }
+
+    // A failed removal must NOT read like a successful one. Without `outcome`
+    // the two records are byte-identical and the trail is confidently wrong.
+    let failed = access("op=\"dataset_remove\"");
+    assert!(
+        failed.contains("outcome=\"error\""),
+        "a failed action must be marked failed: {failed}"
+    );
+    assert!(
+        failed.contains("dataset=never-existed"),
+        "the attempted target is still recorded: {failed}"
+    );
+
+    let no_token = access("rejected: no token");
+    assert!(
+        no_token.contains("op=\"policy_get\"") && no_token.contains("outcome=\"error\""),
+        "a tokenless attempt must name the RPC it targeted: {no_token}"
+    );
+    assert!(
+        no_token.contains("verified=false") && no_token.contains("subject= "),
+        "a rejected caller has no verified identity: {no_token}"
+    );
+    let bad_token = access("rejected: invalid token");
+    assert!(
+        bad_token.contains("op=\"policy_get\"") && bad_token.contains("outcome=\"error\""),
+        "a forged-token attempt must be recorded: {bad_token}"
+    );
+    assert!(
+        bad_token.contains("agent=intruder") && bad_token.contains("verified=false"),
+        "the claim is all a rejected caller has, and it is not authority: {bad_token}"
+    );
 }
