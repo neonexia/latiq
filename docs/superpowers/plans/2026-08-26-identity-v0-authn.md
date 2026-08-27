@@ -1164,17 +1164,20 @@ git commit -m "feat(auth): --auth-issuer/--auth-audience server flags and LATIQ_
 ```
 
 ---
+## Task 9: Keycloak and the test runners, all on the compose network
 
-## Task 9: Keycloak in the internal compose
+**Auth is nightly-only and container-only.** Nothing in daily development runs in auth mode — `./dev.sh`, `cargo test`, and the default compose stay exactly as they are. That decision removes a whole class of problem: if the test clients are containers on the same network as Keycloak and the pond nodes, **everything resolves `keycloak:8080` through Docker DNS**, there is one issuer, and no host/container address split exists to reconcile.
+
+**Use an override file, not a profile.** Profiles gate whole *services*; they cannot add environment variables to an existing service, and the pond nodes need auth env only in this mode. A second compose file layered on top does exactly that and leaves the base file untouched.
 
 **Files:**
 - Create: `deploy/cluster/keycloak-realm.json`
-- Modify: `deploy/cluster/docker-compose.yml`
+- Create: `deploy/cluster/docker-compose.auth.yml`
 - Modify: `deploy/CLAUDE.md`
 
 - [ ] **Step 1: Write the realm import**
 
-`deploy/cluster/keycloak-realm.json` — a realm `latiq` with a confidential client `latiq-agent` (service accounts enabled = `client_credentials`), and **an audience mapper**. The mapper is essential and easy to miss: Keycloak does not put a custom `aud` in access tokens by default, so without it every token fails our audience check.
+`deploy/cluster/keycloak-realm.json` — realm `latiq` with a confidential client `latiq-agent` (service accounts on = `client_credentials`), and **an audience mapper**. The mapper is essential and easy to miss: Keycloak does not put a custom `aud` in access tokens by default, so without it every token fails our audience check.
 
 ```json
 {
@@ -1205,65 +1208,117 @@ git commit -m "feat(auth): --auth-issuer/--auth-audience server flags and LATIQ_
 }
 ```
 
-- [ ] **Step 2: Add the service behind a profile**
+- [ ] **Step 2: Write the auth override compose**
 
-`deploy/cluster/docker-compose.yml` — profiles belong on the internal compose only; `deploy/latiq-compose.yml` (the user-facing one) must not change.
+`deploy/cluster/docker-compose.auth.yml`:
 
 ```yaml
+# Auth mode. Layered on top of docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.auth.yml ...
+# Everything -- pond nodes AND test clients -- lives on the one compose network
+# and reaches Keycloak as `keycloak:8080`, so there is a single issuer and no
+# host-vs-container address split. Nothing here runs in normal development.
+services:
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
-    profiles: ["auth"]
+    hostname: keycloak
     command: ["start-dev", "--import-realm"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
       KC_HTTP_PORT: "8080"
-      # Pins the `iss` claim to the address CLIENTS use (the host). Nodes inside
-      # the compose network reach Keycloak as `keycloak:8080` instead -- which
-      # is fine, because AuthConfig.issuer is only ever string-compared and
-      # AuthConfig.jwks_uri is the only URL the verifier dials. See Task 12.
-      KC_HOSTNAME_URL: http://localhost:8080
+      # Pins the `iss` claim. Every party uses this exact URL.
+      KC_HOSTNAME_URL: http://keycloak:8080
     volumes:
       - ./keycloak-realm.json:/opt/keycloak/data/import/realm.json:ro
-    ports:
-      - "8080:8080"
-```
+    # No published ports: nothing outside the network needs to reach it. Add
+    # `ports: ["8080:8080"]` temporarily if you want the admin console.
 
-No container healthcheck: recent Keycloak images ship without `curl`, and its health endpoint lives on a separate management port. CI polls the discovery URL from the runner instead (Task 12).
-
-**The split-horizon config — this is the whole trick.** Add to every pond-node service in the same compose file:
-
-```yaml
+  # Turn auth ON for the nodes. These keys are absent from the base compose, so
+  # a plain `docker compose up` is still the unauthenticated deployment.
+  pond-node-1:
     environment:
-      # Compared as a string against the token's `iss`. NEVER dialed, so it can
-      # name an address this container cannot reach.
-      LATIQ_AUTH_ISSUER: http://localhost:8080/realms/latiq
+      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
       LATIQ_AUTH_AUDIENCE: latiq
-      # The only URL the verifier actually fetches -- via Docker DNS.
-      LATIQ_AUTH_JWKS_URI: http://keycloak:8080/realms/latiq/protocol/openid-connect/certs
+    depends_on:
+      keycloak: { condition: service_started }
+
+  pond-node-2:
+    environment:
+      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+      LATIQ_AUTH_AUDIENCE: latiq
+    depends_on:
+      keycloak: { condition: service_started }
+
+  # ---- Test runners. In-network, so they see `keycloak` and `gateway` by name.
+  # Same pattern as the existing one-shot `cli` service. Run with:
+  #   docker compose ... run --rm auth-tests-sdk
+  auth-tests-sdk:
+    image: python:3.11-slim
+    profiles: ["auth-tests"]
+    working_dir: /repo
+    volumes:
+      - ../..:/repo
+    environment:
+      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+      LATIQ_GATEWAY: gateway:51500
+      LATIQ_SERVER: http://control-plane:51400
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        pip install -q /repo/dist/*.whl -r /repo/e2e/sdk/requirements.txt
+        pytest /repo/e2e/sdk/test_auth.py -v
+    depends_on: [gateway, keycloak]
+
+  auth-tests-agent:
+    image: node:22-slim
+    profiles: ["auth-tests"]
+    working_dir: /repo/e2e/agent
+    volumes:
+      - ../..:/repo
+    environment:
+      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+      LATIQ_MCP: http://gateway:51510/mcp
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        npm ci
+        npm test
+    depends_on: [gateway, keycloak]
 ```
 
-Clients on the host use `http://localhost:8080` for discovery and the token grant, and the `iss` in the resulting token matches what the nodes compare against. Nobody needs an `/etc/hosts` entry and nobody needs to run tests inside a container. This mirrors a real deployment pattern (an IdP with distinct internal and external addresses), which is why `AuthConfig` carries `jwks_uri` separately in the first place — see Task 3.
+The SDK runner installs the wheel from `/repo/dist`, so **the wheel must be built before this runs** — CI already builds it for the other e2e jobs (`.github/workflows/nightly.yml`, the `maturin build` step).
 
-One consequence to keep in mind: the protected-resource metadata document the node serves advertises its configured `issuer`, so MCP clients on the host are pointed at `http://localhost:8080/realms/latiq` and can reach it. That is correct here; in a production deployment the advertised issuer must be the address *agents* can reach, not the one nodes use.
+- [ ] **Step 3: Verify the realm and the audience mapper**
 
-- [ ] **Step 3: Verify locally**
+The audience mapper is the single most likely thing to be wrong, and it fails as an opaque "token rejected". Check it directly, from inside the network:
 
 ```bash
-docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d keycloak
-until curl -sf http://localhost:8080/realms/latiq/.well-known/openid-configuration >/dev/null; do sleep 2; done
-curl -s -d grant_type=client_credentials -d client_id=latiq-agent -d client_secret=latiq-agent-secret \
-  http://localhost:8080/realms/latiq/protocol/openid-connect/token | python3 -c 'import sys,json,base64;
-t=json.load(sys.stdin)["access_token"].split(".")[1]; t+="="*(-len(t)%4)
-print(json.loads(base64.urlsafe_b64decode(t))["aud"])'
+cd deploy/cluster
+docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d keycloak
+docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm --entrypoint sh auth-tests-sdk -c '
+  pip install -q requests
+  python - <<PY
+import base64, json, requests
+t = requests.post("http://keycloak:8080/realms/latiq/protocol/openid-connect/token",
+    data={"grant_type":"client_credentials","client_id":"latiq-agent",
+          "client_secret":"latiq-agent-secret"}).json()["access_token"]
+p = t.split(".")[1]; p += "=" * (-len(p) % 4)
+c = json.loads(base64.urlsafe_b64decode(p))
+print("iss:", c["iss"]); print("aud:", c["aud"])
+PY'
 ```
-Expected: prints an audience list containing `latiq`. If it does not, the audience mapper is wrong — fix it here, not in Rust.
+Expected: `iss: http://keycloak:8080/realms/latiq` and an `aud` containing `latiq`. If `aud` is missing, the mapper is wrong — fix it here, not in Rust.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add deploy/cluster/keycloak-realm.json deploy/cluster/docker-compose.yml deploy/CLAUDE.md
-git commit -m "test(auth): Keycloak realm behind an auth profile on the internal compose"
+git add deploy/cluster/keycloak-realm.json deploy/cluster/docker-compose.auth.yml deploy/CLAUDE.md
+git commit -m "test(auth): Keycloak plus in-network test runners as a compose override"
 ```
 
 ---
@@ -1276,16 +1331,17 @@ git commit -m "test(auth): Keycloak realm behind an auth profile on the internal
 
 - [ ] **Step 1: Write the test**
 
-`e2e/sdk/test_auth.py` — skips itself when `LATIQ_AUTH_ISSUER` is unset, so the existing EMBEDDED and unauthenticated REMOTE runs are unaffected.
+`e2e/sdk/test_auth.py` — skips itself when `LATIQ_AUTH_ISSUER` is unset, so the existing EMBEDDED and unauthenticated REMOTE runs are untouched. It only ever runs inside `auth-tests-sdk`.
 
 ```python
-"""Auth e2e against a REAL IdP (Keycloak). Proves the parts a hand-minted token
+"""Auth e2e against a REAL IdP (Keycloak). Proves what a hand-minted token
 cannot: real discovery documents, real claim sets, a real client_credentials
-grant. Skipped unless the cluster was brought up with auth."""
+grant. Runs ONLY inside the auth-tests-sdk container, on the compose network."""
+import json
 import os
 import urllib.parse
 import urllib.request
-import json
+
 import pytest
 import latiq
 
@@ -1318,7 +1374,8 @@ def test_auth_missing_token_is_rejected():
     c = latiq.connect(os.environ["LATIQ_GATEWAY"])
     with pytest.raises(Exception) as e:
         c.allocate_pond("auth-e2e-no-token")
-    assert "unauthenticated" in str(e.value).lower() or "bearer" in str(e.value).lower()
+    msg = str(e.value).lower()
+    assert "unauthenticated" in msg or "bearer" in msg
 
 
 def test_auth_garbage_token_is_rejected():
@@ -1327,14 +1384,14 @@ def test_auth_garbage_token_is_rejected():
         c.allocate_pond("auth-e2e-bad-token")
 ```
 
-- [ ] **Step 2: Run against a local authenticated cluster**
+- [ ] **Step 2: Run it**
 
 ```bash
-docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d
-LATIQ_AUTH_ISSUER=http://localhost:8080/realms/latiq \
-LATIQ_GATEWAY=127.0.0.1:51500 pytest e2e/sdk/test_auth.py -v
+cd deploy/cluster
+docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-sdk
 ```
-Expected: 3 passed.
+Expected: 3 passed. (`docker compose run` starts `depends_on` services automatically.)
 
 - [ ] **Step 3: Commit**
 
@@ -1349,22 +1406,22 @@ git commit -m "test(auth): SDK e2e against a real Keycloak client_credentials gr
 
 **Background you need before touching this file.** `e2e/agent/` uses two clients: `ai@4.3.19`'s `experimental_createMCPClient` drives the tools, and `@modelcontextprotocol/sdk@1.29.0`'s `Client` drives resources and prompts (the AI SDK doesn't surface those). The Vercel AI SDK implements **no** OAuth of its own — its `ai@4.x` transport config is `{ type: 'sse', url, headers? }`, static headers only.
 
-**That does not block us**, because of how the harness is already written: it hands `experimental_createMCPClient` a **transport instance it constructs itself**, and that transport is the official SDK's `StreamableHTTPClientTransport` — which does accept an `authProvider`. So one provider configures both clients, and the OAuth engine is the official SDK in both cases.
+**That does not block us**, because of how the harness is already written: it hands `experimental_createMCPClient` a **transport instance it constructs itself**, and that transport is the official SDK's `StreamableHTTPClientTransport` — which does accept an `authProvider`. So one provider configures both clients, and the OAuth engine is the official SDK either way.
 
-`ClientCredentialsProvider` (from `@modelcontextprotocol/sdk/client/auth-extensions.js`, added in **1.24.0**) runs non-interactively: with no `redirectUrl`, `auth()` skips the browser redirect and performs a `client_credentials` grant. `package.json` declares `^1.12.0` and resolves to 1.29.0, so no install changes — but tighten the range to `^1.24.0` to make the requirement explicit rather than accidental.
+`ClientCredentialsProvider` (from `@modelcontextprotocol/sdk/client/auth-extensions.js`, added in **1.24.0**) runs non-interactively: with no `redirectUrl`, `auth()` skips the browser redirect and performs a `client_credentials` grant. `package.json` declares `^1.12.0` and resolves to 1.29.0, so no install change is strictly needed — but tighten the range to `^1.24.0` to make the requirement explicit rather than accidental.
 
 **Files:**
-- Modify: `e2e/agent/package.json` (bump the `@modelcontextprotocol/sdk` range)
-- Modify: `e2e/agent/harness.test.ts:36-41` (transport construction)
+- Modify: `e2e/agent/package.json`
+- Modify: `e2e/agent/harness.test.ts:36-41`
 - Create: `e2e/agent/auth.test.ts`
 
 - [ ] **Step 1: Tighten the SDK range**
 
 `e2e/agent/package.json`: change `"@modelcontextprotocol/sdk": "^1.12.0"` to `"^1.24.0"`. Run `npm install --prefix e2e/agent` and commit the lockfile change.
 
-- [ ] **Step 2: Build the transports through one optional provider**
+- [ ] **Step 2: Build both transports through one optional provider**
 
-In `e2e/agent/harness.test.ts`, replace the two bare transport constructions (L36-41) with a shared helper so both clients authenticate identically:
+In `e2e/agent/harness.test.ts`, replace the two bare transport constructions (L36-41):
 
 ```ts
 import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth-extensions.js";
@@ -1398,7 +1455,7 @@ Then `ai = await experimental_createMCPClient({ transport: transport() })` and `
 
 - [ ] **Step 3: Write the auth-specific test**
 
-`e2e/agent/auth.test.ts` — asserts the two things the unauthenticated harness cannot:
+`e2e/agent/auth.test.ts`:
 
 ```ts
 import { describe, it, expect } from "vitest";
@@ -1429,14 +1486,13 @@ describe.skipIf(!ISSUER)("auth (MCP)", () => {
 });
 ```
 
-The full authenticated tool loop is already covered: with `LATIQ_AUTH_ISSUER` set, every existing test in `harness.test.ts` runs through the authenticated transport. That is the point of Step 2 — we get authenticated coverage of all nine tools without duplicating a single assertion.
+The full authenticated tool loop needs no new assertions: with `LATIQ_AUTH_ISSUER` set, every existing test in `harness.test.ts` already runs through the authenticated transport. That is the point of Step 2 — authenticated coverage of all nine tools without duplicating anything.
 
-- [ ] **Step 4: Run it locally**
+- [ ] **Step 4: Run it**
 
 ```bash
-docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d
-LATIQ_AUTH_ISSUER=http://localhost:8080/realms/latiq \
-LATIQ_MCP=http://127.0.0.1:51510/mcp npm --prefix e2e/agent test
+cd deploy/cluster
+docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-agent
 ```
 Expected: the existing harness tests pass through the authenticated transport, plus 2 new auth tests.
 
@@ -1454,47 +1510,46 @@ git commit -m "test(auth): agent harness authenticates via the MCP SDK client_cr
 **Files:**
 - Modify: `.github/workflows/nightly.yml`
 
-- [ ] **Step 1: Add an authenticated cluster job**
+- [ ] **Step 1: Add the authenticated-cluster job**
 
-A separate job rather than a flag on `e2e-suite`: the unauthenticated path is the default deployment and must keep being tested exactly as it is today.
+A separate job, not a flag on `e2e-suite`: the unauthenticated path is the default deployment and must keep being tested exactly as it is today. Every client here is a container on the compose network, so the workflow needs no issuer/gateway env of its own — it all lives in the override file.
 
 ```yaml
   auth-e2e:
-    name: e2e — authenticated cluster (Keycloak)
+    name: e2e — authenticated cluster (Keycloak, in-network)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # No /etc/hosts entry and no containerized test runner: Keycloak's `iss`
-      # is pinned to the address CLIENTS use (localhost:8080, published), while
-      # the nodes fetch JWKS over Docker DNS at keycloak:8080. The verifier
-      # compares the issuer and dials only the jwks_uri, so the two differ
-      # safely. Both settings live in the compose file (Task 9 Step 2).
-      - name: Start Keycloak
-        run: docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d keycloak
-      - name: Wait for the realm to import
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The SDK test runner installs this wheel from /repo/dist.
+      - name: Build the wheel
         run: |
-          for i in $(seq 1 60); do
-            curl -sf http://localhost:8080/realms/latiq/.well-known/openid-configuration >/dev/null && exit 0
-            sleep 2
-          done
-          echo "::error::Keycloak realm did not come up"
-          docker compose -f deploy/cluster/docker-compose.yml logs keycloak
-          exit 1
-      - name: Start the cluster with auth on
-        run: docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d
-      - name: SDK auth e2e
-        env:
-          LATIQ_AUTH_ISSUER: http://localhost:8080/realms/latiq
-          LATIQ_GATEWAY: 127.0.0.1:51500
-        run: pytest e2e/sdk/test_auth.py -v
-      - name: Agent (MCP) auth e2e
-        env:
-          LATIQ_AUTH_ISSUER: http://localhost:8080/realms/latiq
-          LATIQ_MCP: http://127.0.0.1:51510/mcp
-        run: npm --prefix e2e/agent test
+          python -m pip install -U pip maturin
+          maturin build --release -m sdk/python/Cargo.toml -o dist
+      - name: Build the latiq image
+        run: docker build -f deploy/cluster/Dockerfile -t ghcr.io/neonexia/latiq:dev .
+      - name: Bring up the authenticated cluster
+        working-directory: deploy/cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+      - name: SDK auth e2e (in-network container)
+        working-directory: deploy/cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-sdk
+      - name: Agent (MCP) auth e2e (in-network container)
+        working-directory: deploy/cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-agent
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml logs --no-color
 ```
 
-The node-side auth settings are baked into the compose file rather than passed here, so `docker compose --profile auth up` behaves identically on a laptop and in CI.
+Match the image build/tag step to whatever the existing `cluster-scale-out` job does — do not invent a second way to build the image.
 
 - [ ] **Step 2: Add it to the publish gate**
 
@@ -1504,7 +1559,7 @@ Add `auth-e2e` to the `needs:` list of the publish job (`.github/workflows/night
 
 ```bash
 git add .github/workflows/nightly.yml
-git commit -m "ci(auth): nightly e2e against an authenticated cluster"
+git commit -m "ci(auth): nightly e2e against an authenticated cluster, clients in-network"
 ```
 
 ---
@@ -1517,7 +1572,8 @@ git commit -m "ci(auth): nightly e2e against an authenticated cluster"
 - [ ] **Step 1: Update the docs**
 
 - `docs/identity.md`: change the `Principal` code block to `Identity` (per the deviation note at the top of this plan), and mark the implemented parts **today**.
-- `docs/dev.md`: how to run a local authenticated cluster (the Task 9 Step 3 commands).
+- `docs/dev.md`: state plainly that **auth mode is nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `-f docker-compose.yml -f docker-compose.auth.yml` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
+- `e2e/CLAUDE.md`: add a third mode alongside REMOTE and EMBEDDED — **AUTH**, which runs only via the compose override with every client in-network.
 - `docs/roadmap.md`: flip the "Identity v0 — authentication" row to ✅ Shipped.
 - `CLAUDE.md`: add `latiq-auth` to the crate list; note that identity is verified when configured.
 - `crates/latiq-agent-core/CLAUDE.md`: its invariant list says "Identity is relaxed (`Identity::claimed`, default anonymous)" — update to describe both modes.
@@ -1543,3 +1599,7 @@ git commit -m "docs(auth): identity v0 is shipped; document authenticated deploy
 **Spec coverage vs `docs/identity.md`:** the flow (Tasks 4, 7), one-verifier-three-carriers (5, 6, 7), the `Identity` shape (1), unauthenticated mode preserved (1, 5, 7 — asserted, not assumed), the MCP carrier change (7), audience checking called out as critical (3, 8, 9). Authorization is correctly absent.
 
 **Known gaps, deliberately deferred:** multiple issuers (one `AuthConfig`, not a list); token expiry mid-query (validated at admission only); dynamic client registration (Keycloak's realm import pre-registers the client, so RFC 7591 is untested); gateway-level verification (nodes verify, the gateway passes through).
+
+**Testing posture, decided:** auth runs **only** in the nightly, **only** in containers, with every client on the compose network. Consequences accepted: (a) there is no host-side auth test, so a bug that only manifests for a client outside the network would be missed — acceptable because the gateway is the boundary either way and it is address-agnostic; (b) `docker compose run` reinstalls the wheel and `npm ci` on each invocation, costing roughly a minute — acceptable for a nightly, and it keeps us from maintaining a bespoke test image.
+
+**Not needed any more:** an `/etc/hosts` entry, a published Keycloak port, and any issuer/JWKS address split. All three were artifacts of running the test client on the host. `AuthConfig` still keeps `issuer` and `jwks_uri` as separate fields — that is right for real split-horizon IdP deployments — but nothing in this plan depends on them differing.
