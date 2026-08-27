@@ -1,26 +1,82 @@
 //! JWKS fetch + cache. Verification is offline after the first fetch: no IdP
 //! round-trip on the request path, because this sits in front of every query.
+//!
+//! `kid` selects the key, so the cache lookup is the FIRST thing an
+//! unauthenticated caller reaches -- before any signature is checked. A naive
+//! refetch-on-miss therefore hands an attacker one outbound request to the
+//! customer's IdP per attacker request. Refetching is bounded three ways: a
+//! minimum interval between fetches, a single-flight guard so concurrent misses
+//! collapse into one fetch, and hard timeouts + a body cap on the fetch itself.
 use crate::AuthError;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::DecodingKey;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::RwLock;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
+
+/// How long after a fetch we refuse to fetch again. Caps IdP traffic at ~1
+/// req/min regardless of attacker volume, while still picking up a genuine key
+/// rotation within a minute.
+pub const DEFAULT_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Real JWKS documents are single-digit KiB. This is the guard against a
+/// `jwks_uri` misconfigured to point at a log file or an object-store listing.
+const MAX_JWKS_BYTES: usize = 256 * 1024;
+
+/// The one message an unauthenticated caller may see for any fetch failure.
+/// Details (the URI, the transport error, the IdP's status) go to the log --
+/// they routinely name internal hosts and addresses.
+const IDP_UNAVAILABLE: &str = "identity provider JWKS endpoint unavailable";
 
 pub struct JwksCache {
     uri: String,
     keys: RwLock<HashMap<String, DecodingKey>>,
     http: reqwest::Client,
     fetches: AtomicUsize,
+    /// Bumped when a refresh FINISHES. Snapshotting it before queueing on the
+    /// guard is what lets a waiter tell "a fetch completed while I waited" from
+    /// "the fetch I saw start is the one I am about to duplicate" -- `fetches`
+    /// is bumped on entry, so it cannot distinguish those.
+    refreshes_completed: AtomicUsize,
+    /// Single-flight guard: concurrent misses queue here so exactly one of them
+    /// fetches. Also closes the lost-update window -- `refresh` replaces the map
+    /// wholesale, so two interleaved refreshes could otherwise discard a freshly
+    /// rotated key.
+    refreshing: Mutex<()>,
+    /// `None` until the first fetch. Guarded by a std mutex: no await inside.
+    last_refresh: StdMutex<Option<Instant>>,
+    min_refresh_interval: Duration,
 }
 
 impl JwksCache {
     pub fn new(uri: String) -> Self {
+        Self::with_min_refresh_interval(uri, DEFAULT_MIN_REFRESH_INTERVAL)
+    }
+
+    /// Same, with the refetch floor overridden. Tests use this to exercise
+    /// rotation without sleeping out the default interval.
+    pub fn with_min_refresh_interval(uri: String, min_refresh_interval: Duration) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(5))
+            // Default is 10. A JWKS endpoint has no business redirecting more
+            // than once or twice.
+            .redirect(reqwest::redirect::Policy::limited(2))
+            .build()
+            // Loud on purpose: a client we cannot build means we would silently
+            // degrade to no timeouts, which is the thing we are guarding against.
+            .expect("build the JWKS HTTP client");
         Self {
             uri,
             keys: RwLock::new(HashMap::new()),
-            http: reqwest::Client::new(),
+            http,
             fetches: AtomicUsize::new(0),
+            refreshes_completed: AtomicUsize::new(0),
+            refreshing: Mutex::new(()),
+            last_refresh: StdMutex::new(None),
+            min_refresh_interval,
         }
     }
 
@@ -29,55 +85,159 @@ impl JwksCache {
         self.fetches.load(Ordering::SeqCst)
     }
 
-    /// Look up a signing key by `kid`, refetching ONCE if it is unknown (key
-    /// rotation). A second miss is an error -- never a refetch loop.
+    /// Look up a signing key by `kid`.
+    ///
+    /// A hit is served from memory. A miss triggers at most one fetch, and only
+    /// if no fetch has completed within `min_refresh_interval` -- so a genuine
+    /// key rotation is picked up within that interval, while a flood of tokens
+    /// bearing unknown `kid`s costs the IdP nothing beyond that one fetch.
+    /// Concurrent misses collapse into a single fetch.
     pub async fn key_for(&self, kid: &str) -> Result<DecodingKey, AuthError> {
         if let Some(key) = self.keys.read().await.get(kid) {
             return Ok(key.clone());
         }
-        self.refresh().await?;
+        self.refresh_once().await?;
         self.keys
             .read()
             .await
             .get(kid)
             .cloned()
-            .ok_or_else(|| AuthError::UnknownKid(kid.to_string()))
+            .ok_or_else(|| AuthError::UnknownKid(sanitize_kid(kid)))
     }
 
+    /// Refresh on behalf of a miss, subject to the interval floor and the
+    /// single-flight guard. Returning `Ok` does NOT mean the key is now known.
+    async fn refresh_once(&self) -> Result<(), AuthError> {
+        // Fast path: too soon since the last fetch, so do not even queue behind
+        // an in-flight one.
+        if self.too_soon() {
+            return Ok(());
+        }
+        // Snapshot BEFORE queueing on the guard. If a refresh completed while
+        // we waited, our miss rode along with it and must not fetch again --
+        // true whether or not the key turned up, so the bogus-kid flood
+        // collapses too, and true even with the interval floor set to zero.
+        let generation = self.refreshes_completed.load(Ordering::SeqCst);
+        let _flight = self.refreshing.lock().await;
+        if self.refreshes_completed.load(Ordering::SeqCst) != generation || self.too_soon() {
+            return Ok(());
+        }
+        self.refresh().await
+    }
+
+    fn too_soon(&self) -> bool {
+        self.last_refresh
+            .lock()
+            .expect("jwks last_refresh mutex poisoned")
+            .is_some_and(|at| at.elapsed() < self.min_refresh_interval)
+    }
+
+    /// Wraps the refresh so the completion generation is bumped on EVERY exit,
+    /// success or failure. A failed refresh still satisfies the waiters behind
+    /// the guard -- retrying it 16 times over is the stampede we are avoiding.
     async fn refresh(&self) -> Result<(), AuthError> {
+        let result = self.refresh_inner().await;
+        self.refreshes_completed.fetch_add(1, Ordering::SeqCst);
+        result
+    }
+
+    async fn refresh_inner(&self) -> Result<(), AuthError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
-        let response = self
-            .http
-            .get(&self.uri)
-            .send()
-            .await
-            .map_err(|e| AuthError::Jwks(format!("fetch {}: {e}", self.uri)))?
-            .error_for_status()
-            .map_err(|e| AuthError::Jwks(format!("fetch {}: {e}", self.uri)))?;
-        let set: JwkSet = response
-            .json()
-            .await
-            .map_err(|e| AuthError::Jwks(format!("parse {}: {e}", self.uri)))?;
+        // Stamped regardless of outcome: a failing IdP must not be retried on
+        // every request either.
+        *self
+            .last_refresh
+            .lock()
+            .expect("jwks last_refresh mutex poisoned") = Some(Instant::now());
+
+        let set = self.fetch().await?;
 
         // One unusable key must not poison the whole set: an IdP may publish an
-        // encryption key or an algorithm we do not support alongside the good one.
+        // encryption key, or an algorithm we do not support, beside the good one.
         let mut fresh = HashMap::new();
         for jwk in &set.keys {
             let Some(kid) = jwk.common.key_id.clone() else {
-                tracing::warn!(jwks_uri = %self.uri, "skipping JWKS key with no kid");
+                tracing::warn!(uri = %self.uri, "skipping JWKS key with no kid");
                 continue;
             };
             match DecodingKey::from_jwk(jwk) {
                 Ok(key) => {
                     fresh.insert(kid, key);
                 }
-                Err(e) => {
-                    tracing::warn!(jwks_uri = %self.uri, %kid, error = %e, "skipping unusable JWKS key")
-                }
+                Err(e) => tracing::warn!(
+                    uri = %self.uri,
+                    kid = %sanitize_kid(&kid),
+                    error = %e,
+                    "skipping unusable JWKS key"
+                ),
             }
         }
 
         *self.keys.write().await = fresh;
         Ok(())
+    }
+
+    async fn fetch(&self) -> Result<JwkSet, AuthError> {
+        let mut response = self.http.get(&self.uri).send().await.map_err(|e| {
+            tracing::warn!(uri = %self.uri, error = %e, "JWKS fetch failed");
+            AuthError::Jwks(IDP_UNAVAILABLE.to_string())
+        })?;
+
+        if !response.status().is_success() {
+            tracing::warn!(uri = %self.uri, status = %response.status(), "JWKS endpoint returned an error status");
+            return Err(AuthError::Jwks(IDP_UNAVAILABLE.to_string()));
+        }
+
+        // Advertised length first (cheap rejection), then enforce the cap while
+        // reading -- a body with no content-length is otherwise unbounded.
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_JWKS_BYTES as u64)
+        {
+            tracing::warn!(uri = %self.uri, content_length = ?response.content_length(), "JWKS document too large");
+            return Err(AuthError::Jwks("jwks document too large".to_string()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            tracing::warn!(uri = %self.uri, error = %e, "JWKS body read failed");
+            AuthError::Jwks(IDP_UNAVAILABLE.to_string())
+        })? {
+            if body.len() + chunk.len() > MAX_JWKS_BYTES {
+                tracing::warn!(uri = %self.uri, "JWKS document too large");
+                return Err(AuthError::Jwks("jwks document too large".to_string()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        serde_json::from_slice(&body).map_err(|e| {
+            tracing::warn!(uri = %self.uri, error = %e, "JWKS document did not parse");
+            AuthError::Jwks(IDP_UNAVAILABLE.to_string())
+        })
+    }
+}
+
+/// `kid` is an unvalidated, unbounded JWT header field under attacker control.
+/// Anything we put in a message or a log line gets bounded and stripped of
+/// control characters first -- otherwise it is a log-injection and log-volume
+/// vector.
+fn sanitize_kid(kid: &str) -> String {
+    kid.chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_kid;
+
+    #[test]
+    fn sanitize_kid_strips_control_characters() {
+        assert_eq!(sanitize_kid("ab\nc\r\0d"), "abcd");
+    }
+
+    #[test]
+    fn sanitize_kid_bounds_length() {
+        assert_eq!(sanitize_kid(&"k".repeat(4096)).len(), 64);
     }
 }
