@@ -5,7 +5,7 @@
 //! deliberately drive the *other* node.
 mod common;
 
-use common::{start_stack_n, start_stack_n_with_auth, MultiStack};
+use common::{start_stack_n, start_stack_n_with_auth, MultiStack, NodeStack};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::*;
@@ -281,4 +281,228 @@ async fn allocate_and_locate_authed(stack: &MultiStack, name: &str, token: &str)
     .unwrap()
     .into_inner()
     .node_endpoint
+}
+
+// ---------------------------------------------------------------------------
+// Auth across the node hop. Placement is random, so ownership is pinned the only
+// reliable way: allocate while a single node exists, THEN add the peer that will
+// forward. That is what makes an asymmetric greeter/owner pair testable.
+// ---------------------------------------------------------------------------
+
+/// An owner-first cluster: `owner` is the sole node when `pond` is allocated (so
+/// it certainly owns it), and `greeter` is added afterwards to forward to it.
+struct HopPair {
+    greeter: NodeStack,
+    _owner: NodeStack,
+}
+
+async fn hop_pair(
+    pond: &str,
+    owner_auth: Option<latiq_auth::AuthConfig>,
+    greeter_auth: Option<latiq_auth::AuthConfig>,
+    alloc_token: Option<&str>,
+) -> HopPair {
+    let (control, _admin) = common::start_control_plane_only().await;
+    let owner = common::add_node("owner", &control, owner_auth).await;
+    let mut oc = client(&owner.data_endpoint).await;
+    let msg = AllocatePondRequest {
+        name: pond.into(),
+        policy_json: String::new(),
+        tier: String::new(),
+    };
+    let r = match alloc_token {
+        Some(t) => bearer_req(msg, "dave", t),
+        None => req(msg, "dave"),
+    };
+    oc.allocate_pond(r).await.unwrap();
+    let greeter = common::add_node("greeter", &control, greeter_auth).await;
+    HopPair {
+        greeter,
+        _owner: owner,
+    }
+}
+
+#[tokio::test]
+async fn forwarding_does_not_leak_a_client_authorization_header_without_auth() {
+    // A node with NO verifier must not capture whatever `authorization` header a
+    // client happens to send — one meant for an upstream gateway, say — and
+    // replay it to a peer over the internal channel. The owner here REQUIRES a
+    // token, so if the greeter had forwarded the (perfectly valid) header, this
+    // write would succeed. It must not.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+    let pair = hop_pair("leak", Some(idp.auth_config()), None, Some(&token)).await;
+    let mut n = client(&pair.greeter.data_endpoint).await;
+
+    let err = n
+        .write_query(bearer_req(
+            q("leak", "CREATE TABLE t(i INTEGER)"),
+            "dave",
+            &token,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("a bearer token is required"),
+        "the client's header must not cross the hop from an unauthenticated node: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn forwarding_without_any_token_fails_at_the_owner() {
+    // The unset-task-local path: the greeter requires nothing, the owner does.
+    // The hop must fail hard rather than quietly forwarding an unauthenticated
+    // request that the owner would then have to trust.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+    let pair = hop_pair("notok", Some(idp.auth_config()), None, Some(&token)).await;
+    let mut n = client(&pair.greeter.data_endpoint).await;
+
+    let err = n
+        .write_query(req(q("notok", "CREATE TABLE t(i INTEGER)"), "dave"))
+        .await
+        .unwrap_err();
+    assert!(
+        err.message().contains("a bearer token is required"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn forwarding_token_the_owner_rejects_surfaces_as_internal() {
+    // Genuine RE-VERIFICATION at the owner: the greeter trusts issuers A and B,
+    // the owner only A. A token from B satisfies the greeter and is replayed —
+    // and the owner rejects it on its own authority. The greeter cannot vouch
+    // for it.
+    //
+    // Pins today's mapping: the peer's `Unauthenticated` comes back through
+    // `status_to_error`'s catch-all as `Code::Internal`. That is a known wart
+    // (it needs a new ErrorKind to fix); this test is here so changing it is a
+    // deliberate act with a visible diff, not a silent drift.
+    let idp_a = latiq_auth::test_support::TestIdp::start().await;
+    let idp_b = latiq_auth::test_support::TestIdp::start_alt().await;
+    let both = latiq_auth::AuthConfig {
+        audience: "latiq".into(),
+        issuers: vec![
+            idp_a.auth_config().issuers[0].clone(),
+            idp_b.auth_config().issuers[0].clone(),
+        ],
+    };
+    let token_a = idp_a.mint("svc-a", "latiq", &idp_a.issuer, 300);
+    let token_b = idp_b.mint("svc-b", "latiq", &idp_b.issuer, 300);
+    let pair = hop_pair(
+        "reverify",
+        Some(idp_a.auth_config()),
+        Some(both),
+        Some(&token_a),
+    )
+    .await;
+    let mut n = client(&pair.greeter.data_endpoint).await;
+
+    // Sanity: issuer A is fine end to end, so the failure below is about issuer
+    // B and not about the hop being broken.
+    n.write_query(bearer_req(
+        q("reverify", "CREATE TABLE t(i INTEGER)"),
+        "dave",
+        &token_a,
+    ))
+    .await
+    .unwrap();
+
+    let err = n
+        .write_query(bearer_req(
+            q("reverify", "CREATE TABLE u(i INTEGER)"),
+            "dave",
+            &token_b,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        Code::Internal,
+        "today's mapping for a peer Unauthenticated"
+    );
+    assert!(
+        err.message().contains("the bearer token was rejected"),
+        "the owner's own rejection should cross the hop: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn forwarding_concurrent_tokens_stay_isolated_per_request() {
+    // The token rides a task-local. Twenty concurrent forwarded writes under two
+    // different subjects must each be attributed to their OWN token — nothing
+    // would otherwise catch a refactor that hoisted it into shared state.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let stack = start_stack_n_with_auth(2, idp.auth_config()).await;
+    let alice = idp.mint("svc-alice", "latiq", &idp.issuer, 300);
+    let bob = idp.mint("svc-bob", "latiq", &idp.issuer, 300);
+
+    // One pond per request, each allocated (and therefore placed) independently,
+    // then driven through a node chosen without regard to ownership.
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let (token, subject) = if i % 2 == 0 {
+            (alice.clone(), "svc-alice")
+        } else {
+            (bob.clone(), "svc-bob")
+        };
+        let pond = format!("conc{i}");
+        let ep0 = stack.nodes[0].data_endpoint.clone();
+        let ep1 = stack.nodes[1].data_endpoint.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut c0 = client(&ep0).await;
+            c0.allocate_pond(bearer_req(
+                AllocatePondRequest {
+                    name: pond.clone(),
+                    policy_json: String::new(),
+                    tier: String::new(),
+                },
+                "dave",
+                &token,
+            ))
+            .await
+            .unwrap();
+            // Drive the OTHER node half the time, so roughly half of these are
+            // real forwards.
+            let mut c = client(if i % 4 < 2 { &ep0 } else { &ep1 }).await;
+            c.write_query(bearer_req(
+                q(&pond, "CREATE TABLE t(i INTEGER)"),
+                "dave",
+                &token,
+            ))
+            .await
+            .unwrap();
+            let r = c
+                .read_query(bearer_req(
+                    q(
+                        &pond,
+                        &format!("SELECT DISTINCT author FROM ducklake_snapshots('{pond}')"),
+                    ),
+                    "dave",
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            let authors = rows(&r.json);
+            let list = authors.as_array().unwrap();
+            assert!(
+                list.iter().any(|row| row[0] == subject),
+                "pond {pond} should be authored by {subject}: {authors}"
+            );
+            let other = if subject == "svc-alice" {
+                "svc-bob"
+            } else {
+                "svc-alice"
+            };
+            assert!(
+                !list.iter().any(|row| row[0] == other),
+                "pond {pond} must not pick up the concurrent request's token: {authors}"
+            );
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
 }

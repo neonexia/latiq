@@ -46,37 +46,42 @@ pub(crate) fn bearer_of<T>(req: &Request<T>) -> Option<String> {
     latiq_auth::bearer(raw).map(String::from)
 }
 
-/// Identity from gRPC metadata. With a verifier configured, an `authorization:
-/// Bearer <jwt>` header is REQUIRED and verified; `latiq-agent-id` then supplies
-/// only the claimed leaf. Without one, identity stays relaxed (claimed, default
-/// anonymous) — the embedded and dev path.
+/// Identity from gRPC metadata, plus the token to replay on a node-to-node hop.
+///
+/// With a verifier configured, an `authorization: Bearer <jwt>` header is
+/// REQUIRED and verified; `latiq-agent-id` then supplies only the claimed leaf.
+/// Without one, identity stays relaxed (claimed, default anonymous) — the
+/// embedded and dev path.
+///
+/// The token is returned ONLY when a verifier is configured. A node that never
+/// opted into auth must not start capturing whatever `authorization` header a
+/// client happens to send — one meant for an upstream gateway, say — and
+/// replaying it to a peer over the internal channel. Returning it here rather
+/// than re-reading the metadata at each call site is what makes that structural
+/// rather than a rule to remember (and saves a second parse per request).
+///
+/// Every rejection is a fixed string: an unauthenticated caller must not be able
+/// to probe our issuer list or key endpoints by reading error text. The detail
+/// goes to the operator's log instead.
 pub(crate) async fn identity_of<T>(
     verifier: Option<&Arc<Verifier>>,
     req: &Request<T>,
-) -> Result<Identity, Status> {
+) -> Result<(Identity, Option<String>), Status> {
     let claimed = req
         .metadata()
         .get("latiq-agent-id")
         .and_then(|v| v.to_str().ok());
     let Some(verifier) = verifier else {
-        return Ok(Identity::claimed(claimed));
+        return Ok((Identity::claimed(claimed), None));
     };
     let Some(token) = bearer_of(req) else {
-        return Err(unauthenticated("a bearer token is required"));
+        return Err(Status::unauthenticated("a bearer token is required"));
     };
-    verifier.verify(&token, claimed).await.map_err(|e| {
-        // Logged in full here, summarised on the wire: the detail is for the
-        // operator, and an unauthenticated caller must not be able to probe our
-        // issuer list or key endpoints by reading error text.
+    let identity = verifier.verify(&token, claimed).await.map_err(|e| {
         tracing::debug!(error = %e, "bearer token rejected");
-        unauthenticated("the bearer token was rejected")
-    })
-}
-
-/// An `Unauthenticated` status whose message echoes neither the token, the
-/// configured issuers, nor the JWKS URI.
-fn unauthenticated(msg: &str) -> Status {
-    Status::unauthenticated(msg)
+        Status::unauthenticated("the bearer token was rejected")
+    })?;
+    Ok((identity, Some(token)))
 }
 
 pub(crate) fn to_status(e: AgentError) -> Status {
@@ -154,7 +159,13 @@ impl Data for DataService {
         &self,
         req: Request<AllocatePondRequest>,
     ) -> Result<Response<AllocatePondResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        // The one handler with no `traced` scope, so neither the trace id nor
+        // the bearer token is ambient here. That is safe only because allocation
+        // NEVER forwards: `ops.allocate_pond` picks a node through the control
+        // plane and returns, without ever calling the forwarder. If it ever does
+        // forward, this handler must be wrapped like the rest — otherwise it
+        // would reach a peer with no token at all.
+        let (id, _tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -186,9 +197,8 @@ impl Data for DataService {
         &self,
         req: Request<DropPondRequest>,
     ) -> Result<Response<DropPondResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("drop_pond", tid, tok, async move {
@@ -204,9 +214,8 @@ impl Data for DataService {
         &self,
         req: Request<DescribePondRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("describe_pond", tid, tok, async move {
@@ -220,9 +229,8 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         // Reads ride the Arrow internal hop, collected to JSON here at the edge.
@@ -240,9 +248,8 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("write_query", tid, tok, async move {
@@ -259,9 +266,8 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("explain_query", tid, tok, async move {
@@ -278,9 +284,8 @@ impl Data for DataService {
         &self,
         req: Request<LoadDatasetRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("load_dataset", tid, tok, async move {
@@ -297,9 +302,8 @@ impl Data for DataService {
         &self,
         req: Request<CatalogPullRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("catalog_pull", tid, tok, async move {
@@ -322,9 +326,8 @@ impl Data for DataService {
         &self,
         req: Request<CatalogDescribeRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("catalog_describe", tid, tok, async move {

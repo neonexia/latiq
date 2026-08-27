@@ -6,7 +6,7 @@
 //! It encodes `AgentOps::read_arrow`'s `RecordBatch` stream into ONE Arrow IPC
 //! stream (schema message first, then batches), chunked into `ArrowChunk`s —
 //! nothing is buffered: each batch becomes a chunk as it arrives.
-use crate::data_service::{bearer_of, identity_of, to_status};
+use crate::data_service::{identity_of, to_status};
 use arrow::ipc::writer::StreamWriter;
 use latiq_agent_core::{AgentOps, ArrowReadStream};
 use latiq_auth::Verifier;
@@ -50,9 +50,8 @@ impl StreamSvc for StreamService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<Self::ReadArrowStream>, Status> {
-        let id = identity_of(self.verifier.as_ref(), &req).await?;
+        let (id, tok) = identity_of(self.verifier.as_ref(), &req).await?;
         let tid = crate::data_service::trace_id_of(&req);
-        let tok = bearer_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         // Resolving the read (incl. pond-not-found / parse errors and the schema)
