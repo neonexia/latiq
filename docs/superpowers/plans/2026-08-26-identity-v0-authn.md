@@ -174,6 +174,98 @@ git commit -m "feat(identity): Identity carries verified subject and issuer alon
 
 ---
 
+## Task 1b: Attribution and the access trail must not stamp a claimed value as verified
+
+**Why this exists.** Found in review of Task 1, and it is a design hole in this plan, not a coding slip. Both consumers of `Identity` today emit the **claimed** `agent_id` right next to the `verified` flag, and neither emits `subject`:
+
+- `crates/latiq-engine-duckdb/src/exec.rs:299-302` — `set_commit_message('{agent_id}', 'write_query', ...)`
+- `crates/latiq-agent-core/src/ops.rs:709-711` — `agent = %identity.agent_id, verified = identity.verified`
+
+Once tokens are verified, a caller holding a valid token for `sub=svc-lowpriv` can claim `agent_id: "svc-admin"`, and the DuckLake commit history — the artifact an operator actually reads to answer "who wrote this" — records `svc-admin` alongside `verified: true`. That is precisely the "claimed value made load-bearing" failure the design rule forbids. The `agent_id := subject` fallback compounds it: a reader cannot distinguish a fallback from an attacker-supplied leaf that happens to equal a subject.
+
+It is currently unreachable (nothing constructs a verified identity yet), which is exactly why it must land **before** any surface can produce one — i.e. before Task 5.
+
+**Files:**
+- Modify: `crates/latiq-agent-core/src/ops.rs:699-717` (`audit`)
+- Modify: `crates/latiq-engine-duckdb/src/exec.rs:296-305` (`set_commit_message`)
+- Test: `crates/latiq-engine-duckdb/tests/engine_e2e.rs`, `crates/latiq-agent-core/tests/agent_ops.rs`
+
+- [ ] **Step 1: Write the failing tests**
+
+In `crates/latiq-engine-duckdb/tests/engine_e2e.rs`, assert that a verified write records the subject and issuer, not just the claimed leaf:
+
+```rust
+#[test]
+fn attribution_records_the_verified_subject_not_only_the_claimed_leaf() {
+    // A caller with a valid token for `svc-lowpriv` claims a flattering leaf id.
+    // History must make the verified subject visible so the claim cannot pass
+    // itself off as authenticated identity.
+    let id = Identity::verified("svc-lowpriv", "https://idp.example/realms/latiq", Some("svc-admin"));
+    // ... allocate a pond, run a write with `id`, then read pond.snapshots() ...
+    let msg = latest_commit_message(&pond);
+    assert!(msg.contains("svc-lowpriv"), "commit message must carry the verified subject: {msg}");
+    assert!(msg.contains("https://idp.example/realms/latiq"), "must carry the issuer: {msg}");
+}
+```
+
+Follow the existing attribution test in that file for pond setup and for how the commit message is read back; do not invent a new helper if one exists.
+
+In `crates/latiq-agent-core/tests/agent_ops.rs`, assert the access trail carries the same fields. If the existing tests do not capture `tracing` output, use `tracing_subscriber`'s test capture (add it as a dev-dependency) rather than restructuring `audit()` to return a value — the emitter must stay a fire-and-forget trace.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `cargo test -p latiq-engine-duckdb attribution_ && cargo test -p latiq-agent-core --test agent_ops`
+Expected: FAIL — the commit message and the log line carry only `agent_id`.
+
+- [ ] **Step 3: Implement**
+
+`crates/latiq-agent-core/src/ops.rs`, in `audit()` — emit the verified pair as their own fields, so `verified` is unambiguously about `subject` and never about `agent`:
+
+```rust
+        info!(
+            target: "latiq::access",
+            agent = %identity.agent_id,          // CLAIMED. never authority.
+            subject = %identity.subject,         // verified, or "" when not
+            issuer = %identity.issuer,
+            verified = identity.verified,        // scopes subject/issuer, NOT agent
+            op = operation,
+            pond = pond_id.unwrap_or("-"),
+            duration_ms,
+            summary = request_summary.as_deref().unwrap_or(""),
+            "access",
+        );
+```
+
+`crates/latiq-engine-duckdb/src/exec.rs` — the DuckLake commit author becomes the **verified subject when there is one**, falling back to the claimed leaf only for unauthenticated deployments, with the claimed leaf preserved in the structured extra info:
+
+```rust
+    // The author is the strongest identity we have: the verified subject when
+    // the caller authenticated, the claimed leaf otherwise. The claimed leaf is
+    // always recorded separately so history distinguishes the two.
+    let author = if identity.verified { &identity.subject } else { &identity.agent_id };
+```
+
+Escape `author`, `issuer`, and `agent_id` for SQL exactly as the existing code escapes `agent` (`.replace('\'', "''")`), and put `agent_id`/`issuer`/`verified` into the `extra_info` JSON. **Never emit a bare `verified` next to a claimed field.**
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo test -p latiq-engine-duckdb && cargo test -p latiq-agent-core`
+Expected: PASS. The pre-existing `attribution_*` tests must still pass — unauthenticated behaviour is unchanged, since `verified` is false and `author` falls back to `agent_id`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/latiq-agent-core crates/latiq-engine-duckdb
+git commit -m "fix(identity): attribution and the access trail record the verified subject
+
+A claimed agent_id must never appear next to a bare verified flag: a caller
+holding a valid token for one subject could otherwise claim any leaf id and
+have history record it as authenticated. The DuckLake commit author is now the
+verified subject when present, with the claimed leaf kept separately."
+```
+
+---
+
 ## Task 2: The `latiq-auth` crate — JWKS cache
 
 **Files:**
@@ -974,6 +1066,8 @@ Run: `cargo test -p latiq --test query_grpc auth_`
 Expected: FAIL to compile — `start_stack_with_auth` does not exist.
 
 - [ ] **Step 3: Implement**
+
+**Node-to-node forwarding also carries identity**, and today it does not carry enough. `crates/latiq-pond-node/src/forward_client.rs:69` (`with_identity`) re-injects only the `latiq-agent-id` header on the forwarded hop, so a verified identity arrives at the owning node **downgraded to claimed** — fail-safe for authority, but it silently loses `subject`/`issuer` and would make the owning node's attribution wrong. Forward the original `Authorization` header instead, so the owning node verifies the same token itself. Do NOT invent a trusted internal header that asserts `verified: true` across the hop — that would be exactly the trust laundering Task 1b exists to prevent. Add a test that a forwarded write records the verified subject on the owning node.
 
 `crates/latiq-pond-node/src/data_service.rs` — replace `identity_of` (L24-31):
 
