@@ -1133,6 +1133,32 @@ principal as an Authorization: Bearer token -- neither reachable by the model."
 
 Build the `AuthConfig` in `run_serve` (L735) and `run_node_add` (L758). **Fail fast**: if `auth_issuer` is set and `auth_audience` is not, exit with a clear error rather than defaulting — a wrong audience is a silent security hole.
 
+- [ ] **Step 1a: Treat a blank issuer as absent**
+
+This one line is what lets the cluster run from a **single** compose file. Compose interpolation (`${LATIQ_AUTH_ISSUER:-}`) always sets the variable, just empty, and clap's `env =` reports an empty string as `Some("")` — which would switch auth on with a meaningless issuer. Normalize at the boundary:
+
+```rust
+/// A blank value means "not set". Compose always passes the variable through
+/// (possibly empty), so an empty string must mean auth off, not a broken issuer.
+fn non_blank(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+```
+
+Apply it to all three of `auth_issuer`, `auth_audience`, and `auth_jwks_uri` before building the `AuthConfig`.
+
+Test it, because this is exactly the sort of thing that silently regresses:
+
+```rust
+#[test]
+fn auth_blank_env_values_mean_auth_is_off() {
+    assert_eq!(non_blank(Some(String::new())), None);
+    assert_eq!(non_blank(Some("   ".into())), None);
+    assert_eq!(non_blank(None), None);
+    assert_eq!(non_blank(Some(" https://idp ".into())), Some("https://idp".to_string()));
+}
+```
+
 - [ ] **Step 2: Add the client token**
 
 The CLI's gRPC request builders (`crates/latiq/src/main.rs:832-838`, where `latiq-agent-id` is set) also attach `authorization: Bearer <token>` when `LATIQ_TOKEN` is set or `--token` is passed. Add `--token` alongside the existing `--agent-id` on `QueryArgs` (L304-317).
@@ -1164,15 +1190,21 @@ git commit -m "feat(auth): --auth-issuer/--auth-audience server flags and LATIQ_
 ```
 
 ---
-## Task 9: Keycloak and the test runners, all on the compose network
+## Task 9: Keycloak and the test runners — one compose file, env-driven
 
-**Auth is nightly-only and container-only.** Nothing in daily development runs in auth mode — `./dev.sh`, `cargo test`, and the default compose stay exactly as they are. That decision removes a whole class of problem: if the test clients are containers on the same network as Keycloak and the pond nodes, **everything resolves `keycloak:8080` through Docker DNS**, there is one issuer, and no host/container address split exists to reconcile.
+**Auth is nightly-only and container-only.** Nothing in daily development runs in auth mode — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay exactly as they are. And because the test clients are containers on the same network as Keycloak and the pond nodes, **everything resolves `keycloak:8080` through Docker DNS**: one issuer, no host-versus-container address split to reconcile.
 
-**Use an override file, not a profile.** Profiles gate whole *services*; they cannot add environment variables to an existing service, and the pond nodes need auth env only in this mode. A second compose file layered on top does exactly that and leaves the base file untouched.
+**One file, no override, no second invocation form.** Two Compose mechanisms do the work together:
+
+- **`profiles:`** gates whether a *service* starts, and the profile list can be set from the environment via `COMPOSE_PROFILES` — no `--profile` flag needed.
+- **Interpolation** (`${VAR:-default}`) injects host environment variables into an *existing* service's definition. This is what turns auth on for the pond nodes; profiles cannot do it, which is the only reason an override file ever looked necessary.
+
+`deploy/cluster/docker-compose.yml` stays the single source of truth, and `deploy/cluster/auth.env` carries the settings so the command line stays short.
 
 **Files:**
 - Create: `deploy/cluster/keycloak-realm.json`
-- Create: `deploy/cluster/docker-compose.auth.yml`
+- Create: `deploy/cluster/auth.env`
+- Modify: `deploy/cluster/docker-compose.yml`
 - Modify: `deploy/CLAUDE.md`
 
 - [ ] **Step 1: Write the realm import**
@@ -1208,20 +1240,31 @@ git commit -m "feat(auth): --auth-issuer/--auth-audience server flags and LATIQ_
 }
 ```
 
-- [ ] **Step 2: Write the auth override compose**
+- [ ] **Step 2: Add the auth env to the pond nodes**
 
-`deploy/cluster/docker-compose.auth.yml`:
+In `deploy/cluster/docker-compose.yml`, add two lines to the `environment:` block of `pond-node-1` (L34-35), `pond-node-2` (L50-51), and `pond-node-3` (L69-70). Interpolation with an empty default means an ordinary `docker compose up` passes a blank issuer, which the binary treats as "no auth" (Task 8 Step 1a):
 
 ```yaml
-# Auth mode. Layered on top of docker-compose.yml:
-#   docker compose -f docker-compose.yml -f docker-compose.auth.yml ...
-# Everything -- pond nodes AND test clients -- lives on the one compose network
-# and reaches Keycloak as `keycloak:8080`, so there is a single issuer and no
-# host-vs-container address split. Nothing here runs in normal development.
-services:
+    environment:
+      LATIQ_SERVER: http://control-plane:51400
+      # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
+```
+
+- [ ] **Step 3: Add Keycloak and the two test runners behind the `auth` profile**
+
+Append to the same file, alongside the existing `test` / `scale` / `tools` profile services:
+
+```yaml
+  # ---- Auth mode (`auth` profile). Nightly + container-only: nothing here runs
+  # in normal development. Every party -- pond nodes and test clients alike --
+  # is on this network and reaches Keycloak as `keycloak:8080`, so there is one
+  # issuer and no host/container address split.
   keycloak:
     image: quay.io/keycloak/keycloak:26.0
     hostname: keycloak
+    profiles: ["auth"]
     command: ["start-dev", "--import-realm"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
@@ -1234,33 +1277,17 @@ services:
     # No published ports: nothing outside the network needs to reach it. Add
     # `ports: ["8080:8080"]` temporarily if you want the admin console.
 
-  # Turn auth ON for the nodes. These keys are absent from the base compose, so
-  # a plain `docker compose up` is still the unauthenticated deployment.
-  pond-node-1:
-    environment:
-      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
-      LATIQ_AUTH_AUDIENCE: latiq
-    depends_on:
-      keycloak: { condition: service_started }
-
-  pond-node-2:
-    environment:
-      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
-      LATIQ_AUTH_AUDIENCE: latiq
-    depends_on:
-      keycloak: { condition: service_started }
-
-  # ---- Test runners. In-network, so they see `keycloak` and `gateway` by name.
-  # Same pattern as the existing one-shot `cli` service. Run with:
-  #   docker compose ... run --rm auth-tests-sdk
+  # One-shot test runners, same in-network pattern as the `cli` service.
+  #   docker compose --env-file auth.env run --rm auth-tests-sdk
   auth-tests-sdk:
     image: python:3.11-slim
-    profiles: ["auth-tests"]
+    profiles: ["auth"]
+    restart: "no"
     working_dir: /repo
     volumes:
       - ../..:/repo
     environment:
-      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_GATEWAY: gateway:51500
       LATIQ_SERVER: http://control-plane:51400
     command:
@@ -1274,12 +1301,13 @@ services:
 
   auth-tests-agent:
     image: node:22-slim
-    profiles: ["auth-tests"]
+    profiles: ["auth"]
+    restart: "no"
     working_dir: /repo/e2e/agent
     volumes:
       - ../..:/repo
     environment:
-      LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_MCP: http://gateway:51510/mcp
     command:
       - sh
@@ -1291,16 +1319,29 @@ services:
     depends_on: [gateway, keycloak]
 ```
 
-The SDK runner installs the wheel from `/repo/dist`, so **the wheel must be built before this runs** — CI already builds it for the other e2e jobs (`.github/workflows/nightly.yml`, the `maturin build` step).
+The SDK runner installs the wheel from `/repo/dist`, so **the wheel must be built before this runs** — CI already builds it for the other e2e jobs.
 
-- [ ] **Step 3: Verify the realm and the audience mapper**
+- [ ] **Step 4: Write the env file**
+
+`deploy/cluster/auth.env` — Compose reads `COMPOSE_PROFILES` from an env file just like any other setting, so this one file both selects the profile and supplies the settings:
+
+```bash
+# Auth mode for the cluster compose. Usage:
+#   docker compose --env-file auth.env up -d
+# Without it, `docker compose up -d` is the ordinary unauthenticated cluster.
+COMPOSE_PROFILES=auth
+LATIQ_AUTH_ISSUER=http://keycloak:8080/realms/latiq
+LATIQ_AUTH_AUDIENCE=latiq
+```
+
+- [ ] **Step 5: Verify the realm and the audience mapper**
 
 The audience mapper is the single most likely thing to be wrong, and it fails as an opaque "token rejected". Check it directly, from inside the network:
 
 ```bash
 cd deploy/cluster
-docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d keycloak
-docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm --entrypoint sh auth-tests-sdk -c '
+docker compose --env-file auth.env up -d keycloak
+docker compose --env-file auth.env run --rm --entrypoint sh auth-tests-sdk -c '
   pip install -q requests
   python - <<PY
 import base64, json, requests
@@ -1314,11 +1355,21 @@ PY'
 ```
 Expected: `iss: http://keycloak:8080/realms/latiq` and an `aud` containing `latiq`. If `aud` is missing, the mapper is wrong — fix it here, not in Rust.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Confirm the default path is unchanged**
 
 ```bash
-git add deploy/cluster/keycloak-realm.json deploy/cluster/docker-compose.auth.yml deploy/CLAUDE.md
-git commit -m "test(auth): Keycloak plus in-network test runners as a compose override"
+cd deploy/cluster
+docker compose up -d
+docker compose ps --services   # must NOT list keycloak / auth-tests-*
+docker compose logs pond-node-1 | grep -i auth   # must show nothing
+```
+Expected: the ordinary 2-node unauthenticated cluster, exactly as before.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add deploy/cluster/keycloak-realm.json deploy/cluster/auth.env deploy/cluster/docker-compose.yml deploy/CLAUDE.md
+git commit -m "test(auth): Keycloak and in-network test runners behind the auth profile"
 ```
 
 ---
@@ -1388,8 +1439,8 @@ def test_auth_garbage_token_is_rejected():
 
 ```bash
 cd deploy/cluster
-docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
-docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-sdk
+docker compose --env-file auth.env up -d
+docker compose --env-file auth.env run --rm auth-tests-sdk
 ```
 Expected: 3 passed. (`docker compose run` starts `depends_on` services automatically.)
 
@@ -1492,7 +1543,7 @@ The full authenticated tool loop needs no new assertions: with `LATIQ_AUTH_ISSUE
 
 ```bash
 cd deploy/cluster
-docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-agent
+docker compose --env-file auth.env run --rm auth-tests-agent
 ```
 Expected: the existing harness tests pass through the authenticated transport, plus 2 new auth tests.
 
@@ -1512,7 +1563,7 @@ git commit -m "test(auth): agent harness authenticates via the MCP SDK client_cr
 
 - [ ] **Step 1: Add the authenticated-cluster job**
 
-A separate job, not a flag on `e2e-suite`: the unauthenticated path is the default deployment and must keep being tested exactly as it is today. Every client here is a container on the compose network, so the workflow needs no issuer/gateway env of its own — it all lives in the override file.
+A separate job, not a flag on `e2e-suite`: the unauthenticated path is the default deployment and must keep being tested exactly as it is today. Every client here is a container on the compose network, so the workflow needs no issuer/gateway env of its own — it all lives in `auth.env`.
 
 ```yaml
   auth-e2e:
@@ -1536,17 +1587,17 @@ A separate job, not a flag on `e2e-suite`: the unauthenticated path is the defau
         run: docker build -f deploy/cluster/Dockerfile -t ghcr.io/neonexia/latiq:dev .
       - name: Bring up the authenticated cluster
         working-directory: deploy/cluster
-        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml up -d
+        run: docker compose --env-file auth.env up -d
       - name: SDK auth e2e (in-network container)
         working-directory: deploy/cluster
-        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-sdk
+        run: docker compose --env-file auth.env run --rm auth-tests-sdk
       - name: Agent (MCP) auth e2e (in-network container)
         working-directory: deploy/cluster
-        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml run --rm auth-tests-agent
+        run: docker compose --env-file auth.env run --rm auth-tests-agent
       - name: Dump logs on failure
         if: failure()
         working-directory: deploy/cluster
-        run: docker compose -f docker-compose.yml -f docker-compose.auth.yml logs --no-color
+        run: docker compose --env-file auth.env logs --no-color
 ```
 
 Match the image build/tag step to whatever the existing `cluster-scale-out` job does — do not invent a second way to build the image.
@@ -1572,8 +1623,8 @@ git commit -m "ci(auth): nightly e2e against an authenticated cluster, clients i
 - [ ] **Step 1: Update the docs**
 
 - `docs/identity.md`: change the `Principal` code block to `Identity` (per the deviation note at the top of this plan), and mark the implemented parts **today**.
-- `docs/dev.md`: state plainly that **auth mode is nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `-f docker-compose.yml -f docker-compose.auth.yml` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
-- `e2e/CLAUDE.md`: add a third mode alongside REMOTE and EMBEDDED — **AUTH**, which runs only via the compose override with every client in-network.
+- `docs/dev.md`: state plainly that **auth mode is nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `docker compose --env-file auth.env up -d` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
+- `e2e/CLAUDE.md`: add a third mode alongside REMOTE and EMBEDDED — **AUTH**, selected by `--env-file auth.env`, with every client in-network.
 - `docs/roadmap.md`: flip the "Identity v0 — authentication" row to ✅ Shipped.
 - `CLAUDE.md`: add `latiq-auth` to the crate list; note that identity is verified when configured.
 - `crates/latiq-agent-core/CLAUDE.md`: its invariant list says "Identity is relaxed (`Identity::claimed`, default anonymous)" — update to describe both modes.
@@ -1602,4 +1653,6 @@ git commit -m "docs(auth): identity v0 is shipped; document authenticated deploy
 
 **Testing posture, decided:** auth runs **only** in the nightly, **only** in containers, with every client on the compose network. Consequences accepted: (a) there is no host-side auth test, so a bug that only manifests for a client outside the network would be missed — acceptable because the gateway is the boundary either way and it is address-agnostic; (b) `docker compose run` reinstalls the wheel and `npm ci` on each invocation, costing roughly a minute — acceptable for a nightly, and it keeps us from maintaining a bespoke test image.
 
-**Not needed any more:** an `/etc/hosts` entry, a published Keycloak port, and any issuer/JWKS address split. All three were artifacts of running the test client on the host. `AuthConfig` still keeps `issuer` and `jwks_uri` as separate fields — that is right for real split-horizon IdP deployments — but nothing in this plan depends on them differing.
+**Not needed any more:** an `/etc/hosts` entry, a published Keycloak port, an issuer/JWKS address split, and a second compose file. All were artifacts of running the test client on the host. `AuthConfig` still keeps `issuer` and `jwks_uri` as separate fields — that is right for real split-horizon IdP deployments — but nothing in this plan depends on them differing.
+
+**One compose file, two knobs:** `COMPOSE_PROFILES` decides which *services* start, interpolation decides what the *existing* services see. Both come from `deploy/cluster/auth.env`, so `docker compose up -d` is the unauthenticated cluster and `docker compose --env-file auth.env up -d` is the authenticated one. Task 9 Step 6 asserts the default path is unchanged rather than assuming it.
