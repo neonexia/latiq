@@ -197,7 +197,7 @@ async fn start_node_with_auth(
             .unwrap();
     });
     tokio::spawn(async move {
-        serve_mcp_with_listener(mcp_l, ops, mcp_verifier)
+        serve_mcp_with_listener(mcp_l, ops, mcp_verifier, None)
             .await
             .unwrap();
     });

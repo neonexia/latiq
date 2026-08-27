@@ -218,18 +218,22 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     let data_ops = ops.clone();
     let data_addr = cfg.data_addr;
     let data_verifier = verifier.clone();
-    // ASSUMPTION: the RFC 9728 document lives on this node's MCP surface, which
-    // serves it from the address it binds (`serve_mcp`). So the Data/Stream
-    // challenge points at `http://<mcp_addr>/.well-known/oauth-protected-resource`
-    // — the same scheme + address the MCP 401 advertises. It is derived rather
-    // than configured because a second flag for it would be one more thing to get
-    // wrong, and any TLS/hostname rewriting in front of the node is the gateway's
-    // job. `None` when no verifier is configured: a node that never opted into
-    // auth must not advertise an authorization server.
+    // ASSUMPTION: the RFC 9728 document lives on this node's MCP surface, so the
+    // Data/Stream challenge points there. Both surfaces derive it from ONE
+    // string — the URL this node ADVERTISES (`--advertise-addr`), not the socket
+    // it bound, since every compose file we ship binds 0.0.0.0 and a challenge
+    // pointing at 0.0.0.0 is undiscoverable. Derived rather than configured
+    // because a second flag for it would be one more thing to get wrong.
+    // `None` when no verifier is configured: a node that never opted into auth
+    // must not advertise an authorization server.
+    let mcp_public_url = latiq_mcp::advertised_mcp_url(&cfg.internal_endpoint, cfg.mcp_addr)
+        .unwrap_or_else(|| format!("http://{}/mcp", cfg.mcp_addr));
     let data_metadata_url = verifier.as_ref().map(|_| {
         format!(
-            "http://{}{}",
-            cfg.mcp_addr,
+            "{}{}",
+            mcp_public_url
+                .strip_suffix("/mcp")
+                .unwrap_or(&mcp_public_url),
             latiq_mcp::server::PROTECTED_RESOURCE_PATH
         )
     });
@@ -244,9 +248,10 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         cfg.node_id, cfg.data_addr
     );
     println!("  pond storage: {}", cfg.data_dir.display());
-    // The MCP surface gets the SAME verifier as Data/Stream: a surface left
-    // unauthenticated is the whole node's auth.
-    serve_mcp(cfg.mcp_addr, ops, verifier)
+    // The MCP surface gets the SAME verifier as Data/Stream (a surface left
+    // unauthenticated is the whole node's auth) and the SAME advertised URL, so
+    // the two challenges can never point at different documents.
+    serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url))
         .await
         .map_err(|e| anyhow::anyhow!("mcp server error: {e}"))?;
     Ok(())

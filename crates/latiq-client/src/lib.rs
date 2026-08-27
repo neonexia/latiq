@@ -1,5 +1,6 @@
-//! latiq-client — an MCP client wrapper over the Latiq agent surface. Used by
-//! the `latiq` CLI and integration tests to drive the server like an agent.
+//! latiq-client — an MCP client wrapper over the Latiq agent surface. For
+//! integration tests and agent simulation ONLY (invariant 1: the CLI and SDK are
+//! not agents and speak gRPC, never MCP). A dev-dependency, never shipped.
 use anyhow::Result;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResult};
