@@ -117,13 +117,15 @@ async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     start_node_with_auth(node_id, control_endpoint, None).await
 }
 
-/// Build a cluster NODE BY NODE, so a test can control which node owns a pond:
-/// placement is `ORDER BY random()`, so the only reliable way to pin ownership
-/// is to allocate while just one node exists, then add the peer that will
-/// forward. Returns the (control, admin) endpoints.
+/// The control plane on its own, with NO pond nodes. Returns the (control,
+/// admin) endpoints.
 ///
-/// This is what makes ASYMMETRIC clusters testable — a greeter and an owner that
-/// trust different issuers, or only one of which requires a token at all.
+/// Paired with `add_node`, this is what lets a test build a cluster node by
+/// node: placement is `ORDER BY random()`, so the only reliable way to pin which
+/// node owns a pond is to allocate while just one node exists and then add the
+/// peer that will forward. That in turn is what makes ASYMMETRIC clusters
+/// testable — a greeter and an owner that trust different issuers, or only one
+/// of which requires a token at all.
 pub async fn start_control_plane_only() -> (String, String) {
     start_control_plane().await
 }
