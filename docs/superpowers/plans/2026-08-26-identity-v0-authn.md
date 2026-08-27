@@ -1321,7 +1321,19 @@ Expected: PASS. The existing MCP tests must pass unchanged — they never set `a
 
 - [ ] **Step 7: Update the agent-facing guidance**
 
-`crates/latiq-mcp/src/resources.rs` and any prompt SOP text that tells an agent to pass `agent_id` must be updated, or agents will be instructed to send a field that no longer exists. Grep: `grep -rn "agent_id" crates/latiq-mcp/src/resources.rs docs/`.
+Two separate problems in the same files.
+
+**(a) The removed argument.** `crates/latiq-mcp/src/resources.rs` and any prompt SOP text that tells an agent to pass `agent_id` must be updated, or agents will be instructed to send a field that no longer exists. Grep: `grep -rn "agent_id" crates/latiq-mcp/src/resources.rs docs/`.
+
+**(b) The history recipes read the wrong columns.** Found in review of Task 1b. `crates/latiq-mcp/src/resources.rs` (around L25, L41, L96) and `docs/dev.md` (~L183) all tell agents and operators to read history with:
+
+```sql
+SELECT author, commit_message FROM ducklake_snapshots(...)
+```
+
+After Task 1b the verified-vs-claimed evidence lives in the **`commit_extra_info`** column, which no recipe mentions — so a reader following the shipped guidance sees `author=svc-admin` for both a genuinely verified `svc-admin` and an unauthenticated caller merely claiming it. The data distinguishes them; the documented way of reading it does not. Update every recipe to select `commit_extra_info` as well.
+
+Note the exact column name is **`commit_extra_info`**, not `extra_info` — state it correctly so the snippets are copy-pasteable.
 
 - [ ] **Step 8: Commit**
 
@@ -1978,7 +1990,7 @@ git commit -m "ci(auth): nightly e2e against an authenticated cluster, clients i
 
 - [ ] **Step 1: Update the docs**
 
-- `docs/identity.md`: change the `Principal` code block to `Identity` (per the deviation note at the top of this plan), and mark the implemented parts **today**.
+- `docs/identity.md`: mark the implemented parts **today**, and update the attribution description — it still says the id "rides DuckLake's native `set_commit_message`" as a single claimed string. After Task 1b the author is the *verified subject* when present, with the claimed leaf and issuer in `commit_extra_info`.
 - `docs/dev.md`: document `./dev.sh --auth` (Task 9a) and state plainly that **auth mode is otherwise nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `docker compose --env-file auth.env up -d` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
 - `e2e/CLAUDE.md`: add a third mode alongside REMOTE and EMBEDDED — **AUTH**, selected by `--env-file auth.env`, with every client in-network.
 - `docs/roadmap.md`: flip the "Identity v0 — authentication" row to ✅ Shipped.
