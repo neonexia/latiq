@@ -2,6 +2,7 @@
 //! takes a token string and returns an Identity. Adapters extract the token
 //! from their own carrier. See docs/identity.md.
 pub mod jwks;
+pub mod metadata;
 pub mod verify;
 
 pub use verify::{AuthConfig, IssuerConfig, Verifier};
