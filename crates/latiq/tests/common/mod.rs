@@ -119,6 +119,38 @@ pub async fn start_control_plane_with_auth(
     (control_endpoint, admin_endpoint)
 }
 
+/// A control plane serving Control + Admin on ONE port, the shape
+/// `serve_control_plane` (and therefore `latiq serve`) really has. The two-port
+/// variant above exists so a test can drive them independently; the CLI cannot,
+/// because it has a single `$LATIQ_SERVER`. Returns that one endpoint.
+pub async fn start_control_plane_one_port(auth: Option<latiq_auth::AuthConfig>) -> String {
+    let verifier = auth.map(|cfg| {
+        std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
+    });
+    let registry = Registry::open(None).unwrap();
+    let (listener, port) = bind().await;
+    let metadata_url = verifier
+        .as_ref()
+        .map(|_| format!("http://127.0.0.1:{port}/.well-known/oauth-protected-resource"));
+
+    let r1 = registry.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ControlServer::new(ControlService::new(r1)))
+            .add_service(AdminServer::new(
+                AdminService::new(registry)
+                    .with_verifier(verifier)
+                    .with_metadata_url(metadata_url.as_deref()),
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let endpoint = format!("http://127.0.0.1:{port}");
+    wait_connectable(&endpoint).await;
+    endpoint
+}
+
 /// Start one pond node (real GrpcControlPlane + forwarding) against `control`.
 async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     start_node_with_auth(node_id, control_endpoint, None).await
