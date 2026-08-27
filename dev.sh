@@ -12,6 +12,12 @@ DATA_PORT=51401
 NODES=1
 ROOT="${HOME}/.latiq"
 DOWN=0
+AUTH=0
+
+REPO_ROOT=$(pwd)                 # dev.sh may be invoked from anywhere; mounts need absolute paths
+KC_CONTAINER=latiq-dev-keycloak
+KC_URL=http://localhost:8080
+KC_REALM_URL="$KC_URL/realms/latiq"
 
 usage() {
   cat <<EOF
@@ -21,6 +27,9 @@ Usage: ./dev.sh [options]
   --data-port   <port>  First pond node's Data gRPC; MCP = +1  (default $DATA_PORT)
   --nodes       <n>     Number of pond nodes to start          (default $NODES)
   --root        <path>  Data root (registry + pond storage)    (default $ROOT)
+  --auth                Start Keycloak in Docker and run the stack with token
+                        verification on. Debugging only -- auth is otherwise
+                        exercised only by the nightly. Requires Docker.
   --down                Tear down a stack from a previous run, then exit
   -h, --help            Show this help
 
@@ -44,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --data-port) DATA_PORT=$2; shift 2 ;;
     --nodes)     NODES=$2;     shift 2 ;;
     --root)      ROOT=$2;      shift 2 ;;
+    --auth)      AUTH=1;       shift ;;
     --down)      DOWN=1;       shift ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -107,6 +117,10 @@ sweep_stale() {
 }
 
 if [[ $DOWN -eq 1 ]]; then
+  # Unconditional and error-suppressed, for the same reason the PID file is swept
+  # unconditionally: a hard-killed `--auth` run leaves the container behind, and
+  # `--down` is the one command that must always leave nothing running.
+  docker rm -f "$KC_CONTAINER" >/dev/null 2>&1 || true
   if [[ -f "$PID_FILE" ]]; then
     sweep_stale
     printf '%sstack down.%s\n' "$DIM" "$RST"
@@ -160,6 +174,7 @@ cleanup() {
   [[ -n "$NGINX_PID" ]] && kill "$NGINX_PID" 2>/dev/null || true
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
   rm -f "$PID_FILE"     # children are being killed; drop the tracking file
+  docker rm -f "$KC_CONTAINER" >/dev/null 2>&1 || true   # no-op unless --auth ran
 }
 trap cleanup INT TERM EXIT
 
@@ -186,6 +201,48 @@ wait_ready() {
   printf '%sERROR%s: %s did not start listening in time (see %s).\n' "$ERRC" "$RST" "$name" "$log" >&2
   exit 1
 }
+
+# --- keycloak (--auth only) ---------------------------------------------
+# Everything here — servers and clients alike — is a host process, so the one
+# published address http://localhost:8080 works for all of them. (The compose
+# cluster pins http://keycloak:8080 instead, because there it is Docker DNS that
+# every party resolves. Both are right for their context.)
+if [[ $AUTH -eq 1 ]]; then
+  command -v docker >/dev/null 2>&1 || {
+    printf '%sERROR%s: --auth needs Docker to run Keycloak, and `docker` is not on PATH.\n' "$ERRC" "$RST" >&2
+    exit 1
+  }
+  if [[ -n "$(docker ps -q -f "name=^${KC_CONTAINER}$" 2>/dev/null)" ]]; then
+    printf '%sreusing keycloak container %s…%s\n' "$DIM" "$KC_CONTAINER" "$RST"
+  else
+    docker rm -f "$KC_CONTAINER" >/dev/null 2>&1 || true   # clear a stopped leftover
+    printf '%sstarting keycloak…%s\n' "$DIM" "$RST"
+    docker run -d --name "$KC_CONTAINER" -p 8080:8080 \
+      -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+      -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+      -e KC_HOSTNAME_URL="$KC_URL" \
+      -v "$REPO_ROOT/deploy/cluster/keycloak-realm.json:/opt/keycloak/data/import/realm.json:ro" \
+      quay.io/keycloak/keycloak:26.0 start-dev --import-realm >/dev/null || {
+        printf '%sERROR%s: could not start the %s container (is port 8080 free?).\n' "$ERRC" "$RST" "$KC_CONTAINER" >&2
+        exit 1
+      }
+  fi
+  kc_up=0
+  for ((i = 0; i < 120; i++)); do
+    if curl -fsS "$KC_REALM_URL/.well-known/openid-configuration" >/dev/null 2>&1; then kc_up=1; break; fi
+    sleep 1
+  done
+  if [[ $kc_up -ne 1 ]]; then
+    printf '%sERROR%s: keycloak did not answer at %s in time — last lines of `docker logs %s`:\n' \
+      "$ERRC" "$RST" "$KC_REALM_URL" "$KC_CONTAINER" >&2
+    docker logs --tail 15 "$KC_CONTAINER" >&2 2>&1 || true
+    exit 1
+  fi
+  # Inherited by the control plane and every node started below, so their
+  # `serve` / `node add` invocations need no extra flags.
+  export LATIQ_AUTH_ISSUER="$KC_REALM_URL"
+  export LATIQ_AUTH_AUDIENCE=latiq
+fi
 
 # --- control plane ------------------------------------------------------
 "$BIN" serve --port "$SERVER_PORT" --root "$ROOT" >"$CP_LOG" 2>&1 &
@@ -292,7 +349,17 @@ else
   row "metrics" "cp http://$HOST:$CP_METRICS/metrics · node http://$HOST:${NODE_METRICS[0]}/metrics"
 fi
 row "prometheus" "$PROM_CFG  (prometheus --config.file=$PROM_CFG)"
+[[ $AUTH -eq 1 ]] && row "auth" "verifying tokens for audience 'latiq' from $KC_REALM_URL"
 echo
+if [[ $AUTH -eq 1 ]]; then
+  printf '   %sAuth is ON — every call needs a bearer token. Mint one, and the CLI%s\n' "$DIM" "$RST"
+  printf '   %sand SDK pick up $LATIQ_TOKEN automatically:%s\n' "$DIM" "$RST"
+  printf '   %sexport LATIQ_TOKEN=$(curl -s -X POST %s/protocol/openid-connect/token \\%s\n' \
+    "$VAL" "$KC_REALM_URL" "$RST"
+  printf '   %s  -d grant_type=client_credentials -d client_id=latiq-agent \\%s\n' "$VAL" "$RST"
+  printf '   %s  -d client_secret=latiq-agent-secret | jq -r .access_token)%s\n' "$VAL" "$RST"
+  echo
+fi
 if [[ $MULTI -eq 1 ]]; then
   printf '   %sDrive the CLI through the front door:%s\n' "$DIM" "$RST"
   printf '   %sexport LATIQ_QUERY_GATEWAY=http://%s:%s%s\n' "$VAL" "$HOST" "$GW_DATA" "$RST"
