@@ -74,18 +74,53 @@ async fn access_trail_records_the_verified_subject_and_issuer() {
         .await
         .unwrap();
 
+    // And an unverified caller through the same path, to pin both shapes.
+    ops.allocate_pond(
+        &Identity::claimed(Some("agent-plain")),
+        Some("unaudited".into()),
+        "{}",
+        "medium",
+        &[],
+    )
+    .await
+    .unwrap();
+
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let verified_line = log
+        .lines()
+        .find(|l| l.contains("agent=svc-admin"))
+        .unwrap_or_else(|| panic!("the claimed leaf must still be recorded: {log}"));
     assert!(
-        log.contains("subject=svc-lowpriv"),
-        "access trail must carry the verified subject: {log}"
+        verified_line.contains("subject=svc-lowpriv"),
+        "access trail must carry the verified subject: {verified_line}"
     );
     assert!(
-        log.contains("issuer=https://idp.example/realms/latiq"),
-        "access trail must carry the issuer: {log}"
+        verified_line.contains("issuer=https://idp.example/realms/latiq"),
+        "access trail must carry the issuer: {verified_line}"
     );
-    // The claimed leaf is still recorded — as a claim, never as authority.
+    // `verified` is the field that makes subject/issuer readable as authority;
+    // without it on the line the pairing means nothing.
     assert!(
-        log.contains("agent=svc-admin"),
-        "the claimed leaf is still recorded: {log}"
+        verified_line.contains("verified=true"),
+        "access trail must mark the pair as verified: {verified_line}"
+    );
+
+    // The unverified shape: the claim stands alone, with nothing that could be
+    // read as an authenticated identity.
+    let claimed_line = log
+        .lines()
+        .find(|l| l.contains("agent=agent-plain"))
+        .unwrap_or_else(|| panic!("the unverified caller must be recorded: {log}"));
+    assert!(
+        claimed_line.contains("subject=") && claimed_line.contains("issuer="),
+        "the verified fields must still be present, just empty: {claimed_line}"
+    );
+    assert!(
+        claimed_line.contains("subject= "),
+        "an unverified caller has no subject: {claimed_line}"
+    );
+    assert!(
+        claimed_line.contains("verified=false"),
+        "an unverified caller must be marked unverified: {claimed_line}"
     );
 }

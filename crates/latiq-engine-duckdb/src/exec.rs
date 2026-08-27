@@ -300,6 +300,12 @@ pub fn run_write(
     // the caller authenticated, the claimed leaf otherwise. The claimed leaf is
     // always recorded separately so history distinguishes the two — a bare
     // `verified` must never sit next to a claimed value.
+    //
+    // Accepted v0 trade-off: `author` is the BARE subject, so subjects from two
+    // different issuers collide when an operator groups history by `author`. The
+    // issuer is recorded in `commit_extra_info` — group by the pair to be exact.
+    // Qualifying the author (`iss#sub`) would churn the format for every reader,
+    // so it waits for a deliberate decision, not a drive-by change.
     let author = if identity.verified {
         &identity.subject
     } else {

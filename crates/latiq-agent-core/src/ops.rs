@@ -692,7 +692,11 @@ impl AgentOps {
     /// target. There is no audit store — operators grep the node log files (or
     /// ship them to their log stack; `LATIQ_LOG_FORMAT=json` makes the fields
     /// structured). Filter with e.g. `RUST_LOG=latiq::access=info` or by grepping
-    /// the `latiq::access` target / the `agent=`/`op=` fields.
+    /// the `latiq::access` target / the `op=`/`pond=` fields. To ask *who* did
+    /// something, filter on `subject=` **together with** `verified=true`:
+    /// `agent=` is the caller's own claim and carries no authority (it is empty
+    /// of meaning for authorization, useful only for correlating one agent's
+    /// activity). `subject=`/`issuer=` are empty when `verified=false`.
     ///
     /// Kept `async` so the (many) call sites are unchanged; the body is a
     /// non-blocking trace emit (no store, no await).
