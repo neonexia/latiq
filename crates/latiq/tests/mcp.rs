@@ -182,3 +182,55 @@ async fn mcp_error_contract_is_structured() {
     assert!(out.value["see"].as_str().unwrap().starts_with("latiq://"));
     c.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn mcp_cross_node_write_fails_on_an_auth_enabled_cluster() {
+    // RECORDS TODAY'S BEHAVIOUR, which is a cliff we want visible rather than
+    // silent. The MCP surface has no verifier yet (that is the next task), so it
+    // sets no bearer token — but it shares one `AgentOps` and one
+    // `GrpcForwarder` with the Data surface. On an auth-enabled cluster an MCP
+    // write against a node that does NOT own the pond therefore forwards with no
+    // token and the owner rejects it.
+    //
+    // That is fail-safe, not a bypass: the hop fails closed. When MCP auth lands
+    // this assertion must change, and changing it is exactly the point — the
+    // diff makes the fix deliberate and reviewable.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let (control, _admin) = common::start_control_plane_only().await;
+
+    // Owner first, alone, so it certainly owns `mcpfwd` (placement is random).
+    let owner = common::add_node("owner", &control, Some(idp.auth_config())).await;
+    let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+    let mut oc = latiq_proto::v1::data_client::DataClient::connect(owner.data_endpoint.clone())
+        .await
+        .unwrap();
+    let mut alloc = tonic::Request::new(latiq_proto::v1::AllocatePondRequest {
+        name: "mcpfwd".into(),
+        policy_json: String::new(),
+        tier: String::new(),
+    });
+    alloc
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    oc.allocate_pond(alloc).await.unwrap();
+
+    // Now the peer, driven over MCP — every op on `mcpfwd` must forward.
+    let greeter = common::add_node("greeter", &control, Some(idp.auth_config())).await;
+    let c = LatiqClient::connect(&greeter.mcp_endpoint, Some("agent-x".into()))
+        .await
+        .unwrap();
+    let out = c
+        .write("mcpfwd", "CREATE TABLE t(i INTEGER)")
+        .await
+        .unwrap();
+    assert!(
+        out.is_error,
+        "MCP has no token to forward yet, so the owner must refuse: {:?}",
+        out.value
+    );
+    assert!(
+        format!("{}", out.value).contains("a bearer token is required"),
+        "the owner's refusal should be what surfaces: {:?}",
+        out.value
+    );
+}
