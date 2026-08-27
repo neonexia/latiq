@@ -97,16 +97,17 @@ token string:
 Covering only MCP would leave the front door locked and a side door open. The
 cost of covering all three is small precisely because the verifier is shared.
 
-### The Principal
+### The identity type
 
-`Identity` becomes `Principal`, and its central property is that **each field
-knows whether it was verified**:
+`Identity` keeps its name and gains fields. Its central property is that **each
+field knows whether it was verified**:
 
 ```rust
-pub struct Principal {
+pub struct Identity {
     /// The IdP's `sub`. Verified when `verified` is true.
     pub subject: String,
     /// Issuer (`iss`) of the token that produced `subject`. Empty when unverified.
+    /// Carried separately so subjects from different issuers cannot collide.
     pub issuer: String,
     pub verified: bool,
 
@@ -114,6 +115,10 @@ pub struct Principal {
     pub agent_id: String,
 }
 ```
+
+*(An earlier draft called this `Principal`. The rename was dropped: it touches 12
+source files and ~30 test call sites for no behaviour change, and `Identity` is an
+honest name for these four fields.)*
 
 Two rules, and they are the whole model:
 

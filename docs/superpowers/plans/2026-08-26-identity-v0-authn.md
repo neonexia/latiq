@@ -12,9 +12,16 @@
 
 ---
 
-## Deviation from the design note (decide before Task 1)
+## Decisions taken before implementation
 
-`docs/identity.md` names the type `Principal`. **This plan keeps it named `Identity`** and adds fields instead. Rationale: the rename touches 12 source files and ~30 test call sites for zero behaviour change, and `Identity` is an honest name for `{subject, issuer, verified, agent_id}`. CLAUDE.md invariant 12 says make it boring. If the reviewer prefers `Principal`, do the rename as a standalone mechanical commit **before** Task 1 and update `docs/identity.md` is unnecessary — it already says `Principal`, so instead update the doc's code block to say `Identity`.
+- **The type stays `Identity`.** An earlier draft of `docs/identity.md` called it
+  `Principal`; the rename was dropped because it touches 12 source files and ~30
+  test call sites for zero behaviour change. `docs/identity.md` has been updated to
+  match, so the doc and this plan agree.
+- **Execution is subagent-driven** (`superpowers:subagent-driven-development`): one
+  fresh subagent per task, then a spec-compliance review and a code-quality review
+  before the next task starts.
+- **Branch:** `feat/identity-v0-authn`.
 
 ---
 
