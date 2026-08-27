@@ -34,7 +34,9 @@ const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 const SERVER_HELP: &str = "\
 ENVIRONMENT:
   LATIQ_SERVER  Control-plane address the CLI connects to. Set this first, e.g.
-                `export LATIQ_SERVER=http://host:51400` (default http://127.0.0.1:51400).";
+                `export LATIQ_SERVER=http://host:51400` (default http://127.0.0.1:51400).
+  LATIQ_TOKEN   OAuth bearer token, sent on every request (same as --token). Needed
+                only against a deployment started with --auth-issuer.";
 
 /// As `SERVER_HELP`, plus the optional query front door — used by `query` and
 /// `pond describe`, which run against a pond node.
@@ -46,12 +48,20 @@ ENVIRONMENT:
   LATIQ_QUERY_GATEWAY  Optional data front door (e.g. an nginx LB over several
                        nodes). If set, the query is sent there and the greeter node
                        forwards to the pond's owner; otherwise the CLI connects to
-                       the owning node directly.";
+                       the owning node directly.
+  LATIQ_TOKEN          OAuth bearer token, sent on every request (same as --token).
+                       Needed only against a deployment started with --auth-issuer.";
 
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
 #[command(after_help = QUERY_HELP)]
 struct Cli {
+    /// OAuth bearer token presented on EVERY request this CLI makes — Admin and
+    /// Control as well as data ops. Only needed where the deployment configures
+    /// an issuer; unset means the relaxed (claimed-identity) path. Global, so it
+    /// works on every subcommand.
+    #[arg(long, global = true, env = "LATIQ_TOKEN")]
+    token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -123,11 +133,6 @@ enum DatasetCmd {
         pond: String,
         #[arg(short, long)]
         agent_id: Option<String>,
-        /// OAuth bearer token presented to the server (`Authorization: Bearer`).
-        /// Only needed where the deployment configures an issuer; unset means the
-        /// relaxed (claimed-identity) path.
-        #[arg(long, env = "LATIQ_TOKEN")]
-        token: Option<String>,
     },
 }
 
@@ -161,11 +166,6 @@ enum CatalogCmd {
         set: Vec<String>,
         #[arg(short, long)]
         agent_id: Option<String>,
-        /// OAuth bearer token presented to the server (`Authorization: Bearer`).
-        /// Only needed where the deployment configures an issuer; unset means the
-        /// relaxed (claimed-identity) path.
-        #[arg(long, env = "LATIQ_TOKEN")]
-        token: Option<String>,
     },
     /// Pull from a catalog into a pond: transient attach → run the query → detach.
     Pull {
@@ -180,11 +180,6 @@ enum CatalogCmd {
         set: Vec<String>,
         #[arg(short, long)]
         agent_id: Option<String>,
-        /// OAuth bearer token presented to the server (`Authorization: Bearer`).
-        /// Only needed where the deployment configures an issuer; unset means the
-        /// relaxed (claimed-identity) path.
-        #[arg(long, env = "LATIQ_TOKEN")]
-        token: Option<String>,
     },
     /// Remove a catalog. Operator action.
     Remove { name: String },
@@ -363,11 +358,6 @@ struct QueryArgs {
     /// Identity attributed to your writes (relaxed; defaults to anonymous).
     #[arg(short, long)]
     agent_id: Option<String>,
-    /// OAuth bearer token presented to the server (`Authorization: Bearer`).
-    /// Only needed where the deployment configures an issuer; unset means the
-    /// relaxed (claimed-identity) path.
-    #[arg(long, env = "LATIQ_TOKEN")]
-    token: Option<String>,
     /// Output format for read results.
     #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
     format: Format,
@@ -376,6 +366,12 @@ struct QueryArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Recorded ONCE, before any client exists, so `auth_interceptor` is the only
+    // thing that ever has to know about it. A blank value is no value (see
+    // `non_blank`): `LATIQ_TOKEN=` from a compose file or a `.env` must not
+    // become an `Authorization: Bearer ` header, which is rejected as malformed
+    // rather than as absent.
+    let _ = TOKEN.set(bearer_of(&cli.token));
     match cli.command {
         #[cfg(feature = "server")]
         Command::Serve(a) => run_serve(a).await,
@@ -490,7 +486,6 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
             name,
             pond,
             agent_id,
-            token,
         } => {
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
@@ -504,7 +499,6 @@ async fn run_dataset_cmd(cmd: DatasetCmd) -> Result<()> {
                         dataset: name,
                     },
                     &agent_id,
-                    &token,
                 ))
                 .await
             {
@@ -597,7 +591,6 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
             pond,
             set,
             agent_id,
-            token,
         } => {
             let params = parse_kv(&set, "--set")?;
             let node = data_target(&pond).await?;
@@ -610,7 +603,6 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                         params,
                     },
                     &agent_id,
-                    &token,
                 ))
                 .await
                 .map_err(render_status)?
@@ -624,7 +616,6 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
             query,
             set,
             agent_id,
-            token,
         } => {
             let params = parse_kv(&set, "--set")?;
             let node = data_target(&pond).await?;
@@ -641,7 +632,6 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                         params,
                     },
                     &agent_id,
-                    &token,
                 ))
                 .await
             {
@@ -928,24 +918,79 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
 
 // ---- gRPC clients (friendly connection errors) --------------------------
 
-async fn control_client() -> Result<ControlClient<Channel>> {
-    let addr = control_addr();
-    ControlClient::connect(addr.clone()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
-    })
+/// The operator's bearer token, resolved once in `main` from `--token` /
+/// `$LATIQ_TOKEN`. A process-wide value because it is a property of the
+/// INVOCATION, not of any one command: threading it through every call site is
+/// what let the Admin commands quietly ship without it.
+static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Attach `authorization: Bearer <token>` to every outbound request.
+///
+/// This is a tonic interceptor rather than a per-call-site header for one
+/// reason: it is the ONLY place a request can be built from, so a command added
+/// later authenticates without its author remembering to. Data ops are not
+/// special — Admin gRPC is the operator surface, and an operator CLI that cannot
+/// reach an authenticated control plane is the slice failing its primary
+/// audience. Still per-request metadata, never channel state.
+// The signature is tonic's `Interceptor`, so the `Err` type is not ours to box.
+#[allow(clippy::result_large_err)]
+fn auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
+    if let Some(token) = TOKEN.get().and_then(Option::as_deref) {
+        if let Ok(value) = format!("Bearer {token}").parse() {
+            req.metadata_mut().insert("authorization", value);
+        }
+    }
+    Ok(req)
 }
 
-async fn admin_client() -> Result<AdminClient<Channel>> {
-    let addr = control_addr();
-    AdminClient::connect(addr.clone()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
-    })
+/// A fn pointer so every client shares one concrete interceptor type.
+type AuthInterceptor = fn(Request<()>) -> Result<Request<()>, Status>;
+/// What every CLI gRPC client actually rides: a channel plus the token.
+type Authed = tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>;
+
+/// The one place the CLI dials. `None` = unreachable; callers phrase the advice.
+async fn dial(endpoint: &str) -> Option<Channel> {
+    Channel::from_shared(endpoint.to_string())
+        .ok()?
+        .connect()
+        .await
+        .ok()
 }
 
-async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
-    DataClient::connect(endpoint.to_string()).await.map_err(|_| {
+fn unreachable_control(addr: &str) -> anyhow::Error {
+    anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
+}
+
+async fn control_client() -> Result<ControlClient<Authed>> {
+    let addr = control_addr();
+    let ch = dial(&addr)
+        .await
+        .ok_or_else(|| unreachable_control(&addr))?;
+    Ok(ControlClient::with_interceptor(
+        ch,
+        auth_interceptor as AuthInterceptor,
+    ))
+}
+
+async fn admin_client() -> Result<AdminClient<Authed>> {
+    let addr = control_addr();
+    let ch = dial(&addr)
+        .await
+        .ok_or_else(|| unreachable_control(&addr))?;
+    Ok(AdminClient::with_interceptor(
+        ch,
+        auth_interceptor as AuthInterceptor,
+    ))
+}
+
+async fn data_client(endpoint: &str) -> Result<DataClient<Authed>> {
+    let ch = dial(endpoint).await.ok_or_else(|| {
         anyhow!("could not reach the pond node at {endpoint}. Is it up? Start one with `latiq node add`.")
-    })
+    })?;
+    Ok(DataClient::with_interceptor(
+        ch,
+        auth_interceptor as AuthInterceptor,
+    ))
 }
 
 /// Where the CLI sends data ops for `pond_ref`. Default: resolve the owning node
@@ -980,21 +1025,14 @@ fn bearer_of(token: &Option<String>) -> Option<String> {
     non_blank(token.clone())
 }
 
-/// The metadata every data op carries: the CLAIMED agent id, and — when the
-/// deployment requires it — the bearer token that actually proves who we are.
-///
-/// The token rides gRPC metadata per request rather than the channel: a `Channel`
-/// is shared and cached, metadata is not.
-fn with_id<T>(msg: T, agent_id: &Option<String>, token: &Option<String>) -> Request<T> {
+/// The CLAIMED agent id a data op is attributed to. The bearer token is NOT set
+/// here — `auth_interceptor` attaches it to every request on every surface, so
+/// there is exactly one place that can forget.
+fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
     let mut r = Request::new(msg);
     if let Some(id) = agent_id {
         if let Ok(v) = id.parse() {
             r.metadata_mut().insert("latiq-agent-id", v);
-        }
-    }
-    if let Some(t) = bearer_of(token) {
-        if let Ok(v) = format!("Bearer {t}").parse() {
-            r.metadata_mut().insert("authorization", v);
         }
     }
     r
@@ -1011,7 +1049,6 @@ async fn run_query(a: QueryArgs) -> Result<()> {
             sql: a.sql.clone(),
         },
         &a.agent_id,
-        &a.token,
     );
     // Still one `query` command — but route by statement so reads ride the Arrow
     // streaming hop (ReadQuery) and writes are attributed/snapshotted (WriteQuery).
