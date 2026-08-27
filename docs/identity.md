@@ -1,8 +1,8 @@
-# Latiq — Identity, Authorization, and Isolation
+# Latiq — Identity (v0: authentication)
 
-*Design note. Not yet a spec — this is the discussion that has to settle before the
-authorization slice is built. Nothing here is implemented except where marked
-**today**.*
+*Design note for the identity slice. **Authorization is explicitly out of scope
+here** — see [Authorization is deferred](#authorization-is-deferred-on-purpose).
+Nothing below is implemented except where marked **today**.*
 
 ---
 
@@ -11,246 +11,209 @@ authorization slice is built. Nothing here is implemented except where marked
 ```rust
 pub struct Identity {
     pub agent_id: String,
-    pub verified: bool,   // always false in M1
+    pub verified: bool,   // always false
 }
 ```
 
-- The agent **claims** an id. On the MCP surface it arrives as an optional
-  `agent_id` tool argument; on gRPC as metadata. Absent or blank → `anonymous`.
+- The caller **claims** an id. On MCP it arrives as an optional `agent_id` *tool
+  argument* (`crates/latiq-mcp/src/server.rs`); on Data gRPC as the
+  `latiq-agent-id` metadata key (`crates/latiq-pond-node/src/data_service.rs`).
+  Absent or blank → `anonymous`.
 - Nothing verifies it. Any caller can assert any id.
-- The id is used for exactly two things: **attribution** (it rides DuckLake's
-  native `set_commit_message`, so `pond.snapshots()` shows who wrote what) and
-  the **`latiq::access` trail** (`agent`, `verified`, `op`, `pond`, `duration_ms`,
-  redacted SQL shape).
-- It is used for **nothing else**. There are no pond ACLs. There are no
-  per-principal catalog grants — the catalog "allowlist" in the code is a
-  *parameter* allowlist that strips credential-shaped keys at registration, not
-  an access control list. Any agent that can reach the gateway can allocate a
-  pond, read any pond, and pull from any registered catalog.
+- It is used for exactly two things: **attribution** (it rides DuckLake's native
+  `set_commit_message`, so `pond.snapshots()` shows who wrote what) and the
+  **`latiq::access` trail** (`crates/latiq-agent-core/src/ops.rs`).
+- There are no pond ACLs and no per-principal catalog grants. Any caller that
+  can reach the gateway can allocate a pond, read any pond, and pull from any
+  registered catalog.
 
-This is a defensible M1 posture for a single trusted deployment. It does not
-survive the production topology the product spec describes.
+Defensible for a single trusted deployment. It does not survive contact with an
+enterprise, for one blunt reason: **an enterprise cannot onboard a service that
+has no relationship with its identity provider.**
 
 ---
 
-## The problem
+## The strategic call
 
-Production agents don't arrive one at a time. A workflow starts and spawns a
-graph — parallel branches, sequential stages, potentially hundreds of agents over
-one run. Multiple workflows share a cluster on purpose, because a busy cluster is
-an efficiently used one.
+There is **no settled standard for multi-agent authorization.** Principal
+hierarchies, delegation chains, agent-to-agent credentials — all of it is in
+motion. Meanwhile every enterprise that would deploy Latiq already runs a
+centralized IdP (Okta, Auth0, Entra) and already knows how to issue tokens to
+workloads.
 
-That breaks a flat agent identity in three specific ways.
+And the agents that exist *today* are overwhelmingly **single agents and loop
+agents**, not the hundred-node graphs a hierarchy would be designed for. Those
+agents carry a **stable** subject — a delegated human via the authorization-code
+flow, or a service account via client credentials. A stable subject has none of
+the "the grant can't precede the agent" problems that motivate a hierarchy.
 
-**1. Grants can't be written against agent instances.** Nobody is going to add
-three hundred ephemeral ids to an access list — and the ids don't exist until the
-workflow is already running. Any scheme where an operator enumerates agents is
-dead on arrival.
+> **So: adopt the standard that exists, invent nothing, and let the multi-agent
+> identity story mature in the industry rather than in our codebase.**
 
-**2. The grant has to precede and outlive the agent.** An agent in stage three
-needs access to a pond created in stage one by an agent that has already exited.
-Authority therefore belongs to something with the run's lifetime, not the agent's.
-
-**3. Attribution and authorization want different granularities.** Authorization
-wants coarse and stable: *this workflow, in this tenant, may read this catalog*.
-Attribution wants fine and disposable: *agent 147 of stage 2 wrote this snapshot*.
-Collapsing both onto one string forces you to choose, and either choice is wrong.
+Concretely, that means the earlier proposal in this document's history — a
+four-level `tenant → workflow → stage → agent` principal chain of our own design
+— is **withdrawn**. What it got right (that attribution wants finer granularity
+than authority) survives as *recorded data*, not as type structure. See
+[`lineage.md`](lineage.md), which is where that granularity now lives.
 
 ---
 
-## Proposal: a principal hierarchy
+## v0 — authenticate, don't authorize
 
-Replace the flat id with a chain. Four levels, each optional below the first, so
-the simple cases stay simple.
+MCP already specifies this, so we implement a spec rather than a design: the MCP
+server is an **OAuth 2.1 resource server**. The same verification then applies to
+our other surfaces, because the hard part (validating a token) is transport-
+independent.
 
+### The flow
+
+1. An unauthenticated request gets `401` with a `WWW-Authenticate` header
+   carrying `resource_metadata=…`.
+2. That points at `/.well-known/oauth-protected-resource`, which advertises the
+   **trusted authorization servers** the operator configured.
+3. The client obtains a token from the IdP directly. **Latiq is never in that
+   exchange**, holds no client secret, and stores no credential.
+4. The client retries with `Authorization: Bearer …`.
+5. Latiq verifies the token **locally** against the IdP's JWKS: signature,
+   issuer, expiry, and — critically — **audience**, so a token minted for some
+   other service cannot be replayed at us. No token passthrough.
+
+JWKS is fetched once and cached with a refresh on unknown `kid`. Verification is
+offline after that: no IdP round-trip on the request path, which matters because
+this sits in front of every query.
+
+### One verifier, three carriers
+
+The verifier belongs in `latiq-agent-core` and knows nothing about transports
+(invariant 5). Each inbound adapter extracts its own carrier and hands over a
+token string:
+
+| Surface | Carrier |
+|---|---|
+| MCP-over-HTTP | `Authorization: Bearer` header |
+| Data / Stream gRPC | `authorization` gRPC metadata |
+| Admin gRPC | `authorization` gRPC metadata |
+
+Covering only MCP would leave the front door locked and a side door open. The
+cost of covering all three is small precisely because the verifier is shared.
+
+### The Principal
+
+`Identity` becomes `Principal`, and its central property is that **each field
+knows whether it was verified**:
+
+```rust
+pub struct Principal {
+    /// The IdP's `sub`. Verified when `verified` is true.
+    pub subject: String,
+    /// Issuer (`iss`) of the token that produced `subject`. Empty when unverified.
+    pub issuer: String,
+    pub verified: bool,
+
+    /// The leaf agent instance. ALWAYS claimed — never verified, never authority.
+    pub agent_id: String,
+}
 ```
-tenant  →  workflow (run)  →  stage  →  agent instance
-```
 
-| Level | Lifetime | Example | Role |
-|---|---|---|---|
-| `tenant` | permanent | `acme-risk` | billing, hard isolation boundary |
-| `workflow` | one run, minutes to hours | `wf-incident/run-8812` | **the principal grants bind to** |
-| `stage` | part of a run | `stage-2-enrich` | optional scoping, readable history |
-| `agent` | seconds to minutes | `agent-147` | attribution, revocation, rate limiting |
+Two rules, and they are the whole model:
 
-**The rule that falls out of it:**
+> **Authority may only ever come from a verified field.**
+> **Everything else is recorded as claimed and never load-bearing.**
 
-> **Authorization binds to the tenant and the workflow. Attribution records the
-> whole chain.**
+The leaf `agent_id` stays claimed on purpose. An agent instance inside a process
+that already holds the run's token can always assert whatever leaf id it likes;
+pretending otherwise would be theatre. The leaf is attribution, not authority —
+and once authorization arrives, it binds to `subject`, which *is* verified.
 
-Everything else follows. Catalog grants are written against a tenant or a
-workflow *role* — never an agent id. Pond ACLs are owned by the run. The access
-trail and the DuckLake commit message carry the full chain, so a 300-agent
-history is readable and one misbehaving agent is individually revocable and
-individually rate-limited without touching the grant model.
+Workflow and step labels are **not** in `Principal`. They belong to lineage, are
+always claimed, and live in the lineage event
+([`lineage.md`](lineage.md#the-run-scope-question)).
 
-### Wire shape
+### Unauthenticated mode stays
 
-The chain should be one structured claim, not four headers to be assembled by
-each adapter. Something like:
+If the operator configures no authorization server, Latiq behaves exactly as it
+does today: claimed identity, `verified: false`, default `anonymous`. This is not
+a loophole to close — it is the embedded SDK, the single-process case, `./dev.sh`,
+and every test in the repo. Auth is **opt-in by configuration**, and turning it on
+is what an enterprise deployment does.
 
-```
-latiq-principal: tenant=acme-risk; workflow=wf-incident/run-8812; stage=2-enrich; agent=147
-```
+### The MCP breaking change
 
-`latiq-agent-core` stays protocol-neutral (invariant 5) — each inbound adapter
-parses its transport's carrier into the same `Principal` type. `Identity` becomes
-`Principal` with `agent_id` retained as the leaf, which keeps the existing
-attribution and access-trail code working through the transition.
-
-**Open:** on MCP the id is currently a *tool argument*, which means the model
-itself can type anything into it. That's fine for claimed identity and
-unacceptable for verified identity — a verified principal must arrive out of band
-(HTTP header or transport credential), never as a tool parameter the model
-controls. This is a breaking change to the MCP tool schemas and should happen
-before the tools have wide adoption.
+Identity moves **out of the tool arguments**. Today the model itself types
+`agent_id` into a tool parameter, which is fine for a claimed value and
+unacceptable for a verified one — a verified principal must arrive out of band,
+in the transport, where the model cannot reach it. This is a breaking change to
+every MCP tool schema and it gets more expensive every day the current surface
+ships. It is the **first** thing to do, not the last.
 
 ---
 
-## Verification: where does the token come from?
+## Authorization is deferred, on purpose
 
-Three options, not mutually exclusive.
+v0 ships **authentication only**. Verified identity flows into attribution, the
+`latiq::access` trail, and lineage. It does **not** yet gate anything: any caller
+holding a valid token from a trusted issuer can still reach any pond.
 
-**A. Workflow-issued token (favored).** The orchestrator authenticates once per
-run against the IdP and receives a token scoped to the run. Agents inherit it and
-add their leaf id in-band. Matches how workflow engines already handle secrets;
-one authentication per run rather than per agent; revoking a run revokes every
-agent in it. Weakness: an agent can spoof its *leaf* id — acceptable, since the
-leaf is attribution, not authority.
+That is a real gap and this document does not pretend otherwise. It is deferred
+because it is genuinely separable — nothing in v0 has to be redesigned to add it
+later, since ACLs will bind to `subject`, which v0 already establishes and
+verifies. Sequencing authn first gets us enterprise-compatible **now**; bundling
+them delays both.
 
-**B. Per-agent minted token.** The harness mints a short-lived, narrowly-scoped
-token per agent from the run's credential. Strongest attribution and per-agent
-revocation. Cost: a minting service and hundreds of token issuances per run.
+The authorization slice (its own design note, its own issue) has to settle at
+least:
 
-**C. Workload identity (SPIFFE / k8s ServiceAccount).** In a cluster-resident
-deployment, the agent pod already has a verifiable identity. Latiq maps the
-workload identity to a tenant and reads the workflow from the request. Zero new
-credential plumbing where it applies; says nothing about agents that share a pod.
-
-A reasonable path: **C for the tenant, A for the run, in-band for the leaf.**
-Each level verified by the cheapest mechanism that can verify it.
-
----
-
-## Pond authorization
-
-Today: no ACLs at all.
-
-Proposed model, deliberately small:
-
-- Every pond has an **owner principal**, set at allocation. Default: the
-  allocating agent's *workflow*, not the agent.
-- Three modes: `read`, `write`, `admin` (describe/drop). Grants are held against
-  a tenant, a workflow, or a workflow role.
-- Default visibility: **same workflow gets `write`, same tenant gets nothing.**
-  Cross-workflow sharing is an explicit grant. This is the safe default for a
-  cluster running several workflows at once, and it's the case the current
-  system gets wrong.
-- Pond discovery (`list_ponds`) filters to what the caller can see. Today it
-  lists everything, which is both a leak and a scaling problem once a cluster
-  runs many concurrent workflows.
-
-**Open:** can an agent grant access to a pond its workflow owns, or is granting
-an operator action? Agent-granting is ergonomic and matches "the agent is the
-customer"; operator-granting is what a compliance team will ask for. A middle
-path — agents may grant within their tenant, operators may grant across tenants
-— is probably right.
-
----
-
-## Catalog authorization
-
-Today a registered catalog is reachable by anyone who can reach the gateway.
-Credentials are not stored, which is a genuine mitigation: the caller must supply
-the credential at pull time, so the catalog registration alone grants nothing.
-That's the reason this is not yet urgent — and also the reason the design must
-land before the identity-bearer integration replaces caller-supplied credentials.
-
-Once Latiq can present the caller's identity to the source, **the registration
-becomes the grant**, and it needs an owner. Grants should bind to tenant or
-workflow role. The `describe`/`pull` path should filter the catalog menu to what
-the principal may use — a catalog an agent can't pull from shouldn't appear in the
-list at all, both for governance and to keep the menu small enough for a model to
-reason about.
+- **Pond ownership.** Owner is the allocating `subject`. Same subject full
+  access; anything cross-subject an explicit grant. `list_ponds` filters to what
+  the caller may see — today it lists everything, which is both a leak and a
+  scaling problem.
+- **Catalog grants.** Today a registered catalog is reachable by anyone who can
+  reach the gateway. Credentials are not stored, which is a genuine mitigation —
+  the caller supplies the credential at pull time, so registration alone grants
+  nothing. That changes the moment Latiq can present the caller's identity to the
+  source: **the registration becomes the grant** and needs an owner.
+- **Who may grant** — agent, operator, or agents-within-a-boundary.
+- **Group and role claims.** Enterprise tokens carry them; binding grants to a
+  group is far more usable than binding to individual subjects, and it is the
+  natural first thing to reach for once ACLs exist.
+- **Pond lifecycle.** `default_pond_lifetime_seconds` (3600) exists in the policy
+  table and **nothing reads it**; there is no pond reaper. Ponds leak. Release
+  authority is an ownership question, so it lands with authorization.
 
 ---
 
 ## Isolation is three problems
 
-They get conflated constantly. They have different mechanisms and different
-owners.
+Conflated constantly; different mechanisms, different owners.
 
-**Access isolation** — which principals may touch which pond and which catalog.
-Policy in the control plane registry, enforced on the pond node. Not built.
+**Access isolation** — which principals may touch which pond and catalog. Policy
+in the control-plane registry, enforced on the pond node. Not built; deferred
+with authorization above.
 
-**Resource isolation** — one pond's scan not starving its neighbors. **Today:**
-per-pond tiers (small/medium/large/x-large) map to hard `memory_limit` and
-`threads` caps on the pond's DuckDB instance. This is the piece that already
-works, and it's the direct answer to "won't this starve my agents?"
+**Resource isolation** — one pond's scan not starving its neighbours. **Today:**
+per-pond tiers map to hard `memory_limit` and `threads` caps on the pond's DuckDB
+instance, plus a per-pond read-connection pool sized off the tier. This is the
+piece that already works.
 
 **Placement** — which node a new pond lands on. Not built; ponds are placed
-without regard to load or tier. On a cluster deliberately kept busy this is the
-gap that turns into a noisy-neighbor incident, and it's the one that costs the
-least to fix: tier-aware binpacking against the per-node metrics already emitted
-(`latiq_node_open_ponds`, `latiq_inflight_queries`, `latiq_process_memory_bytes`).
-
----
-
-## Pond lifecycle — an ownership problem, not an identity one, but it lands here
-
-`default_pond_lifetime_seconds` (3600) exists in the policy table and **nothing
-reads it.** There is no pond reaper. Node liveness is reaped on a 30s TTL; ponds
-are not reaped at all.
-
-With a 300-agent graph this becomes acute, because "the agent drops the pond when
-done" has no meaning when there are three hundred of them:
-
-- **Who drops it?** If any agent may, one finishing branch tears down the
-  workspace a parallel branch is still writing to.
-- **What if nobody does?** The run dies mid-flight and the pond leaks forever.
-
-Proposal: the pond's owner is the **run**; `drop` requires `admin` on the owning
-principal; every pond carries a TTL that a control-plane reaper enforces; and the
-orchestrator can extend it with a heartbeat while the run is live. A leaked pond
-then costs one lifetime, not forever.
-
----
-
-## What to decide now vs. later
-
-**Now, because retrofitting is expensive:**
-
-1. **The principal is a chain, not a string.** Getting `Principal` into
-   `latiq-common` and threaded through the adapters is cheap today and invasive
-   after OIDC ships against a flat id.
-2. **The carrier moves out of the tool arguments** on MCP. Breaking change; do it
-   before the tool surface has adopters.
-3. **Attribution carries run and stage**, not just the agent. A one-line change to
-   the commit message today; unreadable history forever if it's skipped. This is
-   the cheapest high-value item on the list.
-4. **Pond ownership defaults to the workflow.** Changes the meaning of `owner` in
-   the registry — decide before ACLs are written against it.
-
-**Later, safely:**
-
-- Verification mechanism (A/B/C above) — the hierarchy is what constrains the
-  design; the token source can change without reshaping the model.
-- Grant management UX (CLI verbs, whether agents may grant).
-- Rate limiting per principal — needs the hierarchy, nothing else.
-- Cross-tenant sharing, column-level policy, masked queries.
+without regard to load or tier. Tier-aware binpacking against the per-node
+metrics already emitted (`latiq_node_open_ponds`, `latiq_inflight_queries`,
+`latiq_process_memory_bytes`) is the cheap fix.
 
 ---
 
 ## Open questions
 
-- Is `tenant` real for us in the near term, or is one deployment one tenant until
-  a managed offering exists? Carrying the level in the type costs nothing; making
-  it load-bearing costs a lot.
-- Does a workflow's identity come from the orchestrator, or does Latiq issue a run
-  handle at first pond allocation and let the orchestrator pass it down? The
-  second is self-contained but puts Latiq in the run-registry business.
-- What happens to a pond when its run ends but another workflow holds a grant on
-  it? Handoff, copy, or refuse.
-- How does an operator revoke a run mid-flight, and what should the several
-  hundred agents holding open queries see when it happens?
+- **Multiple issuers.** One trusted AS is simple; several (a workforce IdP plus a
+  workload IdP) is realistic. The metadata document supports a list — the
+  question is whether subjects from different issuers can collide, which is why
+  `issuer` is carried alongside `subject` rather than folded into it.
+- **Token lifetime vs. long queries.** A token that expires mid-scan: do we
+  validate once at admission (favoured — the operation was authorized when it
+  started) or re-check during execution?
+- **Dynamic client registration** (RFC 7591) is optional in the MCP spec and many
+  enterprise IdPs disable it. Do we require pre-registered clients in v0?
+- **Does the gateway verify, or the node?** Verifying at the nginx front door is
+  conventional and centralizes JWKS; verifying on the node keeps the security
+  boundary inside our own code and survives someone bypassing the gateway. Doing
+  it on the node is the safer default; doing it at both is not wrong.
