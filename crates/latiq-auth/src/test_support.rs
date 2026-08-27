@@ -8,17 +8,33 @@ use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::RwLock;
 
 pub const KID: &str = "test-key-1";
 
-pub struct TestIdp {
+/// A generated keypair: the signing key plus its JWKS public components.
+struct Keypair {
     encoding: EncodingKey,
-    pub issuer: String,
-    pub jwks_uri: String,
+    n: String,
+    e: String,
 }
 
-/// Generate a keypair and return (encoding key, JWKS `n`, JWKS `e`).
-fn keypair() -> (EncodingKey, String, String) {
+/// 2048-bit RSA keygen costs 1-5 seconds and is wildly variable. Tests need a
+/// CONSISTENT key, not a unique one, so every `TestIdp` shares these two.
+static SIGNING_KEY: OnceLock<Keypair> = OnceLock::new();
+static FOREIGN_KEY: OnceLock<Keypair> = OnceLock::new();
+
+fn signing_key() -> &'static Keypair {
+    SIGNING_KEY.get_or_init(generate)
+}
+
+/// A key the IdP never publishes, for proving signature checking works.
+fn foreign_key() -> &'static Keypair {
+    FOREIGN_KEY.get_or_init(generate)
+}
+
+fn generate() -> Keypair {
     let mut rng = rand::thread_rng();
     let key = RsaPrivateKey::new(&mut rng, 2048).expect("generate rsa key");
     let pem = key
@@ -26,9 +42,40 @@ fn keypair() -> (EncodingKey, String, String) {
         .expect("pkcs1 pem");
     let encoding = EncodingKey::from_rsa_pem(pem.as_bytes()).expect("encoding key");
     let public = key.to_public_key();
-    let n = URL_SAFE_NO_PAD.encode(public.n().to_bytes_be());
-    let e = URL_SAFE_NO_PAD.encode(public.e().to_bytes_be());
-    (encoding, n, e)
+    Keypair {
+        encoding,
+        n: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+        e: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+    }
+}
+
+/// The JWKS document as served, plus the status to serve it with. Mutable so a
+/// test can rotate keys, serve a broken document, or fail the endpoint.
+struct IdpState {
+    body: String,
+    status: u16,
+}
+
+pub struct TestIdp {
+    state: Arc<RwLock<IdpState>>,
+    pub issuer: String,
+    pub jwks_uri: String,
+}
+
+/// A one-key JWKS document publishing the shared signing key under `kid`.
+pub fn jwks_document(kid: &str) -> String {
+    let key = signing_key();
+    json!({
+        "keys": [{
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": kid,
+            "n": key.n,
+            "e": key.e,
+        }]
+    })
+    .to_string()
 }
 
 fn now_secs() -> i64 {
@@ -41,27 +88,24 @@ fn now_secs() -> i64 {
 impl TestIdp {
     /// Start the JWKS server on an ephemeral port and return the fixture.
     pub async fn start() -> Self {
-        let (encoding, n, e) = keypair();
-        let jwks = json!({
-            "keys": [{
-                "kty": "RSA",
-                "use": "sig",
-                "alg": "RS256",
-                "kid": KID,
-                "n": n,
-                "e": e,
-            }]
-        })
-        .to_string();
+        let state = Arc::new(RwLock::new(IdpState {
+            body: jwks_document(KID),
+            status: 200,
+        }));
 
+        let handler_state = state.clone();
         let app = axum::Router::new().route(
             "/jwks",
             axum::routing::get(move || {
-                let jwks = jwks.clone();
+                let state = handler_state.clone();
                 async move {
+                    let state = state.read().await;
+                    let status = axum::http::StatusCode::from_u16(state.status)
+                        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
                     (
+                        status,
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        jwks,
+                        state.body.clone(),
                     )
                 }
             }),
@@ -76,10 +120,27 @@ impl TestIdp {
         });
 
         Self {
-            encoding,
+            state,
             issuer: format!("http://{addr}"),
             jwks_uri: format!("http://{addr}/jwks"),
         }
+    }
+
+    /// Publish the signing key under a new `kid` instead of the old one, as an
+    /// IdP does when it rotates.
+    pub async fn rotate(&self, kid: &str) {
+        self.set_jwks_body(jwks_document(kid)).await;
+    }
+
+    /// Serve an arbitrary body, for documents we could not otherwise produce
+    /// (unusable keys, non-JSON, oversize).
+    pub async fn set_jwks_body(&self, body: String) {
+        self.state.write().await.body = body;
+    }
+
+    /// Serve this HTTP status instead of 200.
+    pub async fn set_status(&self, status: u16) {
+        self.state.write().await.status = status;
     }
 
     /// Mint a token. `exp_offset_secs` is relative to now, so a negative value
@@ -96,32 +157,39 @@ impl TestIdp {
         exp_offset_secs: i64,
         kid: Option<String>,
     ) -> String {
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = kid;
-        let now = now_secs();
-        let claims = json!({
-            "sub": sub,
-            "aud": aud,
-            "iss": iss,
-            "iat": now,
-            "exp": now + exp_offset_secs,
-        });
-        jsonwebtoken::encode(&header, &claims, &self.encoding).expect("mint token")
+        encode(&signing_key().encoding, sub, aud, iss, exp_offset_secs, kid)
     }
 
     /// A token signed by a DIFFERENT key, to prove signature checking works.
     pub fn mint_with_foreign_key(&self, sub: &str, aud: &str, iss: &str) -> String {
-        let (foreign, _, _) = keypair();
-        let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(KID.to_string());
-        let now = now_secs();
-        let claims = json!({
-            "sub": sub,
-            "aud": aud,
-            "iss": iss,
-            "iat": now,
-            "exp": now + 300,
-        });
-        jsonwebtoken::encode(&header, &claims, &foreign).expect("mint token")
+        encode(
+            &foreign_key().encoding,
+            sub,
+            aud,
+            iss,
+            300,
+            Some(KID.to_string()),
+        )
     }
+}
+
+fn encode(
+    key: &EncodingKey,
+    sub: &str,
+    aud: &str,
+    iss: &str,
+    exp_offset_secs: i64,
+    kid: Option<String>,
+) -> String {
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = kid;
+    let now = now_secs();
+    let claims = json!({
+        "sub": sub,
+        "aud": aud,
+        "iss": iss,
+        "iat": now,
+        "exp": now + exp_offset_secs,
+    });
+    jsonwebtoken::encode(&header, &claims, key).expect("mint token")
 }
