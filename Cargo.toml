@@ -5,6 +5,7 @@ members = [
   "crates/latiq-common",
   "crates/latiq-proto",
   "crates/latiq-agent-core",
+  "crates/latiq-auth",
   "crates/latiq-mcp",
   "crates/latiq-client",
   "crates/latiq-engine",
@@ -53,6 +54,13 @@ duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 arrow = { version = "58", features = ["ipc", "json", "chrono-tz"] }
 rmcp = { version = "1.7.0", features = ["server", "client", "transport-streamable-http-server", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "macros"] }
 axum = { version = "0.8", features = ["http1"] }
+base64 = "0.22"
+jsonwebtoken = "9.3"
+# Pinned to 0.13 to match the copy rmcp already pulls in — a second major
+# version would duplicate the whole hyper/rustls tree. 0.13 renamed the
+# `rustls-tls` feature to `rustls` (it now also pulls the platform verifier
+# for root certs); `rustls-tls` no longer exists.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 schemars = "0.8"
 # Observability. metrics-exporter-prometheus without default features drops its
 # hyper http-listener (we serve /metrics ourselves via axum) — no tonic skew.
