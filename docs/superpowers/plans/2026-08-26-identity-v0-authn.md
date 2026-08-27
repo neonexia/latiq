@@ -1267,6 +1267,12 @@ Expected: FAIL — `agent_id` is present in every tool schema; the metadata rout
 
 Delete the `pub agent_id: Option<String>,` field from all 9 structs in `crates/latiq-mcp/src/server.rs`: `AllocateArgs` (L40), `PondRefArgs` (L48), `ListArgs` (L54), `DropArgs` (L63), `QueryArgs` (L73), `SearchArgs` (L83), `LoadDatasetArgs` (L93), `CatalogDescribeArgs` (L107), `CatalogPullArgs` (L125).
 
+- [ ] **Step 3a: MCP-origin requests must carry the bearer across the node hop**
+
+Surfaced by the Task 5 review, and easy to miss because it is not in this file. The MCP surface shares `AgentOps`/`GrpcForwarder` with the Data surface, and forwarding replays the caller's `Authorization` header from a `tokio::task_local!` (`BEARER`) that the pond-node adapter scopes. **MCP does not set it today**, so on an auth-enabled multi-node cluster an MCP call against a non-owner node fails with `a bearer token is required` — measured, and currently pinned by a test added in Task 5.
+
+So this task must scope `BEARER` around MCP handler futures the same way `data_service.rs` does, and then **update that pinning test** to assert the new, working behaviour. If the test is left asserting the failure, this task will look like it broke something; if it is deleted rather than updated, the property stops being guarded. Update it deliberately.
+
 - [ ] **Step 4: Read identity from the transport instead**
 
 Add `ctx: RequestContext<RoleServer>` to each of the 10 tool handlers and replace `let id = Identity::claimed(a.agent_id.as_deref());` with `let id = self.identity(&ctx).await?;`, where:
@@ -1427,6 +1433,10 @@ fn auth_blank_env_values_mean_auth_is_off() {
     assert_eq!(non_blank(Some(" https://idp ".into())), Some("https://idp".to_string()));
 }
 ```
+
+- [ ] **Step 1b: Attach the discovery challenge to gRPC rejections**
+
+`latiq_auth::metadata::challenge_header` exists (Task 4) but only the MCP surface will serve the 401 challenge. A Data/Stream or Admin client that gets `Unauthenticated` has no in-band way to discover the authorization server, which is half of the flow `docs/identity.md` describes. tonic's `Status` carries metadata — attach `www-authenticate` with the challenge value, and the matching `/.well-known/oauth-protected-resource` URL, whenever a verifier is configured. Test that the metadata is present on a rejected call and absent when no verifier is configured.
 
 - [ ] **Step 2: Add the client token**
 
@@ -1997,6 +2007,17 @@ git commit -m "ci(auth): nightly e2e against an authenticated cluster, clients i
 
 ---
 
+## Task 12b: Cleanup — deferred minors from the review rounds
+
+Small items raised by reviews and deliberately deferred so they would not interrupt the run. None is a live vulnerability; all are real.
+
+- [ ] **A forwarded `Unauthenticated` surfaces as `Code::Internal`.** `forward_client.rs::status_to_error`'s catch-all maps it, so a real auth failure across a node hop is indistinguishable from a crash in the code clients branch on. The message text does survive, so logs are not blind. `status_to_error` already special-cases `NotFound` and `AlreadyExists`; this needs an `ErrorKind::Unauthenticated` in `latiq-common` to do the same. Task 5 left a test pinning the current behaviour — update it.
+- [ ] **A JWK declaring a key-management `alg` (e.g. `RSA-OAEP`) but omitting `use` is imported as an unconstrained signing key.** `jwks.rs::as_signing_alg` returns `None` for such algorithms, leaving the key unconstrained rather than skipped, and the `use: "enc"` skip only fires on an explicit `use`. Defence in depth only — an attacker still needs the private key — but skipping non-signature algorithms outright is strictly safer.
+- [ ] **`https:/jwks` (single slash) passes the startup guard** and resolves to a host named `jwks`. The raw-string empty-host check only fires when `"://"` is present. No security consequence (the http single-slash forms all resolve to real non-loopback hosts and are refused by the scheme arm) — a diagnostics gap that fails at fetch time instead of at startup.
+- [ ] **`auth_rejects_an_empty_subject`** is the last bare `expect_err()` in `tests/verify.rs`; assert the reason like its neighbours do.
+
+---
+
 ## Task 13: Documentation
 
 **Files:**
@@ -2008,6 +2029,7 @@ git commit -m "ci(auth): nightly e2e against an authenticated cluster, clients i
 - `docs/dev.md`: document `./dev.sh --auth` (Task 9a) and state plainly that **auth mode is otherwise nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `docker compose --env-file auth.env up -d` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
 - `e2e/CLAUDE.md`: add a third mode alongside REMOTE and EMBEDDED — **AUTH**, selected by `--env-file auth.env`, with every client in-network.
 - `docs/roadmap.md`: flip the "Identity v0 — authentication" row to ✅ Shipped.
+- `docs/identity.md`: record the cross-node requirement — on an auth-enabled cluster every surface that can forward must carry the caller's bearer across the hop, because the owning node re-verifies from scratch. This is why MCP needed its own scoping (Task 7 Step 3a) and why a surface that forgets it fails closed rather than open.
 - `CLAUDE.md`: add `latiq-auth` to the crate list; note that identity is verified when configured.
 - `crates/latiq-agent-core/CLAUDE.md`: its invariant list says "Identity is relaxed (`Identity::claimed`, default anonymous)" — update to describe both modes.
 
