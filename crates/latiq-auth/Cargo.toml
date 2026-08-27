@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 latiq-common = { path = "../latiq-common" }
+base64 = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -16,14 +17,13 @@ tracing = { workspace = true }
 axum = { workspace = true, optional = true }
 rsa = { version = "0.9", optional = true }
 rand = { version = "0.8", optional = true }
-base64 = { workspace = true, optional = true }
 tokio-stream = { workspace = true, optional = true }
 
 [features]
 default = []
 # An in-process fake IdP for tests. Off by default so none of this ships in a
 # release binary; enabled by this crate's own tests and by other crates' tests.
-test-support = ["dep:axum", "dep:rsa", "dep:rand", "dep:base64", "dep:tokio-stream"]
+test-support = ["dep:axum", "dep:rsa", "dep:rand", "dep:tokio-stream"]
 
 [dev-dependencies]
 latiq-auth = { path = ".", features = ["test-support"] }

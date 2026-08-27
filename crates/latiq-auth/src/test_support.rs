@@ -21,15 +21,23 @@ struct Keypair {
 }
 
 /// 2048-bit RSA keygen costs 1-5 seconds and is wildly variable. Tests need a
-/// CONSISTENT key, not a unique one, so every `TestIdp` shares these two.
+/// CONSISTENT key, not a unique one, so every `TestIdp` shares these. Each is
+/// generated lazily, so a test run only pays for the ones it touches.
 static SIGNING_KEY: OnceLock<Keypair> = OnceLock::new();
+static ALT_KEY: OnceLock<Keypair> = OnceLock::new();
 static FOREIGN_KEY: OnceLock<Keypair> = OnceLock::new();
 
 fn signing_key() -> &'static Keypair {
     SIGNING_KEY.get_or_init(generate)
 }
 
-/// A key the IdP never publishes, for proving signature checking works.
+/// The key of the SECOND fixture IdP. Published, but by a different issuer --
+/// which is what makes cross-issuer confusion testable.
+fn alt_key() -> &'static Keypair {
+    ALT_KEY.get_or_init(generate)
+}
+
+/// A key NO fixture publishes, for proving signature checking works.
 fn foreign_key() -> &'static Keypair {
     FOREIGN_KEY.get_or_init(generate)
 }
@@ -58,6 +66,8 @@ struct IdpState {
 
 pub struct TestIdp {
     state: Arc<RwLock<IdpState>>,
+    /// The key this IdP signs with AND publishes.
+    key: &'static Keypair,
     pub issuer: String,
     pub jwks_uri: String,
     /// Serves the same document as `jwks_uri`, but chunked and WITHOUT a
@@ -79,7 +89,10 @@ pub async fn advertised_content_length(uri: &str) -> Option<u64> {
 
 /// A one-key JWKS document publishing the shared signing key under `kid`.
 pub fn jwks_document(kid: &str) -> String {
-    let key = signing_key();
+    jwks_document_for(signing_key(), kid)
+}
+
+fn jwks_document_for(key: &Keypair, kid: &str) -> String {
     json!({
         "keys": [{
             "kty": "RSA",
@@ -103,8 +116,19 @@ fn now_secs() -> i64 {
 impl TestIdp {
     /// Start the JWKS server on an ephemeral port and return the fixture.
     pub async fn start() -> Self {
+        Self::start_with_key(signing_key()).await
+    }
+
+    /// A SECOND IdP, publishing a different key under the SAME `kid`. That
+    /// collision is deliberate: it is how a test proves the verifier picks keys
+    /// per issuer rather than from one shared pool.
+    pub async fn start_alt() -> Self {
+        Self::start_with_key(alt_key()).await
+    }
+
+    async fn start_with_key(key: &'static Keypair) -> Self {
         let state = Arc::new(RwLock::new(IdpState {
-            body: jwks_document(KID),
+            body: jwks_document_for(key, KID),
             status: 200,
         }));
 
@@ -155,6 +179,7 @@ impl TestIdp {
 
         Self {
             state,
+            key,
             issuer: format!("http://{addr}"),
             jwks_uri: format!("http://{addr}/jwks"),
             jwks_stream_uri: format!("http://{addr}/jwks-stream"),
@@ -164,7 +189,20 @@ impl TestIdp {
     /// Publish the signing key under a new `kid` instead of the old one, as an
     /// IdP does when it rotates.
     pub async fn rotate(&self, kid: &str) {
-        self.set_jwks_body(jwks_document(kid)).await;
+        self.set_jwks_body(jwks_document_for(self.key, kid)).await;
+    }
+
+    /// An `AuthConfig` naming this fixture as the only issuer, with the JWKS
+    /// URI given explicitly -- the fixture's issuer is a bare `http://host:port`
+    /// with no discovery document behind it.
+    pub fn auth_config(&self) -> crate::AuthConfig {
+        crate::AuthConfig {
+            audience: "latiq".to_string(),
+            issuers: vec![crate::IssuerConfig {
+                issuer: self.issuer.clone(),
+                jwks_uri: Some(self.jwks_uri.clone()),
+            }],
+        }
     }
 
     /// Serve an arbitrary body, for documents we could not otherwise produce
@@ -192,10 +230,11 @@ impl TestIdp {
         exp_offset_secs: i64,
         kid: Option<String>,
     ) -> String {
-        encode(&signing_key().encoding, sub, aud, iss, exp_offset_secs, kid)
+        encode(&self.key.encoding, sub, aud, iss, exp_offset_secs, kid)
     }
 
-    /// A token signed by a DIFFERENT key, to prove signature checking works.
+    /// A token signed by a key NO fixture publishes, to prove signature
+    /// checking works.
     pub fn mint_with_foreign_key(&self, sub: &str, aud: &str, iss: &str) -> String {
         encode(
             &foreign_key().encoding,
