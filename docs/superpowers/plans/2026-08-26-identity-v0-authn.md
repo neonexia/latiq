@@ -1218,33 +1218,42 @@ git commit -m "feat(auth): --auth-issuer/--auth-audience server flags and LATIQ_
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
       KC_HTTP_PORT: "8080"
-      # Pins the `iss` claim. Everything -- pond nodes inside the network and
-      # test clients outside it -- must use this exact hostname, so `keycloak`
-      # has to resolve on the host too (see Task 12 Step 1).
-      KC_HOSTNAME_URL: http://keycloak:8080
+      # Pins the `iss` claim to the address CLIENTS use (the host). Nodes inside
+      # the compose network reach Keycloak as `keycloak:8080` instead -- which
+      # is fine, because AuthConfig.issuer is only ever string-compared and
+      # AuthConfig.jwks_uri is the only URL the verifier dials. See Task 12.
+      KC_HOSTNAME_URL: http://localhost:8080
     volumes:
       - ./keycloak-realm.json:/opt/keycloak/data/import/realm.json:ro
     ports:
       - "8080:8080"
 ```
 
-No container healthcheck: recent Keycloak images ship without `curl`, and its health endpoint lives on a separate management port. CI polls the discovery URL from the runner instead (Task 10).
+No container healthcheck: recent Keycloak images ship without `curl`, and its health endpoint lives on a separate management port. CI polls the discovery URL from the runner instead (Task 12).
+
+**The split-horizon config — this is the whole trick.** Add to every pond-node service in the same compose file:
+
+```yaml
+    environment:
+      # Compared as a string against the token's `iss`. NEVER dialed, so it can
+      # name an address this container cannot reach.
+      LATIQ_AUTH_ISSUER: http://localhost:8080/realms/latiq
+      LATIQ_AUTH_AUDIENCE: latiq
+      # The only URL the verifier actually fetches -- via Docker DNS.
+      LATIQ_AUTH_JWKS_URI: http://keycloak:8080/realms/latiq/protocol/openid-connect/certs
+```
+
+Clients on the host use `http://localhost:8080` for discovery and the token grant, and the `iss` in the resulting token matches what the nodes compare against. Nobody needs an `/etc/hosts` entry and nobody needs to run tests inside a container. This mirrors a real deployment pattern (an IdP with distinct internal and external addresses), which is why `AuthConfig` carries `jwks_uri` separately in the first place — see Task 3.
+
+One consequence to keep in mind: the protected-resource metadata document the node serves advertises its configured `issuer`, so MCP clients on the host are pointed at `http://localhost:8080/realms/latiq` and can reach it. That is correct here; in a production deployment the advertised issuer must be the address *agents* can reach, not the one nodes use.
 
 - [ ] **Step 3: Verify locally**
 
-Because `KC_HOSTNAME_URL` pins the issuer to `http://keycloak:8080`, the name must resolve on your machine too. Once, on the dev box:
-
-```bash
-echo "127.0.0.1 keycloak" | sudo tee -a /etc/hosts
-```
-
-Then:
-
 ```bash
 docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d keycloak
-until curl -sf http://keycloak:8080/realms/latiq/.well-known/openid-configuration >/dev/null; do sleep 2; done
+until curl -sf http://localhost:8080/realms/latiq/.well-known/openid-configuration >/dev/null; do sleep 2; done
 curl -s -d grant_type=client_credentials -d client_id=latiq-agent -d client_secret=latiq-agent-secret \
-  http://keycloak:8080/realms/latiq/protocol/openid-connect/token | python3 -c 'import sys,json,base64;
+  http://localhost:8080/realms/latiq/protocol/openid-connect/token | python3 -c 'import sys,json,base64;
 t=json.load(sys.stdin)["access_token"].split(".")[1]; t+="="*(-len(t)%4)
 print(json.loads(base64.urlsafe_b64decode(t))["aud"])'
 ```
@@ -1322,7 +1331,7 @@ def test_auth_garbage_token_is_rejected():
 
 ```bash
 docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d
-LATIQ_AUTH_ISSUER=http://keycloak:8080/realms/latiq \
+LATIQ_AUTH_ISSUER=http://localhost:8080/realms/latiq \
 LATIQ_GATEWAY=127.0.0.1:51500 pytest e2e/sdk/test_auth.py -v
 ```
 Expected: 3 passed.
@@ -1426,10 +1435,10 @@ The full authenticated tool loop is already covered: with `LATIQ_AUTH_ISSUER` se
 
 ```bash
 docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d
-LATIQ_AUTH_ISSUER=http://keycloak:8080/realms/latiq \
+LATIQ_AUTH_ISSUER=http://localhost:8080/realms/latiq \
 LATIQ_MCP=http://127.0.0.1:51510/mcp npm --prefix e2e/agent test
 ```
-Expected: the existing harness tests pass through the authenticated transport, plus 2 new auth tests. Requires the `keycloak` hosts entry from Task 12 Step 1.
+Expected: the existing harness tests pass through the authenticated transport, plus 2 new auth tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1455,42 +1464,37 @@ A separate job rather than a flag on `e2e-suite`: the unauthenticated path is th
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # ONE hostname for Keycloak everywhere. The `iss` claim inside a token is
-      # whatever Keycloak was configured with, and both the pond nodes (inside
-      # the compose network) and the test clients (on the runner) compare
-      # against it. Two hostnames = a guaranteed issuer mismatch for one of
-      # them, so make `keycloak` resolve on the runner too.
-      - name: Make `keycloak` resolve on the runner
-        run: echo "127.0.0.1 keycloak" | sudo tee -a /etc/hosts
+      # No /etc/hosts entry and no containerized test runner: Keycloak's `iss`
+      # is pinned to the address CLIENTS use (localhost:8080, published), while
+      # the nodes fetch JWKS over Docker DNS at keycloak:8080. The verifier
+      # compares the issuer and dials only the jwks_uri, so the two differ
+      # safely. Both settings live in the compose file (Task 9 Step 2).
       - name: Start Keycloak
         run: docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d keycloak
       - name: Wait for the realm to import
         run: |
           for i in $(seq 1 60); do
-            curl -sf http://keycloak:8080/realms/latiq/.well-known/openid-configuration >/dev/null && exit 0
+            curl -sf http://localhost:8080/realms/latiq/.well-known/openid-configuration >/dev/null && exit 0
             sleep 2
           done
           echo "::error::Keycloak realm did not come up"
           docker compose -f deploy/cluster/docker-compose.yml logs keycloak
           exit 1
       - name: Start the cluster with auth on
-        env:
-          LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
-          LATIQ_AUTH_AUDIENCE: latiq
         run: docker compose -f deploy/cluster/docker-compose.yml --profile auth up -d
       - name: SDK auth e2e
         env:
-          LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+          LATIQ_AUTH_ISSUER: http://localhost:8080/realms/latiq
           LATIQ_GATEWAY: 127.0.0.1:51500
         run: pytest e2e/sdk/test_auth.py -v
       - name: Agent (MCP) auth e2e
         env:
-          LATIQ_AUTH_ISSUER: http://keycloak:8080/realms/latiq
+          LATIQ_AUTH_ISSUER: http://localhost:8080/realms/latiq
           LATIQ_MCP: http://127.0.0.1:51510/mcp
         run: npm --prefix e2e/agent test
 ```
 
-The compose service must pin the same hostname so the tokens it mints carry that issuer — add `KC_HOSTNAME_URL: http://keycloak:8080` to the `keycloak` service environment in Task 9 Step 2 and map `8080:8080` (already done).
+The node-side auth settings are baked into the compose file rather than passed here, so `docker compose --profile auth up` behaves identically on a laptop and in CI.
 
 - [ ] **Step 2: Add it to the publish gate**
 
