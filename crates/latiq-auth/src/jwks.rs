@@ -36,6 +36,17 @@ const MAX_JWKS_BYTES: usize = 256 * 1024;
 /// they routinely name internal hosts and addresses.
 const IDP_UNAVAILABLE: &str = "identity provider JWKS endpoint unavailable";
 
+/// The conventional JWKS location for an issuer. Keycloak and most OIDC
+/// providers serve `<issuer>/protocol/openid-connect/certs`. Deployments whose
+/// issuer identifier is not a reachable address configure `jwks_uri` explicitly
+/// instead.
+pub fn discover_uri(issuer: &str) -> String {
+    format!(
+        "{}/protocol/openid-connect/certs",
+        issuer.trim_end_matches('/')
+    )
+}
+
 pub struct JwksCache {
     uri: String,
     keys: RwLock<HashMap<String, DecodingKey>>,
