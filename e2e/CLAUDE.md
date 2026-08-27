@@ -17,9 +17,10 @@ unit tests of our code. Lives in `.github/workflows/nightly.yml`'s `e2e-suite` j
   before/after any change to the engine's concurrency model. **Build the wheel `--release`** —
   a debug wheel measures the compiler, not the engine.
 
-## Two modes, same assertions
+## Three modes, same assertions
 - **REMOTE** (CI): set `LATIQ_CONTROL` + `LATIQ_GATEWAY` (+ `LATIQ_MCP` for the agent harness) → drives the dockerized cluster through the gateway. Proves multi-node + forwarding + the front door.
 - **EMBEDDED** (local, no docker): unset → an in-process single-node cluster (`connect("local")`). Validates the call + Arrow/pandas logic. Multi-node-only tests self-skip. Run: `pytest e2e/sdk -v`; `LATIQ_MCP=http://127.0.0.1:51402/mcp npm --prefix e2e/agent test` against a local `dev.sh` node.
+- **AUTH** (nightly, container-only): `cd deploy/cluster && docker compose --env-file auth.env up -d` → the same cluster with token verification on, plus an in-network Keycloak. The runners (`auth-tests-sdk`, `auth-tests-agent`) run **inside the compose network**, so servers and clients share ONE issuer URL (`http://keycloak:8080/realms/latiq`) — no host-vs-container split. `docker compose --env-file auth.env run --rm auth-tests-sdk` (build the wheel into `dist/` first). The auth tests self-skip when `LATIQ_AUTH_ISSUER` is unset, so REMOTE/EMBEDDED runs are untouched. They test the **integration** with a real OIDC provider (discovery, `client_credentials`, array `aud`, verified identity reaching DuckLake attribution) — verification *logic* is the Rust suite's job, against its fake IdP. `./dev.sh --nodes 2 --auth` gives the same shape locally (issuer `http://localhost:8080/realms/latiq`).
 
 ## Gotchas (paid for in CI)
 - **MCP sessions are node-local** (rmcp's in-memory session manager): the gateway's MCP upstream **must be sticky** (`ip_hash`) or round-robin breaks the session (`session not found`). The agent harness caught this; the Data/Stream gateway stays round-robin (stateless + forwarding).
