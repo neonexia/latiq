@@ -296,10 +296,28 @@ pub fn run_write(
             return Err(e);
         }
     };
-    let agent = identity.agent_id.replace('\'', "''");
-    let extra = format!("{{\"verified\":{}}}", identity.verified);
-    let call =
-        format!("CALL {cat}.set_commit_message('{agent}', 'write_query', extra_info => '{extra}')");
+    // The author is the strongest identity we have: the verified subject when
+    // the caller authenticated, the claimed leaf otherwise. The claimed leaf is
+    // always recorded separately so history distinguishes the two — a bare
+    // `verified` must never sit next to a claimed value.
+    let author = if identity.verified {
+        &identity.subject
+    } else {
+        &identity.agent_id
+    };
+    let author = author.replace('\'', "''");
+    // Built with serde_json (never hand-concatenated) then escaped as one SQL
+    // literal: every value here is caller- or token-supplied.
+    let extra = serde_json::json!({
+        "agent_id": identity.agent_id,
+        "issuer": identity.issuer,
+        "verified": identity.verified,
+    })
+    .to_string()
+    .replace('\'', "''");
+    let call = format!(
+        "CALL {cat}.set_commit_message('{author}', 'write_query', extra_info => '{extra}')"
+    );
     if let Err(e) = exec(&call) {
         rollback();
         return Err(e);
