@@ -38,7 +38,7 @@ async fn server_client_agent_loop() {
     let addr = format!("127.0.0.1:{port}").parse().unwrap();
 
     tokio::spawn(async move {
-        serve_mcp(addr, ops, None).await.unwrap();
+        serve_mcp(addr, ops, None, None).await.unwrap();
     });
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 

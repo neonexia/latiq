@@ -9,9 +9,11 @@
 //!
 //! With a verifier configured this surface is an OAuth 2.1 resource server: it
 //! publishes RFC 9728 metadata at `/.well-known/oauth-protected-resource`,
-//! answers a request with no bearer token with a 401 + `WWW-Authenticate`
-//! challenge, and verifies the token in the handler. Without one, identity stays
-//! relaxed (claimed, default anonymous) — the embedded and dev path.
+//! answers any request whose bearer token is missing OR invalid with a 401 +
+//! `WWW-Authenticate` challenge, and verifies every request in one layer in
+//! front of the router (so `initialize` and the discovery methods are covered
+//! too, not just tool calls). Without one, identity stays relaxed (claimed,
+//! default anonymous) — the embedded and dev path.
 use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
 use crate::resources;
 use latiq_agent_core::{with_bearer, AgentError, AgentOps};
@@ -55,10 +57,6 @@ pub struct PondRefArgs {
     #[schemars(description = "Pond id or name")]
     pub pond: String,
 }
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct ListArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -157,8 +155,15 @@ impl LatiqServer {
 
     /// Identity for one MCP request. The claimed leaf comes from the
     /// `latiq-agent-id` HTTP header (NOT a tool argument -- the model must not
-    /// be able to type it). With a verifier configured, a bearer token is
-    /// required and verified.
+    /// be able to type it).
+    ///
+    /// With a verifier configured this is a LOOKUP, not a decision: the auth
+    /// layer in front of the router has already verified the token and stashed
+    /// the resulting `VerifiedCaller` in the request's extensions. Verifying
+    /// here instead would leave every non-tool method (`initialize`,
+    /// `tools/list`, `resources/read`, …) unchecked, and would answer a forged
+    /// or expired token with a JSON-RPC error inside HTTP 200 — which no MCP
+    /// client can act on, because client-side re-auth keys off a real 401.
     ///
     /// The token is returned ONLY when a verifier produced it, exactly as on the
     /// Data surface: a node that never opted into auth must not start capturing
@@ -168,36 +173,116 @@ impl LatiqServer {
     /// rmcp injects the request's `http::request::Parts` on the POST path (which
     /// is where every tool call lands); the SSE/GET stream carries none, so this
     /// is per-request rather than per-session by construction.
-    ///
-    /// Every rejection is a fixed string: an unauthenticated caller must not be
-    /// able to probe our issuer list or key endpoints by reading error text.
-    async fn identity(
+    fn identity(
         &self,
         ctx: &RequestContext<RoleServer>,
     ) -> Result<(Identity, Option<String>), McpError> {
-        let headers = ctx
-            .extensions
-            .get::<http::request::Parts>()
-            .map(|p| &p.headers);
-        let claimed = headers
-            .and_then(|h| h.get(AGENT_ID_HEADER))
-            .and_then(|v| v.to_str().ok());
-        let Some(verifier) = self.verifier.as_ref() else {
+        let parts = ctx.extensions.get::<http::request::Parts>();
+        let Some(_verifier) = self.verifier.as_ref() else {
+            let claimed = parts
+                .and_then(|p| p.headers.get(AGENT_ID_HEADER))
+                .and_then(|v| v.to_str().ok());
             return Ok((Identity::claimed(claimed), None));
         };
-        // One parser for every surface (`latiq_auth::bearer`) — a second copy of
-        // a security-relevant parser drifts.
-        let token = headers
-            .and_then(|h| h.get(http::header::AUTHORIZATION))
-            .and_then(|v| v.to_str().ok())
-            .and_then(latiq_auth::bearer)
-            .ok_or_else(|| McpError::invalid_request("a bearer token is required", None))?;
-        let identity = verifier.verify(token, claimed).await.map_err(|e| {
-            tracing::debug!(error = %e, "bearer token rejected");
-            McpError::invalid_request("the bearer token was rejected", None)
-        })?;
-        Ok((identity, Some(token.to_string())))
+        // Unreachable through the HTTP surface (the layer 401s first), so this
+        // is the fail-closed branch for any path that reaches a handler without
+        // passing the layer -- never a fallback to a claimed identity.
+        parts
+            .and_then(|p| p.extensions.get::<VerifiedCaller>())
+            .cloned()
+            .map(|c| (c.identity, Some(c.token)))
+            .ok_or_else(|| McpError::invalid_request("a bearer token is required", None))
     }
+}
+
+/// The outcome of verifying one request's bearer token, handed from the auth
+/// layer to the handler through the request's extensions. Carrying the decision
+/// (rather than the raw token) is what keeps exactly ONE place validating.
+#[derive(Clone)]
+struct VerifiedCaller {
+    identity: Identity,
+    /// The original token, replayed on a node-to-node hop so the owning node
+    /// verifies it itself.
+    token: String,
+}
+
+/// 401 + the RFC 9728 challenge. Deliberately bodiless and fixed: an
+/// unauthenticated caller must not be able to probe our issuer list or key
+/// endpoints by reading error text. The detail goes to the operator's log.
+fn unauthorized(challenge: &str) -> axum::response::Response {
+    let mut res = axum::response::Response::new(axum::body::Body::empty());
+    *res.status_mut() = http::StatusCode::UNAUTHORIZED;
+    if let Ok(v) = http::HeaderValue::from_str(challenge) {
+        res.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
+    }
+    res
+}
+
+/// The auth layer: verifies the bearer token for EVERY request to this surface
+/// and stashes the result for the handler.
+///
+/// It sits in front of the router rather than inside the tool handlers for two
+/// reasons. First, coverage: `initialize`, `tools/list`, `resources/read` and
+/// friends never build an `Identity`, so a handler-only check would let an
+/// unauthenticated caller complete the handshake, enumerate the tool catalogue,
+/// read every `latiq://` resource, and allocate an rmcp session (plus its
+/// worker task) per request. Second, protocol: a missing OR invalid token has
+/// to produce a real 401 with a `WWW-Authenticate` challenge — that is what
+/// makes an MCP client re-authenticate instead of wedging on an opaque
+/// JSON-RPC error when its token expires mid-session.
+async fn verify_bearer(
+    verifier: Arc<Verifier>,
+    challenge: String,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // The metadata document is exempt, or discovery is impossible: a client with
+    // no token could never learn which authorization server to ask.
+    if req.uri().path() == PROTECTED_RESOURCE_PATH {
+        return next.run(req).await;
+    }
+    let claimed = req
+        .headers()
+        .get(AGENT_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    // One parser for every surface (`latiq_auth::bearer`) — a second copy of a
+    // security-relevant parser drifts.
+    let token = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(latiq_auth::bearer)
+        .map(String::from);
+    let Some(token) = token else {
+        return unauthorized(&challenge);
+    };
+    match verifier.verify(&token, claimed.as_deref()).await {
+        Ok(identity) => {
+            req.extensions_mut()
+                .insert(VerifiedCaller { identity, token });
+            next.run(req).await
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "bearer token rejected");
+            unauthorized(&challenge)
+        }
+    }
+}
+
+/// The public MCP URL to advertise, from the endpoint this node advertises to
+/// its peers (which already carries `--advertise-addr`) and the port the MCP
+/// surface is bound to.
+///
+/// The bound address is NOT usable for this: every compose file we ship binds
+/// `0.0.0.0`, so a challenge derived from it would point clients at
+/// `http://0.0.0.0:51402/…` and declare a `resource` identifier no conforming
+/// client can match against the host it dialled.
+pub fn advertised_mcp_url(advertised_endpoint: &str, mcp_addr: SocketAddr) -> Option<String> {
+    let mut url = url::Url::parse(advertised_endpoint).ok()?;
+    url.set_port(Some(mcp_addr.port())).ok()?;
+    url.set_path("/mcp");
+    Some(url.to_string())
 }
 
 #[tool_router]
@@ -221,7 +306,7 @@ Then write_query to create tables and load data, and read_query to query. See la
         Parameters(a): Parameters<AllocateArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         let tier = a.tier.as_deref().unwrap_or("medium");
         // Validate requested extensions against the signed/official allowlist
         // before allocating, so a bad name returns a clear, actionable error.
@@ -259,7 +344,7 @@ To discover tables/columns in detail, read_query `SHOW TABLES` or `SELECT * FROM
         Parameters(a): Parameters<PondRefArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.describe_pond(&id, &a.pond).await {
                 Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
@@ -283,10 +368,9 @@ Follow with describe_pond on a candidate to inspect its tables.",
     )]
     async fn list_ponds(
         &self,
-        Parameters(_a): Parameters<ListArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.list_ponds(&id).await {
                 Ok(ponds) => ok_value(serde_json::json!({ "ponds": ponds })),
@@ -312,7 +396,7 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
         Parameters(a): Parameters<DropArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self
                 .ops
@@ -346,7 +430,7 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
         Parameters(a): Parameters<QueryArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         // Reads ride the Arrow internal hop, collected to the neutral result here.
         Ok(with_bearer(tok, async {
             match self.ops.read_collected(&id, &a.pond, &a.sql).await {
@@ -377,7 +461,7 @@ Do: add column COMMENTs so other agents understand your tables. See latiq://reci
         Parameters(a): Parameters<QueryArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.write_query(&id, &a.pond, &a.sql).await {
                 Ok(qr) => ok_query("write_query", qr),
@@ -405,7 +489,7 @@ This makes you thrifty rather than greedy. Read-only and side-effect-free.",
         Parameters(a): Parameters<QueryArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.explain_query(&id, &a.pond, &a.sql).await {
                 Ok(er) => ok_explain(er),
@@ -433,11 +517,12 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
         Parameters(a): Parameters<SearchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // No identity reaches the op (the catalog is deployment-wide), but the
-        // token is still verified: a tool that skipped it would be the one
-        // unauthenticated hole in an auth-enabled surface.
-        self.identity(&ctx).await?;
-        Ok(
+        // No identity reaches the op (the dataset catalogue is
+        // deployment-wide), but the token is still required — and scoped like
+        // every other tool, so this stays symmetric with the Data surface
+        // rather than relying on "this one happens never to forward".
+        let (_id, tok) = self.identity(&ctx)?;
+        Ok(with_bearer(tok, async {
             match self
                 .ops
                 .list_datasets(a.query.as_deref().unwrap_or(""))
@@ -445,8 +530,9 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
             {
                 Ok(datasets) => ok_value(serde_json::json!({ "datasets": datasets })),
                 Err(e) => err_envelope(e.envelope()),
-            },
-        )
+            }
+        })
+        .await)
     }
 
     /// Copy a dataset's tables into a pond, under a schema named after the dataset. Pick a name from list_datasets.
@@ -467,7 +553,7 @@ This is a WRITE (it creates a schema + tables, attributed to you). For an extern
         Parameters(a): Parameters<LoadDatasetArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.load_dataset(&id, &a.pond, &a.dataset).await {
                 Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
@@ -495,10 +581,10 @@ Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sour
         Parameters(a): Parameters<SearchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        // Verified for the same reason as list_datasets, though no identity
-        // reaches the op.
-        self.identity(&ctx).await?;
-        Ok(
+        // Required + scoped for the same reasons as list_datasets, though no
+        // identity reaches the op.
+        let (_id, tok) = self.identity(&ctx)?;
+        Ok(with_bearer(tok, async {
             match self
                 .ops
                 .list_catalogs(a.query.as_deref().unwrap_or(""))
@@ -506,8 +592,9 @@ Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sour
             {
                 Ok(catalogs) => ok_value(serde_json::json!({ "catalogs": catalogs })),
                 Err(e) => err_envelope(e.envelope()),
-            },
-        )
+            }
+        })
+        .await)
     }
 
     /// List an external catalog's tables (transient attach on a pond). Pass creds via `set`.
@@ -528,7 +615,7 @@ If a credential is missing the attach fails with a clear error — read it and r
         Parameters(a): Parameters<CatalogDescribeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         let set = a.set.unwrap_or_default().into_iter().collect();
         Ok(with_bearer(tok, async {
             match self
@@ -569,7 +656,7 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
         Parameters(a): Parameters<CatalogPullArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let (id, tok) = self.identity(&ctx).await?;
+        let (id, tok) = self.identity(&ctx)?;
         let set = a.set.unwrap_or_default().into_iter().collect();
         Ok(with_bearer(tok, async {
             match self
@@ -649,13 +736,18 @@ suggest/see links to latiq:// resources. Prompts provide SOPs for common multi-a
 
 /// Serve the MCP Streamable-HTTP surface at `/mcp` on `addr`. `verifier` is
 /// built once at startup and shared — never per request.
+///
+/// `public_url` is the URL clients actually dial (see `advertised_mcp_url`); the
+/// bound address is only the fallback, and is wrong on every deployment that
+/// binds `0.0.0.0` or sits behind a TLS-terminating gateway.
 pub async fn serve_mcp(
     addr: SocketAddr,
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,
+    public_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    serve_mcp_with_listener(listener, ops, verifier).await
+    serve_mcp_with_listener(listener, ops, verifier, public_url).await
 }
 
 /// Serve the MCP surface on an already-bound listener (no port race; used by the
@@ -664,6 +756,7 @@ pub async fn serve_mcp_with_listener(
     listener: tokio::net::TcpListener,
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,
+    public_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mcp_verifier = verifier.clone();
     let service = StreamableHttpService::new(
@@ -674,11 +767,20 @@ pub async fn serve_mcp_with_listener(
     let mut router = axum::Router::new().nest_service("/mcp", service);
 
     if let Some(v) = verifier {
-        // The addresses a client sees, derived from the bound socket — the same
-        // source `run_pond_node` advertises its MCP endpoint from.
-        let addr = listener.local_addr()?;
-        let resource = format!("http://{addr}/mcp");
-        let metadata_url = format!("http://{addr}{PROTECTED_RESOURCE_PATH}");
+        // The URL a client dials, NOT the socket we bound. `local_addr` is only
+        // the fallback for a deployment that advertises nothing (and is right
+        // just when the two coincide, as they do on loopback in tests).
+        let resource = match public_url {
+            Some(u) => u,
+            None => format!("http://{}/mcp", listener.local_addr()?),
+        };
+        // The document sits at the well-known path on the same origin. Derived
+        // from `resource` so the two can never disagree; a gateway that rewrites
+        // paths (rather than only the host) would need this configured.
+        let metadata_url = format!(
+            "{}{PROTECTED_RESOURCE_PATH}",
+            resource.strip_suffix("/mcp").unwrap_or(&resource)
+        );
         // ALL configured issuers, from the verifier's NORMALIZED config, so the
         // document advertises exactly what is enforced.
         let issuers: Vec<String> = v
@@ -699,38 +801,52 @@ pub async fn serve_mcp_with_listener(
                     async move { axum::Json(doc) }
                 }),
             )
-            // Presence only. The cryptographic check happens in the handler, so
-            // exactly ONE place validates a token; this layer exists to turn the
-            // no-credential case into the RFC 9728 challenge a client needs to
-            // discover where to get one.
+            // Every request to this surface passes through one verification.
+            // Applied AFTER the well-known route is registered, so it covers
+            // that route too — `verify_bearer` exempts it by path rather than by
+            // layer ordering.
             .layer(axum::middleware::from_fn(
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
-                    let challenge = challenge.clone();
-                    async move {
-                        // The metadata document is exempt, or discovery is
-                        // impossible: a client with no token could never learn
-                        // which authorization server to ask.
-                        let exempt = req.uri().path() == PROTECTED_RESOURCE_PATH;
-                        let has_token = req
-                            .headers()
-                            .get(http::header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(latiq_auth::bearer)
-                            .is_some();
-                        if exempt || has_token {
-                            return next.run(req).await;
-                        }
-                        let mut res = axum::response::Response::new(axum::body::Body::empty());
-                        *res.status_mut() = http::StatusCode::UNAUTHORIZED;
-                        if let Ok(v) = http::HeaderValue::from_str(&challenge) {
-                            res.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
-                        }
-                        res
-                    }
+                    verify_bearer(v.clone(), challenge.clone(), req, next)
                 },
             ));
     }
 
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advertised_mcp_url;
+
+    #[test]
+    fn advertised_url_takes_the_host_from_the_advertise_endpoint() {
+        // The bug this exists for: the node binds 0.0.0.0 but advertises a name.
+        let bound = "0.0.0.0:51402".parse().unwrap();
+        assert_eq!(
+            advertised_mcp_url("http://pond-node-1:51401", bound).as_deref(),
+            Some("http://pond-node-1:51402/mcp")
+        );
+    }
+
+    #[test]
+    fn advertised_url_keeps_the_scheme_and_handles_ipv6() {
+        let bound = "[::]:51402".parse().unwrap();
+        assert_eq!(
+            advertised_mcp_url("https://gateway.example:443", bound).as_deref(),
+            Some("https://gateway.example:51402/mcp")
+        );
+        assert_eq!(
+            advertised_mcp_url("http://[::1]:51401", bound).as_deref(),
+            Some("http://[::1]:51402/mcp")
+        );
+    }
+
+    #[test]
+    fn advertised_url_is_none_for_an_unparseable_endpoint() {
+        // Callers fall back to the bound address rather than advertising junk.
+        let bound = "0.0.0.0:51402".parse().unwrap();
+        assert_eq!(advertised_mcp_url("pond-node-1:51401", bound), None);
+    }
 }

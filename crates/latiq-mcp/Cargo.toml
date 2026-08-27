@@ -11,12 +11,19 @@ latiq-engine = { path = "../latiq-engine" }
 rmcp = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
+# Rewriting the advertised endpoint into the public MCP URL: hand-rolled
+# authority splitting disagrees with the WHATWG parser, and this string ends up
+# in a challenge clients follow.
+url = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# The in-process fake IdP behind the auth tests.
+latiq-auth = { path = "../latiq-auth", features = ["test-support"] }
+reqwest = { workspace = true }
 latiq-control-plane = { path = "../latiq-control-plane" }
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 latiq-storage = { path = "../latiq-storage" }

@@ -1877,12 +1877,14 @@ dependencies = [
  "latiq-engine",
  "latiq-engine-duckdb",
  "latiq-storage",
+ "reqwest 0.13.4",
  "rmcp",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
