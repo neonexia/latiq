@@ -151,13 +151,22 @@ latiq pond drop demo --confirm                 # DESTRUCTIVE — requires --conf
 
 **Resource tiers** cap a pond's DuckDB instance (memory + threads) — caps, not reservations:
 
-| Tier | memory_limit | threads |
-|---|---|---|
-| x-small | 512 MB | 1 |
-| small | 1 GB | 2 |
-| **medium** (default) | 4 GB | 4 |
-| large | 16 GB | 8 |
-| x-large | 32 GB | 8 |
+| Tier | memory_limit | threads | concurrent reads |
+|---|---|---|---|
+| x-small | 512 MB | 1 | 4 |
+| small | 1 GB | 2 | 4 |
+| **medium** (default) | 4 GB | 4 | 8 |
+| large | 16 GB | 8 | 16 |
+| x-large | 32 GB | 16 | 32 |
+| `none` | — | — | host (up to 32) |
+
+`none` applies **no caps at all** — the engine's own defaults govern the pond
+(DuckDB: every core, ~80% of RAM). It is operator-only and cannot be requested
+when a pond is created: `latiq pond set-tier <pond> --tier none`. Re-tiering takes
+effect on the pond's next query.
+
+"Concurrent reads" is how many queries run at once on one pond (its read-connection
+pool). Readers past that wait briefly for a connection.
 
 `pond drop` without `--confirm` is refused with a structured error and leaves the pond intact.
 

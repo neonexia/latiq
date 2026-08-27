@@ -120,7 +120,24 @@ impl Pond {
         // Read concurrency allowed per pond. Scaled off the tier's core budget —
         // measurably still worth ~2x the serial rate at 2x cores — and clamped so
         // a tiny pond keeps some concurrency and a big one can't hoard handles.
-        let cores = loc.limits.as_ref().map(|l| l.cores).unwrap_or(4) as usize;
+        // The ceiling must stay above 2x the largest tier's cores, or the top
+        // tiers clamp to the same value and a bigger tier buys no read
+        // parallelism. More concurrency costs neighbour isolation, which is the
+        // trade a larger tier is meant to make — never a default-tier pond.
+        // No limits = the `none` tier: the engine is using the whole host, so the
+        // read pool sizes off the host too. Defaulting to a fixed number here
+        // would pin an uncapped pond to a mid-tier pond's read concurrency, so
+        // uncapping would raise DuckDB's thread budget while quietly leaving
+        // concurrent readers queued.
+        let cores = loc
+            .limits
+            .as_ref()
+            .map(|l| l.cores as usize)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
         Ok(Self {
             limits: loc.limits,
             writer: Mutex::new(writer),
@@ -128,7 +145,7 @@ impl Pond {
             reads: ReadPool {
                 state: Mutex::new(PoolState::default()),
                 returned: Condvar::new(),
-                max: (cores * 2).clamp(4, 16),
+                max: (cores * 2).clamp(4, 32),
             },
         })
     }
@@ -782,6 +799,35 @@ mod tests {
             Arc::ptr_eq(&pond_before, &eng.pond(&loc).unwrap()),
             "identical limits must reuse the cached instance"
         );
+    }
+
+    #[test]
+    fn an_uncapped_pond_sizes_its_read_pool_off_the_host() {
+        // The `none` tier means "engine defaults" — DuckDB takes the whole host.
+        // The read pool must follow, or uncapping raises the thread budget while
+        // leaving concurrent readers queued behind a mid-tier-sized pool.
+        let fs = TempFs::new();
+        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        loc.limits = None; // the `none` tier
+        let eng = DuckEngine::new();
+        let uncapped = eng.pond(&loc).unwrap().reads.max;
+
+        let mut medium = fs.create_pond(PondId::new()).unwrap();
+        medium.limits = Some(latiq_common::ResourceLimits {
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+            cores: 4,
+        });
+        let capped = eng.pond(&medium).unwrap().reads.max;
+
+        let host = std::thread::available_parallelism().map_or(4, |n| n.get());
+        assert_eq!(uncapped, (host * 2).clamp(4, 32));
+        if host > 4 {
+            assert!(
+                uncapped > capped,
+                "uncapped ({uncapped}) must allow more concurrent reads than \
+                 medium ({capped}) on a {host}-core host"
+            );
+        }
     }
 
     #[test]

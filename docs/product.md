@@ -102,7 +102,7 @@ An agent connected to Latiq can do the following, using only SQL and a handful o
 
 **Register the data agents may use.** `latiq dataset add` for curated files; `latiq catalog add` for external sources, with a type and locator params. Credential-shaped params are *dropped* at registration by a per-type allowlist — Latiq stores no credentials, ever. Credentials ride in at pull time, build a temporary secret for that one operation, and are dropped on detach.
 
-**Size ponds.** Each pond has a resource tier (small / medium / large / x-large) that maps to hard `memory_limit` and `threads` caps on its DuckDB instance. This is what keeps one workflow's scan from starving its neighbors on a busy shared cluster.
+**Size ponds.** Each pond has a resource tier (x-small / small / medium / large / x-large) that maps to hard `memory_limit` and `threads` caps on its DuckDB instance, and to how many reads it runs at once. This is what keeps one workflow's scan from starving its neighbors on a busy shared cluster. A tier can be changed after creation (`latiq pond set-tier`), and an operator can opt a pond out of capping entirely with the `none` tier — the engine's own defaults then govern it. `none` is operator-only: a pond cannot ask for it at allocation.
 
 **Watch it run.** Every process serves a Prometheus `/metrics` endpoint: ponds by tier, per-pond query rate, p95 latency, errors by kind, in-flight load, cross-node forwarding, node liveness. Logs are structured `tracing`, JSON on request, with a `trace_id` propagated across the node hop so one request correlates across the cluster. Latiq ships no dashboards and stores no time series — you point your existing Prometheus, Grafana, and log pipeline at it.
 
