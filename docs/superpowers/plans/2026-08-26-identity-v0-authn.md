@@ -42,7 +42,8 @@
 | `crates/latiq-control-plane/src/admin_service.rs` | Extract identity at all (it reads none today) and audit it |
 | `crates/latiq-pond-node/src/lib.rs` | `PondNodeConfig` carries the auth settings |
 | `crates/latiq-control-plane/src/lib.rs` | `serve_control_plane` takes auth settings |
-| `crates/latiq/src/main.rs` | `--auth-issuer` / `--auth-audience` server flags; `--token` / `LATIQ_TOKEN` client side |
+| `crates/latiq/src/main.rs` | `--auth-issuer` (repeatable) / `--auth-audience` server flags; `--token` / `LATIQ_TOKEN` client side |
+| `dev.sh` | `--auth` flag: throwaway Keycloak in Docker, stack runs verified (debugging only) |
 | `crates/latiq-sdk/src/lib.rs` | `token=` connect parameter → gRPC metadata |
 | `deploy/cluster/docker-compose.yml` | Keycloak behind an `auth` profile (internal compose only) |
 | `.github/workflows/nightly.yml` | Auth e2e job |
@@ -485,12 +486,17 @@ git commit -m "feat(auth): latiq-auth crate with a caching JWKS key store"
 
 ---
 
-## Task 3: Token verification
+## Task 3: Token verification (multi-issuer)
+
+**Why N issuers from the start.** A realistic enterprise has two: a *workforce* IdP for operators using the CLI, and a *workload* IdP for machine agents. Supporting one and adding the second later means changing `AuthConfig`'s shape, the CLI flag arity, and the metadata document — all public surface. Supporting N now costs about fifteen extra lines of verification logic and one extra field, and the metadata document's `authorization_servers` is *already* an array in the spec. So: a list from day one, with one entry as the ordinary case.
+
+**How key selection stays safe.** To pick the right JWKS we need the token's `iss`, which we can only read *before* verifying. That is safe as long as the unverified `iss` is used **only to select a key**, and the final validation still pins issuer and audience: a token claiming an issuer it wasn't signed by gets checked against that issuer's real keys and fails the signature. What we must never do is trust an unverified claim for anything else. Selecting per-issuer also avoids `kid` collisions between two IdPs that happen to use the same key id.
 
 **Files:**
 - Create: `crates/latiq-auth/src/verify.rs`
 - Create: `crates/latiq-auth/tests/verify.rs`
 - Modify: `crates/latiq-auth/src/lib.rs`
+- Modify: `crates/latiq-auth/src/jwks.rs` (one cache per issuer)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -498,22 +504,24 @@ git commit -m "feat(auth): latiq-auth crate with a caching JWKS key store"
 
 ```rust
 mod support;
-use latiq_auth::{AuthConfig, Verifier};
+use latiq_auth::{AuthConfig, IssuerConfig, Verifier};
 
 const AUD: &str = "latiq";
 
-async fn verifier(idp: &support::TestIdp) -> Verifier {
-    Verifier::new(AuthConfig {
-        issuer: idp.issuer.clone(),
+fn config(idp: &support::TestIdp) -> AuthConfig {
+    AuthConfig {
         audience: AUD.to_string(),
-        jwks_uri: idp.jwks_uri.clone(),
-    })
+        issuers: vec![IssuerConfig {
+            issuer: idp.issuer.clone(),
+            jwks_uri: Some(idp.jwks_uri.clone()),
+        }],
+    }
 }
 
 #[tokio::test]
 async fn auth_valid_token_yields_a_verified_identity() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint("svc-orch", AUD, &idp.issuer, 300);
 
     let id = v.verify(&token, Some("agent-7")).await.expect("verify");
@@ -528,15 +536,15 @@ async fn auth_rejects_wrong_audience() {
     // The single most important check: a token minted for another service
     // must not be replayable at us.
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint("svc-orch", "some-other-service", &idp.issuer, 300);
     assert!(v.verify(&token, None).await.is_err());
 }
 
 #[tokio::test]
-async fn auth_rejects_wrong_issuer() {
+async fn auth_rejects_an_unlisted_issuer() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint("svc-orch", AUD, "https://evil.example", 300);
     assert!(v.verify(&token, None).await.is_err());
 }
@@ -544,7 +552,7 @@ async fn auth_rejects_wrong_issuer() {
 #[tokio::test]
 async fn auth_rejects_expired_token() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint("svc-orch", AUD, &idp.issuer, -60);
     assert!(v.verify(&token, None).await.is_err());
 }
@@ -552,7 +560,7 @@ async fn auth_rejects_expired_token() {
 #[tokio::test]
 async fn auth_rejects_foreign_signature() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint_with_foreign_key("svc-orch", AUD, &idp.issuer);
     assert!(v.verify(&token, None).await.is_err());
 }
@@ -560,7 +568,7 @@ async fn auth_rejects_foreign_signature() {
 #[tokio::test]
 async fn auth_rejects_token_without_kid() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint_with_kid("svc-orch", AUD, &idp.issuer, 300, None);
     assert!(v.verify(&token, None).await.is_err());
 }
@@ -568,7 +576,7 @@ async fn auth_rejects_token_without_kid() {
 #[tokio::test]
 async fn auth_rejects_garbage() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     assert!(v.verify("not.a.token", None).await.is_err());
     assert!(v.verify("", None).await.is_err());
 }
@@ -576,17 +584,56 @@ async fn auth_rejects_garbage() {
 #[tokio::test]
 async fn auth_leaf_agent_id_defaults_to_subject() {
     let idp = support::TestIdp::start().await;
-    let v = verifier(&idp).await;
+    let v = Verifier::new(config(&idp));
     let token = idp.mint("svc-orch", AUD, &idp.issuer, 300);
     let id = v.verify(&token, None).await.expect("verify");
     assert_eq!(id.agent_id, "svc-orch");
+}
+
+// ---- multi-issuer
+
+#[tokio::test]
+async fn auth_accepts_tokens_from_either_configured_issuer() {
+    // The workforce-IdP + workload-IdP case.
+    let a = support::TestIdp::start().await;
+    let b = support::TestIdp::start().await;
+    let v = Verifier::new(AuthConfig {
+        audience: AUD.to_string(),
+        issuers: vec![
+            IssuerConfig { issuer: a.issuer.clone(), jwks_uri: Some(a.jwks_uri.clone()) },
+            IssuerConfig { issuer: b.issuer.clone(), jwks_uri: Some(b.jwks_uri.clone()) },
+        ],
+    });
+
+    let ida = v.verify(&a.mint("ops-alice", AUD, &a.issuer, 300), None).await.expect("idp a");
+    assert_eq!(ida.issuer, a.issuer);
+    let idb = v.verify(&b.mint("svc-agent", AUD, &b.issuer, 300), None).await.expect("idp b");
+    assert_eq!(idb.issuer, b.issuer);
+}
+
+#[tokio::test]
+async fn auth_a_token_cannot_borrow_another_issuers_identity() {
+    // Signed by IdP b, but CLAIMS to come from IdP a. Selecting the key by the
+    // unverified `iss` must then check it against a's real keys -- and fail.
+    let a = support::TestIdp::start().await;
+    let b = support::TestIdp::start().await;
+    let v = Verifier::new(AuthConfig {
+        audience: AUD.to_string(),
+        issuers: vec![
+            IssuerConfig { issuer: a.issuer.clone(), jwks_uri: Some(a.jwks_uri.clone()) },
+            IssuerConfig { issuer: b.issuer.clone(), jwks_uri: Some(b.jwks_uri.clone()) },
+        ],
+    });
+
+    let forged = b.mint("svc-agent", AUD, &a.issuer, 300);  // b's key, a's iss
+    assert!(v.verify(&forged, None).await.is_err());
 }
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `cargo test -p latiq-auth --test verify`
-Expected: FAIL to compile — `Verifier` and `AuthConfig` do not exist.
+Expected: FAIL to compile — `Verifier`, `AuthConfig`, and `IssuerConfig` do not exist.
 
 - [ ] **Step 3: Implement**
 
@@ -595,22 +642,38 @@ Expected: FAIL to compile — `Verifier` and `AuthConfig` do not exist.
 ```rust
 //! JWT claim validation. Algorithms are an ALLOWLIST, never taken from the
 //! token header -- accepting the header's `alg` is the classic algorithm
-//! confusion bug.
+//! confusion bug. Issuers are an allowlist too: an `iss` we do not know is
+//! rejected before any key lookup happens.
 use crate::jwks::JwksCache;
 use crate::AuthError;
 use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 use latiq_common::Identity;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Signature algorithms we accept. Asymmetric only: a symmetric alg would mean
 /// the verifier holds a signing secret, which a resource server must not.
-const ALLOWED_ALGS: &[Algorithm] = &[Algorithm::RS256, Algorithm::RS384, Algorithm::RS512, Algorithm::ES256];
+const ALLOWED_ALGS: &[Algorithm] =
+    &[Algorithm::RS256, Algorithm::RS384, Algorithm::RS512, Algorithm::ES256];
+
+#[derive(Debug, Clone)]
+pub struct IssuerConfig {
+    /// Compared as a STRING against the token's `iss`. Never dialed.
+    pub issuer: String,
+    /// The URL actually fetched for signing keys. `None` = derive it by OIDC
+    /// discovery from `issuer`. An explicit value covers split-horizon
+    /// deployments where the issuer identifier is not a reachable address.
+    pub jwks_uri: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
-    pub issuer: String,
+    /// The `aud` this deployment expects. One value across all issuers: the
+    /// audience names US, not who vouched for the caller.
     pub audience: String,
-    pub jwks_uri: String,
+    /// Trusted issuers. One is the ordinary case; two covers the common
+    /// workforce-IdP + workload-IdP split.
+    pub issuers: Vec<IssuerConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -618,14 +681,31 @@ struct Claims {
     sub: String,
 }
 
+/// Only ever used to SELECT a key. Every field is unverified at this point.
+#[derive(Debug, Deserialize)]
+struct Untrusted {
+    iss: String,
+}
+
 pub struct Verifier {
     cfg: AuthConfig,
-    jwks: JwksCache,
+    /// One cache per issuer -- two IdPs may legitimately use the same `kid`.
+    jwks: HashMap<String, JwksCache>,
 }
 
 impl Verifier {
     pub fn new(cfg: AuthConfig) -> Self {
-        let jwks = JwksCache::new(cfg.jwks_uri.clone());
+        let jwks = cfg
+            .issuers
+            .iter()
+            .map(|i| {
+                let uri = i
+                    .jwks_uri
+                    .clone()
+                    .unwrap_or_else(|| JwksCache::discover_uri(&i.issuer));
+                (i.issuer.clone(), JwksCache::new(uri))
+            })
+            .collect();
         Self { cfg, jwks }
     }
 
@@ -635,28 +715,76 @@ impl Verifier {
 
     /// Verify a bearer token and build a verified Identity. `claimed_agent` is
     /// the caller-asserted leaf id -- never verified, attribution only.
-    pub async fn verify(&self, token: &str, claimed_agent: Option<&str>) -> Result<Identity, AuthError> {
+    pub async fn verify(
+        &self,
+        token: &str,
+        claimed_agent: Option<&str>,
+    ) -> Result<Identity, AuthError> {
         if token.trim().is_empty() {
             return Err(AuthError::Missing);
         }
         let header = decode_header(token).map_err(|e| AuthError::Malformed(e.to_string()))?;
         if !ALLOWED_ALGS.contains(&header.alg) {
-            return Err(AuthError::Invalid(format!("algorithm {:?} not allowed", header.alg)));
+            return Err(AuthError::Invalid(format!(
+                "algorithm {:?} not allowed",
+                header.alg
+            )));
         }
         let kid = header.kid.ok_or_else(|| {
             AuthError::Malformed("token header has no 'kid'; cannot select a signing key".into())
         })?;
-        let key = self.jwks.key_for(&kid).await?;
+
+        // Read `iss` WITHOUT verifying, purely to choose which issuer's keys to
+        // check against. Safe because the real validation below pins iss and
+        // aud: a token claiming an issuer it wasn't signed by fails signature.
+        let iss = untrusted_issuer(token)?;
+        let cache = self
+            .jwks
+            .get(&iss)
+            .ok_or_else(|| AuthError::Invalid(format!("issuer '{iss}' is not trusted here")))?;
+        let key = cache.key_for(&kid).await?;
 
         let mut validation = Validation::new(header.alg);
         validation.set_audience(&[self.cfg.audience.as_str()]);
-        validation.set_issuer(&[self.cfg.issuer.as_str()]);
+        validation.set_issuer(&[iss.as_str()]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
 
-        let data = decode::<Claims>(token, &key, &validation)
-            .map_err(|e| AuthError::Invalid(e.to_string()))?;
+        let data =
+            decode::<Claims>(token, &key, &validation).map_err(|e| AuthError::Invalid(e.to_string()))?;
 
-        Ok(Identity::verified(&data.claims.sub, &self.cfg.issuer, claimed_agent))
+        Ok(Identity::verified(&data.claims.sub, &iss, claimed_agent))
+    }
+}
+
+/// Decode the payload without verifying, to read `iss` for key selection only.
+fn untrusted_issuer(token: &str) -> Result<String, AuthError> {
+    use base64::Engine;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| AuthError::Malformed("token is not a JWT".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| AuthError::Malformed(format!("payload is not base64url: {e}")))?;
+    let u: Untrusted = serde_json::from_slice(&bytes)
+        .map_err(|e| AuthError::Malformed(format!("payload has no usable 'iss': {e}")))?;
+    Ok(u.iss)
+}
+```
+
+Add `base64 = "0.22"` to `latiq-auth`'s **regular** dependencies (it was a dev-dependency in Task 2 for the fixture; it is now needed at runtime).
+
+Add to `crates/latiq-auth/src/jwks.rs`:
+
+```rust
+impl JwksCache {
+    /// The conventional JWKS location for an issuer, used when no explicit
+    /// `jwks_uri` is configured. Keycloak and most OIDC providers serve
+    /// `<issuer>/protocol/openid-connect/certs`; the generic OIDC discovery
+    /// document lives at `<issuer>/.well-known/openid-configuration`.
+    pub fn discover_uri(issuer: &str) -> String {
+        let base = issuer.trim_end_matches('/');
+        format!("{base}/protocol/openid-connect/certs")
     }
 }
 ```
@@ -665,19 +793,19 @@ Add to `crates/latiq-auth/src/lib.rs`:
 
 ```rust
 pub mod verify;
-pub use verify::{AuthConfig, Verifier};
+pub use verify::{AuthConfig, IssuerConfig, Verifier};
 ```
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p latiq-auth`
-Expected: PASS, 11 tests total.
+Expected: PASS, 13 tests total (3 JWKS + 10 verify).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add crates/latiq-auth
-git commit -m "feat(auth): verify bearer tokens against issuer, audience, expiry, and an algorithm allowlist"
+git commit -m "feat(auth): verify bearer tokens against an issuer allowlist, audience, expiry, and allowed algorithms"
 ```
 
 ---
@@ -697,10 +825,10 @@ git commit -m "feat(auth): verify bearer tokens against issuer, audience, expiry
 use latiq_auth::metadata::{challenge_header, ProtectedResourceMetadata};
 
 #[test]
-fn auth_metadata_document_advertises_the_authorization_server() {
+fn auth_metadata_document_advertises_every_authorization_server() {
     let doc = ProtectedResourceMetadata::new(
         "http://node-1:51402/mcp",
-        "https://idp.example/realms/latiq",
+        &["https://idp.example/realms/latiq".to_string()],
     );
     let json = serde_json::to_value(&doc).expect("serialize");
     assert_eq!(json["resource"], "http://node-1:51402/mcp");
@@ -739,10 +867,13 @@ pub struct ProtectedResourceMetadata {
 }
 
 impl ProtectedResourceMetadata {
-    pub fn new(resource: &str, authorization_server: &str) -> Self {
+    /// `authorization_servers` mirrors the configured issuer allowlist -- the
+    /// field is an array in RFC 9728 precisely because a resource may trust
+    /// more than one.
+    pub fn new(resource: &str, authorization_servers: &[String]) -> Self {
         Self {
             resource: resource.to_string(),
-            authorization_servers: vec![authorization_server.to_string()],
+            authorization_servers: authorization_servers.to_vec(),
             bearer_methods_supported: vec!["header".to_string()],
         }
     }
@@ -1061,7 +1192,9 @@ In `serve_mcp_with_listener` (`crates/latiq-mcp/src/server.rs:506-521`), when au
 ```rust
     let mut router = axum::Router::new().nest_service("/mcp", service);
     if let Some(v) = &verifier {
-        let doc = ProtectedResourceMetadata::new(&resource_url, &v.config().issuer);
+        let servers: Vec<String> =
+            v.config().issuers.iter().map(|i| i.issuer.clone()).collect();
+        let doc = ProtectedResourceMetadata::new(&resource_url, &servers);
         let challenge = challenge_header(&metadata_url);
         router = router
             .route(
@@ -1114,24 +1247,33 @@ principal as an Authorization: Bearer token -- neither reachable by the model."
 `ServeArgs` (`crates/latiq/src/main.rs:178-194`) and `NodeAddArgs` (L208-232) each gain:
 
 ```rust
-    /// OIDC issuer URL. Setting this turns on token verification for every
-    /// surface on this process. Unset = relaxed claimed identity (dev/embedded).
-    #[arg(long, env = "LATIQ_AUTH_ISSUER")]
-    auth_issuer: Option<String>,
+    /// Trusted OIDC issuer URL. Repeatable: pass it more than once, or set
+    /// LATIQ_AUTH_ISSUER to a comma-separated list, to trust several IdPs (the
+    /// usual case being a workforce IdP for operators plus a workload IdP for
+    /// agents). Any issuer here turns on verification for every surface on this
+    /// process. None = relaxed claimed identity (dev / embedded).
+    #[arg(long, env = "LATIQ_AUTH_ISSUER", value_delimiter = ',')]
+    auth_issuer: Vec<String>,
 
-    /// The audience this deployment expects in a token (`aud`). Required with
-    /// --auth-issuer: without it, a token minted for any other service that
-    /// trusts the same IdP would be accepted here.
+    /// The audience this deployment expects in a token (`aud`). Required
+    /// whenever an issuer is set: without it, a token minted for any other
+    /// service that trusts the same IdP would be accepted here. One value for
+    /// all issuers -- the audience names US, not who vouched for the caller.
     #[arg(long, env = "LATIQ_AUTH_AUDIENCE")]
     auth_audience: Option<String>,
 
-    /// JWKS URL. Defaults to <issuer>/protocol/openid-connect/certs when the
-    /// issuer looks like Keycloak, otherwise <issuer>/.well-known/jwks.json.
+    /// Explicit JWKS URL, overriding the default derived from the issuer. Only
+    /// valid with exactly ONE --auth-issuer, since it cannot be matched to a
+    /// particular issuer otherwise. Needed for split-horizon deployments where
+    /// the issuer identifier is not a reachable address.
     #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
     auth_jwks_uri: Option<String>,
 ```
 
-Build the `AuthConfig` in `run_serve` (L735) and `run_node_add` (L758). **Fail fast**: if `auth_issuer` is set and `auth_audience` is not, exit with a clear error rather than defaulting — a wrong audience is a silent security hole.
+Build the `AuthConfig` in `run_serve` (L735) and `run_node_add` (L758). **Fail fast** on both of these, with a clear message rather than a default:
+
+- an issuer is set but `auth_audience` is not — a wrong or absent audience is a silent security hole;
+- `auth_jwks_uri` is set alongside more than one issuer — ambiguous, and guessing which issuer it belongs to would be worse than refusing.
 
 - [ ] **Step 1a: Treat a blank issuer as absent**
 
@@ -1145,7 +1287,7 @@ fn non_blank(v: Option<String>) -> Option<String> {
 }
 ```
 
-Apply it to all three of `auth_issuer`, `auth_audience`, and `auth_jwks_uri` before building the `AuthConfig`.
+Apply it to `auth_audience` and `auth_jwks_uri`, and filter `auth_issuer` with the same rule — `LATIQ_AUTH_ISSUER=` must yield an **empty** issuer list (auth off), not a one-element list containing `""`.
 
 Test it, because this is exactly the sort of thing that silently regresses:
 
@@ -1370,6 +1512,119 @@ Expected: the ordinary 2-node unauthenticated cluster, exactly as before.
 ```bash
 git add deploy/cluster/keycloak-realm.json deploy/cluster/auth.env deploy/cluster/docker-compose.yml deploy/CLAUDE.md
 git commit -m "test(auth): Keycloak and in-network test runners behind the auth profile"
+```
+
+---
+
+## Task 9a: `./dev.sh --auth` for debugging
+
+`./dev.sh` must stay **unauthenticated by default** — it is the inner development loop and nothing about it changes. But when a nightly auth failure needs reproducing, spinning up the whole compose cluster to poke at one node is heavy. An `--auth` flag gives the same native dev stack with verification on.
+
+**This case is simpler than the cluster**, because `dev.sh` runs the binaries natively on the host: Keycloak is published on `localhost:8080` and *everything* — nodes and clients alike — uses that one address. No Docker DNS, no split, no override.
+
+**Files:**
+- Modify: `dev.sh` (flag parsing at L41-51, usage at L16-39, and the node/control-plane launch)
+
+- [ ] **Step 1: Add the flag**
+
+In the `while` loop at `dev.sh:41-51`, alongside `--nodes` / `--root` / `--down`:
+
+```bash
+    --auth)      AUTH=1;        shift ;;
+```
+
+Initialize `AUTH=0` next to the other defaults (L9-14), and add to `usage()`:
+
+```
+  --auth                Start Keycloak in Docker and run the stack with token
+                        verification on. Debugging only -- auth is otherwise
+                        exercised only by the nightly. Requires Docker.
+```
+
+- [ ] **Step 2: Start Keycloak and export the settings**
+
+After argument validation (around L53) and before the control plane starts:
+
+```bash
+KC_PORT=8080
+KC_NAME=latiq-dev-keycloak
+if [[ "$AUTH" == "1" ]]; then
+  command -v docker >/dev/null || {
+    echo "--auth needs Docker (it runs Keycloak in a container)" >&2; exit 2; }
+
+  if ! docker ps --format '{{.Names}}' | grep -qx "$KC_NAME"; then
+    echo "Starting Keycloak on :$KC_PORT ..."
+    docker run -d --rm --name "$KC_NAME" -p "$KC_PORT:8080" \
+      -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+      -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+      -e KC_HOSTNAME_URL="http://localhost:$KC_PORT" \
+      -v "$PWD/deploy/cluster/keycloak-realm.json:/opt/keycloak/data/import/realm.json:ro" \
+      quay.io/keycloak/keycloak:26.0 start-dev --import-realm >/dev/null
+  fi
+
+  echo -n "Waiting for the latiq realm "
+  for _ in $(seq 1 60); do
+    curl -sf "http://localhost:$KC_PORT/realms/latiq/.well-known/openid-configuration" \
+      >/dev/null && break
+    echo -n "."; sleep 2
+  done
+  echo
+
+  # Native processes on the host, so ONE address works for everyone.
+  export LATIQ_AUTH_ISSUER="http://localhost:$KC_PORT/realms/latiq"
+  export LATIQ_AUTH_AUDIENCE=latiq
+fi
+```
+
+`dev.sh` launches the control plane and nodes as children, so exporting these is enough — the existing `serve` / `node add` invocations need no new arguments.
+
+Note `KC_HOSTNAME_URL` here is `localhost:8080`, **not** the `keycloak:8080` the compose file uses. Both are correct for their context: compose clients are containers, `dev.sh` clients are host processes.
+
+- [ ] **Step 3: Tear it down with the stack**
+
+`--auth` must not leave a container running. In the existing EXIT trap and the `--down` path (see the PID-file cleanup documented at `dev.sh:83-88`):
+
+```bash
+docker rm -f "$KC_NAME" >/dev/null 2>&1 || true
+```
+
+Unconditional and error-suppressed, so `--down` cleans up a Keycloak left behind by a hard-killed run — the same reasoning the PID file already follows.
+
+- [ ] **Step 4: Print how to get a token**
+
+The stack banner is useless in auth mode without one. Add, when `AUTH=1`:
+
+```bash
+  cat <<BANNER
+Auth is ON. Get a token with:
+  export LATIQ_TOKEN=\$(curl -s -d grant_type=client_credentials \\
+    -d client_id=latiq-agent -d client_secret=latiq-agent-secret \\
+    http://localhost:$KC_PORT/realms/latiq/protocol/openid-connect/token \\
+    | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+Then the CLI and SDK pick it up automatically.
+BANNER
+```
+
+- [ ] **Step 5: Verify both modes**
+
+```bash
+./dev.sh --nodes 2                 # unauthenticated -- must be unchanged
+# in another shell:
+latiq pond list                    # succeeds with no token
+
+./dev.sh --nodes 2 --auth          # authenticated
+latiq pond list                    # must FAIL: unauthenticated
+export LATIQ_TOKEN=$(...)          # per the banner
+latiq pond list                    # must SUCCEED
+```
+
+Then `./dev.sh --down` and confirm `docker ps` shows no `latiq-dev-keycloak`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add dev.sh
+git commit -m "feat(dev): ./dev.sh --auth runs the local stack against a throwaway Keycloak"
 ```
 
 ---
@@ -1618,12 +1873,12 @@ git commit -m "ci(auth): nightly e2e against an authenticated cluster, clients i
 ## Task 13: Documentation
 
 **Files:**
-- Modify: `docs/identity.md`, `docs/dev.md`, `docs/roadmap.md`, `CLAUDE.md`, `crates/latiq-agent-core/CLAUDE.md`
+- Modify: `docs/identity.md`, `docs/dev.md`, `docs/roadmap.md`, `CLAUDE.md`, `crates/latiq-agent-core/CLAUDE.md`, `e2e/CLAUDE.md`, `dev.sh` usage text
 
 - [ ] **Step 1: Update the docs**
 
 - `docs/identity.md`: change the `Principal` code block to `Identity` (per the deviation note at the top of this plan), and mark the implemented parts **today**.
-- `docs/dev.md`: state plainly that **auth mode is nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `docker compose --env-file auth.env up -d` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
+- `docs/dev.md`: document `./dev.sh --auth` (Task 9a) and state plainly that **auth mode is otherwise nightly-and-container-only** — `./dev.sh`, `cargo test`, and a plain `docker compose up` all stay unauthenticated. Include the `docker compose --env-file auth.env up -d` invocation for the rare case someone needs to reproduce a nightly auth failure locally.
 - `e2e/CLAUDE.md`: add a third mode alongside REMOTE and EMBEDDED — **AUTH**, selected by `--env-file auth.env`, with every client in-network.
 - `docs/roadmap.md`: flip the "Identity v0 — authentication" row to ✅ Shipped.
 - `CLAUDE.md`: add `latiq-auth` to the crate list; note that identity is verified when configured.
@@ -1649,7 +1904,11 @@ git commit -m "docs(auth): identity v0 is shipped; document authenticated deploy
 
 **Spec coverage vs `docs/identity.md`:** the flow (Tasks 4, 7), one-verifier-three-carriers (5, 6, 7), the `Identity` shape (1), unauthenticated mode preserved (1, 5, 7 — asserted, not assumed), the MCP carrier change (7), audience checking called out as critical (3, 8, 9). Authorization is correctly absent.
 
-**Known gaps, deliberately deferred:** multiple issuers (one `AuthConfig`, not a list); token expiry mid-query (validated at admission only); dynamic client registration (Keycloak's realm import pre-registers the client, so RFC 7591 is untested); gateway-level verification (nodes verify, the gateway passes through).
+**Known gaps, deliberately deferred:** token expiry mid-query (validated at admission only); dynamic client registration (Keycloak's realm import pre-registers the client, so RFC 7591 is untested); gateway-level verification (nodes verify, the gateway passes through).
+
+**Multiple issuers: supported from the start.** `AuthConfig.issuers` is a list, `--auth-issuer` is repeatable, and the metadata document advertises all of them. The cost was ~15 lines; retrofitting would have been a breaking change to the config shape, the flag arity, and the published metadata. Key selection reads the *unverified* `iss` only to pick which issuer's JWKS to check against, and the final validation still pins issuer and audience -- `auth_a_token_cannot_borrow_another_issuers_identity` proves a token signed by IdP B cannot claim IdP A.
+
+**`./dev.sh` stays unauthenticated by default** (Task 9a). `--auth` is a debugging affordance, not a mode anyone works in; it needs no address split because the binaries run natively on the host, so everything uses `localhost:8080`.
 
 **Testing posture, decided:** auth runs **only** in the nightly, **only** in containers, with every client on the compose network. Consequences accepted: (a) there is no host-side auth test, so a bug that only manifests for a client outside the network would be missed — acceptable because the gateway is the boundary either way and it is address-agnostic; (b) `docker compose run` reinstalls the wheel and `npm ci` on each invocation, costing roughly a minute — acceptable for a nightly, and it keeps us from maintaining a bespoke test image.
 
