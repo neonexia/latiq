@@ -570,7 +570,8 @@ impl LocalCluster {
         let registry = Registry::open(Some(&root.join("registry.duckdb")))
             .map_err(|e| anyhow!("open registry: {e}"))?;
         rt.spawn(async move {
-            let _ = serve_control_plane(cp_addr, registry).await;
+            // Embedded: no issuer, so identity stays relaxed (claimed).
+            let _ = serve_control_plane(cp_addr, registry, None).await;
         });
         wait_connectable(&control_endpoint).await?;
 
