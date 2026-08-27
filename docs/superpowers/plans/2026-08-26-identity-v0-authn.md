@@ -851,6 +851,13 @@ impl Verifier {
         let data =
             decode::<Claims>(token, &key, &validation).map_err(|e| AuthError::Invalid(e.to_string()))?;
 
+        // A blank `sub` would produce an identity whose author field is empty,
+        // and `Identity::verified` only guards this with a debug_assert -- which
+        // is nothing in release. Reject it here, where it is a real runtime
+        // condition: a token with no usable subject is not a usable identity.
+        if data.claims.sub.trim().is_empty() {
+            return Err(AuthError::Invalid("token has an empty 'sub' claim".into()));
+        }
         Ok(Identity::verified(&data.claims.sub, &iss, claimed_agent))
     }
 }
@@ -871,7 +878,14 @@ fn untrusted_issuer(token: &str) -> Result<String, AuthError> {
 }
 ```
 
-Add `base64 = "0.22"` to `latiq-auth`'s **regular** dependencies (it was a dev-dependency in Task 2 for the fixture; it is now needed at runtime).
+Add `base64 = "0.22"` to `latiq-auth`'s **regular** dependencies (it was gated behind `test-support` in Task 2 for the fixture; it is now needed at runtime).
+
+**Also validate the config, which is where a misconfiguration becomes an auth bypass.** Add a constructor that rejects bad input rather than trusting it:
+
+- **A non-`https` `jwks_uri` is a total auth bypass.** Signing keys fetched over plaintext can be replaced by anyone on-path, letting them mint arbitrary identities. Reject any `jwks_uri` (explicit or derived) whose scheme is not `https`, **unless** the host is a loopback address — tests and `./dev.sh --auth` legitimately use `http://127.0.0.1` and `http://localhost`. Raised in review of Task 2 and deferred to here on purpose: this is config validation, not cache behaviour.
+- Reject an empty `audience`, an empty `issuers` list where auth is meant to be on, and a duplicate issuer entry.
+
+Test each rejection. `auth_rejects_a_plaintext_jwks_uri` and `auth_allows_plaintext_jwks_on_loopback` are the two that matter.
 
 Add to `crates/latiq-auth/src/jwks.rs`:
 
