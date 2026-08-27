@@ -9,22 +9,48 @@ use base64::Engine as _;
 use jsonwebtoken::{Algorithm, Validation};
 use latiq_common::Identity;
 use serde::Deserialize;
+use url::{Host, Url};
 
-/// Asymmetric only: a symmetric alg would mean the verifier holds a signing
-/// secret, which a resource server must not.
+/// The line is drawn at ASYMMETRIC signatures: with a symmetric alg the
+/// verifier would hold a signing secret, which a resource server must not --
+/// and it is exactly what the algorithm-confusion attack reaches for, feeding a
+/// public key back as an HMAC secret. Everything an enterprise IdP actually
+/// issues is here (RSA PKCS#1 v1.5, RSA-PSS, ECDSA); nothing symmetric is, and
+/// `none` cannot be expressed by this type at all.
 const ALLOWED_ALGS: &[Algorithm] = &[
     Algorithm::RS256,
     Algorithm::RS384,
     Algorithm::RS512,
+    Algorithm::PS256,
+    Algorithm::PS384,
+    Algorithm::PS512,
     Algorithm::ES256,
+    Algorithm::ES384,
 ];
+
+/// Tokens are bounded BEFORE any parsing. `verify()` is protocol-neutral by
+/// design, so it must not inherit whatever header cap the calling transport
+/// happens to impose: an unauthenticated caller could otherwise spend our CPU
+/// and allocator on a multi-megabyte "token" that was always going to be
+/// rejected. Real IdP access tokens are 1-4 KB.
+const MAX_TOKEN_BYTES: usize = 8 * 1024;
+
+/// Accepted clock skew between us and the IdP, applied to `exp`/`nbf`. An
+/// explicit decision rather than jsonwebtoken's inherited 60s default: 30s
+/// covers ordinary NTP drift while halving the window in which a revoked or
+/// expired token still works.
+const CLOCK_SKEW_LEEWAY_SECS: u64 = 30;
 
 /// The claims we need after validation. `aud`/`exp`/`iss` are checked by
 /// `jsonwebtoken` itself against the pinned `Validation`, so they need no field
 /// here.
 #[derive(Deserialize)]
 struct Claims {
-    sub: String,
+    /// Optional at the SERDE layer only. `sub` is in the required-spec-claims
+    /// set, so an absent one is rejected by `jsonwebtoken` with a clear
+    /// `MissingRequiredClaim` -- a non-optional field here would instead fail
+    /// deserialization first and surface as an opaque JSON error.
+    sub: Option<String>,
 }
 
 /// The one claim we read BEFORE verifying anything, purely to pick which
@@ -79,7 +105,8 @@ impl Verifier {
     /// misconfiguration becomes an auth bypass, so every check here is a
     /// hard failure rather than a warning.
     pub fn new(cfg: AuthConfig) -> Result<Self, AuthError> {
-        if cfg.audience.trim().is_empty() {
+        let audience = cfg.audience.trim().to_string();
+        if audience.is_empty() {
             return Err(AuthError::Invalid(
                 "auth audience must not be empty: without it any token minted for any service \
                  would be accepted"
@@ -92,6 +119,10 @@ impl Verifier {
             ));
         }
 
+        // The stored config is the NORMALIZED one. Anything that reads it back
+        // -- the later protected-resource metadata document above all -- must
+        // publish the same strings the verifier actually enforces.
+        let mut issuers = Vec::with_capacity(cfg.issuers.len());
         let mut caches = Vec::with_capacity(cfg.issuers.len());
         for issuer in &cfg.issuers {
             let name = issuer.issuer.trim().to_string();
@@ -109,11 +140,18 @@ impl Verifier {
                 Some(u) if !u.is_empty() => u.to_string(),
                 _ => discover_uri(&name),
             };
-            require_tls_or_loopback(&uri)?;
+            let uri = checked_jwks_uri(&uri)?;
+            issuers.push(IssuerConfig {
+                issuer: name.clone(),
+                jwks_uri: Some(uri.clone()),
+            });
             caches.push((name, JwksCache::new(uri)));
         }
 
-        Ok(Self { cfg, caches })
+        Ok(Self {
+            cfg: AuthConfig { audience, issuers },
+            caches,
+        })
     }
 
     pub fn config(&self) -> &AuthConfig {
@@ -130,6 +168,12 @@ impl Verifier {
         let token = token.trim();
         if token.is_empty() {
             return Err(AuthError::Missing);
+        }
+        if token.len() > MAX_TOKEN_BYTES {
+            return Err(AuthError::Malformed(format!(
+                "token is {} bytes, over the {MAX_TOKEN_BYTES}-byte limit",
+                token.len()
+            )));
         }
 
         let header = jsonwebtoken::decode_header(token)
@@ -170,22 +214,40 @@ impl Verifier {
 
         let key = cache.key_for(&kid).await?;
 
+        // A JWK may declare the ONE algorithm its key is for. Honour it: pinning
+        // only the token's `alg` would let a key published as RS512 verify an
+        // RS256 token, which is the issuer's policy being quietly downgraded by
+        // the caller.
+        if let Some(declared) = key.alg {
+            if declared != header.alg {
+                return Err(AuthError::Invalid(format!(
+                    "token algorithm {:?} does not match the {declared:?} declared by signing key",
+                    header.alg
+                )));
+            }
+        }
+
         // `header.alg` is safe to pin here ONLY because it was checked against
         // ALLOWED_ALGS above and the key came from the issuer's JWKS -- so an
         // `alg` swap can at most pick another asymmetric algorithm this key
         // cannot satisfy. (The list cannot simply be ALLOWED_ALGS: jsonwebtoken
         // requires every entry to belong to the decoding key's family.)
         let mut validation = Validation::new(header.alg);
+        validation.leeway = CLOCK_SKEW_LEEWAY_SECS;
+        // Off by default in jsonwebtoken. `nbf` stays OPTIONAL (it is not in the
+        // required set), but when a token carries one, RFC 7519 4.1.5 says the
+        // token MUST NOT be accepted before it.
+        validation.validate_nbf = true;
         validation.set_audience(&[self.cfg.audience.as_str()]);
         validation.set_issuer(&[issuer]);
         validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
 
-        let data = jsonwebtoken::decode::<Claims>(token, &key, &validation)
+        let data = jsonwebtoken::decode::<Claims>(token, &key.key, &validation)
             .map_err(|e| AuthError::Invalid(e.to_string()))?;
 
         // `sub` being *present* is not the same as it being usable: an empty
         // subject would become an empty DuckLake commit author.
-        let subject = data.claims.sub.trim();
+        let subject = data.claims.sub.as_deref().unwrap_or_default().trim();
         if subject.is_empty() {
             return Err(AuthError::Invalid(
                 "token 'sub' is empty, so the caller has no identity to attribute".to_string(),
@@ -216,90 +278,128 @@ fn unverified_issuer(token: &str) -> Result<String, AuthError> {
     })
 }
 
-/// A plaintext JWKS URI is a total auth bypass -- anyone on-path substitutes
-/// keys and mints arbitrary identities. Loopback is exempt because tests and
+/// Validate a JWKS URI and return the NORMALIZED form that will actually be
+/// fetched. A plaintext URI is a total auth bypass -- anyone on-path substitutes
+/// keys and mints arbitrary identities -- so the guard must run on the same host
+/// the HTTP client will dial. That is why this parses with `url` rather than
+/// splitting the authority by hand: hand-rolled splitting disagrees with the
+/// WHATWG parser, and `http://evil.com\@127.0.0.1/jwks` is exactly that
+/// disagreement (the backslash is a path separator, so the host is `evil.com`,
+/// not the loopback address it reads as).
+///
+/// Loopback is exempt from the https requirement because tests and
 /// `./dev.sh --auth` legitimately run a fake IdP there, and there is no network
 /// to be on-path of.
-fn require_tls_or_loopback(uri: &str) -> Result<(), AuthError> {
-    let Some((scheme, rest)) = uri.split_once("://") else {
-        return Err(AuthError::Invalid(format!(
-            "jwks uri '{uri}' is not an absolute http(s) URL"
-        )));
-    };
-    match scheme.to_ascii_lowercase().as_str() {
-        "https" => Ok(()),
-        "http" if is_loopback(rest) => Ok(()),
-        "http" => Err(AuthError::Invalid(format!(
-            "jwks uri '{uri}' is plaintext http: signing keys must be fetched over https \
-             (loopback excepted)"
-        ))),
-        other => Err(AuthError::Invalid(format!(
-            "jwks uri scheme '{other}' is not supported; use https"
-        ))),
+fn checked_jwks_uri(uri: &str) -> Result<String, AuthError> {
+    // Caught on the RAW string, before parsing: for a special scheme the WHATWG
+    // parser silently promotes the first path segment to the authority, so
+    // `https:///jwks` becomes a confidently-https fetch of a host named `jwks`.
+    if let Some((_, rest)) = uri.split_once("://") {
+        if rest.starts_with('/') {
+            return Err(AuthError::Invalid(format!(
+                "jwks uri '{uri}' has an empty host"
+            )));
+        }
     }
+
+    let parsed = Url::parse(uri)
+        .map_err(|e| AuthError::Invalid(format!("jwks uri '{uri}' is not a valid URL: {e}")))?;
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" if is_loopback(&parsed) => {}
+        "http" => {
+            return Err(AuthError::Invalid(format!(
+                "jwks uri '{uri}' is plaintext http to a non-loopback host: signing keys must be \
+                 fetched over https"
+            )))
+        }
+        other => {
+            return Err(AuthError::Invalid(format!(
+                "jwks uri scheme '{other}' is not supported; use https"
+            )))
+        }
+    }
+
+    Ok(parsed.to_string())
 }
 
-/// `rest` is everything after `://`. Extracts the host and asks whether it is a
-/// loopback name or address.
-fn is_loopback(rest: &str) -> bool {
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        // Drop any userinfo: `http://evil.example@127.0.0.1/` and
-        // `http://127.0.0.1@evil.example/` differ only after the last '@'.
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
-
-    let host = if let Some(literal) = authority.strip_prefix('[') {
-        // IPv6 literal: `[::1]:8080`.
-        match literal.split_once(']') {
-            // Only a port may follow the bracket; anything else means this was
-            // never an IPv6 authority.
-            Some((inner, after)) if after.is_empty() || after.starts_with(':') => inner,
-            _ => return false,
+/// Whether the host the client will DIAL is loopback. Decided on the parsed
+/// host, so `127.1`, `2130706433` and `[::ffff:127.0.0.1]` -- all of which
+/// resolve to 127.0.0.1 -- are recognised, while `127.0.0.1.evil.example` and
+/// `evil.com\@127.0.0.1` are not.
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => {
+            // `is_loopback` on an Ipv6Addr is false for the IPv4-MAPPED
+            // loopback, which still dials 127.0.0.1.
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
         }
-    } else {
-        authority.split(':').next().unwrap_or_default()
-    };
-
-    matches!(
-        host.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+        None => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback, require_tls_or_loopback};
+    use super::checked_jwks_uri;
+
+    fn allowed(uri: &str) -> bool {
+        checked_jwks_uri(uri).is_ok()
+    }
 
     #[test]
     fn https_is_always_allowed() {
-        assert!(require_tls_or_loopback("https://idp.example/jwks").is_ok());
-        assert!(require_tls_or_loopback("HTTPS://idp.example/jwks").is_ok());
+        assert!(allowed("https://idp.example/jwks"));
+        assert!(allowed("HTTPS://idp.example/jwks"));
     }
 
     #[test]
     fn plaintext_off_loopback_is_refused() {
-        assert!(require_tls_or_loopback("http://idp.example/jwks").is_err());
-        assert!(require_tls_or_loopback("ftp://idp.example/jwks").is_err());
-        assert!(require_tls_or_loopback("idp.example/jwks").is_err());
+        assert!(!allowed("http://idp.example/jwks"));
+        assert!(!allowed("ftp://idp.example/jwks"));
+        assert!(!allowed("idp.example/jwks"));
+    }
+
+    #[test]
+    fn a_backslash_cannot_smuggle_a_loopback_host() {
+        // The WHATWG parser treats a backslash as a path separator for special
+        // schemes, so the host here is `evil.com` and the "127.0.0.1" is path. A
+        // hand-rolled authority split reads it the other way and waves the URI
+        // through -- an on-path attacker then substitutes signing keys.
+        assert!(!allowed("http://evil.com\\@127.0.0.1/jwks"));
+        assert!(!allowed("http://evil.com\\127.0.0.1/jwks"));
     }
 
     #[test]
     fn userinfo_cannot_fake_a_loopback_host() {
-        // The host is what comes AFTER the last '@'.
-        assert!(!is_loopback("127.0.0.1@evil.example/jwks"));
-        assert!(is_loopback("evil.example@127.0.0.1/jwks"));
+        assert!(!allowed("http://127.0.0.1@evil.example/jwks"));
+        assert!(allowed("http://evil.example@127.0.0.1/jwks"));
+    }
+
+    #[test]
+    fn an_empty_host_is_refused() {
+        // Would otherwise parse to the host `jwks`.
+        assert!(!allowed("https:///jwks"));
+        assert!(!allowed("http:///jwks"));
     }
 
     #[test]
     fn loopback_forms() {
-        assert!(is_loopback("127.0.0.1:8080/jwks"));
-        assert!(is_loopback("[::1]:8080/jwks"));
-        assert!(is_loopback("LocalHost/jwks"));
-        assert!(!is_loopback("127.0.0.1.evil.example/jwks"));
-        assert!(!is_loopback("[::1].evil.example/jwks"));
+        assert!(allowed("http://127.0.0.1:8080/jwks"));
+        assert!(allowed("http://[::1]:8080/jwks"));
+        assert!(allowed("http://LocalHost/jwks"));
+        // All three of these dial 127.0.0.1.
+        assert!(allowed("http://127.1/jwks"));
+        assert!(allowed("http://2130706433/jwks"));
+        assert!(allowed("http://[::ffff:127.0.0.1]/jwks"));
+    }
+
+    #[test]
+    fn loopback_lookalikes_are_refused() {
+        assert!(!allowed("http://127.0.0.1.evil.example/jwks"));
+        assert!(!allowed("http://localhost.evil.example/jwks"));
+        assert!(!allowed("http://notlocalhost/jwks"));
     }
 }
