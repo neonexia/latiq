@@ -6,12 +6,15 @@ edition.workspace = true
 [dependencies]
 latiq-common = { path = "../latiq-common" }
 latiq-agent-core = { path = "../latiq-agent-core" }
+latiq-auth = { path = "../latiq-auth" }
 latiq-engine = { path = "../latiq-engine" }
 rmcp = { workspace = true }
 axum = { workspace = true }
+http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 latiq-control-plane = { path = "../latiq-control-plane" }

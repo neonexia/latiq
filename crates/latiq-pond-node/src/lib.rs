@@ -219,7 +219,9 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         cfg.node_id, cfg.data_addr
     );
     println!("  pond storage: {}", cfg.data_dir.display());
-    serve_mcp(cfg.mcp_addr, ops)
+    // The MCP surface gets the SAME verifier as Data/Stream: a surface left
+    // unauthenticated is the whole node's auth.
+    serve_mcp(cfg.mcp_addr, ops, verifier)
         .await
         .map_err(|e| anyhow::anyhow!("mcp server error: {e}"))?;
     Ok(())

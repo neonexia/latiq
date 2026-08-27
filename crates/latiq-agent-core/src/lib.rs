@@ -1,5 +1,6 @@
 //! latiq-agent-core — protocol-neutral agent operations + in-flight/abort registry.
 pub mod arrow;
+pub mod bearer;
 pub mod control;
 pub mod error;
 pub mod forward;
@@ -10,6 +11,7 @@ pub mod trace;
 pub mod types;
 
 pub use arrow::{ArrowReadStream, BatchStream};
+pub use bearer::{current_bearer, with_bearer};
 pub use control::ControlPlane;
 pub use error::AgentError;
 pub use forward::Forwarder;

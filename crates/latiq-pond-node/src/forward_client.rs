@@ -79,7 +79,7 @@ fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
     if let Ok(v) = MetadataValue::try_from(id.agent_id.as_str()) {
         req.metadata_mut().insert("latiq-agent-id", v);
     }
-    if let Some(token) = crate::data_service::current_bearer() {
+    if let Some(token) = latiq_agent_core::current_bearer() {
         if let Ok(v) = MetadataValue::try_from(format!("Bearer {token}").as_str()) {
             req.metadata_mut().insert("authorization", v);
         }

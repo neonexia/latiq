@@ -156,6 +156,7 @@ async fn start_node_with_auth(
     let data_endpoint = format!("http://127.0.0.1:{data_port}");
     let internal_endpoint = data_endpoint.clone();
 
+    let mcp_verifier = verifier.clone();
     let ops = build_ops(
         node_id,
         &mcp_endpoint,
@@ -180,7 +181,9 @@ async fn start_node_with_auth(
             .unwrap();
     });
     tokio::spawn(async move {
-        serve_mcp_with_listener(mcp_l, ops).await.unwrap();
+        serve_mcp_with_listener(mcp_l, ops, mcp_verifier)
+            .await
+            .unwrap();
     });
 
     wait_connectable(&data_endpoint).await;

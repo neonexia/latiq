@@ -1,11 +1,14 @@
 //! latiq-client — an MCP client wrapper over the Latiq agent surface. Used by
 //! the `latiq` CLI and integration tests to drive the server like an agent.
 use anyhow::Result;
+use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResult};
 use rmcp::service::RunningService;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 /// The decoded outcome of a tool call: the structured result + whether it was an
 /// error (in which case `value` is the `ErrorEnvelope`).
@@ -17,22 +20,41 @@ pub struct CallOutcome {
 
 pub struct LatiqClient {
     service: RunningService<RoleClient, ()>,
-    agent_id: Option<String>,
 }
 
 impl LatiqClient {
     /// Connect to a Latiq MCP endpoint (e.g. `http://127.0.0.1:8080/mcp`) and run
-    /// the MCP handshake. `agent_id` is sent as a tool argument on every call.
+    /// the MCP handshake. `agent_id` is the CLAIMED leaf id and rides the
+    /// `latiq-agent-id` HTTP header on every request — never a tool argument
+    /// (an argument is typed by the model; a header is not reachable by it).
     pub async fn connect(endpoint: &str, agent_id: Option<String>) -> Result<Self> {
-        let transport = StreamableHttpClientTransport::from_uri(endpoint);
-        let service = ().serve(transport).await?;
-        Ok(Self { service, agent_id })
+        Self::connect_with_token(endpoint, agent_id, None).await
     }
 
-    async fn call(&self, name: &'static str, mut args: Map<String, Value>) -> Result<CallOutcome> {
-        if let Some(a) = &self.agent_id {
-            args.insert("agent_id".into(), Value::String(a.clone()));
+    /// Connect presenting a bearer token — the VERIFIED principal on an
+    /// auth-enabled deployment. The token rides `Authorization: Bearer` on every
+    /// request, including the handshake and the SSE stream.
+    pub async fn connect_with_token(
+        endpoint: &str,
+        agent_id: Option<String>,
+        token: Option<String>,
+    ) -> Result<Self> {
+        let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint);
+        if let Some(a) = agent_id {
+            config = config.custom_headers(HashMap::from([(
+                HeaderName::from_static("latiq-agent-id"),
+                HeaderValue::from_str(&a)?,
+            )]));
         }
+        if let Some(t) = token {
+            config = config.auth_header(t);
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
+        let service = ().serve(transport).await?;
+        Ok(Self { service })
+    }
+
+    async fn call(&self, name: &'static str, args: Map<String, Value>) -> Result<CallOutcome> {
         // CallToolRequestParams is #[non_exhaustive]: build via Default + fields.
         let mut params = CallToolRequestParams::default();
         params.name = name.into();

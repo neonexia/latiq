@@ -1740,6 +1740,7 @@ dependencies = [
  "latiq-pond-node",
  "latiq-proto",
  "metrics",
+ "reqwest 0.13.4",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1797,6 +1798,7 @@ name = "latiq-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http",
  "rmcp",
  "serde_json",
  "tokio",
@@ -1865,7 +1867,9 @@ name = "latiq-mcp"
 version = "0.1.0"
 dependencies = [
  "axum 0.8.9",
+ "http",
  "latiq-agent-core",
+ "latiq-auth",
  "latiq-client",
  "latiq-common",
  "latiq-control-plane",
@@ -1877,6 +1881,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

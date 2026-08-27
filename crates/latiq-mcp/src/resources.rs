@@ -22,7 +22,7 @@ const RESOURCES: &[Res] = &[
         body: "# Working in a Latiq pond\n\n\
 - **SQL dialect:** Latiq speaks ANSI SQL on DuckDB. DuckDB-specific functions work but reduce portability — prefer ANSI when other agents will read your code.\n\
 - **Self-describing schemas:** when you CREATE TABLE, add column and table COMMENTs. Other agents discovering your pond rely on them. See latiq://recipes/schema-design.\n\
-- **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message FROM ducklake_snapshots('<pond>')`.\n\
+- **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')`. `author` is the identity; `commit_extra_info` carries the evidence for it (issuer/subject when the caller was verified) — read BOTH, because an unverified caller can claim any author.\n\
 - **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
 - **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
@@ -38,7 +38,7 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 - **read_query** accepts SELECT and read-only metadata (SHOW/DESCRIBE). Writes are rejected — use write_query.\n\
 - **write_query** accepts INSERT/UPDATE/DELETE and DDL (CREATE/DROP/ALTER, CREATE TABLE AS SELECT).\n\
 - Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
-- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message FROM ducklake_snapshots('<pond>')`. List tables/columns with `SHOW TABLES` / `information_schema`.\n\
+- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` (`commit_extra_info` is where verified-vs-claimed shows up). List tables/columns with `SHOW TABLES` / `information_schema`.\n\
 - Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.",
     },
     Res {
@@ -93,8 +93,9 @@ Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB download
         name: "Recipe: attribution lookup",
         desc: "Who wrote what in a pond",
         body: "# Recipe — attribution lookup\n\n\
-Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT author, commit_message, snapshot_id FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
-Use this to coordinate: see who created a table before extending it.",
+Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
+Use this to coordinate: see who created a table before extending it.\n\
+**Always read `commit_extra_info` alongside `author`.** `author` alone cannot tell a VERIFIED writer from one merely claiming that name — the evidence (issuer/subject, and whether the identity was verified) lives in `commit_extra_info`.",
     },
     Res {
         uri: "latiq://troubleshooting",

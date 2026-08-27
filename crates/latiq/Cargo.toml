@@ -39,6 +39,9 @@ latiq-agent-core = { path = "../latiq-agent-core" }
 latiq-client = { path = "../latiq-client" }
 # The in-process fake IdP behind the auth_* surface tests.
 latiq-auth = { path = "../latiq-auth", features = ["test-support"] }
+# Drives the MCP surface's plain-HTTP bits (well-known metadata + the 401
+# challenge), which are not reachable through an MCP client.
+reqwest = { workspace = true }
 tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 arrow = { workspace = true }
