@@ -1,6 +1,6 @@
 # Latiq — Developer Guide
 
-> **Status:** Slice 0+ (M1–M11) complete and runnable, plus **multi-node request forwarding** (a front door over N nodes), **Arrow streaming reads** (the SDK path), and **per-pond resource tiers**. This is the hands-on guide for building Latiq, starting the dev stack, and driving it manually through the **CLI** (the gRPC surfaces). Agents drive the separate **MCP** surface; a packaged SDK is still a later slice (the Arrow stream is standard `pyarrow`-decodable today). Federation/catalogs, OIDC, rate-limiting, OpenTelemetry, node-liveness reaping, and disk quotas are deferred.
+> **Status:** Slice 0+ (M1–M11) complete and runnable, plus **multi-node request forwarding** (a front door over N nodes), **Arrow streaming reads** (the SDK path), and **per-pond resource tiers**. This is the hands-on guide for building Latiq, starting the dev stack, and driving it manually through the **CLI** (the gRPC surfaces). Agents drive the separate **MCP** surface; a packaged SDK is still a later slice (the Arrow stream is standard `pyarrow`-decodable today). **OAuth 2.1 token verification** ships too, off by default — see *Auth mode* below. Rate-limiting, OpenTelemetry, disk quotas, and authorization (who may reach which pond) are deferred.
 
 ## What you're running
 
@@ -94,6 +94,28 @@ latiq query -p demo "SELECT 1"                   # via the gateway → forwarded
 
 The MCP upstream is sticky (`ip_hash`) so a streamable-HTTP session stays on its greeter; the Data gRPC upstream is spread, since forwarding makes node choice irrelevant to correctness. `--nodes 1` (the default) keeps the single-node path with **no nginx dependency**.
 
+### Auth mode (optional, debugging only)
+
+The dev stack runs **unauthenticated** — identity is claimed, default `anonymous`.
+That is the default everywhere: `cargo test`, the embedded SDK, and a plain
+`docker compose up`. Token verification is opt-in by configuration.
+
+```bash
+./dev.sh --auth            # needs Docker
+```
+
+Starts a Keycloak container (realm imported from `deploy/cluster/keycloak-realm.json`),
+waits for it, and exports `LATIQ_AUTH_ISSUER` + `LATIQ_AUTH_AUDIENCE` so the control
+plane and every node it starts verify tokens on **all** surfaces — MCP, Data/Stream,
+and Admin. The banner prints a `client_credentials` curl that mints a token; the CLI
+and SDK pick up `$LATIQ_TOKEN` automatically (same as `--token`). Without a token
+every call is refused: `401` + `WWW-Authenticate` on MCP, `Unauthenticated` carrying
+the same challenge on gRPC.
+
+This is for debugging by hand. Auth is otherwise exercised only by the **nightly**,
+in containers (`docker compose --env-file auth.env up`, which also brings up an
+in-network Keycloak). See [`docs/identity.md`](identity.md) for the design.
+
 ### Manual start (two terminals)
 
 ```bash
@@ -112,6 +134,9 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 |---|---|---|
 | `--port` | `51400` | Control + Admin gRPC port (one port, both services) |
 | `--root` | `~/.latiq` | Data root; registry at `<root>/registry.duckdb` |
+| `--auth-issuer` | — | Trusted OIDC issuer (`$LATIQ_AUTH_ISSUER`). Repeatable / comma-separated for several IdPs. Any value turns verification on for this process; none = relaxed claimed identity |
+| `--auth-audience` | — | The `aud` this deployment expects (`$LATIQ_AUTH_AUDIENCE`). **Required** whenever an issuer is set |
+| `--auth-jwks-uri` | derived from the issuer | Explicit JWKS URL; only valid with exactly one issuer (split-horizon deployments) |
 
 **`latiq node add`** (pond node)
 
@@ -120,6 +145,9 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 | `--node-id` | `node-1` | This node's id in the registry |
 | `--port` | `51401` | Data/Query gRPC port; MCP (agents) is served on `port + 1` |
 | `--root` | `~/.latiq` | Data root; pond storage under `<root>/ponds` |
+| `--advertise-addr` | `127.0.0.1:<port>` | The node's **internal** `host:port`, advertised to the control plane so peer nodes can forward pond requests. Agents never dial it |
+| `--public-mcp-url` | derived from `--advertise-addr` | The URL **agents** dial, e.g. `https://latiq.example.com/mcp` (`$LATIQ_PUBLIC_MCP_URL`). Published as the RFC 9728 `resource` and in the 401 challenge — behind a gateway this must be the *gateway's* URL, or conforming clients reject the metadata document |
+| `--auth-issuer` / `--auth-audience` / `--auth-jwks-uri` | — | As `latiq serve` above; turns verification on for MCP and Data/Stream |
 
 `--root` defaults to `~/.latiq` (pass `--root /data` to override); the node registers with the control plane at `$LATIQ_SERVER` (default `http://127.0.0.1:51400`). So `LATIQ_SERVER=… latiq serve --root /data` needs nothing more.
 
@@ -127,7 +155,7 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 
 ## Drive it from the CLI
 
-The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_SERVER` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops. Set `$LATIQ_QUERY_GATEWAY` (a multi-node front door, see above) to send data ops there instead and let the greeter node forward.
+The CLI is a **gRPC client whose one entry point is the control plane.** Its address comes from the `LATIQ_SERVER` env var (default `http://127.0.0.1:51400`) — set it once, there's no per-command flag. `--agent-id <name>` (the identity your writes are attributed to) lives only on the commands that record one: `query` and `pond create`. You never pass a node address — the CLI resolves the node via the control plane and connects to it directly for data ops. Set `$LATIQ_QUERY_GATEWAY` (a multi-node front door, see above) to send data ops there instead and let the greeter node forward. Against a deployment started with `--auth-issuer`, set `$LATIQ_TOKEN` (or pass the global `--token`) — the CLI presents it on every request, Admin as well as data ops; it is simply unused where no issuer is configured.
 
 For dev, put the build output on your PATH (every `cargo build` refreshes it in place) and export the control address only if it's not the default:
 
@@ -179,8 +207,11 @@ latiq query --pond demo --agent-id alice "CREATE TABLE events(id INTEGER, sev VA
 latiq query --pond demo --agent-id alice "INSERT INTO events VALUES (1,'high'),(2,'critical')"
 latiq query --pond demo "SELECT id, sev FROM events ORDER BY id"
 
-# Native DuckLake — history/attribution (the catalog is named after the pond)
-latiq query --pond demo "SELECT snapshot_id, author, commit_message FROM demo.snapshots()"
+# Native DuckLake — history/attribution (the catalog is named after the pond).
+# `author` is the verified subject where the caller authenticated, the claimed agent
+# id otherwise; `commit_extra_info` carries the evidence (agent_id, issuer, verified).
+# Read both — `author` alone can't tell a verified writer from one claiming the name.
+latiq query --pond demo "SELECT snapshot_id, author, commit_message, commit_extra_info FROM demo.snapshots()"
 
 # Catalog introspection is standard SQL (engine-portable)
 latiq query --pond demo "SHOW TABLES"
@@ -305,7 +336,7 @@ latiq stats -f json      # raw snapshot for scripts
 (Per-node CPU/memory and per-pond query metrics are the next pass — a Prometheus
 `/metrics` endpoint. This snapshot is registry state only.)
 
-(Policy commands were trimmed from the CLI for now — the Admin gRPC still serves them; commands return when needed. Access auditing is not a registry capability — each access is a structured trace on the pond node's `latiq::access` log target; operators grep the node log files.)
+(Policy commands were trimmed from the CLI for now — the Admin gRPC still serves them; commands return when needed. Access auditing is not a registry capability — each access is a structured trace on the `latiq::access` log target (the pond node and the Admin surface both write it, with identical fields); operators grep the log files. Records carry `outcome=ok|error`, so failures and rejected calls show up too.)
 
 ---
 
@@ -357,15 +388,15 @@ Agents (frontier LLMs), not the CLI, point an MCP client at the node's MCP endpo
 http://127.0.0.1:51402/mcp     (Streamable HTTP transport)
 ```
 
-Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`, `write_query`, `explain_query` — plus `latiq://` resources and prompt SOPs for guidance. Results carry both a text block and `structuredContent`; errors set `isError` with the structured envelope. Identity is relaxed (Slice 0+): pass an optional `agent_id` argument; header-based/OIDC identity is a later slice. To exercise this surface programmatically in tests, use `latiq-client` (the agent-sim MCP client) — never from the CLI.
+Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`, `write_query`, `explain_query` — plus `latiq://` resources and prompt SOPs for guidance. Results carry both a text block and `structuredContent`; errors set `isError` with the structured envelope. **Identity arrives in the transport, never in a tool argument** — the claimed leaf is the `latiq-agent-id` HTTP header, and a verified principal is `Authorization: Bearer`. With no issuer configured (the dev default) identity stays claimed, default `anonymous`. To exercise this surface programmatically in tests, use `latiq-client` (the agent-sim MCP client) — never from the CLI.
 
 ---
 
 ## What works now vs. later
 
-**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, structured access traces (`latiq::access` log target), **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), and **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads).
+**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, structured access traces (`latiq::access` log target, with `outcome`), **OAuth 2.1 authentication across all three surfaces** (opt-in via `--auth-issuer`; the caller's token is replayed on the node hop and re-verified by the owner), **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), and **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads).
 
-**Later slices:** external catalogs + credentials + federation, OIDC verification, rate limiting, OpenTelemetry, node-liveness reaping (a crashed node currently stays `active`), disk quotas, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
+**Later slices:** authorization (pond ownership + grants bound to the verified subject), rate limiting, OpenTelemetry, node-liveness reaping (a crashed node currently stays `active`), disk quotas, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
 
 ---
 
