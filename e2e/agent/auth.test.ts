@@ -30,16 +30,25 @@ const provider = () =>
     scope: "openid",
   });
 
-test("auth: an unauthenticated client cannot even initialize", SKIP, async () => {
-  // Every JSON-RPC method needs a verified token now — `initialize` included —
-  // so a transport with no authProvider must fail to connect at all.
-  const client = new Client({ name: "latiq-agent-harness-anon", version: "0.0.0" });
-  await assert.rejects(
-    () => client.connect(new StreamableHTTPClientTransport(new global.URL(URL_))),
-    "an anonymous MCP client must be rejected",
-  );
-  await client.close().catch(() => {});
-});
+// Two negative tests used to live here and no longer do:
+//
+//   - "an unauthenticated client cannot even initialize" — superseded by
+//     `crates/latiq/tests/mcp.rs::auth_mcp_non_tool_methods_require_a_verified_token`,
+//     which probes `initialize`, `tools/list`, `resources/read` AND
+//     `prompts/list`, and pins the positive counterpart so the refusal is about
+//     the credential and not about the method being blocked outright. It was
+//     also WEAK: a bare `assert.rejects` with no error predicate passes when the
+//     gateway is down, `LATIQ_MCP` is wrong, nginx misroutes, or the node
+//     crashed — it could not tell "refused for want of a token" from
+//     "unreachable", which is exactly this tier's failure mode. The no-token
+//     path is still covered below, by a bare POST that asserts a 401 and a
+//     well-formed challenge.
+//
+//   - "a garbage bearer token is rejected" — superseded by
+//     `crates/latiq/tests/mcp.rs::auth_mcp_rejects_an_invalid_token_with_a_401_challenge`,
+//     which runs this exact `alg:none` case plus a foreign signature, an expired
+//     token, a wrong audience and a non-JWT. A forged token never reaches the
+//     IdP, so a real Keycloak proves nothing a fake one does not.
 
 test("auth: the protected-resource metadata is discoverable with no credential", SKIP, async () => {
   const res = await fetch(PRM_URL);
@@ -66,6 +75,16 @@ test("auth: a 401 carries a WWW-Authenticate challenge that leaks nothing", SKIP
   // It must not leak where the IdP's keys actually live.
   assert.ok(!/jwks/i.test(challenge), `challenge must not leak a JWKS URI: ${challenge}`);
 
+  // KEEP. The *code* property — that the node advertises whatever public URL it
+  // was configured with, and that the challenge is built from it — is already
+  // proven in-process by `crates/latiq-mcp/tests/mcp_auth.rs` and
+  // `crates/latiq-pond-node/tests/public_mcp_url.rs`. What is uniquely e2e here
+  // is a CONFIG assertion those cannot make: that the compose file actually sets
+  // `LATIQ_PUBLIC_MCP_URL` on each node, and that nginx does not rewrite or drop
+  // it on the way back out. Either mistake ships a cluster whose challenge points
+  // real clients at an unreachable internal address, with the whole Rust suite
+  // still green.
+  //
   // The metadata URL must sit on the SAME origin the client dialled. That is the
   // property that matters, and it is what a conforming client enforces: publish a
   // node's internal address while the client came in through a gateway and it
@@ -78,37 +97,21 @@ test("auth: a 401 carries a WWW-Authenticate challenge that leaks nothing", SKIP
     `challenge must advertise the origin the client dialled: ${challenge}`);
 });
 
-test("auth: a garbage bearer token is rejected (presence is not enough)", SKIP, async () => {
-  // The middleware VERIFIES the token — a syntactically plausible but unsigned
-  // JWT must be refused exactly like no token at all.
-  const junk = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhdHRhY2tlciIsImF1ZCI6ImxhdGlxIn0.";
-  const res = await fetch(URL_, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-      authorization: `Bearer ${junk}`,
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
-  });
-  assert.equal(res.status, 401, "an unverifiable token is rejected");
-  assert.ok((res.headers.get("www-authenticate") ?? "").includes("resource_metadata="),
-    "the challenge is present on an invalid token too");
-});
-
 test("auth: a client_credentials token gets a working session", SKIP, async () => {
-  // The positive path in one place. (The whole harness suite also runs through
-  // this transport when LATIQ_AUTH_ISSUER is set — this just pins it directly.)
+  // The one thing only this tier can prove: the OFFICIAL MCP SDK's full
+  // client-side OAuth handshake against a real authorization server —
+  // 401 → RFC 9728 protected-resource discovery → AS metadata discovery →
+  // `client_credentials` grant → retry with the bearer token. Nothing in
+  // `cargo test` drives a real client through that sequence.
+  //
+  // Deliberately NOT asserted here: that `agent_id` is absent from the tool
+  // schemas. That is a schema property with no dependency on a real IdP and is
+  // pinned exactly by `crates/latiq/tests/mcp.rs::auth_mcp_tool_schemas_do_not_expose_agent_id`.
   const client = new Client({ name: "latiq-agent-harness-auth", version: "0.0.0" });
   await client.connect(
     new StreamableHTTPClientTransport(new global.URL(URL_), { authProvider: provider() }),
   );
   const tools = await client.listTools();
   assert.ok(tools.tools.length > 0, "an authenticated client sees the tool surface");
-  // Identity is no longer a tool argument — it rides the latiq-agent-id header.
-  for (const t of tools.tools) {
-    assert.ok(!("agent_id" in ((t.inputSchema as any)?.properties ?? {})),
-      `agent_id must not appear in the ${t.name} schema`);
-  }
   await client.close();
 });
