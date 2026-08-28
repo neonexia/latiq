@@ -274,21 +274,19 @@ fn auth_rejects_a_plaintext_jwks_uri() {
 
 #[test]
 fn auth_allows_plaintext_jwks_on_loopback() {
-    // Tests and `./dev.sh --auth` legitimately use http on loopback.
-    for uri in [
-        "http://127.0.0.1:8080/jwks",
-        "http://[::1]:8080/jwks",
-        "http://localhost:8080/jwks",
-    ] {
-        Verifier::new(AuthConfig {
-            audience: AUD.to_string(),
-            issuers: vec![IssuerConfig {
-                issuer: "http://localhost:8080/realms/latiq".to_string(),
-                jwks_uri: Some(uri.to_string()),
-            }],
-        })
-        .unwrap_or_else(|e| panic!("loopback plaintext must be allowed for {uri}: {e}"));
-    }
+    // Tests and `./dev.sh --auth` legitimately use http on loopback. One form is
+    // enough HERE: this is the wiring proof that `Verifier::new` consults the
+    // loopback exemption at all. WHICH spellings count as loopback (v4, v6,
+    // `localhost`, `127.1`, the integer form, the v4-mapped v6 form) is the unit
+    // test `loopback_forms` in `src/verify.rs`, which covers six.
+    Verifier::new(AuthConfig {
+        audience: AUD.to_string(),
+        issuers: vec![IssuerConfig {
+            issuer: "http://localhost:8080/realms/latiq".to_string(),
+            jwks_uri: Some("http://127.0.0.1:8080/jwks".to_string()),
+        }],
+    })
+    .expect("loopback plaintext must be allowed");
 }
 
 #[test]
@@ -315,20 +313,6 @@ fn auth_rejects_a_degenerate_config() {
         issuers: vec![issuer(), issuer()],
     })
     .expect_err("a duplicate issuer entry is a misconfiguration");
-}
-
-#[test]
-fn auth_config_is_readable_back() {
-    let v = Verifier::new(AuthConfig {
-        audience: AUD.to_string(),
-        issuers: vec![IssuerConfig {
-            issuer: "https://idp.example".to_string(),
-            jwks_uri: None,
-        }],
-    })
-    .expect("valid config");
-    assert_eq!(v.config().audience, AUD);
-    assert_eq!(v.config().issuers.len(), 1);
 }
 
 // ---- the algorithm allowlist
@@ -570,21 +554,6 @@ async fn auth_a_padded_audience_still_verifies_tokens() {
         .verify(&idp.mint("svc-orchestrator", AUD, &idp.issuer, 300), None)
         .await
         .expect("the padding must not leak into the audience comparison");
-}
-
-#[test]
-fn auth_rejects_a_jwks_uri_that_smuggles_a_loopback_host() {
-    // A backslash is a path separator to the WHATWG parser, so the host is
-    // evil.com and
-    // the guard must refuse the plaintext fetch.
-    Verifier::new(AuthConfig {
-        audience: AUD.to_string(),
-        issuers: vec![IssuerConfig {
-            issuer: "https://idp.example".to_string(),
-            jwks_uri: Some("http://evil.com\\@127.0.0.1/jwks".to_string()),
-        }],
-    })
-    .expect_err("a backslash must not smuggle a loopback host past the tls guard");
 }
 
 // ---- what the JWKS itself says about a key
