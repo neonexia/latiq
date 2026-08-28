@@ -1,6 +1,10 @@
-//! Agent/client actions on the Data + Stream gRPC must land in the SAME
-//! `latiq::access` stream operator actions do, with the SAME `outcome` field —
-//! including the ones that FAIL and the ones that are turned away at the door.
+//! The `latiq::access` trail, captured.
+//!
+//! Every action -- operator (Admin gRPC) and agent/client (Data + Stream gRPC)
+//! alike -- must land in the SAME searchable stream with the SAME field set and
+//! the SAME `outcome`, including the ones that FAIL and the ones that are turned
+//! away at the door. Succeeding is not enough: an unattributed `policy_set` is a
+//! gap, and so is a `read_query` that recorded nothing because it was rejected.
 //!
 //! Before this, `AgentOps::audit` fired only after a success and the Data
 //! surface's auth rejections recorded nothing, while the Admin surface recorded
@@ -8,16 +12,26 @@
 //! operator filtering it saw a complete picture of operator activity and a
 //! systematically incomplete one of everything else.
 //!
-//! Its own test binary on purpose: capturing `tracing` output needs a subscriber
-//! installed as the *process* default, because callsite interest is cached
-//! process-wide the first time a callsite is hit. Same shape as
-//! `admin_access_trail.rs` and `latiq-agent-core/tests/access_trail.rs`.
+//! ## Why this is its own binary (and why the two tests share it)
+//!
+//! Capturing `tracing` output needs a subscriber installed as the *process*
+//! default, because callsite interest is cached process-wide the first time a
+//! callsite is hit: a sibling test that touches `latiq::access` before any
+//! subscriber exists caches "never", and the capture then sees an empty buffer.
+//!
+//! That argument buys ONE SUBSCRIBER PER BINARY, not one test per binary. Both
+//! tests below install the identical subscriber, so it is installed once behind
+//! a `OnceLock` (`set_global_default` panics on a second call) and they share
+//! the buffer, each searching for its own distinct needles. Every lookup is
+//! narrowed by the RPC it is about, so neither test can match the other's
+//! records -- see `rejected: invalid token`, which both surfaces emit.
 mod common;
 
+use latiq_proto::v1::admin_client::AdminClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::stream_client::StreamClient;
 use latiq_proto::v1::*;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tonic::Request;
 
 /// A `tracing` writer that collects everything into a shared buffer.
@@ -41,6 +55,27 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
     }
 }
 
+/// Install the capture subscriber exactly once, and hand back the shared buffer.
+/// Called as the FIRST statement of every test in this binary, so it is always
+/// in place before any `latiq::access` callsite is reached.
+fn captured() -> CapturedLog {
+    static CAPTURED: OnceLock<CapturedLog> = OnceLock::new();
+    CAPTURED
+        .get_or_init(|| {
+            let captured = CapturedLog::default();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(captured.clone())
+                    .with_max_level(tracing::Level::INFO)
+                    .with_ansi(false)
+                    .finish(),
+            )
+            .expect("nothing else in this binary installs a subscriber");
+            captured
+        })
+        .clone()
+}
+
 fn bearer_req<T>(msg: T, agent: &str, token: &str) -> Request<T> {
     let mut r = Request::new(msg);
     r.metadata_mut()
@@ -51,16 +86,158 @@ fn bearer_req<T>(msg: T, agent: &str, token: &str) -> Request<T> {
 }
 
 #[tokio::test]
+async fn auth_admin_actions_are_attributed_in_the_access_trail() {
+    let captured = captured();
+
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let (_control, admin_endpoint) =
+        common::start_control_plane_with_auth(Some(idp.auth_config())).await;
+    let mut admin = AdminClient::connect(admin_endpoint.clone()).await.unwrap();
+    let token = idp.mint("svc-ops", "latiq", &idp.issuer, 300);
+
+    admin
+        .policy_set(bearer_req(
+            PolicySetRequest {
+                key: "query_timeout_seconds".into(),
+                value: "45".into(),
+            },
+            "opsbot",
+            &token,
+        ))
+        .await
+        .unwrap();
+    admin
+        .catalog_add(bearer_req(
+            CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "audited".into(),
+                    r#type: "iceberg".into(),
+                    params: Default::default(),
+                    description: String::new(),
+                    tags: vec![],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            },
+            "opsbot",
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    // A FAILING action, to prove the trail distinguishes it from a real one.
+    admin
+        .dataset_remove(bearer_req(
+            DatasetRemoveRequest {
+                name: "never-existed".into(),
+            },
+            "opsbot",
+            &token,
+        ))
+        .await
+        .unwrap_err();
+
+    // ...and two rejected callers, who leave a record precisely BECAUSE they
+    // were rejected: a surface whose job is "record who tried" must not go
+    // silent on the attempts worth reading.
+    let mut anon = AdminClient::connect(admin_endpoint.clone()).await.unwrap();
+    anon.policy_get(PolicyGetRequest {}).await.unwrap_err();
+    anon.policy_get(bearer_req(PolicyGetRequest {}, "intruder", "not-a-jwt"))
+        .await
+        .unwrap_err();
+
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let access = |needle: &str| -> String {
+        log.lines()
+            .filter(|l| l.contains("latiq::access"))
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no access record matching {needle}: {log}"))
+            .to_string()
+    };
+    let access_rpc = |rpc: &str, needle: &str| -> String {
+        let op = format!("op={rpc:?}");
+        log.lines()
+            .filter(|l| l.contains("latiq::access"))
+            .find(|l| l.contains(&op) && l.contains(needle))
+            .unwrap_or_else(|| panic!("no {op} access record matching {needle}: {log}"))
+            .to_string()
+    };
+
+    for op in ["policy_set", "catalog_add"] {
+        let line = log
+            .lines()
+            .filter(|l| l.contains("latiq::access"))
+            // Quoted because `op` is a string field -- exactly how `ops.rs`
+            // renders it for agent actions.
+            .find(|l| l.contains(&format!("op={op:?}")))
+            .unwrap_or_else(|| panic!("operator action {op} must be on the access trail: {log}"));
+        assert!(
+            line.contains("outcome=\"ok\""),
+            "a successful action must be marked as such: {line}"
+        );
+        assert!(
+            line.contains("agent=opsbot"),
+            "the claimed leaf must still be recorded: {line}"
+        );
+        assert!(
+            line.contains("subject=svc-ops"),
+            "the access trail must carry the verified subject: {line}"
+        );
+        assert!(
+            line.contains(&format!("issuer={}", idp.issuer)),
+            "the access trail must carry the issuer: {line}"
+        );
+        assert!(
+            line.contains("verified=true"),
+            "the access trail must mark the pair as verified: {line}"
+        );
+        // Same field set as `AgentOps::audit`, so one grep finds operator and
+        // agent actions alike.
+        assert!(
+            line.contains("pond=\"-\"")
+                && line.contains("duration_ms=")
+                && line.contains("summary="),
+            "operator records must carry the same fields as agent records: {line}"
+        );
+    }
+
+    // A failed removal must NOT read like a successful one. Without `outcome`
+    // the two records are byte-identical and the trail is confidently wrong.
+    let failed = access("op=\"dataset_remove\"");
+    assert!(
+        failed.contains("outcome=\"error\""),
+        "a failed action must be marked failed: {failed}"
+    );
+    assert!(
+        failed.contains("dataset=never-existed"),
+        "the attempted target is still recorded: {failed}"
+    );
+
+    let no_token = access("rejected: no token");
+    assert!(
+        no_token.contains("op=\"policy_get\"") && no_token.contains("outcome=\"error\""),
+        "a tokenless attempt must name the RPC it targeted: {no_token}"
+    );
+    assert!(
+        no_token.contains("verified=false") && no_token.contains("subject= "),
+        "a rejected caller has no verified identity: {no_token}"
+    );
+    // Narrowed by RPC: the Data surface in this same binary also emits
+    // "rejected: invalid token", and an unnarrowed `find` could return its line.
+    let bad_token = access_rpc("policy_get", "rejected: invalid token");
+    assert!(
+        bad_token.contains("op=\"policy_get\"") && bad_token.contains("outcome=\"error\""),
+        "a forged-token attempt must be recorded: {bad_token}"
+    );
+    assert!(
+        bad_token.contains("agent=intruder") && bad_token.contains("verified=false"),
+        "the claim is all a rejected caller has, and it is not authority: {bad_token}"
+    );
+}
+
+#[tokio::test]
 async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
-    let captured = CapturedLog::default();
-    tracing::subscriber::set_global_default(
-        tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish(),
-    )
-    .expect("this binary runs one test, so nothing else installs a subscriber");
+    let captured = captured();
 
     let idp = latiq_auth::test_support::TestIdp::start().await;
     let stack = common::start_stack_with_auth(idp.auth_config()).await;
@@ -219,6 +396,14 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
             .unwrap_or_else(|| panic!("no access record matching {needle}: {log}"))
             .to_string()
     };
+    let access_rpc = |rpc: &str, needle: &str| -> String {
+        let op = format!("op={rpc:?}");
+        log.lines()
+            .filter(|l| l.contains("latiq::access"))
+            .find(|l| l.contains(&op) && l.contains(needle))
+            .unwrap_or_else(|| panic!("no {op} access record matching {needle}: {log}"))
+            .to_string()
+    };
 
     let allocated = access("op=\"allocate_pond\"");
     assert!(
@@ -320,7 +505,9 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         no_token.contains("verified=false") && no_token.contains("subject= "),
         "a rejected caller has no verified identity: {no_token}"
     );
-    let bad_token = access("rejected: invalid token");
+    // Narrowed by RPC: the Admin surface in this same binary also emits
+    // "rejected: invalid token", and an unnarrowed `find` could return its line.
+    let bad_token = access_rpc("read_query", "rejected: invalid token");
     assert!(
         bad_token.contains("op=\"read_query\"") && bad_token.contains("outcome=\"error\""),
         "a forged-token attempt must be recorded: {bad_token}"

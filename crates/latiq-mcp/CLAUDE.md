@@ -20,4 +20,4 @@ This surface must make a frontier agent immediately effective:
 - Errors are next-action-oriented; `see` links must resolve to a real resource.
 
 ## Tests
-`tests/mcp_e2e.rs` (server+client over real MCP). Surface-level e2e: `crates/latiq/tests/mcp.rs`. Exercise tools, annotations, resources, prompts, and the structured-error path.
+`tests/mcp_auth.rs` — the crate's ONE integration binary (server+client over real MCP, plus the RFC 9728 metadata/challenge tests). Every integration binary statically links a bundled DuckDB, so add tests here rather than adding a binary. Surface-level e2e: `crates/latiq/tests/mcp.rs`. Exercise tools, annotations, resources, prompts, and the structured-error path.
