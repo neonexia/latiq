@@ -142,9 +142,31 @@ test("dataset catalog surface: list + load + query a curated dataset", async () 
 
 test("catalog surface is reachable (list_catalogs)", async () => {
   // describe/pull_catalog need a registered external catalog (the dedicated
-  // iceberg e2e covers that); here we just prove the agent can enumerate them.
-  const r = await tools.list_catalogs.execute({}, opts());
-  ok(r);
+  // iceberg e2e covers that); here we prove the agent can ENUMERATE them — and
+  // asserting only `isError === false` could not fail on any regression in what
+  // enumeration returns, so assert the payload the model actually reads.
+  const r: any = ok(await tools.list_catalogs.execute({}, opts()));
+  assert.ok(Array.isArray(r?.catalogs),
+    `list_catalogs returns {catalogs: [...]}: ${JSON.stringify(r)}`);
+  // A fresh cluster registers none (that is an operator action via the CLI). If
+  // this cluster is meant to have some, update this test rather than loosening it.
+  assert.deepEqual(r.catalogs, [],
+    `no external catalogs are registered on a fresh cluster: ${JSON.stringify(r.catalogs)}`);
+  // Whatever IS listed must be usable by a model: named and typed.
+  for (const c of r.catalogs as any[]) {
+    assert.ok(c?.name, `a catalog entry is named: ${JSON.stringify(c)}`);
+    assert.ok(c?.type, `catalog ${c?.name} must advertise its type: ${JSON.stringify(c)}`);
+  }
+
+  // The negative half: an unknown catalog is a structured tool error, not a
+  // silent empty success the model would read as "nothing there".
+  const pond = name("cat");
+  ok(await tools.allocate_pond.execute({ name: pond }, opts()));
+  const err = failed(await tools.describe_catalog.execute(
+    { pond, catalog: "does-not-exist" }, opts()));
+  assert.match(JSON.stringify(err ?? ""), /does-not-exist/,
+    `the error names the unknown catalog: ${JSON.stringify(err)}`);
+  ok(await tools.drop_pond.execute({ pond, confirm: true }, opts()));
 });
 
 test("resources: guidance + dialect are readable", async () => {
