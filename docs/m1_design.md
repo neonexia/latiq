@@ -43,9 +43,14 @@ reads**; **per-pond resource tiers**; cancellation + prompt-resource release.
 - **Subcommands:** `latiq serve` (control plane), `latiq node add` (pond node),
   plus `pond` / `query` / `dataset` / `node` CLI verbs — not `control-plane` /
   `pond-node` / `dev` as written in §2/§12.
-- **Identity is relaxed:** a claimed `agent_id` (MCP arg / `latiq-agent-id` gRPC
-  metadata), default `anonymous`, `verified:false`. OIDC verification (§7) is
-  deferred. Cross-hop identity propagation carries the claim; no signing yet.
+- **Identity always rides the transport**, never a tool/RPC argument: the claimed
+  leaf is the `latiq-agent-id` header / gRPC metadata key, a verified principal is
+  `Authorization: Bearer`. Configure `--auth-issuer` and every surface verifies
+  tokens (OAuth 2.1 resource server, §7); configure none — the default — and
+  identity stays relaxed (claimed, default `anonymous`, `verified:false`). On the
+  node hop the caller's own token is replayed and re-verified by the owner; there
+  is no trusted internal "already verified" header. **Authorization** (who may
+  reach which pond) is deliberately a separate slice — see `docs/identity.md`.
 - **Result handling:** the unary JSON path (MCP/CLI) is bounded by the inline cap
   (default 10k rows); the **Arrow stream path is uncapped** (the streaming answer to
   large results, ahead of a packaged SDK).
@@ -57,7 +62,7 @@ reads**; **per-pond resource tiers**; cancellation + prompt-resource release.
   story landing as compute caps; disk quotas themselves remain deferred.)
 
 **Designed here but not yet built:** admin-curated catalogs + credentials/Vault
-(§5, §11), OIDC (§7), per-identity rate limiting (§13a), OpenTelemetry (§13), the
+(§5, §11), authorization/ACLs on top of the verified subject, per-identity rate limiting (§13a), OpenTelemetry (§13), the
 Docker Compose harness (§12), node-liveness reaping (a crashed node stays
 `active`), and disk quotas. These remain the roadmap, not the current surface.
 

@@ -36,10 +36,21 @@ Loki/ELK). Nothing Latiq-specific to configure.
 
 There is **no audit table** — every access is a structured `tracing` event on the
 **`latiq::access`** target (one per operation: allocate/describe/list/drop pond,
-read/write/explain, dataset load, catalog pull/describe). Each carries
-`agent`, `verified`, `op`, `pond`, `duration_ms`, and a redacted `summary` (SQL
-shape with literals replaced by `?`). Operators grep the node log files (or query
-them in their log stack); with `LATIQ_LOG_FORMAT=json` the fields are structured.
+read/write/explain, dataset load, catalog pull/describe, and the Admin surface's
+operator actions — pure registry browsing, `list_datasets`/`list_catalogs` and
+their `get_*`, is deliberately not audited: no pond, no identity). Each carries
+`agent` (the caller's **claim**), `subject`/`issuer` (verified, empty when not),
+`verified`, `op`, `pond`, `duration_ms`, a redacted `summary` (SQL shape with
+literals replaced by `?`), and `outcome` (`ok`/`error` — failures and rejected
+calls are recorded too, not only successes). Operators grep the log files (or
+query them in their log stack); with `LATIQ_LOG_FORMAT=json` the fields are
+structured.
+
+To ask *who* did something, filter on `subject=` **together with**
+`verified=true`: `agent=` is the caller's own claim and carries no authority.
+A streaming read (`read_arrow`) is recorded when the stream is **established**,
+not when it finishes — so `duration_ms` there measures establishment and
+`outcome` says whether the read started.
 
 ```bash
 # tail just the access trail
