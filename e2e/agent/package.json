@@ -5,11 +5,11 @@
   "type": "module",
   "description": "Deterministic MCP agent harness for Latiq, driven via the Vercel AI SDK MCP client.",
   "scripts": {
-    "test": "node --import tsx --test harness.test.ts"
+    "test": "node --import tsx --test harness.test.ts auth.test.ts"
   },
   "dependencies": {
     "ai": "^4.3.16",
-    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@modelcontextprotocol/sdk": "^1.24.0",
     "tsx": "^4.19.0"
   }
 }
