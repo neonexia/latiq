@@ -63,10 +63,19 @@ test("auth: a 401 carries a WWW-Authenticate challenge that leaks nothing", SKIP
   const challenge = res.headers.get("www-authenticate") ?? "";
   assert.ok(challenge.toLowerCase().startsWith("bearer"), `Bearer challenge expected, got: ${challenge}`);
   assert.ok(challenge.includes("resource_metadata="), `challenge points at the metadata doc: ${challenge}`);
-  // It must not leak where the node or the IdP's keys actually live.
+  // It must not leak where the IdP's keys actually live.
   assert.ok(!/jwks/i.test(challenge), `challenge must not leak a JWKS URI: ${challenge}`);
-  assert.ok(!/pond-node|127\.0\.0\.1|localhost|keycloak/i.test(challenge),
-    `challenge must not leak an internal hostname: ${challenge}`);
+
+  // The metadata URL must sit on the SAME origin the client dialled. That is the
+  // property that matters, and it is what a conforming client enforces: publish a
+  // node's internal address while the client came in through a gateway and it
+  // refuses the document outright. Asserting the origin rather than blocklisting
+  // hostnames keeps this honest wherever it runs -- `gateway:51510` under compose,
+  // `127.0.0.1:51406` under ./dev.sh, both legitimately public.
+  const dialled = new global.URL(URL_).origin;
+  const advertised = challenge.match(/resource_metadata="([^"]+)"/)?.[1] ?? "";
+  assert.equal(new global.URL(advertised).origin, dialled,
+    `challenge must advertise the origin the client dialled: ${challenge}`);
 });
 
 test("auth: a garbage bearer token is rejected (presence is not enough)", SKIP, async () => {

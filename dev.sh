@@ -242,6 +242,17 @@ if [[ $AUTH -eq 1 ]]; then
   # `serve` / `node add` invocations need no extra flags.
   export LATIQ_AUTH_ISSUER="$KC_REALM_URL"
   export LATIQ_AUTH_AUDIENCE=latiq
+  # The RFC 9728 `resource` and the 401 challenge must name the address clients
+  # actually dial. With >1 node that is the gateway, not a node — publishing a
+  # node address makes a conforming MCP client refuse the document outright.
+  # Respect an operator-supplied value; otherwise derive it.
+  if [[ -z "${LATIQ_PUBLIC_MCP_URL:-}" ]]; then
+    if [[ "$MULTI" == "1" ]]; then
+      export LATIQ_PUBLIC_MCP_URL="http://${HOST}:${GW_MCP}/mcp"
+    else
+      export LATIQ_PUBLIC_MCP_URL="http://${HOST}:${NODE_MCP[0]}/mcp"
+    fi
+  fi
 fi
 
 # --- control plane ------------------------------------------------------
@@ -297,6 +308,16 @@ $data_servers    }
             proxy_set_header Connection "";
             proxy_set_header Host \$host;
             proxy_buffering off;
+        }
+        # OAuth discovery. The 401 challenge points clients at this path on the
+        # PUBLIC url (the gateway), so the gateway has to route it — otherwise a
+        # client is told to fetch a document that 404s and discovery dead-ends.
+        # deploy/cluster/nginx.conf gets this for free via \`location /\`.
+        location /.well-known/ {
+            proxy_pass http://latiq_mcp;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_set_header Host \$host;
         }
     }
     server {
