@@ -4,6 +4,8 @@ The **nightly end-to-end suite**: it exercises a real, multi-node, dockerized
 deployment over **every external surface, the way a user or an agent would** — not
 unit tests of our code. Lives in `.github/workflows/nightly.yml`'s `e2e-suite` job.
 
+The shared rules for writing any test (which layer earns it, assert *why*, no vacuous guards, what belongs up here vs. in Rust) live in **`crates/latiq/tests/CLAUDE.md`** — read it first; the guidance below is the e2e-specific half.
+
 ## Three drivers (one per audience)
 - **`sdk/`** — Python (`latiq` wheel + `pyarrow`/`pandas`). All SDK surfaces, **Arrow→pandas analysis asserted == SQL**, uncapped Arrow streaming past the 10k cap, multi-node placement + greeter forwarding.
 - **`agent/`** — TypeScript, **Vercel AI SDK MCP client** (the same client an `ai` agent uses), driven by a *scripted* sequence (no live LLM → deterministic, no API key). Every MCP tool + read-only guard + structured-error contract; resources + prompt SOPs via the raw MCP SDK client (the AI SDK client doesn't surface those).

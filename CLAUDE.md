@@ -56,6 +56,8 @@ Plus one internal surface: **Control gRPC** (pond-node → control-plane; routin
 
 Tests are categorized by **layer** and **surface/feature** so a given change runs a known subset.
 
+**Before adding or deleting a test, read [`crates/latiq/tests/CLAUDE.md`](crates/latiq/tests/CLAUDE.md)** — the conventions for *what a test must assert* (assert why not that, no vacuous guards, don't add test binaries, label regression pins). This section says where a test goes; that file says whether it should exist.
+
 **Layers:**
 - **Unit** (`#[test]` in `src/`) — pure logic, per crate. Run: `cargo test -p <crate> --lib`.
 - **Crate integration** (`crates/<crate>/tests/*.rs`) — that crate's public API over real deps (e.g. engine lifecycle, gRPC round-trip). Run: `cargo test -p <crate> --test '*'`.
