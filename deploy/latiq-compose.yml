@@ -38,6 +38,12 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial. MCP is reachable only through the gateway
+      # here, so the node publishes that as its RFC 9728 `resource` and in its
+      # 401 challenge -- a client that discovers this node's own address would
+      # refuse it as a different origin. Override when you expose the gateway
+      # under a public name (e.g. https://latiq.example.com/mcp).
+      LATIQ_PUBLIC_MCP_URL: ${LATIQ_PUBLIC_MCP_URL:-http://localhost:51510/mcp}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:
@@ -54,6 +60,12 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial. MCP is reachable only through the gateway
+      # here, so the node publishes that as its RFC 9728 `resource` and in its
+      # 401 challenge -- a client that discovers this node's own address would
+      # refuse it as a different origin. Override when you expose the gateway
+      # under a public name (e.g. https://latiq.example.com/mcp).
+      LATIQ_PUBLIC_MCP_URL: ${LATIQ_PUBLIC_MCP_URL:-http://localhost:51510/mcp}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:

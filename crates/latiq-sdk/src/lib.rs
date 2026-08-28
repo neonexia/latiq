@@ -671,6 +671,7 @@ impl LocalCluster {
             internal_endpoint: format!("http://127.0.0.1:{data_port}"),
             // Embedded: the client dials this very process on loopback, so the
             // derived URL is already the one it reaches.
+            public_mcp_url: None,
             control_endpoint: control_endpoint.clone(),
             data_dir: root.join("ponds"),
             metrics_addr: None,
