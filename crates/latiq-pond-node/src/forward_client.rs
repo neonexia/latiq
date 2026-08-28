@@ -12,7 +12,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
 use latiq_agent_core::{AgentError, ArrowReadStream, DescribeResult, Forwarder, PullResult};
-use latiq_common::{ErrorEnvelope, Identity};
+use latiq_common::{ErrorEnvelope, ErrorKind, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::stream_client::StreamClient;
@@ -104,6 +104,14 @@ fn status_to_error(s: Status) -> AgentError {
     match s.code() {
         Code::NotFound => AgentError::pond_not_found(s.message()),
         Code::AlreadyExists => AgentError::name_conflict(s.message()),
+        // The owner re-verifies the replayed token on its own authority and can
+        // legitimately refuse a token the greeter accepted (asymmetric issuer
+        // trust). The catch-all would report that as `Internal` — a crash, from
+        // the client's point of view — and hide the one failure the client can
+        // actually act on by re-minting its token and retrying.
+        Code::Unauthenticated => {
+            AgentError::of_kind(ErrorKind::Unauthenticated, s.message().to_string())
+        }
         _ => AgentError::internal(s.message().to_string()),
     }
 }
