@@ -272,6 +272,26 @@ pub async fn start_stack_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
     }
 }
 
+/// The whole stack authenticated the way a deployment really is: Control +
+/// Admin on ONE port behind one verifier, plus a pond node behind the same one.
+/// `control_endpoint == admin_endpoint` here, which is what an SDK or CLI client
+/// sees — it has a single server address and cannot aim Admin somewhere else.
+/// The two-port `start_stack_with_auth` leaves the control plane relaxed, so an
+/// Admin call from a client would land on the Control port and fail as
+/// `Unimplemented` rather than `Unauthenticated`: it cannot see a client that
+/// forgets its token on the Admin channel.
+pub async fn start_stack_one_port_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
+    let endpoint = start_control_plane_one_port(Some(auth.clone())).await;
+    let node = start_node_with_auth("node-test", &endpoint, Some(auth)).await;
+    TestStack {
+        data_endpoint: node.data_endpoint.clone(),
+        admin_endpoint: endpoint.clone(),
+        control_endpoint: endpoint,
+        mcp_endpoint: node.mcp_endpoint.clone(),
+        _tmp: node._tmp,
+    }
+}
+
 /// `n` pond nodes, all requiring the same verified bearer token — the shape a
 /// real cluster has, and what makes the forward hop's own auth testable.
 pub async fn start_stack_n_with_auth(n: usize, auth: latiq_auth::AuthConfig) -> MultiStack {

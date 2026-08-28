@@ -8,7 +8,7 @@
 mod common;
 
 use arrow::array::Array;
-use common::start_stack_with_auth;
+use common::{start_stack_one_port_with_auth, start_stack_with_auth};
 use latiq_sdk::Latiq;
 
 /// The SDK is blocking (it owns its own runtime), so every call runs on a
@@ -94,5 +94,42 @@ async fn auth_sdk_token_is_required_and_sufficient() {
     assert!(
         authors.iter().any(|a| a == "svc-sdk"),
         "the DuckLake author must be the token's subject, got {authors:?}"
+    );
+}
+
+/// `list_ponds` is the SDK's ONE Admin call, and Admin is the surface a client
+/// is most likely to leave un-tokened: everything else it does rides Data or
+/// Control. Against a fully authenticated stack a tokened client must be able to
+/// read pond metadata, and an un-tokened one must be refused — the second half
+/// is what proves the first is not passing because nothing is enforced.
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_sdk_admin_metadata_read_carries_the_token() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = start_stack_one_port_with_auth(idp.auth_config()).await;
+    let token = idp.mint("svc-sdk", "latiq", &idp.issuer, 300);
+    let (server, gateway) = (s.control_endpoint.clone(), s.data_endpoint.clone());
+
+    let (c, g, t) = (server.clone(), gateway.clone(), token);
+    let listed = blocking(move || {
+        let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
+        db.create_pond(Some("sdkadmin"), "medium", "").unwrap();
+        db.list_ponds().unwrap()
+    })
+    .await;
+    assert!(
+        listed.contains_key("sdkadmin"),
+        "a tokened operator read must see the pond, got {:?}",
+        listed.keys().collect::<Vec<_>>()
+    );
+
+    let (c, g) = (server, gateway);
+    let err = blocking(move || {
+        let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
+        db.list_ponds().unwrap_err().to_string()
+    })
+    .await;
+    assert!(
+        err.to_lowercase().contains("token"),
+        "an un-tokened Admin read must be refused: {err}"
     );
 }
