@@ -120,23 +120,41 @@ async fn auth_cli_every_server_command_sends_the_token() {
 }
 
 /// A structural guard the table above cannot give: the gRPC client constructors
-/// appear exactly once each, inside the three helpers that attach the token. A
-/// command that dialed its own `AdminClient` would send no credential no matter
-/// what the table says, and would trip this.
+/// appear exactly once each, inside the helpers that attach the token. A command
+/// that dialed its own `AdminClient` would send no credential no matter what the
+/// table says, and would trip this.
+///
+/// Pinned to EXACTLY one, not "at most one": `<= 1` is satisfied by zero, so the
+/// guard passed vacuously the moment a helper was renamed or a client stopped
+/// being built — silently guarding nothing. Same counter-assertion the SDK's
+/// `client_construction.rs` uses.
 #[test]
 fn auth_cli_clients_are_only_built_in_the_shared_helpers() {
     let src = include_str!("../src/main.rs");
-    for ctor in [
-        "AdminClient::",
-        "ControlClient::",
-        "DataClient::",
-        "StreamClient::",
-    ] {
+
+    // The three clients the CLI actually dials, each from exactly one helper.
+    for ctor in ["AdminClient::", "ControlClient::", "DataClient::"] {
         let uses = src.matches(ctor).count();
-        assert!(
-            uses <= 1,
-            "{ctor} is constructed {uses} times; every gRPC client must come from \
-             the shared builder that attaches the bearer token"
+        assert_eq!(
+            uses, 1,
+            "{ctor} is constructed {uses} times; it must be built exactly once, in \
+             the shared helper that attaches the bearer token"
+        );
+        let authed = src.matches(&format!("{ctor}with_interceptor")).count();
+        assert_eq!(
+            authed, 1,
+            "the one {ctor} construction is not `with_interceptor`, so it would send \
+             neither `latiq-agent-id` nor the bearer token"
         );
     }
+
+    // `StreamClient` has no CLI command today (the SDK owns the streaming path),
+    // so it is asserted differently: not "exactly one", which would fire on an
+    // honest new command, but "every construction, if any, is authenticated".
+    assert_eq!(
+        src.matches("StreamClient::").count(),
+        src.matches("StreamClient::with_interceptor").count(),
+        "a StreamClient is being built outside the shared builder, so it would \
+         carry no bearer token"
+    );
 }

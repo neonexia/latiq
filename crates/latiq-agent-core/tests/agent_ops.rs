@@ -108,11 +108,17 @@ async fn read_arrow_streams_rows_locally() {
     }
     assert_eq!(rows, 3000, "all rows streamed across batches");
 
-    // read_arrow rejects writes too (the error surfaces before the schema).
-    assert!(ops
-        .read_arrow(&id, "ar", "INSERT INTO t VALUES (1)")
-        .await
-        .is_err());
+    // read_arrow rejects writes too (the error surfaces before the schema), and
+    // for the read-only reason — a bare `is_err()` would also be satisfied by a
+    // vanished pond or a SQL parse failure, i.e. by the guard being gone.
+    // (`ArrowReadStream` is not `Debug`, so `expect_err` is not available.)
+    let Err(err) = ops.read_arrow(&id, "ar", "INSERT INTO t VALUES (1)").await else {
+        panic!("the streaming read path must refuse a write");
+    };
+    assert_eq!(
+        err.envelope().kind,
+        latiq_common::ErrorKind::ReadOnlyViolation
+    );
 }
 
 #[tokio::test]
@@ -224,11 +230,24 @@ async fn pond_lifecycle_allocate_rejects_the_uncapped_tier() {
         "the error should point at the operator path: {msg}"
     );
 
-    // The alias is refused too, so it can't be smuggled in under another name.
-    assert!(ops
+    // The alias is refused too, so it can't be smuggled in under another name --
+    // and refused for the SAME reason. A bare `is_err()` here would be satisfied
+    // by `uncapped` being rejected as an UNKNOWN tier, which is exactly the
+    // confusion this case exists to rule out: the alias must resolve to the
+    // uncapped tier and then be refused as an operator grant.
+    let err = ops
         .allocate_pond(&id, Some("grabby2".into()), "{}", "uncapped", &[])
         .await
-        .is_err());
+        .expect_err("the `uncapped` alias must be refused too");
+    let msg = err.envelope().message.to_lowercase();
+    assert!(
+        msg.contains("none"),
+        "the alias must be refused as the uncapped tier, not as an unknown one: {msg}"
+    );
+    assert!(
+        msg.contains("set-tier") || msg.contains("operator"),
+        "the error should point at the operator path: {msg}"
+    );
 
     // A normal tier still allocates.
     ops.allocate_pond(&id, Some("fine".into()), "{}", "large", &[])

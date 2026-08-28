@@ -194,7 +194,10 @@ async fn catalog_pull_from_local_ducklake_lands_in_pond() {
     assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2, "pulled rows: {r}");
 
     // After detach, the external catalog is no longer queryable from the pond.
-    let after = data
+    // After detach, the external catalog is no longer queryable from the pond.
+    // Asserted on the REASON: `is_err()` alone is satisfied by a dropped pond, a
+    // dead node, or a syntax error -- i.e. by everything except the detach.
+    let err = data
         .read_query(req(
             QueryRequest {
                 pond: "shop".into(),
@@ -202,11 +205,24 @@ async fn catalog_pull_from_local_ducklake_lands_in_pond() {
             },
             "agent-x",
         ))
-        .await;
+        .await
+        .expect_err("external catalog must be detached after pull");
+    let msg = err.message().to_lowercase();
     assert!(
-        after.is_err(),
-        "external catalog must be detached after pull"
+        msg.contains("ext") && msg.contains("does not exist"),
+        "the failure must be `ext` being gone, not some other error: {msg}"
     );
+    // ...and the pond itself is fine, which is what rules out "the whole pond
+    // went away" as the reason above.
+    data.read_query(req(
+        QueryRequest {
+            pond: "shop".into(),
+            sql: "SELECT count(*) FROM cheap".into(),
+        },
+        "agent-x",
+    ))
+    .await
+    .expect("detaching the catalog must not disturb the pond");
 }
 
 #[tokio::test]
@@ -237,7 +253,9 @@ async fn catalog_add_drops_credentials_and_rejects_unknown_type() {
         .into_inner();
     assert!(added.dropped_params.contains(&"token".to_string()));
 
-    // Unknown type is rejected at add.
+    // Unknown type is rejected at add -- and rejected FOR THAT REASON. A bare
+    // `is_err()` is equally satisfied by a complaint about the empty `params`
+    // (no `endpoint`), which would leave the type allowlist untested.
     let err = admin
         .catalog_add(CatalogAddRequest {
             catalog: Some(CatalogMsg {
@@ -250,6 +268,11 @@ async fn catalog_add_drops_credentials_and_rejects_unknown_type() {
                 created_at: String::new(),
             }),
         })
-        .await;
-    assert!(err.is_err(), "unknown catalog type must be rejected");
+        .await
+        .expect_err("unknown catalog type must be rejected");
+    let msg = err.message().to_lowercase();
+    assert!(
+        msg.contains("catalog type") && msg.contains("snowflake"),
+        "the rejection must name the unsupported type: {msg}"
+    );
 }

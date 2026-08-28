@@ -108,10 +108,14 @@ async fn auth_rejects_token_without_kid() {
     let idp = TestIdp::start().await;
     let token = idp.mint_with_kid("svc-orchestrator", AUD, &idp.issuer, 300, None);
 
-    verifier(&idp)
+    let err = verifier(&idp)
         .verify(&token, None)
         .await
         .expect_err("without a kid we cannot pin a key, so the token is unusable");
+    // WHY, not merely that: this token is otherwise valid, so a bare
+    // `expect_err` would stay green if it were rejected for an unreachable
+    // fixture or an unknown kid with the missing-kid check itself removed.
+    assert_rejected_because(&err, "no 'kid'");
 }
 
 #[tokio::test]
@@ -119,14 +123,28 @@ async fn auth_rejects_garbage() {
     let idp = TestIdp::start().await;
     let verifier = verifier(&idp);
 
-    verifier
+    // WHY, not merely that. Both of these die before anything downstream (the
+    // JWKS fetch, the signature check) is reached, so neither rejection can be
+    // an unreachable fixture or a network error wearing a rejection's clothes --
+    // and the two die at DIFFERENT checks, which a bare `expect_err` pair could
+    // not tell apart.
+    let err = verifier
         .verify("not.a.token", None)
         .await
         .expect_err("a non-JWT string must be rejected");
-    verifier
+    assert_rejected_because(&err, "unreadable token header");
+    assert!(
+        matches!(err, AuthError::Malformed(_)),
+        "expected a malformed-token rejection, got {err:?}"
+    );
+
+    // An empty credential is the absent one, not a malformed one: the caller
+    // needs "present a token", not "your token is broken".
+    let err = verifier
         .verify("", None)
         .await
         .expect_err("an empty token must be rejected");
+    assert_rejected_because(&err, "no bearer token presented");
 }
 
 #[tokio::test]
