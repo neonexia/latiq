@@ -1691,4 +1691,54 @@ mod tests {
         assert_eq!(bearer_of(&Some("  ".into())), None);
         assert_eq!(bearer_of(&Some(" abc ".into())), Some("abc".to_string()));
     }
+
+    /// A structural guard the CLI's behavioural auth tests cannot give: the gRPC
+    /// client constructors appear exactly once each, inside the helpers that
+    /// attach the token. A command that dialed its own `AdminClient` would send
+    /// no credential no matter what those tests say, and would trip this.
+    ///
+    /// Pinned to EXACTLY one, not "at most one": `<= 1` is satisfied by zero, so
+    /// the guard passed vacuously the moment a helper was renamed or a client
+    /// stopped being built — silently guarding nothing. Same anti-vacuity
+    /// counter-assertion the SDK's `client_construction` module makes.
+    ///
+    /// A unit test rather than an integration one: it is an `include_str!` grep
+    /// needing no subprocess and no fake IdP, and an integration binary would
+    /// statically link a bundled DuckDB to run it.
+    #[test]
+    fn auth_cli_clients_are_only_built_in_the_shared_helpers() {
+        // Only the NON-test half of the file: this module names every one of the
+        // constructors below as a string literal, and counting those would both
+        // inflate the totals and let a stray literal here mask a real violation.
+        let src = include_str!("main.rs")
+            .split_once("#[cfg(test)]")
+            .expect("this file has a #[cfg(test)] module, and this test is in it")
+            .0;
+
+        // The three clients the CLI actually dials, each from exactly one helper.
+        for ctor in ["AdminClient::", "ControlClient::", "DataClient::"] {
+            let uses = src.matches(ctor).count();
+            assert_eq!(
+                uses, 1,
+                "{ctor} is constructed {uses} times; it must be built exactly once, in \
+                 the shared helper that attaches the bearer token"
+            );
+            let authed = src.matches(&format!("{ctor}with_interceptor")).count();
+            assert_eq!(
+                authed, 1,
+                "the one {ctor} construction is not `with_interceptor`, so it would send \
+                 neither `latiq-agent-id` nor the bearer token"
+            );
+        }
+
+        // `StreamClient` has no CLI command today (the SDK owns the streaming path),
+        // so it is asserted differently: not "exactly one", which would fire on an
+        // honest new command, but "every construction, if any, is authenticated".
+        assert_eq!(
+            src.matches("StreamClient::").count(),
+            src.matches("StreamClient::with_interceptor").count(),
+            "a StreamClient is being built outside the shared builder, so it would \
+             carry no bearer token"
+        );
+    }
 }

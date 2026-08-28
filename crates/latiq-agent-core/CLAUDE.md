@@ -13,4 +13,4 @@ The **protocol-neutral core** of the hexagon. Holds `AgentOps` (allocate/describ
 - **Engine calls are blocking** → run via `spawn_blocking`. Don't hold a std mutex guard across `.await`.
 
 ## Tests
-Unit: in `src/`. Cross-component (AgentOps over RegistryControlPlane + DuckEngine + TempFs): `tests/agent_ops.rs`, `tests/m7.rs`. These are the in-process feature tests; full-stack/surface tests live in `crates/latiq/tests/`.
+Unit: in `src/`. Cross-component (AgentOps over RegistryControlPlane + DuckEngine + TempFs): `tests/agent_ops.rs` — the crate's one general integration binary, with `mod m7` (M7 success criteria) and `mod forwarding` (the delegation decision, over fakes) inside it. `tests/access_trail.rs` is a separate binary ONLY because it installs a process-global `tracing` subscriber; nothing else earns one, since every binary statically links a bundled DuckDB. These are the in-process feature tests; full-stack/surface tests live in `crates/latiq/tests/`.

@@ -1,5 +1,15 @@
-//! Full-stack feature tests for the operator Admin gRPC surface (control plane):
-//! node list, pond list (metadata read), policy. Names prefixed by feature.
+//! The operator-facing surfaces, in ONE test binary.
+//!
+//! At the top level: full-stack feature tests for the operator Admin gRPC
+//! surface (control plane) — node list, pond list (metadata read), policy.
+//! Names prefixed by feature.
+//!
+//! In submodules, the operator-adjacent surfaces that used to be a binary each:
+//! `catalogs` and `catalogs_iceberg` (datasets + external catalogs, registered
+//! over Admin), `cli_auth` (the CLI as an OAuth client) and `sdk_auth` (the SDK
+//! against an authenticated stack). Each integration binary statically links a
+//! bundled DuckDB (~130-160 MB), so a new file is expensive and a new module is
+//! free — see `crates/latiq/tests/CLAUDE.md` rule 5.
 mod common;
 
 use common::start_stack;
@@ -478,4 +488,666 @@ async fn auth_admin_unverified_creator_falls_back_to_the_claim() {
         .datasets;
     let added = d.iter().find(|x| x.name == "relaxed").expect("listed");
     assert_eq!(added.created_by, "dana", "{d:?}");
+}
+
+/// Dataset + external-catalog e2e over the real Admin + Data gRPC.
+///
+/// The catalog path runs against a **real local DuckLake catalog** (file
+/// metadata + local data — no network, no docker), so it runs in the normal CI
+/// suite. The iceberg/MinIO variant is `mod catalogs_iceberg` below.
+mod catalogs {
+    use crate::common::start_stack;
+    use latiq_proto::v1::admin_client::AdminClient;
+    use latiq_proto::v1::data_client::DataClient;
+    use latiq_proto::v1::*;
+    use std::collections::HashMap;
+    use tonic::Request;
+
+    fn req<T>(msg: T, agent: &str) -> Request<T> {
+        let mut r = Request::new(msg);
+        r.metadata_mut()
+            .insert("latiq-agent-id", agent.parse().unwrap());
+        r
+    }
+
+    fn json(resp: JsonResponse) -> serde_json::Value {
+        serde_json::from_str(&resp.json).unwrap()
+    }
+
+    /// Create a local DuckLake catalog with one table, returning (metadata_path,
+    /// data_path). Uses a throwaway in-memory DuckDB — same engine the pond uses.
+    fn seed_ducklake(dir: &std::path::Path) -> (String, String) {
+        let meta = dir.join("meta.duckdb");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake;
+             ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
+             CREATE TABLE ext.widgets AS
+               SELECT * FROM (VALUES (1,'gear',9.99),(2,'bolt',0.99),(3,'pulley',12.40))
+                             t(id,name,price);",
+            meta.display(),
+            data.display(),
+        ))
+        .unwrap();
+        (meta.display().to_string(), data.display().to_string())
+    }
+
+    #[tokio::test]
+    async fn dataset_load_copies_seeded_sample_into_pond() {
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "work".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        // `holdings` is a seeded sample dataset (one public CSV).
+        let loaded = json(
+            data.load_dataset(req(
+                LoadDatasetRequest {
+                    pond: "work".into(),
+                    dataset: "holdings".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(loaded["dataset"], "holdings");
+        // Datasets load into a schema named after the dataset; tables are reported
+        // schema-qualified (holdings.holdings).
+        assert_eq!(loaded["schema"], "holdings");
+        assert_eq!(loaded["tables"][0], "holdings.holdings");
+
+        let r = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "work".into(),
+                    sql: "SELECT count(*) AS n FROM holdings.holdings".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert!(
+            r["rows"][0][0].as_i64().unwrap() >= 1,
+            "holdings loaded: {r}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_pull_from_local_ducklake_lands_in_pond() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (metadata_path, data_path) = seed_ducklake(tmp.path());
+
+        let s = start_stack().await;
+        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+            .await
+            .unwrap();
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+
+        // Register the external catalog (operator).
+        let added = admin
+            .catalog_add(CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "ext".into(),
+                    r#type: "ducklake".into(),
+                    params: HashMap::from([
+                        ("metadata_path".into(), metadata_path),
+                        ("data_path".into(), data_path),
+                    ]),
+                    description: "local ducklake".into(),
+                    tags: vec!["test".into()],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(added.name, "ext");
+
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        // Describe: discover the catalog's tables (transient attach → detach).
+        let described = json(
+            data.catalog_describe(req(
+                CatalogDescribeRequest {
+                    pond: "shop".into(),
+                    catalog: "ext".into(),
+                    params: HashMap::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        let tables: Vec<&str> = described["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["table"].as_str())
+            .collect();
+        assert!(
+            tables.contains(&"widgets"),
+            "describe found tables: {tables:?}"
+        );
+
+        // Pull a subset into the pond, then detach.
+        data.catalog_pull(req(
+            CatalogPullRequest {
+                pond: "shop".into(),
+                catalog: "ext".into(),
+                query: "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
+                    .into(),
+                params: HashMap::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        // The data is now a pond table; the external catalog is detached.
+        let r = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT count(*) AS n FROM cheap".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2, "pulled rows: {r}");
+
+        // After detach, the external catalog is no longer queryable from the pond.
+        // After detach, the external catalog is no longer queryable from the pond.
+        // Asserted on the REASON: `is_err()` alone is satisfied by a dropped pond, a
+        // dead node, or a syntax error -- i.e. by everything except the detach.
+        let err = data
+            .read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT count(*) FROM ext.widgets".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .expect_err("external catalog must be detached after pull");
+        let msg = err.message().to_lowercase();
+        assert!(
+            msg.contains("ext") && msg.contains("does not exist"),
+            "the failure must be `ext` being gone, not some other error: {msg}"
+        );
+        // ...and the pond itself is fine, which is what rules out "the whole pond
+        // went away" as the reason above.
+        data.read_query(req(
+            QueryRequest {
+                pond: "shop".into(),
+                sql: "SELECT count(*) FROM cheap".into(),
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("detaching the catalog must not disturb the pond");
+    }
+
+    #[tokio::test]
+    async fn catalog_add_drops_credentials_and_rejects_unknown_type() {
+        let s = start_stack().await;
+        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+            .await
+            .unwrap();
+
+        // A credential-shaped param is dropped at add (never persisted).
+        let added = admin
+            .catalog_add(CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    params: HashMap::from([
+                        ("endpoint".into(), "https://polaris/api".into()),
+                        ("token".into(), "SECRET".into()),
+                    ]),
+                    description: String::new(),
+                    tags: vec![],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(added.dropped_params.contains(&"token".to_string()));
+
+        // Unknown type is rejected at add -- and rejected FOR THAT REASON. A bare
+        // `is_err()` is equally satisfied by a complaint about the empty `params`
+        // (no `endpoint`), which would leave the type allowlist untested.
+        let err = admin
+            .catalog_add(CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "no".into(),
+                    r#type: "snowflake".into(),
+                    params: HashMap::new(),
+                    description: String::new(),
+                    tags: vec![],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            })
+            .await
+            .expect_err("unknown catalog type must be rejected");
+        let msg = err.message().to_lowercase();
+        assert!(
+            msg.contains("catalog type") && msg.contains("snowflake"),
+            "the rejection must name the unsupported type: {msg}"
+        );
+    }
+}
+
+/// Iceberg + MinIO end-to-end for the catalog pull path. `#[ignore]`d because it
+/// needs a live Iceberg REST catalog + S3 (MinIO) — bring them up with
+/// `deploy/iceberg-minio/up.sh`, then run with `--ignored`. Config comes from env
+/// (set by the harness / CI):
+///
+///   LATIQ_ICEBERG_ENDPOINT  LATIQ_ICEBERG_WAREHOUSE  LATIQ_ICEBERG_TOKEN
+///   LATIQ_S3_ENDPOINT  LATIQ_S3_ACCESS_KEY  LATIQ_S3_SECRET_KEY
+mod catalogs_iceberg {
+    use crate::common::start_stack;
+    use latiq_proto::v1::admin_client::AdminClient;
+    use latiq_proto::v1::data_client::DataClient;
+    use latiq_proto::v1::*;
+    use std::collections::HashMap;
+    use tonic::Request;
+
+    fn req<T>(msg: T, agent: &str) -> Request<T> {
+        let mut r = Request::new(msg);
+        r.metadata_mut()
+            .insert("latiq-agent-id", agent.parse().unwrap());
+        r
+    }
+    fn env(k: &str) -> String {
+        std::env::var(k).unwrap_or_else(|_| panic!("set {k} (see deploy/iceberg-minio/up.sh)"))
+    }
+    fn json(resp: JsonResponse) -> serde_json::Value {
+        serde_json::from_str(&resp.json).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Iceberg REST + MinIO; see deploy/iceberg-minio/up.sh"]
+    async fn iceberg_pull_seeded_widgets_into_pond() {
+        // Storage creds + the REST bearer ride in at pull/describe — never persisted.
+        let runtime = HashMap::from([
+            ("token".to_string(), env("LATIQ_ICEBERG_TOKEN")),
+            ("s3_endpoint".to_string(), env("LATIQ_S3_ENDPOINT")),
+            ("s3_access_key".to_string(), env("LATIQ_S3_ACCESS_KEY")),
+            ("s3_secret_key".to_string(), env("LATIQ_S3_SECRET_KEY")),
+            ("s3_region".to_string(), "us-east-1".to_string()),
+        ]);
+
+        let s = start_stack().await;
+        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+            .await
+            .unwrap();
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+
+        admin
+            .catalog_add(CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    params: HashMap::from([
+                        ("endpoint".into(), env("LATIQ_ICEBERG_ENDPOINT")),
+                        ("warehouse".into(), env("LATIQ_ICEBERG_WAREHOUSE")),
+                        ("s3_endpoint".into(), env("LATIQ_S3_ENDPOINT")),
+                    ]),
+                    description: "local iceberg".into(),
+                    tags: vec!["test".into()],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            })
+            .await
+            .unwrap();
+
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        let described = json(
+            data.catalog_describe(req(
+                CatalogDescribeRequest {
+                    pond: "shop".into(),
+                    catalog: "lake".into(),
+                    params: runtime.clone(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        let tables: Vec<&str> = described["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["table"].as_str())
+            .collect();
+        assert!(tables.contains(&"widgets"), "tables: {tables:?}");
+
+        data.catalog_pull(req(
+            CatalogPullRequest {
+                pond: "shop".into(),
+                catalog: "lake".into(),
+                query:
+                    "CREATE TABLE cheap AS SELECT id,name FROM lake.demo.widgets WHERE price < 10"
+                        .into(),
+                params: runtime,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        let r = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT count(*) AS n FROM cheap".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2);
+    }
+}
+
+/// The `latiq` CLI as an OAuth client, driven as a real subprocess.
+///
+/// Admin gRPC is the OPERATOR surface, so the operator's CLI has to be able to
+/// reach an authenticated control plane. Every command here talks to Control or
+/// Admin — the surfaces `latiq serve --auth-issuer` protects — and none of them
+/// is a data op, which is exactly the gap this module exists to hold shut.
+mod cli_auth {
+    use crate::common::start_control_plane_one_port;
+    use std::process::Command;
+
+    /// Run the CLI against `server`, optionally with a token in the environment.
+    /// Returns (success, stderr) — the CLI renders gRPC errors to stderr and exits 1.
+    fn cli(server: &str, token: Option<&str>, args: &[&str]) -> (bool, String) {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_latiq"));
+        cmd.env("LATIQ_SERVER", server)
+            // Never inherited from the developer's shell: it would mask exactly the
+            // failure these tests look for.
+            .env_remove("LATIQ_TOKEN")
+            .env_remove("LATIQ_QUERY_GATEWAY")
+            .args(args);
+        if let Some(t) = token {
+            cmd.env("LATIQ_TOKEN", t);
+        }
+        let out = cmd.output().expect("run the latiq binary");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    /// The CLI's rendering of an `Unauthenticated` status (no ErrorEnvelope rides on
+    /// those, so it is the raw message).
+    fn is_unauthenticated(stderr: &str) -> bool {
+        stderr.contains("bearer token")
+    }
+
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    /// The headline case: an operator listing ponds against an authenticated control
+    /// plane. This is a pure Admin call — no pond node is involved at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_cli_admin_command_needs_a_token() {
+        let idp = latiq_auth::test_support::TestIdp::start().await;
+        let server = start_control_plane_one_port(Some(idp.auth_config())).await;
+        let token = idp.mint("svc-ops", "latiq", &idp.issuer, 300);
+
+        let s = server.clone();
+        let (ok, stderr) = blocking(move || cli(&s, None, &["pond", "list"])).await;
+        assert!(!ok, "`pond list` must be refused without a token");
+        assert!(is_unauthenticated(&stderr), "got: {stderr}");
+
+        // $LATIQ_TOKEN alone is enough — no flag, no code change.
+        let (s, t) = (server.clone(), token.clone());
+        let (ok, stderr) = blocking(move || cli(&s, Some(&t), &["pond", "list"])).await;
+        assert!(ok, "`pond list` must succeed with LATIQ_TOKEN: {stderr}");
+
+        // …and so is the explicit global flag, on a subcommand that never declared
+        // one of its own.
+        let (s, t) = (server, token);
+        let (ok, stderr) = blocking(move || cli(&s, None, &["pond", "list", "--token", &t])).await;
+        assert!(ok, "`pond list --token` must succeed: {stderr}");
+    }
+
+    /// The guard against a future command that builds its own client and bypasses
+    /// the shared helper. In the spirit of the 12-RPC enumeration in `admin.rs`:
+    /// enumerate the CLI commands that talk to a server and assert none of them is
+    /// turned away when a valid token is present. A command may still FAIL here (a
+    /// missing pond, an empty registry) — what it may never do is fail for want of a
+    /// credential it was handed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_cli_every_server_command_sends_the_token() {
+        let idp = latiq_auth::test_support::TestIdp::start().await;
+        let server = start_control_plane_one_port(Some(idp.auth_config())).await;
+        let token = idp.mint("svc-ops", "latiq", &idp.issuer, 300);
+
+        // Every CLI command that reaches the ADMIN surface — the one `--auth-issuer`
+        // protects. Data ops (`query`, `pond drop|describe`, `dataset load`,
+        // `catalog describe|pull`) need a pond node and are covered by the
+        // Data-surface tests; `pond create` is the one command on the internal
+        // Control surface, which carries no verifier by design, so its credential is
+        // covered structurally by the constructor guard below instead.
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["pond", "list"],
+            vec!["pond", "set-tier", "cliauth", "--tier", "small"],
+            vec!["node", "list"],
+            vec!["node", "describe", "node-nope"],
+            vec!["dataset", "list"],
+            vec!["dataset", "add", "sales", "--table", "t=/tmp/t.parquet"],
+            vec!["dataset", "remove", "sales"],
+            vec!["catalog", "list"],
+            vec!["catalog", "add", "lake", "--type", "iceberg"],
+            vec!["catalog", "remove", "lake"],
+            vec!["stats"],
+        ];
+
+        for args in commands {
+            let (s, t, a) = (server.clone(), token.clone(), args.clone());
+            let (_ok, stderr) = blocking(move || cli(&s, Some(&t), &a)).await;
+            assert!(
+                !is_unauthenticated(&stderr),
+                "`latiq {}` did not send the bearer token — it is building a client \
+                 outside the shared helper: {stderr}",
+                args.join(" ")
+            );
+
+            // The same command with no token must be refused, which is what proves
+            // the assertion above is testing the token and not merely a command that
+            // never reaches the server.
+            let (s, a) = (server.clone(), args.clone());
+            let (_ok, stderr) = blocking(move || cli(&s, None, &a)).await;
+            assert!(
+                is_unauthenticated(&stderr),
+                "`latiq {}` was NOT refused without a token: {stderr}",
+                args.join(" ")
+            );
+        }
+    }
+}
+
+/// The SDK against an auth-enabled stack: the client half of identity v0.
+///
+/// The Rust SDK is what the Python SDK wraps, so proving the token reaches the
+/// Data/Stream surface from here covers both. The stack's pond node requires a
+/// verified bearer token; its control plane does not (pond CREATION is a pure
+/// control-plane op), which is exactly the asymmetry that makes "the query is
+/// the thing that needs the token" visible.
+mod sdk_auth {
+    use crate::common::{start_stack_one_port_with_auth, start_stack_with_auth};
+    use arrow::array::Array;
+    use latiq_sdk::Latiq;
+
+    /// The SDK is blocking (it owns its own runtime), so every call runs on a
+    /// blocking thread rather than on this test's runtime.
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        tokio::task::spawn_blocking(f).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_sdk_token_is_required_and_sufficient() {
+        let idp = latiq_auth::test_support::TestIdp::start().await;
+        let s = start_stack_with_auth(idp.auth_config()).await;
+        let token = idp.mint("svc-sdk", "latiq", &idp.issuer, 300);
+        let (control, gateway) = (s.control_endpoint.clone(), s.data_endpoint.clone());
+
+        // ── no token ────────────────────────────────────────────────────
+        // The pond is allocated through the (unauthenticated) control plane, so the
+        // first thing that touches the node is the query — and it is refused.
+        let (c, g) = (control.clone(), gateway.clone());
+        let err = blocking(move || {
+            let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
+            db.create_pond(Some("sdkauth"), "medium", "").unwrap();
+            db.query("sdkauth", "SELECT 1 AS n")
+                .unwrap_err()
+                .to_string()
+        })
+        .await;
+        assert!(
+            err.to_lowercase().contains("token"),
+            "an SDK call with no token must be refused: {err}"
+        );
+
+        // ── explicit token ──────────────────────────────────────────────
+        let (c, g, t) = (control.clone(), gateway.clone(), token.clone());
+        let batches = blocking(move || {
+            let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
+            db.query("sdkauth", "SELECT 1 AS n").unwrap()
+        })
+        .await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+        // ── LATIQ_TOKEN ─────────────────────────────────────────────────
+        // Same call, no code change: the env var is how a notebook or a job gets a
+        // token in without threading it through every `connect`.
+        let (c, g, t) = (control.clone(), gateway.clone(), token.clone());
+        let rows = blocking(move || {
+            // Set and cleared on this thread's process — done inside ONE test so no
+            // other test can observe the window.
+            std::env::set_var("LATIQ_TOKEN", &t);
+            let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
+            let out = db.query("sdkauth", "SELECT 1 AS n");
+            std::env::remove_var("LATIQ_TOKEN");
+            out.unwrap().iter().map(|b| b.num_rows()).sum::<usize>()
+        })
+        .await;
+        assert_eq!(rows, 1);
+
+        // ── writes are attributed to the token's subject ────────────────
+        let (c, g, t) = (control, gateway, token);
+        let authors = blocking(move || {
+            let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
+            db.query("sdkauth", "CREATE TABLE t(i INTEGER)").unwrap();
+            let b = db
+                .query(
+                    "sdkauth",
+                    "SELECT DISTINCT author FROM ducklake_snapshots('sdkauth')",
+                )
+                .unwrap();
+            b.iter()
+                .flat_map(|batch| {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .expect("author is a string column");
+                    (0..col.len())
+                        .map(|i| col.value(i).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await;
+        assert!(
+            authors.iter().any(|a| a == "svc-sdk"),
+            "the DuckLake author must be the token's subject, got {authors:?}"
+        );
+    }
+
+    /// `list_ponds` is the SDK's ONE Admin call, and Admin is the surface a client
+    /// is most likely to leave un-tokened: everything else it does rides Data or
+    /// Control. Against a fully authenticated stack a tokened client must be able to
+    /// read pond metadata, and an un-tokened one must be refused — the second half
+    /// is what proves the first is not passing because nothing is enforced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auth_sdk_admin_metadata_read_carries_the_token() {
+        let idp = latiq_auth::test_support::TestIdp::start().await;
+        let s = start_stack_one_port_with_auth(idp.auth_config()).await;
+        let token = idp.mint("svc-sdk", "latiq", &idp.issuer, 300);
+        let (server, gateway) = (s.control_endpoint.clone(), s.data_endpoint.clone());
+
+        let (c, g, t) = (server.clone(), gateway.clone(), token);
+        let listed = blocking(move || {
+            let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
+            db.create_pond(Some("sdkadmin"), "medium", "").unwrap();
+            db.list_ponds().unwrap()
+        })
+        .await;
+        assert!(
+            listed.contains_key("sdkadmin"),
+            "a tokened operator read must see the pond, got {:?}",
+            listed.keys().collect::<Vec<_>>()
+        );
+
+        let (c, g) = (server, gateway);
+        let err = blocking(move || {
+            let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
+            db.list_ponds().unwrap_err().to_string()
+        })
+        .await;
+        assert!(
+            err.to_lowercase().contains("token"),
+            "an un-tokened Admin read must be refused: {err}"
+        );
+    }
 }
