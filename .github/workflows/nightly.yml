@@ -179,6 +179,103 @@ jobs:
         working-directory: deploy/cluster
         run: docker compose --profile scale down -v
 
+  # Identity v0 end-to-end against an AUTHENTICATED cluster. Deliberately a job of
+  # its own rather than a flag on `e2e-suite`: the unauthenticated cluster is the
+  # default deployment and must keep being tested exactly as it is. Everything auth
+  # lives in `deploy/cluster/auth.env` + the compose `auth` profile — this workflow
+  # sets no issuer/audience/gateway env of its own.
+  auth-e2e:
+    name: auth e2e — Keycloak + SDK + agent (MCP), in-network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The wheel MUST exist before `auth-tests-sdk` starts: that runner installs
+      # latiq from /repo/dist. Release profile — the auth suite drives a real
+      # cluster, and a debug wheel is pointlessly slow.
+      - name: Build the latiq wheel (release) into dist/
+        run: |
+          python -m pip install -U pip maturin
+          maturin build --release -m sdk/python/Cargo.toml -o dist
+      # Same image, built the same way as the other cluster jobs.
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:nightly .
+      - name: Bring up the authenticated cluster (+ Keycloak)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: docker compose --env-file auth.env up -d
+      - name: Wait for control plane + nodes healthy
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose --env-file auth.env ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose --env-file auth.env ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      # Keycloak imports its realm on startup and is the slowest thing here. It
+      # publishes NO ports by design, so the runner cannot poll it — poll from
+      # INSIDE the compose network instead, with a throwaway `run --no-deps` on the
+      # SDK runner image (python is all we need; the slim image has no curl).
+      - name: Wait for the Keycloak realm (polled in-network — it has no ports)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: |
+          ok=0
+          docker compose --env-file auth.env run --rm --no-deps -T auth-tests-sdk '
+            for _ in $(seq 1 60); do
+              python -c "import urllib.request; urllib.request.urlopen(\"http://keycloak:8080/realms/latiq/.well-known/openid-configuration\", timeout=3)" >/dev/null 2>&1 && exit 0
+              sleep 5
+            done
+            exit 1
+          ' && ok=1
+          if [ "$ok" != "1" ]; then
+            echo "::error::Keycloak never served http://keycloak:8080/realms/latiq/.well-known/openid-configuration within ~5 min (realm import failed or the container is unhealthy)"
+            docker compose --env-file auth.env logs --no-color keycloak
+            exit 1
+          fi
+      - name: SDK auth e2e (in-network, wheel from dist/)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: docker compose --env-file auth.env run --rm -T auth-tests-sdk
+      - name: Agent (MCP) auth e2e (in-network)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: docker compose --env-file auth.env run --rm -T auth-tests-agent
+      # An auth failure with no server logs is nearly undebuggable — dump everything.
+      - name: Cluster + Keycloak logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: docker compose --env-file auth.env logs --no-color
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:nightly
+        run: docker compose --env-file auth.env down -v
+
   # ---- Versioned publish: only if (a) enabled, (b) something changed since the
   # last publish, and (c) every test/e2e job above is green. Inert until the repo
   # variable PUBLISH_NIGHTLY=true is set (after the one-time PyPI trusted-publisher
@@ -219,7 +316,7 @@ jobs:
 
   publish:
     name: publish (PyPI wheel + GHCR image), versioned
-    needs: [gate, checks, iceberg, cluster-scale-out, e2e-suite]
+    needs: [gate, checks, iceberg, cluster-scale-out, e2e-suite, auth-e2e]
     if: needs.gate.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
