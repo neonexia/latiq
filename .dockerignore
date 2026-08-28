@@ -1,0 +1,35 @@
+# Keep the build context small. Without this, `COPY . .` ships the whole repo
+# into the Docker VM -- and `target/` alone is tens of GB once DuckDB has been
+# built a few times, which is enough to exhaust the VM's disk mid-build.
+# The Dockerfile builds from source inside the image, so nothing here is needed.
+
+# Rust build output (the big one)
+target/
+sdk/python/target/
+spike/target/
+
+# Node
+node_modules/
+e2e/agent/node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.e2e/
+dist/
+*.egg-info/
+
+# Local state and scratch
+.git/
+.github/
+.claude/
+docs/
+*.duckdb
+*.duckdb.wal
+.DS_Store
+
+# Test/report artifacts
+e2e/perf/*.json
+e2e/perf/*.html
