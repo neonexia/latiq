@@ -369,16 +369,17 @@ async fn forwarding_without_any_token_fails_at_the_owner() {
 }
 
 #[tokio::test]
-async fn forwarding_token_the_owner_rejects_surfaces_as_internal() {
+async fn forwarding_token_the_owner_rejects_surfaces_as_unauthenticated() {
     // Genuine RE-VERIFICATION at the owner: the greeter trusts issuers A and B,
     // the owner only A. A token from B satisfies the greeter and is replayed —
     // and the owner rejects it on its own authority. The greeter cannot vouch
     // for it.
     //
-    // Pins today's mapping: the peer's `Unauthenticated` comes back through
-    // `status_to_error`'s catch-all as `Code::Internal`. That is a known wart
-    // (it needs a new ErrorKind to fix); this test is here so changing it is a
-    // deliberate act with a visible diff, not a silent drift.
+    // The CODE is what a client branches on, so the peer's `Unauthenticated`
+    // must survive the hop as `Unauthenticated` (via `ErrorKind::Unauthenticated`
+    // in the envelope) rather than falling into `status_to_error`'s catch-all as
+    // `Internal` — which reads as a crash and hides the one failure a client can
+    // act on by re-minting its token.
     let idp_a = latiq_auth::test_support::TestIdp::start().await;
     let idp_b = latiq_auth::test_support::TestIdp::start_alt().await;
     let both = latiq_auth::AuthConfig {
@@ -419,13 +420,18 @@ async fn forwarding_token_the_owner_rejects_surfaces_as_internal() {
         .unwrap_err();
     assert_eq!(
         err.code(),
-        Code::Internal,
-        "today's mapping for a peer Unauthenticated"
+        Code::Unauthenticated,
+        "a peer's Unauthenticated must stay actionable across the hop"
     );
     assert!(
         err.message().contains("the bearer token was rejected"),
         "the owner's own rejection should cross the hop: {err:?}"
     );
+    // …and the kind travels in the envelope, so a client reading `kind` (rather
+    // than the gRPC code) branches the same way.
+    let env: latiq_common::ErrorEnvelope =
+        serde_json::from_slice(err.details()).expect("the envelope rides the Status details");
+    assert_eq!(env.kind, latiq_common::ErrorKind::Unauthenticated);
 }
 
 #[tokio::test]

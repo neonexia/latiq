@@ -126,6 +126,9 @@ pub(crate) fn to_status(e: AgentError) -> Status {
         ErrorKind::NameConflict => Code::AlreadyExists,
         ErrorKind::QueryTimeout => Code::DeadlineExceeded,
         ErrorKind::QueryCancelled => Code::Cancelled,
+        // Reached when the OWNER of a forwarded pond refused the caller's token:
+        // the code must stay actionable across the hop, not collapse to Internal.
+        ErrorKind::Unauthenticated => Code::Unauthenticated,
         ErrorKind::Storage | ErrorKind::Internal => Code::Internal,
         // ParseError / InvalidValue / MissingArgument / ReadOnlyViolation /
         // WriteToReservedSchema / ResultCapExceeded / UriNotAllowed
