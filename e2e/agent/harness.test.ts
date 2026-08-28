@@ -14,8 +14,39 @@ import { after, before, test } from "node:test";
 import { experimental_createMCPClient } from "ai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth-extensions.js";
 
 const URL_ = process.env.LATIQ_MCP ?? "http://127.0.0.1:51402/mcp";
+
+/** One provider for both clients. undefined when the cluster has no auth. */
+function authProvider() {
+  const issuer = process.env.LATIQ_AUTH_ISSUER;
+  if (!issuer) return undefined;
+  // No `expectedIssuer` on purpose: ClientCredentialsProviderOptions has no such
+  // field (SDK 1.29), so passing one would read as issuer pinning that isn't
+  // actually happening. The issuer is discovered from the RFC 9728 document.
+  return new ClientCredentialsProvider({
+    clientId: "latiq-agent",
+    clientSecret: process.env.LATIQ_CLIENT_SECRET ?? "latiq-agent-secret",
+    scope: "openid",
+  });
+}
+
+/**
+ * The transport BOTH clients use: the AI SDK's MCP client is handed a transport
+ * instance we construct, so the official SDK is the OAuth engine in both cases.
+ * With LATIQ_AUTH_ISSUER set the whole suite runs authenticated; without it the
+ * behaviour is byte-for-byte what it was before.
+ */
+function transport() {
+  const provider = authProvider();
+  // NEVER also set requestInit.headers.Authorization -- _commonHeaders spreads
+  // requestInit.headers AFTER the provider's, silently overriding the token.
+  return new StreamableHTTPClientTransport(
+    new global.URL(URL_),
+    provider ? { authProvider: provider } : undefined,
+  );
+}
 
 const EXPECTED_TOOLS = [
   "allocate_pond", "describe_pond", "list_ponds", "drop_pond",
@@ -34,10 +65,10 @@ const failed = (r: any) => { assert.equal(r.isError, true, `expected an error re
 const name = (p: string) => `${p}-${randomUUID().slice(0, 8)}`;
 
 before(async () => {
-  ai = await experimental_createMCPClient({ transport: new StreamableHTTPClientTransport(new global.URL(URL_)) });
+  ai = await experimental_createMCPClient({ transport: transport() });
   tools = await ai.tools();
   raw = new Client({ name: "latiq-agent-harness", version: "0.0.0" });
-  await raw.connect(new StreamableHTTPClientTransport(new global.URL(URL_)));
+  await raw.connect(transport());
 });
 
 after(async () => {
