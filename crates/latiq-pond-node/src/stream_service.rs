@@ -60,8 +60,13 @@ impl StreamSvc for StreamService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<Self::ReadArrowStream>, Status> {
-        let (id, tok) =
-            identity_of(self.verifier.as_ref(), self.challenge.as_deref(), &req).await?;
+        let (id, tok) = identity_of(
+            self.verifier.as_ref(),
+            self.challenge.as_deref(),
+            &req,
+            "read_arrow",
+        )
+        .await?;
         let tid = crate::data_service::trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();

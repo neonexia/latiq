@@ -123,4 +123,34 @@ async fn access_trail_records_the_verified_subject_and_issuer() {
         claimed_line.contains("verified=false"),
         "an unverified caller must be marked unverified: {claimed_line}"
     );
+
+    // `outcome` is part of the shared field set: the Admin surface writes it on
+    // the same target, and a stream where only one producer says whether the
+    // action LANDED cannot be filtered honestly.
+    for line in [&verified_line, &claimed_line] {
+        assert!(
+            line.contains("outcome=\"ok\""),
+            "an agent record must say whether the action landed: {line}"
+        );
+    }
+
+    // A FAILED op must leave a record too — the whole point of the change. The
+    // name is taken, so this allocation cannot succeed.
+    ops.allocate_pond(&id, Some("audited".into()), "{}", "medium", &[])
+        .await
+        .expect_err("the name is already taken");
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let failed = log
+        .lines()
+        .filter(|l| l.contains("latiq::access"))
+        .find(|l| l.contains("outcome=\"error\""))
+        .unwrap_or_else(|| panic!("a failed op must be on the access trail: {log}"));
+    assert!(
+        failed.contains("op=\"allocate_pond\"") && failed.contains("subject=svc-lowpriv"),
+        "a failed op is still attributed: {failed}"
+    );
+    assert!(
+        failed.contains("pond=\"-\""),
+        "an allocation that failed has no pond to name: {failed}"
+    );
 }

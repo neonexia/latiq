@@ -1,0 +1,58 @@
+//! The `latiq::access` trace target — the operator's record of who did what.
+//!
+//! There is no audit store: operators grep the node log files (or ship them to
+//! their log stack; `LATIQ_LOG_FORMAT=json` makes the fields structured). Filter
+//! with e.g. `RUST_LOG=latiq::access=info`, or by grepping the `latiq::access`
+//! target / the `op=`/`pond=` fields.
+//!
+//! To ask *who* did something, filter on `subject=` **together with**
+//! `verified=true`: `agent=` is the caller's own claim and carries no authority
+//! (it is empty of meaning for authorization, useful only for correlating one
+//! agent's activity). `subject=`/`issuer=` are empty when `verified=false`.
+//!
+//! The emitter lives here, in the protocol-neutral core, rather than in each
+//! surface, because the trail is only searchable if every producer writes the
+//! SAME fields with the SAME meaning: `AgentOps` and the pond node's Data/Stream
+//! adapter both call this. (The control plane's Admin surface keeps a local twin
+//! — it holds no `AgentOps` — whose fields are deliberately identical.)
+use latiq_common::Identity;
+
+/// The `outcome` field's two values. An audit record that does not say whether
+/// the action LANDED is worse than none: a rejected `drop_pond` would read
+/// byte-identically to a real one.
+pub const OK: &str = "ok";
+pub const ERROR: &str = "error";
+
+/// `ok`/`error` for a completed op.
+pub fn outcome<T, E>(res: &Result<T, E>) -> &'static str {
+    if res.is_ok() {
+        OK
+    } else {
+        ERROR
+    }
+}
+
+/// Emit one access record. `pond` is `-` where the action is not about one pond
+/// (or where it never got far enough to resolve one).
+pub fn record(
+    identity: &Identity,
+    op: &str,
+    pond: Option<&str>,
+    summary: Option<&str>,
+    duration_ms: u64,
+    outcome: &str,
+) {
+    tracing::info!(
+        target: "latiq::access",
+        agent = %identity.agent_id,          // CLAIMED. never authority.
+        subject = %identity.subject,         // verified, or "" when not
+        issuer = %identity.issuer,
+        verified = identity.verified,        // scopes subject/issuer, NOT agent
+        op,
+        pond = pond.unwrap_or("-"),
+        duration_ms,
+        summary = summary.unwrap_or(""),
+        outcome,                             // ok | error — did it LAND?
+        "access",
+    );
+}

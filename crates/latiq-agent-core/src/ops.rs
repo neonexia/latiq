@@ -1,6 +1,7 @@
 //! AgentOps — the protocol-neutral agent operations. Composes ControlPlane +
 //! PondStorage + QueryEngine. Engine calls (blocking DuckDB) run on the blocking
 //! pool; cancellation flows through the in-flight registry's AbortToken.
+use crate::access::{outcome, ERROR, OK};
 use crate::arrow::ArrowReadStream;
 use crate::control::ControlPlane;
 use crate::error::AgentError;
@@ -109,7 +110,34 @@ impl AgentOps {
         PondId::parse(pond_id).map_err(|e| AgentError::internal(format!("bad pond id: {e}")))
     }
 
+    /// Allocate a pond, recording the attempt either way. Allocation is the one
+    /// op with no pond to name on failure (there is not one yet), so a failed
+    /// record carries `pond=-`.
     pub async fn allocate_pond(
+        &self,
+        identity: &Identity,
+        name: Option<String>,
+        policy_json: &str,
+        tier: &str,
+        extensions: &[String],
+    ) -> Result<AllocateResult, AgentError> {
+        let started = Instant::now();
+        let res = self
+            .allocate_pond_inner(identity, name, policy_json, tier, extensions)
+            .await;
+        self.audit(
+            identity,
+            "allocate_pond",
+            res.as_ref().ok().map(|r| r.pond_id.as_str()),
+            None,
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    async fn allocate_pond_inner(
         &self,
         identity: &Identity,
         name: Option<String>,
@@ -127,8 +155,6 @@ impl AgentOps {
         // it lazily on first use (ensure_pond). Single-node: owner == self, so this
         // is skipped and the eager init below runs as before.
         if self.forward_target(&info).is_some() {
-            self.audit(identity, "allocate_pond", Some(&info.pond_id), None, 0)
-                .await;
             return Ok(AllocateResult {
                 pond_id: info.pond_id,
                 pond_name: info.name,
@@ -154,8 +180,6 @@ impl AgentOps {
             let _ = self.storage.drop_pond(pid);
             return Err(e.into());
         }
-        self.audit(identity, "allocate_pond", Some(&info.pond_id), None, 0)
-            .await;
         Ok(AllocateResult {
             pond_id: info.pond_id,
             pond_name: info.name,
@@ -167,7 +191,9 @@ impl AgentOps {
         identity: &Identity,
         pond_ref: &str,
     ) -> Result<DescribeResult, AgentError> {
-        let info = self.control.pond_info(pond_ref).await?;
+        let info = self
+            .pond_info_audited(identity, "describe_pond", pond_ref)
+            .await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
             info!(
                 op = "describe_pond",
@@ -179,6 +205,30 @@ impl AgentOps {
             return fwd.describe(owner, identity, pond_ref).await;
         }
         info!(op = "describe_pond", pond = pond_ref, "processing locally");
+        let started = Instant::now();
+        let res = self.describe_pond_local(&info).await;
+        self.audit(
+            identity,
+            "describe_pond",
+            Some(&info.pond_id),
+            None,
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        Ok(DescribeResult {
+            pond: info,
+            schema: res?,
+        })
+    }
+
+    /// The local half of `describe_pond` — split out so its failures are audited
+    /// alongside its successes without the forwarded path double-recording (the
+    /// owner audits what it actually ran).
+    async fn describe_pond_local(
+        &self,
+        info: &PondInfo,
+    ) -> Result<latiq_engine::SchemaSummary, AgentError> {
         let pid = Self::parse_id(&info.pond_id)?;
         // ensure_pond materializes storage on first touch; attach under the
         // pond's registry name so introspection is scoped to this catalog.
@@ -191,18 +241,18 @@ impl AgentOps {
         loc.extensions = info.extensions.clone();
         let engine = self.engine.clone();
         let loc2 = loc.clone();
-        let schema = tokio::task::spawn_blocking(move || engine.describe_schema(&loc2))
-            .await
-            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
-        self.audit(identity, "describe_pond", Some(&info.pond_id), None, 0)
-            .await;
-        Ok(DescribeResult { pond: info, schema })
+        Ok(
+            tokio::task::spawn_blocking(move || engine.describe_schema(&loc2))
+                .await
+                .map_err(|e| AgentError::internal(format!("join: {e}")))??,
+        )
     }
 
     pub async fn list_ponds(&self, identity: &Identity) -> Result<Vec<PondInfo>, AgentError> {
-        let ponds = self.control.list_ponds().await?;
-        self.audit(identity, "list_ponds", None, None, 0).await;
-        Ok(ponds)
+        let res = self.control.list_ponds().await;
+        self.audit(identity, "list_ponds", None, None, 0, outcome(&res))
+            .await;
+        res
     }
 
     pub async fn drop_pond(
@@ -215,14 +265,25 @@ impl AgentOps {
         // Every surface plumbs this flag; enforcing it here keeps the gate
         // consistent across MCP and the Data gRPC.
         if !confirm {
-            return Err(AgentError::new(
-                ErrorKind::MissingArgument,
-                format!("drop_pond deletes pond '{pond_ref}' and all its data; set confirm=true to proceed"),
-                "Re-issue drop_pond with confirm=true once you're certain.",
-                "latiq://guidance",
-            ));
+            // Recorded, not silently refused: "someone tried to drop this pond"
+            // is exactly the kind of attempt an operator wants in the trail.
+            return Err(self.audit_err(
+                identity,
+                "drop_pond",
+                Some(pond_ref),
+                None,
+                0,
+                AgentError::new(
+                    ErrorKind::MissingArgument,
+                    format!("drop_pond deletes pond '{pond_ref}' and all its data; set confirm=true to proceed"),
+                    "Re-issue drop_pond with confirm=true once you're certain.",
+                    "latiq://guidance",
+                ),
+            ).await);
         }
-        let info = self.control.pond_info(pond_ref).await?;
+        let info = self
+            .pond_info_audited(identity, "drop_pond", pond_ref)
+            .await?;
         // Owned by another node → forward the drop so the owner evicts its engine
         // instance and deletes the files it actually holds.
         if let Some((fwd, owner)) = self.forward_target(&info) {
@@ -236,8 +297,16 @@ impl AgentOps {
             return fwd.drop_pond(owner, identity, pond_ref, confirm).await;
         }
         info!(op = "drop_pond", pond = pond_ref, "processing locally");
+        let started = Instant::now();
         let pond_id = info.pond_id.clone();
-        let pid = Self::parse_id(&pond_id)?;
+        let pid = match Self::parse_id(&pond_id) {
+            Ok(pid) => pid,
+            Err(e) => {
+                return Err(self
+                    .audit_err(identity, "drop_pond", Some(&pond_id), None, 0, e)
+                    .await)
+            }
+        };
         // Tombstone the pond + cancel its in-flight ops. begin_drop also makes any
         // query that registers from here on get a pre-cancelled token, so one that
         // slipped past resolve_pond can't run against files we're about to delete.
@@ -246,7 +315,16 @@ impl AgentOps {
             // Registry drop failed: the pond still exists — clear the tombstone so
             // it stays usable instead of permanently rejecting queries.
             self.inflight.end_drop(&pond_id);
-            return Err(e);
+            return Err(self
+                .audit_err(
+                    identity,
+                    "drop_pond",
+                    Some(&pond_id),
+                    None,
+                    started.elapsed().as_millis() as u64,
+                    e,
+                )
+                .await);
         }
         // Evict the cached engine instance (closing its connection to the catalog)
         // BEFORE deleting the files out from under it. Best-effort: a pond that was
@@ -256,8 +334,15 @@ impl AgentOps {
         }
         let _ = self.storage.drop_pond(pid);
         self.inflight.end_drop(&pond_id);
-        self.audit(identity, "drop_pond", Some(&pond_id), None, 0)
-            .await;
+        self.audit(
+            identity,
+            "drop_pond",
+            Some(&pond_id),
+            None,
+            started.elapsed().as_millis() as u64,
+            OK,
+        )
+        .await;
         Ok(())
     }
 
@@ -342,7 +427,9 @@ impl AgentOps {
         query: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<PullResult, AgentError> {
-        let info = self.control.pond_info(pond_ref).await?;
+        let info = self
+            .pond_info_audited(identity, "catalog_pull", pond_ref)
+            .await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
             info!(
                 op = "catalog_pull",
@@ -355,20 +442,35 @@ impl AgentOps {
                 .catalog_pull(owner, identity, pond_ref, catalog, query, params)
                 .await;
         }
-        let (loc, cat, merged) = self.prepare_pull(&info, catalog, params).await?;
-        let engine = self.engine.clone();
-        let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
-        tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
-            .await
-            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        let started = Instant::now();
+        let res = self.catalog_pull_local(&info, catalog, query, params).await;
         self.audit(
             identity,
             "catalog_pull",
             Some(pond_ref),
             Some(query.to_string()),
-            0,
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
         )
         .await;
+        res
+    }
+
+    /// The local half of `catalog_pull` (see `describe_pond_local` for why it is
+    /// split out).
+    async fn catalog_pull_local(
+        &self,
+        info: &PondInfo,
+        catalog: &str,
+        query: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<PullResult, AgentError> {
+        let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
+        let engine = self.engine.clone();
+        let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
+        tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
         Ok(PullResult {
             catalog: cat.name,
             query: query.to_string(),
@@ -562,7 +664,8 @@ impl AgentOps {
         identity: &Identity,
         write: bool,
     ) -> Result<QueryResult, AgentError> {
-        let info = self.control.pond_info(pond_ref).await?;
+        let op = if write { "write_query" } else { "read_query" };
+        let info = self.pond_info_audited(identity, op, pond_ref).await?;
         // The CLI sends every statement through write_query (it doesn't parse SQL;
         // the engine classifies it), and forwarding happens *before* execution — so
         // at this point we can't honestly say read vs write. Log a neutral "query".
@@ -583,6 +686,30 @@ impl AgentOps {
             };
         }
         info!(op = "query", pond = pond_ref, "processing locally");
+        let t0 = Instant::now();
+        let res = self.run_query_local(&info, sql, identity, write).await;
+        self.audit(
+            identity,
+            op,
+            Some(&info.pond_id),
+            Some(redact_sql(sql)),
+            t0.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    /// The local half of `run_query` (see `describe_pond_local` for why it is
+    /// split out): every way this can fail is now on the access trail, where
+    /// before only the successes were.
+    async fn run_query_local(
+        &self,
+        info: &PondInfo,
+        sql: &str,
+        identity: &Identity,
+        write: bool,
+    ) -> Result<QueryResult, AgentError> {
         record_query(&info.name, if write { "write" } else { "read" });
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
         let pond_id = info.pond_id.clone();
@@ -629,17 +756,11 @@ impl AgentOps {
             record_error(&info.name, &ae);
             return Err(ae);
         }
-        let elapsed = t0.elapsed();
-        record_query_duration(&info.name, if write { "write" } else { "read" }, elapsed);
-        let op = if write { "write_query" } else { "read_query" };
-        self.audit(
-            identity,
-            op,
-            Some(&pond_id),
-            Some(redact_sql(sql)),
-            elapsed.as_millis() as u64,
-        )
-        .await;
+        record_query_duration(
+            &info.name,
+            if write { "write" } else { "read" },
+            t0.elapsed(),
+        );
         Ok(qr)
     }
 
@@ -649,7 +770,9 @@ impl AgentOps {
         pond_ref: &str,
         sql: &str,
     ) -> Result<ExplainResult, AgentError> {
-        let info = self.control.pond_info(pond_ref).await?;
+        let info = self
+            .pond_info_audited(identity, "explain_query", pond_ref)
+            .await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
             info!(
                 op = "explain_query",
@@ -661,6 +784,26 @@ impl AgentOps {
             return fwd.explain(owner, identity, pond_ref, sql).await;
         }
         info!(op = "explain_query", pond = pond_ref, "processing locally");
+        let started = Instant::now();
+        let res = self.explain_query_local(&info, sql).await;
+        self.audit(
+            identity,
+            "explain_query",
+            Some(info.pond_id.as_str()),
+            Some(redact_sql(sql)),
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    /// The local half of `explain_query` (see `describe_pond_local`).
+    async fn explain_query_local(
+        &self,
+        info: &PondInfo,
+        sql: &str,
+    ) -> Result<ExplainResult, AgentError> {
         let pid = Self::parse_id(&info.pond_id)?;
         // ensure_pond materializes storage on first touch; attach under the
         // pond's registry name so the plan resolves names in this catalog.
@@ -674,29 +817,20 @@ impl AgentOps {
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let sql2 = sql.to_string();
-        let res = tokio::task::spawn_blocking(move || engine.explain_query(&loc2, &sql2))
-            .await
-            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
-        self.audit(
-            identity,
-            "explain_query",
-            Some(info.pond_id.as_str()),
-            Some(redact_sql(sql)),
-            0,
+        Ok(
+            tokio::task::spawn_blocking(move || engine.explain_query(&loc2, &sql2))
+                .await
+                .map_err(|e| AgentError::internal(format!("join: {e}")))??,
         )
-        .await;
-        Ok(res)
     }
 
-    /// Emit one access record as a structured trace on the `latiq::access`
-    /// target. There is no audit store — operators grep the node log files (or
-    /// ship them to their log stack; `LATIQ_LOG_FORMAT=json` makes the fields
-    /// structured). Filter with e.g. `RUST_LOG=latiq::access=info` or by grepping
-    /// the `latiq::access` target / the `op=`/`pond=` fields. To ask *who* did
-    /// something, filter on `subject=` **together with** `verified=true`:
-    /// `agent=` is the caller's own claim and carries no authority (it is empty
-    /// of meaning for authorization, useful only for correlating one agent's
-    /// activity). `subject=`/`issuer=` are empty when `verified=false`.
+    /// Emit one access record on the `latiq::access` target (see the `access`
+    /// module for the field contract and how operators read it).
+    ///
+    /// `outcome` is not optional: auditing only successes leaves an operator
+    /// with a systematically incomplete picture of agent activity while the
+    /// Admin surface — same target, same field names — gives them a complete one
+    /// for operators. Every audited op records both outcomes.
     ///
     /// Kept `async` so the (many) call sites are unchanged; the body is a
     /// non-blocking trace emit (no store, no await).
@@ -707,19 +841,50 @@ impl AgentOps {
         pond_id: Option<&str>,
         request_summary: Option<String>,
         duration_ms: u64,
+        outcome: &str,
     ) {
-        info!(
-            target: "latiq::access",
-            agent = %identity.agent_id,          // CLAIMED. never authority.
-            subject = %identity.subject,         // verified, or "" when not
-            issuer = %identity.issuer,
-            verified = identity.verified,        // scopes subject/issuer, NOT agent
-            op = operation,
-            pond = pond_id.unwrap_or("-"),
+        crate::access::record(
+            identity,
+            operation,
+            pond_id,
+            request_summary.as_deref(),
             duration_ms,
-            summary = request_summary.as_deref().unwrap_or(""),
-            "access",
+            outcome,
         );
+    }
+
+    /// Audit a failure and hand the error back, so an error path is a one-liner
+    /// rather than a block that is easy to forget to add.
+    async fn audit_err(
+        &self,
+        identity: &Identity,
+        operation: &str,
+        pond: Option<&str>,
+        summary: Option<String>,
+        duration_ms: u64,
+        e: AgentError,
+    ) -> AgentError {
+        self.audit(identity, operation, pond, summary, duration_ms, ERROR)
+            .await;
+        e
+    }
+
+    /// `control.pond_info`, recording a FAILED lookup on the access trail. A
+    /// pond that does not resolve is the most common way an agent op dies, and
+    /// without this it would leave no record at all — an operator would see
+    /// only the ops that got far enough to succeed.
+    async fn pond_info_audited(
+        &self,
+        identity: &Identity,
+        operation: &str,
+        pond_ref: &str,
+    ) -> Result<PondInfo, AgentError> {
+        match self.control.pond_info(pond_ref).await {
+            Ok(info) => Ok(info),
+            Err(e) => Err(self
+                .audit_err(identity, operation, Some(pond_ref), None, 0, e)
+                .await),
+        }
     }
 }
 

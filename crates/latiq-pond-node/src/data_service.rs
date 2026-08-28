@@ -44,8 +44,12 @@ impl DataService {
         self
     }
 
-    async fn identity<T>(&self, req: &Request<T>) -> Result<(Identity, Option<String>), Status> {
-        identity_of(self.verifier.as_ref(), self.challenge.as_deref(), req).await
+    async fn identity<T>(
+        &self,
+        req: &Request<T>,
+        op: &'static str,
+    ) -> Result<(Identity, Option<String>), Status> {
+        identity_of(self.verifier.as_ref(), self.challenge.as_deref(), req, op).await
     }
 }
 
@@ -97,10 +101,19 @@ pub(crate) fn bearer_of<T>(req: &Request<T>) -> Option<String> {
 /// Every rejection is a fixed string: an unauthenticated caller must not be able
 /// to probe our issuer list or key endpoints by reading error text. The detail
 /// goes to the operator's log instead.
+///
+/// A rejection is also RECORDED on the `latiq::access` trail with
+/// `outcome=error`, exactly as the Admin surface records a rejected operator
+/// call. A rejected Data/Stream call otherwise left no trace at all, so an
+/// operator grepping that one stream saw a complete picture of operator
+/// activity and a partial one of everything else. `op` is the RPC being
+/// attempted; there is no verified identity yet, so the record carries only the
+/// caller's claim.
 pub(crate) async fn identity_of<T>(
     verifier: Option<&Arc<Verifier>>,
     challenge: Option<&str>,
     req: &Request<T>,
+    op: &'static str,
 ) -> Result<(Identity, Option<String>), Status> {
     let claimed = req
         .metadata()
@@ -110,13 +123,29 @@ pub(crate) async fn identity_of<T>(
         return Ok((Identity::claimed(claimed), None));
     };
     let Some(token) = bearer_of(req) else {
+        record_rejection(claimed, op, "rejected: no bearer token");
         return Err(unauthenticated("a bearer token is required", challenge));
     };
     let identity = verifier.verify(&token, claimed).await.map_err(|e| {
         tracing::debug!(error = %e, "bearer token rejected");
+        record_rejection(claimed, op, "rejected: invalid token");
         unauthenticated("the bearer token was rejected", challenge)
     })?;
     Ok((identity, Some(token)))
+}
+
+/// One `latiq::access` record for a call turned away before it reached
+/// `AgentOps` — same emitter, so the fields cannot drift from the ones the
+/// successful calls write.
+fn record_rejection(claimed: Option<&str>, op: &'static str, summary: &str) {
+    latiq_agent_core::record_access(
+        &Identity::claimed(claimed),
+        op,
+        None,
+        Some(summary),
+        0,
+        latiq_agent_core::access::ERROR,
+    );
 }
 
 pub(crate) fn to_status(e: AgentError) -> Status {
@@ -185,7 +214,7 @@ impl Data for DataService {
         // plane and returns, without ever calling the forwarder. If it ever does
         // forward, this handler must be wrapped like the rest — otherwise it
         // would reach a peer with no token at all.
-        let (id, _tok) = self.identity(&req).await?;
+        let (id, _tok) = self.identity(&req, "allocate_pond").await?;
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -217,7 +246,7 @@ impl Data for DataService {
         &self,
         req: Request<DropPondRequest>,
     ) -> Result<Response<DropPondResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "drop_pond").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -234,7 +263,7 @@ impl Data for DataService {
         &self,
         req: Request<DescribePondRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "describe_pond").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -249,7 +278,7 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "read_query").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -268,7 +297,7 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "write_query").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -286,7 +315,7 @@ impl Data for DataService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "explain_query").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -304,7 +333,7 @@ impl Data for DataService {
         &self,
         req: Request<LoadDatasetRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "load_dataset").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -322,7 +351,7 @@ impl Data for DataService {
         &self,
         req: Request<CatalogPullRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "catalog_pull").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
@@ -346,7 +375,7 @@ impl Data for DataService {
         &self,
         req: Request<CatalogDescribeRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req).await?;
+        let (id, tok) = self.identity(&req, "catalog_describe").await?;
         let tid = trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
