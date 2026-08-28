@@ -1784,6 +1784,7 @@ dependencies = [
  "latiq-common",
  "rand 0.8.6",
  "reqwest 0.13.4",
+ "ring",
  "rsa",
  "serde",
  "serde_json",
