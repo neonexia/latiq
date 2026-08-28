@@ -264,13 +264,29 @@ impl JwksCache {
                 tracing::debug!(uri = %self.uri, kid = %sanitize_kid(&kid), "skipping JWKS key marked use=enc");
                 continue;
             }
+            // A declared `alg` that is not a SIGNATURE algorithm (RSA-OAEP and
+            // friends) names an encryption key as surely as `use: "enc"` does --
+            // and unlike `use`, which IdPs routinely omit, it is present on every
+            // such key. Skipping is the only safe reading: importing it with
+            // `alg: None` would leave it UNCONSTRAINED, i.e. usable to verify a
+            // signature its issuer never meant it to make.
+            let declared = jwk.common.key_algorithm;
+            if declared.is_some_and(|a| as_signing_alg(a).is_none()) {
+                tracing::warn!(
+                    uri = %self.uri,
+                    kid = %sanitize_kid(&kid),
+                    alg = ?declared,
+                    "skipping JWKS key whose declared alg is not a signature algorithm"
+                );
+                continue;
+            }
             match DecodingKey::from_jwk(jwk) {
                 Ok(key) => {
                     fresh.insert(
                         kid,
                         SigningKey {
                             key,
-                            alg: jwk.common.key_algorithm.and_then(as_signing_alg),
+                            alg: declared.and_then(as_signing_alg),
                         },
                     );
                 }
@@ -328,8 +344,8 @@ impl JwksCache {
 
 /// Map a JWKS `alg` to the signature algorithm it names. `None` for anything
 /// that is not a signature algorithm (key-management algs appear here on
-/// encryption keys), which leaves the key unconstrained rather than
-/// mis-constrained.
+/// encryption keys) -- which is why `refresh_inner` treats `None` from a
+/// DECLARED alg as "skip this key" rather than "no constraint".
 fn as_signing_alg(alg: jsonwebtoken::jwk::KeyAlgorithm) -> Option<Algorithm> {
     use jsonwebtoken::jwk::KeyAlgorithm as K;
     Some(match alg {

@@ -240,6 +240,38 @@ async fn auth_jwks_edge_one_unusable_key_does_not_poison_the_set() {
 }
 
 #[tokio::test]
+async fn auth_jwks_edge_a_key_management_alg_is_not_imported_as_a_signing_key() {
+    // The `use: "enc"` skip only fires when `use` is present, and IdPs routinely
+    // omit it. A key declaring a KEY-MANAGEMENT alg (RSA-OAEP) is an encryption
+    // key just as plainly, and importing it would leave it UNCONSTRAINED --
+    // usable to verify a signature its issuer never meant it to make. Defence in
+    // depth (an attacker still needs the private key), but skipping is strictly
+    // safer than importing with no algorithm pinned.
+    let idp = TestIdp::start().await;
+    let good: serde_json::Value =
+        serde_json::from_str(&jwks_document(KID)).expect("good jwks parses");
+    // Same real RSA material as the good key, so nothing but the declared `alg`
+    // distinguishes them: `from_jwk` accepts it, which is exactly the problem.
+    let mut enc = good["keys"][0].clone();
+    enc["kid"] = serde_json::json!("enc-key");
+    enc["alg"] = serde_json::json!("RSA-OAEP");
+    // No `use` at all -- the case the `use: "enc"` skip cannot catch.
+    enc.as_object_mut().expect("jwk object").remove("use");
+    idp.set_jwks_body(serde_json::json!({ "keys": [enc, good["keys"][0]] }).to_string())
+        .await;
+
+    let cache = eager_cache(&idp);
+    assert!(
+        cache.key_for(KID).await.is_ok(),
+        "one skipped key must not poison the set"
+    );
+    assert!(
+        cache.key_for("enc-key").await.is_err(),
+        "a key-management alg must not be importable as a signing key"
+    );
+}
+
+#[tokio::test]
 async fn auth_jwks_edge_non_success_status_is_an_error() {
     let idp = TestIdp::start().await;
     idp.set_status(503).await;
