@@ -220,7 +220,10 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >-
-        pip install --no-cache-dir --find-links /repo/dist latiq &&
+        # --no-index is load-bearing: without it a missing/stale wheel in
+        # /repo/dist silently falls back to PyPI, and the auth suite would go
+        # green against the PUBLISHED latiq instead of this branch's code.
+        pip install --no-cache-dir --no-index --find-links /repo/dist latiq &&
         pip install --no-cache-dir -r /repo/e2e/sdk/requirements.txt &&
         pytest /repo/e2e/sdk/test_auth.py -v
     depends_on: [gateway, keycloak]
