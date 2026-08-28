@@ -389,7 +389,34 @@ impl AgentOps {
     /// Copy a dataset's tables into a pond — one `CREATE OR REPLACE TABLE … AS
     /// SELECT * FROM read_*(uri)` per table, routed through the normal write path
     /// (so forwarding to the owning node is handled).
+    ///
+    /// Its component writes are each audited as `write_query` (with the redacted
+    /// SQL), so the data movement was never invisible — but the operation the
+    /// caller actually asked for was, and "which dataset was pulled into this
+    /// pond" is not reconstructable from N `CREATE TABLE` shapes. This records
+    /// the op itself, at completion: it is a bounded server-side sequence, and a
+    /// partial load that failed on table 3 of 5 must not read as a clean one.
     pub async fn load_dataset(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        dataset: &str,
+    ) -> Result<LoadDatasetResult, AgentError> {
+        let started = Instant::now();
+        let res = self.load_dataset_inner(identity, pond_ref, dataset).await;
+        self.audit(
+            identity,
+            "load_dataset",
+            Some(pond_ref),
+            Some(dataset.to_string()),
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    async fn load_dataset_inner(
         &self,
         identity: &Identity,
         pond_ref: &str,
@@ -485,7 +512,9 @@ impl AgentOps {
         catalog: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, String)>, AgentError> {
-        let info = self.control.pond_info(pond_ref).await?;
+        let info = self
+            .pond_info_audited(identity, "catalog_describe", pond_ref)
+            .await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
             info!(
                 op = "catalog_describe",
@@ -498,7 +527,31 @@ impl AgentOps {
                 .catalog_describe(owner, identity, pond_ref, catalog, params)
                 .await;
         }
-        let (loc, cat, merged) = self.prepare_pull(&info, catalog, params).await?;
+        // This attaches an EXTERNAL catalog on the pond's engine and reads its
+        // table list — a real access to a real system, not a registry lookup, so
+        // it belongs on the trail like `catalog_pull`.
+        let started = Instant::now();
+        let res = self.catalog_describe_local(&info, catalog, params).await;
+        self.audit(
+            identity,
+            "catalog_describe",
+            Some(&info.pond_id),
+            Some(catalog.to_string()),
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    /// The local half of `catalog_describe` (see `describe_pond_local`).
+    async fn catalog_describe_local(
+        &self,
+        info: &PondInfo,
+        catalog: &str,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, AgentError> {
+        let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
         let engine = self.engine.clone();
         let (ty, alias) = (cat.r#type.clone(), cat.name.clone());
         tokio::task::spawn_blocking(move || engine.describe_catalog(&loc, &ty, &alias, &merged))
@@ -544,13 +597,39 @@ impl AgentOps {
     /// schema is resolved before returning, so an empty result still carries
     /// columns and a pre-stream error (parse / pond-not-found) surfaces here
     /// rather than mid-stream.
+    ///
+    /// AUDIT TIMING — the access record is emitted when the stream is
+    /// ESTABLISHED, not when it finishes.
+    ///
+    /// Establishment is the moment the access is authorized and rows begin to
+    /// flow, and it is reached exactly once, here, on the server, before any
+    /// byte reaches the client. Completion is not: when a stream ends, and
+    /// whether that end is observed at all, is controlled by the consumer. Two
+    /// consequences decide it. A read held open for an hour would be invisible
+    /// for that hour, so "who is reading this pond right now" could not be
+    /// answered from the trail at the one time it matters. And a consumer that
+    /// drops mid-stream is noticed in different places on the local and
+    /// forwarded paths (`decode_arrow_stream` simply returns when its receiver
+    /// is gone), so a completion-time record would be reliable on one path and
+    /// not the other. An audit record must not be contingent on the behaviour
+    /// of the party being audited.
+    ///
+    /// The cost is paid in two fields, and it is the right trade: `duration_ms`
+    /// measures ESTABLISHMENT (pond resolution, planning, first schema) and not
+    /// the life of the stream, and `outcome` says whether the read STARTED — a
+    /// read that dies mid-stream still leaves an `ok` record, because the access
+    /// it records did happen. Row counts are deliberately not claimed here for
+    /// the same reason. The non-streaming `read_collected` runs entirely
+    /// server-side, so it can and does record at completion instead.
     pub async fn read_arrow(
         &self,
         identity: &Identity,
         pond_ref: &str,
         sql: &str,
     ) -> Result<ArrowReadStream, AgentError> {
-        let info = self.control.pond_info(pond_ref).await?;
+        let info = self
+            .pond_info_audited(identity, "read_arrow", pond_ref)
+            .await?;
         if let Some((fwd, owner)) = self.forward_target(&info) {
             info!(
                 op = "read_arrow",
@@ -559,9 +638,32 @@ impl AgentOps {
                 "forwarding to owner node"
             );
             record_forward("read_arrow");
+            // The owner audits the read it actually ran, as everywhere else.
             return fwd.read_arrow(owner, identity, pond_ref, sql).await;
         }
         info!(op = "read_arrow", pond = pond_ref, "processing locally");
+        let started = Instant::now();
+        let res = self.read_arrow_local(&info, sql).await;
+        self.audit(
+            identity,
+            "read_arrow",
+            Some(&info.pond_id),
+            Some(redact_sql(sql)),
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    /// The local half of `read_arrow`: everything from the engine call onward.
+    /// Returning as soon as the schema is known is what makes the establishment
+    /// -time audit above possible.
+    async fn read_arrow_local(
+        &self,
+        info: &PondInfo,
+        sql: &str,
+    ) -> Result<ArrowReadStream, AgentError> {
         record_query(&info.name, "read");
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
         let pond_id = info.pond_id.clone();
@@ -622,13 +724,58 @@ impl AgentOps {
     /// bounded by the inline cap. So MCP/CLI reads ride the same Arrow internal
     /// transport (no double-materialize on a forward) and only convert to JSON
     /// once here, at the edge.
+    ///
+    /// Audited at COMPLETION, unlike `read_arrow`: the collection runs entirely
+    /// server-side, so nothing about the record depends on the client still
+    /// being there. That buys a true `duration_ms` and an `outcome` that
+    /// accounts for the whole read — including a result that blows the inline
+    /// cap, which is a read that returned no data to anyone.
+    ///
+    /// Recorded as `read_query`, the RPC the caller actually invoked (the
+    /// rejection records on that RPC use the same name), not as the internal
+    /// Arrow hop it happens to ride.
     pub async fn read_collected(
         &self,
         identity: &Identity,
         pond_ref: &str,
         sql: &str,
     ) -> Result<QueryResult, AgentError> {
-        let stream = self.read_arrow(identity, pond_ref, sql).await?;
+        let info = self
+            .pond_info_audited(identity, "read_query", pond_ref)
+            .await?;
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "read_query",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            record_forward("read_arrow");
+            // The owner audits the read it ran; we only collect its stream.
+            let stream = fwd.read_arrow(owner, identity, pond_ref, sql).await?;
+            return self.collect_stream(stream).await;
+        }
+        info!(op = "read_query", pond = pond_ref, "processing locally");
+        let started = Instant::now();
+        let res = match self.read_arrow_local(&info, sql).await {
+            Ok(stream) => self.collect_stream(stream).await,
+            Err(e) => Err(e),
+        };
+        self.audit(
+            identity,
+            "read_query",
+            Some(&info.pond_id),
+            Some(redact_sql(sql)),
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    /// Drain an Arrow stream into the neutral `QueryResult`, bounded by the
+    /// inline cap.
+    async fn collect_stream(&self, stream: ArrowReadStream) -> Result<QueryResult, AgentError> {
         let columns: Vec<String> = stream
             .schema
             .fields()

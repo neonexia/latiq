@@ -95,6 +95,76 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
     .await
     .unwrap_err();
 
+    // A STREAMING read whose stream the client abandons without reading a byte.
+    // The record must exist anyway, and must already be there by the time the
+    // client could have consumed anything: the pond was opened, the query ran
+    // and rows were flowing. This is what pins the establishment-time choice —
+    // the record is complete before the consumer has any say in it.
+    let mut stream_client = StreamClient::connect(stack.data_endpoint.clone())
+        .await
+        .unwrap();
+    let abandoned = stream_client
+        .read_arrow(bearer_req(
+            QueryRequest {
+                pond: "trail".into(),
+                sql: "SELECT * FROM range(50000)".into(),
+            },
+            "agent-7",
+            &token,
+        ))
+        .await
+        .expect("the read is established before the first chunk is consumed");
+    drop(abandoned);
+
+    // A collected (non-streaming) read, which is the `read_query` RPC.
+    data.read_query(bearer_req(
+        QueryRequest {
+            pond: "trail".into(),
+            sql: "SELECT 1 AS one".into(),
+        },
+        "agent-7",
+        &token,
+    ))
+    .await
+    .unwrap();
+
+    // ...and one that blows the inline cap. It is knowable ONLY after collecting
+    // every row, so an `error` here is what proves `read_collected` records at
+    // completion rather than at establishment (where it looked fine).
+    data.read_query(bearer_req(
+        QueryRequest {
+            pond: "trail".into(),
+            sql: "SELECT * FROM range(50000)".into(),
+        },
+        "agent-7",
+        &token,
+    ))
+    .await
+    .unwrap_err();
+
+    // The two paths that reached the engine with no record at all until now.
+    data.catalog_describe(bearer_req(
+        CatalogDescribeRequest {
+            pond: "never-existed".into(),
+            catalog: "nope".into(),
+            params: Default::default(),
+        },
+        "agent-7",
+        &token,
+    ))
+    .await
+    .unwrap_err();
+    data.load_dataset(bearer_req(
+        LoadDatasetRequest {
+            pond: "trail".into(),
+            dataset: "never-existed".into(),
+        },
+        "agent-7",
+        &token,
+    ))
+    .await
+    .unwrap_err();
+
     // A refused drop (no confirm): an ATTEMPT to delete a pond and all its data
     // is precisely the kind of thing an operator wants in the trail.
     data.drop_pond(bearer_req(
@@ -176,6 +246,64 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         "a failed action is still attributed: {failed}"
     );
 
+    // ---- the streaming read path, previously invisible entirely ------------
+    let all = |needle: &str| -> Vec<String> {
+        log.lines()
+            .filter(|l| l.contains("latiq::access") && l.contains(needle))
+            .map(|l| l.to_string())
+            .collect()
+    };
+
+    let streamed = access("op=\"read_arrow\"");
+    assert!(
+        streamed.contains("outcome=\"ok\""),
+        "an established stream is an access that happened, however it ends: {streamed}"
+    );
+    assert!(
+        streamed.contains("subject=svc-analyst") && streamed.contains("verified=true"),
+        "the bulk-read path must carry the verified reader: {streamed}"
+    );
+    // A locally-executed op records the resolved pond id, never the placeholder.
+    assert!(
+        streamed.contains("pond=\"") && !streamed.contains("pond=\"-\""),
+        "the stream record must name the pond read: {streamed}"
+    );
+    // The redacted SQL shape is part of the documented field set, and a read
+    // record without it does not say WHAT was read.
+    assert!(
+        streamed.contains("range"),
+        "the redacted SQL shape must be recorded: {streamed}"
+    );
+
+    // `read_query` is recorded under the RPC the caller invoked, not under the
+    // internal Arrow hop it rides — so it matches the rejection records above.
+    let reads = all("op=\"read_query\"");
+    assert!(
+        reads.iter().any(|l| l.contains("outcome=\"ok\"")),
+        "the successful collected read must be recorded: {reads:?}"
+    );
+    let capped = reads
+        .iter()
+        .find(|l| l.contains("outcome=\"error\""))
+        .unwrap_or_else(|| {
+            panic!("a read that blew the inline cap must be recorded as failed: {reads:?}")
+        });
+    assert!(
+        capped.contains("range"),
+        "the failed read still records what was attempted: {capped}"
+    );
+
+    let described = access("op=\"catalog_describe\"");
+    assert!(
+        described.contains("outcome=\"error\"") && described.contains("pond=\"never-existed\""),
+        "an external-catalog describe must be on the trail: {described}"
+    );
+    let loaded = access("op=\"load_dataset\"");
+    assert!(
+        loaded.contains("outcome=\"error\"") && loaded.contains("summary=\"never-existed\""),
+        "a dataset load must name the dataset it attempted: {loaded}"
+    );
+
     let refused = access("op=\"drop_pond\"");
     assert!(
         refused.contains("outcome=\"error\"") && refused.contains("pond=\"trail\""),
@@ -203,13 +331,15 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
     );
     // The Stream surface shares the guard, so it must share the record too --
     // otherwise the streaming read path (the SDK's primary one) is a blind spot.
-    let streamed = log
+    // Narrowed to the REJECTION: the same op now also has a successful record
+    // above, and a filter that matched either would prove nothing.
+    let rejected_stream = log
         .lines()
         .filter(|l| l.contains("latiq::access"))
-        .find(|l| l.contains("op=\"read_arrow\""))
+        .find(|l| l.contains("op=\"read_arrow\"") && l.contains("rejected: no bearer token"))
         .unwrap_or_else(|| panic!("a rejected read_arrow must be recorded: {log}"));
     assert!(
-        streamed.contains("outcome=\"error\"") && streamed.contains("rejected: no bearer token"),
-        "the Stream surface must record rejections like the Data surface: {streamed}"
+        rejected_stream.contains("outcome=\"error\"") && rejected_stream.contains("verified=false"),
+        "the Stream surface must record rejections like the Data surface: {rejected_stream}"
     );
 }
