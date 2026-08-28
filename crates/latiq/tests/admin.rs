@@ -158,81 +158,87 @@ async fn auth_admin_absent_config_keeps_relaxed_identity() {
     admin.list_nodes(ListNodesRequest {}).await.unwrap();
 }
 
+/// The Admin mirror of `query_grpc.rs::auth_rejects_every_bad_credential_on_both_surfaces`:
+/// the rejection matrix on ONE control plane rather than three startups for
+/// three tests. An operator whose CLI is turned away needs the same discovery
+/// hint an agent gets from the MCP 401 — which authorization server this
+/// deployment trusts — and needs it however the credential failed.
 #[tokio::test]
-async fn auth_admin_rejects_missing_token_when_configured() {
+async fn auth_admin_rejects_every_bad_credential_with_a_discovery_challenge() {
     let idp = latiq_auth::test_support::TestIdp::start().await;
     let (_control, admin_endpoint) =
         common::start_control_plane_with_auth(Some(idp.auth_config())).await;
     let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
-    let err = admin.list_nodes(ListNodesRequest {}).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    let msg = err.message().to_lowercase();
-    assert!(
-        !msg.contains(&idp.issuer.to_lowercase()) && !msg.contains("jwks"),
-        "the challenge must not leak issuers or the JWKS uri: {msg}"
-    );
-    // A mutating handler is guarded the same way -- the reads are not the only
-    // thing on this surface, and the mutations are the ones that matter.
-    let err = admin
-        .policy_set(PolicySetRequest {
-            key: "query_timeout_seconds".into(),
-            value: "45".into(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    let err = admin
-        .dataset_remove(DatasetRemoveRequest {
-            name: "nope".into(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    let err = admin
-        .catalog_remove(CatalogRemoveRequest {
-            name: "nope".into(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
-}
+    let expired = idp.mint("svc-ops", "latiq", &idp.issuer, -60);
 
-/// An operator whose CLI is turned away needs the same discovery hint an agent
-/// gets from the MCP 401: which authorization server this deployment trusts.
-#[tokio::test]
-async fn auth_admin_rejection_carries_the_discovery_challenge() {
-    let idp = latiq_auth::test_support::TestIdp::start().await;
-    let (_control, admin_endpoint) =
-        common::start_control_plane_with_auth(Some(idp.auth_config())).await;
-    let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
+    let credentials: [(&str, Option<&str>); 3] = [
+        ("no token at all", None),
+        ("a token that is not a JWT", Some("not-a-jwt")),
+        (
+            "an expired token from the real issuer",
+            Some(expired.as_str()),
+        ),
+    ];
 
-    let err = admin.list_nodes(ListNodesRequest {}).await.unwrap_err();
-    let challenge = err
-        .metadata()
-        .get("www-authenticate")
-        .expect("a rejection must advertise where to get a token")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        challenge.starts_with(r#"Bearer resource_metadata=""#),
-        "got {challenge}"
-    );
-    assert!(
-        challenge.contains("/.well-known/oauth-protected-resource"),
-        "got {challenge}"
-    );
+    let mut challenges: Vec<String> = Vec::new();
+    for (why, token) in credentials {
+        // A read and a MUTATION per row: the reads are not the only thing on
+        // this surface, and the mutations are the ones that matter.
+        let list = match token {
+            Some(t) => bearer_req(ListNodesRequest {}, "opsbot", t),
+            None => Request::new(ListNodesRequest {}),
+        };
+        let set = match token {
+            Some(t) => bearer_req(
+                PolicySetRequest {
+                    key: "query_timeout_seconds".into(),
+                    value: "45".into(),
+                },
+                "opsbot",
+                t,
+            ),
+            None => Request::new(PolicySetRequest {
+                key: "query_timeout_seconds".into(),
+                value: "45".into(),
+            }),
+        };
 
-    // A token that fails verification gets the same challenge.
-    let err = admin
-        .list_nodes(bearer_req(ListNodesRequest {}, "opsbot", "not-a-jwt"))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err.metadata()
-            .get("www-authenticate")
-            .map(|v| v.to_str().unwrap()),
-        Some(challenge.as_str())
+        for (rpc, err) in [
+            ("list_nodes", admin.list_nodes(list).await.unwrap_err()),
+            ("policy_set", admin.policy_set(set).await.unwrap_err()),
+        ] {
+            assert_eq!(err.code(), tonic::Code::Unauthenticated, "{rpc}: {why}");
+
+            // The rejection must not tell an unauthenticated caller which
+            // issuers we trust or where their keys live.
+            let msg = err.message().to_lowercase();
+            assert!(
+                !msg.contains(&idp.issuer.to_lowercase()) && !msg.contains("jwks"),
+                "{rpc}: {why} — the rejection leaks issuers or the JWKS uri: {msg}"
+            );
+
+            let challenge = err
+                .metadata()
+                .get("www-authenticate")
+                .unwrap_or_else(|| {
+                    panic!("{rpc}: {why} — a rejection must advertise where to get a token")
+                })
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                challenge.starts_with(r#"Bearer resource_metadata=""#)
+                    && challenge.contains("/.well-known/oauth-protected-resource"),
+                "{rpc}: {why} — got {challenge}"
+            );
+            challenges.push(challenge);
+        }
+    }
+    // The same challenge every time: an operator's recovery does not depend on
+    // WHICH RPC they hit or HOW their credential failed.
+    assert!(
+        challenges.windows(2).all(|w| w[0] == w[1]),
+        "the challenge must not vary by rpc or failure mode: {challenges:?}"
     );
 }
 
@@ -249,26 +255,6 @@ async fn auth_admin_absent_config_sends_no_challenge() {
         .await
         .unwrap_err();
     assert!(err.metadata().get("www-authenticate").is_none());
-}
-
-#[tokio::test]
-async fn auth_admin_rejects_an_invalid_token_when_configured() {
-    let idp = latiq_auth::test_support::TestIdp::start().await;
-    let (_control, admin_endpoint) =
-        common::start_control_plane_with_auth(Some(idp.auth_config())).await;
-    let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
-    let err = admin
-        .list_nodes(bearer_req(ListNodesRequest {}, "opsbot", "not-a-jwt"))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    // An expired token from the real issuer is rejected the same way.
-    let expired = idp.mint("svc-ops", "latiq", &idp.issuer, -60);
-    let err = admin
-        .list_nodes(bearer_req(ListNodesRequest {}, "opsbot", &expired))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
 #[tokio::test]
@@ -340,6 +326,8 @@ async fn auth_admin_every_rpc_rejects_a_missing_token() {
         common::start_control_plane_with_auth(Some(idp.auth_config())).await;
     let mut admin = AdminClient::connect(admin_endpoint).await.unwrap();
 
+    let issuer = idp.issuer.to_lowercase();
+
     // Default requests: identity is checked before any argument validation, so
     // an empty message still has to be rejected as unauthenticated.
     macro_rules! probe {
@@ -352,6 +340,19 @@ async fn auth_admin_every_rpc_rejects_a_missing_token() {
                 err.code(),
                 tonic::Code::Unauthenticated,
                 concat!(stringify!($method), " must reject a tokenless call")
+            );
+            // No RPC may tell an unauthenticated caller which issuers we trust
+            // or where their keys live. Asserted HERE, across the whole surface,
+            // rather than on one sampled RPC as it used to be: a leak added to a
+            // single handler is exactly what a sample misses.
+            let msg = err.message().to_lowercase();
+            assert!(
+                !msg.contains(&issuer) && !msg.contains("jwks"),
+                concat!(
+                    stringify!($method),
+                    " leaks issuers or the JWKS uri in its rejection: {}"
+                ),
+                msg
             );
             stringify!($method)
         }};

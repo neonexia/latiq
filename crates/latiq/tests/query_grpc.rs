@@ -400,69 +400,98 @@ async fn auth_absent_config_keeps_relaxed_identity() {
     );
 }
 
+/// The whole rejection matrix for the Data and Stream surfaces, on ONE stack:
+/// `(surface, credential) -> (Unauthenticated, an RFC 9728 discovery challenge,
+/// no leak of what we trust)`. This was four tests and four
+/// `start_stack_with_auth` startups for what is one table; the matrix IS the
+/// property, so it reads better as one.
+///
+/// RFC 9728 discovery is the reason the challenge is asserted on every row: a
+/// Data/Stream client that is turned away has no other in-band way to learn
+/// WHERE to get a token, and the challenge in the Status' metadata is the whole
+/// handshake we participate in. The `for (why, ...)` shape is borrowed from
+/// `tests/mcp.rs` — every assertion names the row it fired on.
 #[tokio::test]
-async fn auth_rejects_missing_token_when_configured() {
+async fn auth_rejects_every_bad_credential_on_both_surfaces() {
     let idp = latiq_auth::test_support::TestIdp::start().await;
     let s = start_stack_with_auth(idp.auth_config()).await;
     let mut c = client(&s.data_endpoint).await;
-    let err = c.allocate_pond(req(alloc("p"), "dana")).await.unwrap_err();
-    assert_eq!(err.code(), Code::Unauthenticated);
-    let msg = err.message().to_lowercase();
-    assert!(
-        !msg.contains(&idp.issuer.to_lowercase()) && !msg.contains("jwks"),
-        "the challenge must not leak issuers or the JWKS uri: {msg}"
-    );
-}
-
-/// RFC 9728 discovery on gRPC. A Data/Stream client that is turned away has no
-/// other in-band way to learn WHERE to get a token; the challenge in the Status'
-/// metadata is the whole handshake we participate in.
-#[tokio::test]
-async fn auth_rejection_carries_the_discovery_challenge() {
-    let idp = latiq_auth::test_support::TestIdp::start().await;
-    let s = start_stack_with_auth(idp.auth_config()).await;
-    let mut c = client(&s.data_endpoint).await;
-
-    // No token at all.
-    let err = c.allocate_pond(req(alloc("p"), "dana")).await.unwrap_err();
-    let challenge = err
-        .metadata()
-        .get("www-authenticate")
-        .expect("a rejection must advertise where to get a token")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        challenge.starts_with(r#"Bearer resource_metadata=""#),
-        "got {challenge}"
-    );
-    assert!(
-        challenge.contains("/.well-known/oauth-protected-resource"),
-        "got {challenge}"
-    );
-
-    // A token that fails verification gets the same challenge — the client's
-    // recovery (go back to the authorization server) is identical.
-    let err = c
-        .allocate_pond(bearer_req(alloc("p"), "dana", "not-a-jwt"))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        err.metadata()
-            .get("www-authenticate")
-            .map(|v| v.to_str().unwrap()),
-        Some(challenge.as_str())
-    );
-
-    // The Stream surface answers the same way.
     let mut sc = latiq_proto::v1::stream_client::StreamClient::connect(s.data_endpoint.clone())
         .await
         .unwrap();
-    let err = sc
-        .read_arrow(req(q("p", "SELECT 1"), "dana"))
+
+    let good = idp.mint("svc-dana", "latiq", &idp.issuer, 300);
+    // A real pond, so a row that got through would succeed — which is what makes
+    // the rejections below about the CREDENTIAL and not about the request.
+    c.allocate_pond(bearer_req(alloc("st"), "dana", &good))
         .await
-        .unwrap_err();
-    assert!(err.metadata().get("www-authenticate").is_some());
+        .unwrap();
+    let expired = idp.mint("svc-dana", "latiq", &idp.issuer, -60);
+
+    let credentials: [(&str, Option<&str>); 3] = [
+        ("no token at all", None),
+        ("a token that is not a JWT", Some("not-a-jwt")),
+        (
+            "an expired token from the real issuer",
+            Some(expired.as_str()),
+        ),
+    ];
+
+    for surface in ["data", "stream"] {
+        let mut challenges: Vec<String> = Vec::new();
+        for (why, token) in credentials {
+            let request = match token {
+                Some(t) => bearer_req(q("st", "SELECT 1"), "dana", t),
+                None => req(q("st", "SELECT 1"), "dana"),
+            };
+            let err = if surface == "data" {
+                c.read_query(request).await.unwrap_err()
+            } else {
+                sc.read_arrow(request).await.unwrap_err()
+            };
+
+            assert_eq!(err.code(), Code::Unauthenticated, "{surface}: {why}");
+
+            // The rejection must not tell an unauthenticated caller which
+            // issuers we trust or where their keys live.
+            let msg = err.message().to_lowercase();
+            assert!(
+                !msg.contains(&idp.issuer.to_lowercase()) && !msg.contains("jwks"),
+                "{surface}: {why} — the rejection leaks issuers or the JWKS uri: {msg}"
+            );
+
+            let challenge = err
+                .metadata()
+                .get("www-authenticate")
+                .unwrap_or_else(|| {
+                    panic!("{surface}: {why} — a rejection must advertise where to get a token")
+                })
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(
+                challenge.starts_with(r#"Bearer resource_metadata=""#)
+                    && challenge.contains("/.well-known/oauth-protected-resource"),
+                "{surface}: {why} — got {challenge}"
+            );
+            challenges.push(challenge);
+        }
+        // Identical for every rejection: the client's recovery (go back to the
+        // authorization server) does not depend on HOW the credential failed.
+        assert!(
+            challenges.windows(2).all(|w| w[0] == w[1]),
+            "{surface}: the challenge must not vary by failure mode: {challenges:?}"
+        );
+    }
+
+    // ...and both surfaces let a good token through, which is what proves the
+    // rows above are not a surface that refuses everything.
+    c.read_query(bearer_req(q("st", "SELECT 1"), "dana", &good))
+        .await
+        .unwrap();
+    sc.read_arrow(bearer_req(q("st", "SELECT 1"), "dana", &good))
+        .await
+        .unwrap();
 }
 
 /// With no verifier there is nothing to discover, so no challenge is attached —
@@ -481,25 +510,6 @@ async fn auth_absent_config_sends_no_challenge() {
         .await
         .unwrap_err();
     assert!(err.metadata().get("www-authenticate").is_none());
-}
-
-#[tokio::test]
-async fn auth_rejects_an_invalid_token_when_configured() {
-    let idp = latiq_auth::test_support::TestIdp::start().await;
-    let s = start_stack_with_auth(idp.auth_config()).await;
-    let mut c = client(&s.data_endpoint).await;
-    let err = c
-        .allocate_pond(bearer_req(alloc("p"), "dana", "not-a-jwt"))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::Unauthenticated);
-    // An expired token from the real issuer is rejected the same way.
-    let expired = idp.mint("svc-dana", "latiq", &idp.issuer, -60);
-    let err = c
-        .allocate_pond(bearer_req(alloc("p"), "dana", &expired))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::Unauthenticated);
 }
 
 #[tokio::test]
@@ -539,28 +549,4 @@ async fn auth_accepts_a_valid_token_and_marks_identity_verified() {
         !authors.iter().any(|a| a == "dana"),
         "the claimed leaf must not be the author for a verified caller: {authors:?}"
     );
-}
-
-#[tokio::test]
-async fn auth_stream_surface_requires_a_token_too() {
-    let idp = latiq_auth::test_support::TestIdp::start().await;
-    let s = start_stack_with_auth(idp.auth_config()).await;
-    let token = idp.mint("svc-dana", "latiq", &idp.issuer, 300);
-    let mut c = client(&s.data_endpoint).await;
-    c.allocate_pond(bearer_req(alloc("st"), "dana", &token))
-        .await
-        .unwrap();
-
-    let mut sc = latiq_proto::v1::stream_client::StreamClient::connect(s.data_endpoint.clone())
-        .await
-        .unwrap();
-    let err = sc
-        .read_arrow(req(q("st", "SELECT 1"), "dana"))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::Unauthenticated);
-    // ...and succeeds with one.
-    sc.read_arrow(bearer_req(q("st", "SELECT 1"), "dana", &token))
-        .await
-        .unwrap();
 }
