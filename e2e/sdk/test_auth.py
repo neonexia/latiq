@@ -167,50 +167,32 @@ def test_auth_real_token_has_array_audience(token, claims):
 # ── the Data/Query surface ───────────────────────────────────────────────────
 
 
-def test_auth_valid_token_can_allocate_write_and_read(db):
-    p = db.create_pond(name=_name("auth"), description="real-token e2e")
-    try:
-        p.query(sql="CREATE TABLE t(id INTEGER, label VARCHAR)")
-        p.query(sql="INSERT INTO t VALUES (1,'a'),(2,'b')")
-        got = p.query(sql="SELECT id, label FROM t ORDER BY id")
-        assert got.num_rows == 2
-        assert got.column("label").to_pylist() == ["a", "b"]
-    finally:
-        db.drop_pond(pond=p.name, confirm=True)
-
-
-def test_auth_no_token_is_rejected(db, anon_db):
-    """The pond is allocated with a good token; the un-tokened client is refused
-    at the query — so the failure can only be the missing credential."""
-    p = db.create_pond(name=_name("notok"))
-    try:
-        with pytest.raises(RuntimeError) as e:
-            anon_db.get_pond(pond=p.name).query(sql="SELECT 1 AS n")
-        _refused(e.value)
-    finally:
-        db.drop_pond(pond=p.name, confirm=True)
-
-
-def test_auth_garbage_token_is_rejected(db):
-    p = db.create_pond(name=_name("garbage"))
-    junk = latiq.connect(server=SERVER, query_gateway=GATEWAY, token="not-a-jwt")
-    try:
-        with pytest.raises(RuntimeError) as e:
-            junk.get_pond(pond=p.name).query(sql="SELECT 1 AS n")
-        _refused(e.value)
-    finally:
-        db.drop_pond(pond=p.name, confirm=True)
+# The negative Data/Stream paths (no token, garbage token) are NOT here. They are
+# proven in milliseconds against the fake IdP by
+# `crates/latiq/tests/query_grpc.rs::auth_rejects_an_invalid_token_when_configured`,
+# `crates/latiq-auth/tests/verify.rs::auth_rejects_garbage` and
+# `crates/latiq/tests/sdk_auth.rs::auth_sdk_token_is_required_and_sufficient`.
+# A garbage token never reaches the IdP, so a real Keycloak adds nothing to it;
+# and a missing-token test is structurally incapable of proving the SDK threads
+# tokens at all — a binding that discarded every token would still pass it.
 
 
 def test_auth_verified_identity_reaches_attribution(db, claims):
     """The assertion that separates "the call succeeded" from "the call was
     genuinely VERIFIED": DuckLake's commit author must be the token's subject,
     not the claimed leaf the SDK also sends. Without this the suite would pass
-    on a silent fallback to claimed identity."""
-    p = db.create_pond(name=_name("attrib"))
+    on a silent fallback to claimed identity.
+
+    This is also the tier's one positive allocate → write → read-back path, so
+    the data is read back as well as the history."""
+    p = db.create_pond(name=_name("attrib"), description="real-token e2e")
     try:
-        p.query(sql="CREATE TABLE t(i INTEGER)")
-        p.query(sql="INSERT INTO t VALUES (1)")
+        p.query(sql="CREATE TABLE t(id INTEGER, label VARCHAR)")
+        p.query(sql="INSERT INTO t VALUES (1,'a'),(2,'b')")
+        got = p.query(sql="SELECT id, label FROM t ORDER BY id")
+        assert got.num_rows == 2
+        assert got.column("label").to_pylist() == ["a", "b"]
+
         hist = p.query(
             sql=f"SELECT author, commit_extra_info FROM ducklake_snapshots('{p.name}')"
         )
@@ -250,6 +232,89 @@ def test_auth_streaming_read_also_carries_the_token(db):
         db.drop_pond(pond=p.name, confirm=True)
 
 
+def test_auth_cross_node_forwarding_replays_the_token(db, claims):
+    """Token replay across the greeter hop, against the REAL gatewayed topology.
+
+    A query for a pond this node does not own is forwarded to the owner, and the
+    caller's token has to ride along — if it did not, the owner would refuse the
+    hop (or, far worse, accept it as an unverified internal call). That is proven
+    in-process by the Rust forwarding tests, but never before against a real
+    multi-node cluster behind nginx with a real Keycloak, which is the only place
+    a gateway that strips `authorization`, or an internal channel that forgets to
+    re-attach it, can show up.
+
+    Placement is random, so allocate enough ponds to spread across nodes (ported
+    from `test_sdk_cluster.py::test_multi_node_placement_and_forwarding`), then
+    write + read EACH through the one gateway address with a token, and check the
+    attribution on a representative pond per node — a forwarded write must be
+    authored by the TOKEN's subject on the far node too, not by the claimed leaf
+    and not by the forwarding node.
+    """
+    names = [_name("authshard") for _ in range(12)]
+    for nm in names:
+        db.create_pond(name=nm)
+    try:
+        listed = db.list_ponds()
+        by_node: dict[str, str] = {}
+        for nm in names:
+            assert nm in listed, f"{nm} missing from the tokened Admin listing"
+            by_node.setdefault(listed[nm]["node_id"], nm)
+        if len(by_node) < 2:
+            pytest.skip(
+                "single-node auth cluster — no cross-node hop to prove "
+                f"(nodes seen: {sorted(by_node)})"
+            )
+
+        # Every pond is reachable + correct through the single gateway address,
+        # with the token surviving whichever hop the greeter takes.
+        for nm in names:
+            h = db.get_pond(pond=nm)
+            h.query(sql="CREATE TABLE t AS SELECT 7 AS v")
+            got = h.query(sql="SELECT v FROM t")
+            assert got.column("v")[0].as_py() == 7, f"forwarded query failed for {nm}"
+
+        # One pond per node: the forwarded write is attributed to the token.
+        for node_id, nm in by_node.items():
+            hist = db.get_pond(pond=nm).query(
+                sql=f"SELECT author FROM ducklake_snapshots('{nm}')"
+            )
+            authors = [a for a in hist.column("author").to_pylist() if a]
+            assert claims["sub"] in authors, (
+                f"on node {node_id}, pond {nm}: a forwarded write must be authored "
+                f"by the token subject {claims['sub']!r}, got {authors!r}"
+            )
+            assert CLAIMED_LEAF not in authors, (
+                f"on node {node_id}, pond {nm}: the claimed leaf must never be the "
+                f"author of a verified write: {authors!r}"
+            )
+    finally:
+        for nm in names:
+            try:
+                db.drop_pond(pond=nm, confirm=True)
+            except RuntimeError:
+                pass
+
+
+# ── what this tier CANNOT reach: the gRPC 401 challenge ──────────────────────
+#
+# The agent suite asserts the MCP 401's `WWW-Authenticate` advertises the origin
+# the client dialled — the config assertion that nginx and `LATIQ_PUBLIC_MCP_URL`
+# agree. The Data/Stream equivalent exists on the wire: `data_service.rs`'s
+# `unauthenticated()` attaches the same challenge to the tonic `Status`'
+# trailing metadata, and `crates/latiq/tests/query_grpc.rs::auth_rejection_carries_
+# the_discovery_challenge` pins it — but only in-process on loopback, where the
+# dialled origin and the advertised one coincide by construction.
+#
+# We deliberately do NOT assert it here, because the Python SDK cannot see it.
+# `latiq-sdk` maps every gRPC failure with `anyhow!("read: {}", s.message())`,
+# keeping ONLY `Status::message()`; the metadata (and so the challenge) is
+# dropped before the pyo3 layer turns it into a `RuntimeError`. There is nothing
+# to assert on from Python short of adding a raw grpcio client and generated
+# stubs to this suite, which would test grpcio's trailer handling rather than
+# ours. Surfacing the challenge through the SDK is an SDK change, not a test
+# change; when it lands, the assertion belongs right here.
+
+
 # ── the Admin surface (operators — a different audience, same token) ─────────
 
 
@@ -257,7 +322,13 @@ def test_auth_admin_metadata_read_requires_a_token(db, anon_db):
     """`list_ponds` is Admin gRPC on the control plane, not the pond node. It is
     the operator surface and the easiest one to leave unguarded — on either side:
     the server must demand a token, and the client must actually send one on the
-    Admin channel too, not just on Data/Stream."""
+    Admin channel too, not just on Data/Stream.
+
+    KEEP: this is the direct regression pin for the `pond_list` missing-token
+    bug — the Admin channel was built without the token interceptor while
+    Data/Stream had it, so every other auth test stayed green. Do not fold this
+    into a Data/Stream test; the whole point is that it rides a different
+    channel."""
     p = db.create_pond(name=_name("admin"))
     try:
         listed = db.list_ponds()
