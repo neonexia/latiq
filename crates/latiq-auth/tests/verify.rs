@@ -365,6 +365,38 @@ async fn auth_rejects_hs256_signed_with_the_rsa_public_key() {
 }
 
 #[tokio::test]
+async fn auth_accepts_eddsa() {
+    // The allowlist is asymmetric-only, not RSA-and-ECDSA-only: an IdP signing
+    // with Ed25519 must work end to end -- OKP JWK imported, EdDSA signature
+    // checked, identity produced -- and not merely pass the allowlist check.
+    let idp = TestIdp::start_ed25519().await;
+    let token = idp.mint("svc-orchestrator", AUD, &idp.issuer, 300);
+
+    let identity = verifier(&idp)
+        .verify(&token, None)
+        .await
+        .expect("an Ed25519-signed token from a configured issuer verifies");
+
+    assert!(identity.verified);
+    assert_eq!(identity.subject, "svc-orchestrator");
+    assert_eq!(identity.issuer, idp.issuer);
+}
+
+#[tokio::test]
+async fn auth_rejects_an_eddsa_token_signed_by_the_wrong_key() {
+    // Guards the test above: proves the EdDSA path actually CHECKS the
+    // signature rather than waving OKP keys through once the alg is allowed.
+    let idp = TestIdp::start_ed25519().await;
+    let token = idp.mint_with_foreign_ed25519_key("svc-orchestrator", AUD, &idp.issuer);
+
+    let err = verifier(&idp)
+        .verify(&token, None)
+        .await
+        .expect_err("an EdDSA token must fail against a different Ed25519 key");
+    assert_rejected_because(&err, "InvalidSignature");
+}
+
+#[tokio::test]
 async fn auth_rejects_alg_none() {
     // An unsigned token, which is a valid JWT and a total bypass if honoured.
     let idp = TestIdp::start().await;

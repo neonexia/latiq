@@ -15,8 +15,8 @@ use url::{Host, Url};
 /// verifier would hold a signing secret, which a resource server must not --
 /// and it is exactly what the algorithm-confusion attack reaches for, feeding a
 /// public key back as an HMAC secret. Everything an enterprise IdP actually
-/// issues is here (RSA PKCS#1 v1.5, RSA-PSS, ECDSA); nothing symmetric is, and
-/// `none` cannot be expressed by this type at all.
+/// issues is here (RSA PKCS#1 v1.5, RSA-PSS, ECDSA, Ed25519); nothing symmetric
+/// is, and `none` cannot be expressed by this type at all.
 const ALLOWED_ALGS: &[Algorithm] = &[
     Algorithm::RS256,
     Algorithm::RS384,
@@ -26,6 +26,10 @@ const ALLOWED_ALGS: &[Algorithm] = &[
     Algorithm::PS512,
     Algorithm::ES256,
     Algorithm::ES384,
+    // Asymmetric like the rest, and the one the JWKS translation in `jwks.rs`
+    // already maps -- leaving it out meant refusing an algorithm we could
+    // otherwise import a key for, with no explanation to the operator.
+    Algorithm::EdDSA,
 ];
 
 /// Tokens are bounded BEFORE any parsing. `verify()` is protocol-neutral by

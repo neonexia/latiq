@@ -1,5 +1,6 @@
-//! A minimal in-process IdP for tests: one RSA keypair, a JWKS endpoint, and a
-//! token minter. Lets us produce a token that is wrong in exactly one way.
+//! A minimal in-process IdP for tests: one keypair (RSA or Ed25519), a JWKS
+//! endpoint, and a token minter. Lets us produce a token that is wrong in
+//! exactly one way.
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -13,19 +14,35 @@ use tokio::sync::RwLock;
 
 pub const KID: &str = "test-key-1";
 
-/// A generated keypair: the signing key plus its JWKS public components.
+/// The public half of a keypair, in the shape its JWK publishes it.
+enum PublicJwk {
+    Rsa {
+        n: String,
+        e: String,
+    },
+    /// An OKP key: the raw 32-byte Ed25519 public key, base64url.
+    Okp {
+        x: String,
+    },
+}
+
+/// A generated keypair: the signing key, the algorithm it signs with, and its
+/// JWKS public components.
 struct Keypair {
     encoding: EncodingKey,
-    n: String,
-    e: String,
+    alg: Algorithm,
+    public: PublicJwk,
 }
 
 /// 2048-bit RSA keygen costs 1-5 seconds and is wildly variable. Tests need a
 /// CONSISTENT key, not a unique one, so every `TestIdp` shares these. Each is
-/// generated lazily, so a test run only pays for the ones it touches.
+/// generated lazily, so a test run only pays for the ones it touches. (Ed25519
+/// keygen is cheap, but it shares the pattern so the fixtures stay uniform.)
 static SIGNING_KEY: OnceLock<Keypair> = OnceLock::new();
 static ALT_KEY: OnceLock<Keypair> = OnceLock::new();
 static FOREIGN_KEY: OnceLock<Keypair> = OnceLock::new();
+static ED25519_KEY: OnceLock<Keypair> = OnceLock::new();
+static ED25519_FOREIGN_KEY: OnceLock<Keypair> = OnceLock::new();
 
 fn signing_key() -> &'static Keypair {
     SIGNING_KEY.get_or_init(generate)
@@ -42,6 +59,17 @@ fn foreign_key() -> &'static Keypair {
     FOREIGN_KEY.get_or_init(generate)
 }
 
+/// The key of the Ed25519 fixture IdP, for the EdDSA end of the allowlist.
+fn ed25519_key() -> &'static Keypair {
+    ED25519_KEY.get_or_init(generate_ed25519)
+}
+
+/// The EdDSA counterpart of `foreign_key`: an Ed25519 key no fixture publishes,
+/// so an EdDSA signature can be proven to actually be checked.
+fn ed25519_foreign_key() -> &'static Keypair {
+    ED25519_FOREIGN_KEY.get_or_init(generate_ed25519)
+}
+
 fn generate() -> Keypair {
     let mut rng = rand::thread_rng();
     let key = RsaPrivateKey::new(&mut rng, 2048).expect("generate rsa key");
@@ -52,8 +80,31 @@ fn generate() -> Keypair {
     let public = key.to_public_key();
     Keypair {
         encoding,
-        n: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
-        e: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+        alg: Algorithm::RS256,
+        public: PublicJwk::Rsa {
+            n: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+            e: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+        },
+    }
+}
+
+/// `ring` rather than a fresh dependency: it is already in the tree underneath
+/// `jsonwebtoken`, and it is the same implementation that will verify the
+/// signature -- so the fixture cannot drift from the verifier.
+fn generate_ed25519() -> Keypair {
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("generate ed25519 key");
+    let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .expect("parse the pkcs8 we just generated");
+    Keypair {
+        // PKCS#8, which is what `jsonwebtoken`'s EdDSA signer expects.
+        encoding: EncodingKey::from_ed_der(pkcs8.as_ref()),
+        alg: Algorithm::EdDSA,
+        public: PublicJwk::Okp {
+            x: URL_SAFE_NO_PAD.encode(<_ as AsRef<[u8]>>::as_ref(
+                ring::signature::KeyPair::public_key(&pair),
+            )),
+        },
     }
 }
 
@@ -93,17 +144,25 @@ pub fn jwks_document(kid: &str) -> String {
 }
 
 fn jwks_document_for(key: &Keypair, kid: &str) -> String {
-    json!({
-        "keys": [{
+    let jwk = match &key.public {
+        PublicJwk::Rsa { n, e } => json!({
             "kty": "RSA",
             "use": "sig",
             "alg": "RS256",
             "kid": kid,
-            "n": key.n,
-            "e": key.e,
-        }]
-    })
-    .to_string()
+            "n": n,
+            "e": e,
+        }),
+        PublicJwk::Okp { x } => json!({
+            "kty": "OKP",
+            "use": "sig",
+            "alg": "EdDSA",
+            "crv": "Ed25519",
+            "kid": kid,
+            "x": x,
+        }),
+    };
+    json!({ "keys": [jwk] }).to_string()
 }
 
 /// Unix seconds. Public so a test can build `nbf`/`exp` relative to now.
@@ -125,6 +184,13 @@ impl TestIdp {
     /// per issuer rather than from one shared pool.
     pub async fn start_alt() -> Self {
         Self::start_with_key(alt_key()).await
+    }
+
+    /// An IdP that signs with Ed25519 and publishes an OKP JWK. Same fixture in
+    /// every other respect, so an EdDSA test differs from its RS256 twin in
+    /// exactly the algorithm.
+    pub async fn start_ed25519() -> Self {
+        Self::start_with_key(ed25519_key()).await
     }
 
     async fn start_with_key(key: &'static Keypair) -> Self {
@@ -231,14 +297,14 @@ impl TestIdp {
         exp_offset_secs: i64,
         kid: Option<String>,
     ) -> String {
-        encode(&self.key.encoding, sub, aud, iss, exp_offset_secs, kid)
+        encode(self.key, sub, aud, iss, exp_offset_secs, kid)
     }
 
     /// Sign an ARBITRARY claims object with this IdP's key, under the usual
     /// `kid`. The escape hatch for tokens the typed minters cannot express: an
     /// array-valued `aud`, a future `nbf`, a missing `sub`.
     pub fn mint_claims(&self, claims: serde_json::Value) -> String {
-        let mut header = Header::new(Algorithm::RS256);
+        let mut header = Header::new(self.key.alg);
         header.kid = Some(KID.to_string());
         jsonwebtoken::encode(&header, &claims, &self.key.encoding).expect("mint token")
     }
@@ -260,9 +326,10 @@ impl TestIdp {
     /// This IdP's RSA modulus, raw. Fed back as an HMAC secret it is the
     /// classic algorithm-confusion attack: the "secret" is public.
     pub fn public_modulus(&self) -> Vec<u8> {
-        URL_SAFE_NO_PAD
-            .decode(&self.key.n)
-            .expect("modulus is base64url")
+        let PublicJwk::Rsa { n, .. } = &self.key.public else {
+            panic!("public_modulus is only meaningful for an RSA fixture");
+        };
+        URL_SAFE_NO_PAD.decode(n).expect("modulus is base64url")
     }
 
     /// An `alg: "none"` token: header and claims, empty signature. Assembled by
@@ -280,8 +347,15 @@ impl TestIdp {
     /// A token signed by a key NO fixture publishes, to prove signature
     /// checking works.
     pub fn mint_with_foreign_key(&self, sub: &str, aud: &str, iss: &str) -> String {
+        encode(foreign_key(), sub, aud, iss, 300, Some(KID.to_string()))
+    }
+
+    /// The same, for EdDSA: a token signed by an Ed25519 key no fixture
+    /// publishes. Proves the EdDSA branch checks signatures rather than
+    /// accepting anything whose `alg` is on the allowlist.
+    pub fn mint_with_foreign_ed25519_key(&self, sub: &str, aud: &str, iss: &str) -> String {
         encode(
-            &foreign_key().encoding,
+            ed25519_foreign_key(),
             sub,
             aud,
             iss,
@@ -292,14 +366,14 @@ impl TestIdp {
 }
 
 fn encode(
-    key: &EncodingKey,
+    key: &Keypair,
     sub: &str,
     aud: &str,
     iss: &str,
     exp_offset_secs: i64,
     kid: Option<String>,
 ) -> String {
-    let mut header = Header::new(Algorithm::RS256);
+    let mut header = Header::new(key.alg);
     header.kid = kid;
     let now = now_secs();
     let claims = json!({
@@ -309,5 +383,5 @@ fn encode(
         "iat": now,
         "exp": now + exp_offset_secs,
     });
-    jsonwebtoken::encode(&header, &claims, key).expect("mint token")
+    jsonwebtoken::encode(&header, &claims, &key.encoding).expect("mint token")
 }
