@@ -292,12 +292,22 @@ fn unverified_issuer(token: &str) -> Result<String, AuthError> {
 /// to be on-path of.
 fn checked_jwks_uri(uri: &str) -> Result<String, AuthError> {
     // Caught on the RAW string, before parsing: for a special scheme the WHATWG
-    // parser silently promotes the first path segment to the authority, so
-    // `https:///jwks` becomes a confidently-https fetch of a host named `jwks`.
-    if let Some((_, rest)) = uri.split_once("://") {
-        if rest.starts_with('/') {
+    // parser silently promotes the first path segment to the authority, so BOTH
+    // `https:///jwks` (empty authority) and `https:/jwks` (no `//` at all)
+    // become a confidently-https fetch of a host named `jwks`. Checking only for
+    // `://` misses the second, which then fails at fetch time on the request
+    // path instead of loudly at startup.
+    //
+    // A URI with no `:` at all is left to `Url::parse` below, which reports it
+    // as the relative URL it is rather than as a host problem.
+    if let Some((_, rest)) = uri.split_once(':') {
+        let empty_host = match rest.strip_prefix("//") {
+            Some(authority) => authority.starts_with('/'),
+            None => true,
+        };
+        if empty_host {
             return Err(AuthError::Invalid(format!(
-                "jwks uri '{uri}' has an empty host"
+                "jwks uri '{uri}' has no host; expected scheme://host/path"
             )));
         }
     }
@@ -383,6 +393,20 @@ mod tests {
         // Would otherwise parse to the host `jwks`.
         assert!(!allowed("https:///jwks"));
         assert!(!allowed("http:///jwks"));
+    }
+
+    #[test]
+    fn a_missing_authority_marker_is_refused() {
+        // Single slash: the WHATWG parser fills the authority in from the path
+        // just as it does for `///`, so `https:/jwks` is an https fetch of a
+        // host named `jwks`. A misconfiguration must fail at startup, not on
+        // the first request.
+        assert!(!allowed("https:/jwks"));
+        assert!(!allowed("https:jwks"));
+        // The http single-slash forms were already refused by the scheme arm
+        // (they resolve to real non-loopback hosts); pin that they still are,
+        // and for the right reason.
+        assert!(!allowed("http:/jwks"));
     }
 
     #[test]

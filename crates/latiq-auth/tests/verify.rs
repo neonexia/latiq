@@ -149,10 +149,14 @@ async fn auth_rejects_an_empty_subject() {
 
     for sub in ["", "   "] {
         let token = idp.mint(sub, AUD, &idp.issuer, 300);
-        verifier
+        let err = verifier
             .verify(&token, None)
             .await
             .expect_err("a blank subject must be rejected");
+        // WHY, not merely that: a bare `expect_err` here would stay green if the
+        // token were rejected for its audience, its signature, or an unreachable
+        // fixture -- with the emptiness check itself removed.
+        assert_rejected_because(&err, "'sub' is empty");
     }
 }
 
