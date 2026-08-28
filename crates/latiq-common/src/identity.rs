@@ -113,6 +113,60 @@ mod tests {
         assert_eq!(id.agent_id, "agent-7");
     }
 
+    /// `docs/identity.md` describes it as STRUCTURAL that `Identity` derives
+    /// `Serialize` but not `Deserialize`: parsing one from a wire payload would
+    /// let attacker-controlled JSON mint a fully-verified principal -- any
+    /// `subject`, any `issuer`, `verified: true`. Until now that was a comment
+    /// and nothing else, so adding `Deserialize` "for convenience" reopened a
+    /// documented privilege-escalation path with every test still green.
+    ///
+    /// A source-level assertion because the thing being guarded is a code shape
+    /// (the derive list), and there is no runtime behaviour to observe -- the
+    /// whole point is that the impl must not EXIST. It cannot pass vacuously:
+    /// both `expect`s fail loudly if the struct or its derive line is renamed
+    /// or moved, rather than silently finding nothing.
+    #[test]
+    fn identity_is_serialize_only_and_never_deserialize() {
+        // Only the NON-test half of the file: this test names the very impl it
+        // forbids as a string literal, and searching itself would both match
+        // that literal and let one written here mask a real one.
+        let code = include_str!("identity.rs")
+            .split_once("#[cfg(test)]")
+            .expect("this file has a #[cfg(test)] module, and this test is in it")
+            .0;
+        let before = code
+            .split_once("\npub struct Identity {")
+            .expect("the guarded type is declared as `pub struct Identity {`")
+            .0;
+        let derives = before
+            .rsplit_once("#[derive(")
+            .expect("`Identity` must carry a derive list")
+            .1
+            .split_once(")]")
+            .expect("the derive list must be closed")
+            .0;
+        // Token-wise, not `contains`: "Deserialize" contains "Serialize", so a
+        // substring check would call a Deserialize-only struct compliant.
+        let derived: Vec<&str> = derives.split(',').map(str::trim).collect();
+        assert!(
+            derived.contains(&"Serialize"),
+            "`Identity` must stay serializable -- the access trail and the \
+             adapters render it. Got: {derived:?}"
+        );
+        assert!(
+            !derived.iter().any(|d| d.ends_with("Deserialize")),
+            "`Identity` must NEVER be deserializable: attacker-controlled JSON \
+             would mint a verified principal. Produce one with `verified()` (from \
+             a token verifier) or `claimed()`. See docs/identity.md. Got: {derived:?}"
+        );
+        // ...and not by hand, either.
+        assert!(
+            !code.contains("Deserialize for Identity"),
+            "a hand-written `Deserialize` impl reopens the same hole the derive \
+             was kept off for"
+        );
+    }
+
     #[test]
     fn verified_trims_subject_and_issuer() {
         let id = Identity::verified("  svc-orchestrator  ", "  https://idp.example  ", None);
