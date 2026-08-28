@@ -29,8 +29,9 @@ A bare `is_err()` / `expect_err()` passes for reasons that have nothing to do wi
 the subject of the test. Real ones we shipped:
 
 - `read_arrow(...).is_err()` — would have passed if the pond had vanished.
-- `"external catalog must be detached after pull"` (`tests/catalogs.rs`) — passed
-  for *any* error, including one raised before the catalog was ever attached.
+- `"external catalog must be detached after pull"` (now `admin.rs`'s `catalogs`
+  module) — passed for *any* error, including one raised before the catalog was
+  ever attached.
 - a tier-alias test that would have passed if the alias were rejected as an
   *unknown tier* — the one outcome it exists to distinguish from the uncapped
   grant it is really about.
@@ -42,16 +43,17 @@ under test. Positive tests get the same treatment — assert the value, not `is_
 
 ## 3. A guard that counts must assert a lower bound
 
-The sharpest finding. `tests/cli_auth.rs::auth_cli_clients_are_only_built_in_the_shared_helpers`
-asserts `uses <= 1` — **so it passes when the count is zero**. If `main.rs` stopped
-building that client, or a helper were renamed so the literal vanished, the test
-stays green while guarding nothing.
+The sharpest finding. `auth_cli_clients_are_only_built_in_the_shared_helpers`
+asserted `uses <= 1` — **so it passed when the count was zero**. If `main.rs` had
+stopped building that client, or a helper were renamed so the literal vanished, it
+would have stayed green while guarding nothing. It is now pinned to exactly one
+and lives in `crates/latiq/src/main.rs`'s unit tests.
 
 Any grep-based, macro-enumerated, or table-driven guard needs an **anti-vacuity**
 assertion. Two that get it right:
 
-- `crates/latiq-sdk/tests/client_construction.rs` — after asserting no
-  unauthenticated constructor appears, it asserts `authed >= 1`.
+- `crates/latiq-sdk/src/lib.rs`'s `client_construction` module — after asserting
+  no unauthenticated constructor appears, it asserts `authed >= 1`.
 - `tests/admin.rs::auth_admin_every_rpc_rejects_a_missing_token` — probes each RPC
   and then asserts `probed.len() == ADMIN_RPC_COUNT`, so a new RPC that nobody
   added to the list fails the build instead of being silently unprobed.
@@ -67,14 +69,30 @@ listing bad values, you have not yet found the invariant.
 
 ## 5. Every test binary statically links a bundled DuckDB (~130–160 MB)
 
-23 binaries was a material contributor to a disk exhaustion that stopped work.
-**Adding a test to an existing binary is free; adding a binary is not.** Default to
-the existing per-surface file (`admin.rs`, `query_grpc.rs`, `mcp.rs`, …).
+25 binaries was a material contributor to a disk exhaustion that stopped work;
+they are now 15 (~1.8 GB less per build profile). **Adding a test to an existing
+binary is free; adding a binary is not.** Default to the existing per-surface file
+(`admin.rs`, `query_grpc.rs`, `mcp.rs`, …), as a **submodule** if the group wants
+its own fixtures — `admin.rs` carries `catalogs`, `catalogs_iceberg`, `cli_auth`
+and `sdk_auth` that way, and `cargo test <feature>` still targets by name because
+the module qualifier only prefixes it.
+
+If a test needs no runtime deps at all — an `include_str!` grep, a pure function —
+it is a `#[cfg(test)]` unit module, not a binary. See
+`latiq-sdk/src/lib.rs::client_construction` and
+`latiq/src/main.rs::auth_cli_clients_are_only_built_in_the_shared_helpers`. Both
+grep only the **non-test half** of their own file: a guard that searches itself
+matches its own string literals, and one written in the test module would mask a
+real violation.
 
 The one legitimate reason to split: `tracing` caches callsite `Interest`
 process-wide, so a log-capture test cannot share a binary with tests that install
 no subscriber. But that argument buys **one subscriber per binary, not one test per
-binary** — we over-applied it to three access-trail binaries where two would do.
+binary** — the two full-stack access-trail binaries are now one `access_trail.rs`
+that installs the subscriber behind a `OnceLock` and shares the buffer, with every
+lookup narrowed by RPC so neither test can match the other's records.
+`latiq-agent-core/tests/access_trail.rs` stays separate for the same reason:
+merging it would force the capture subscriber onto seven unrelated tests.
 
 ## 6. Label regression pins, and never delete them
 
