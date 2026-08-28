@@ -37,6 +37,11 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial: MCP is only reachable through the gateway
+      # in this topology, so that is what the node publishes as its RFC 9728
+      # `resource` and points its 401 challenge at. A property of the topology,
+      # not of auth mode -- hence a plain value, set whether or not auth is on.
+      LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
@@ -56,6 +61,11 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial: MCP is only reachable through the gateway
+      # in this topology, so that is what the node publishes as its RFC 9728
+      # `resource` and points its 401 challenge at. A property of the topology,
+      # not of auth mode -- hence a plain value, set whether or not auth is on.
+      LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
@@ -78,6 +88,11 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial: MCP is only reachable through the gateway
+      # in this topology, so that is what the node publishes as its RFC 9728
+      # `resource` and points its 401 challenge at. A property of the topology,
+      # not of auth mode -- hence a plain value, set whether or not auth is on.
+      LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}

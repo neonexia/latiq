@@ -252,6 +252,15 @@ struct NodeAddArgs {
     /// deployments, or forwarding lands on the wrong host.
     #[arg(long)]
     advertise_addr: Option<String>,
+    /// The public URL agents use to reach this node's MCP endpoint, e.g.
+    /// https://latiq.example.com/mcp. Published as the RFC 9728 `resource`
+    /// identifier and in the 401 challenge, so it MUST be the address clients
+    /// actually dial -- behind a gateway that is the gateway's URL, not this
+    /// node's. Distinct from --advertise-addr, which is the internal address
+    /// peer nodes use to forward pond requests. Defaults to deriving from
+    /// --advertise-addr, which is correct only when clients reach nodes directly.
+    #[arg(long, env = "LATIQ_PUBLIC_MCP_URL")]
+    public_mcp_url: Option<String>,
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
     #[arg(short, long)]
     root: Option<PathBuf>,
@@ -907,6 +916,9 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         data_addr: data_addr.parse()?,
         internal_endpoint: advertise,
         control_endpoint: control_addr(),
+        // Blank means absent (compose interpolation passes empty strings); the
+        // node then derives the published URL from --advertise-addr as before.
+        public_mcp_url: non_blank(a.public_mcp_url),
         data_dir: root.join("ponds"),
         metrics_addr: Some(metrics_addr),
         // `None` unless --auth-issuer was given: no flags means the relaxed

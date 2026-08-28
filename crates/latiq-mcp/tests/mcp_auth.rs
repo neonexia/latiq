@@ -99,6 +99,56 @@ async fn auth_metadata_advertises_the_public_url_not_the_bound_socket() {
 }
 
 #[tokio::test]
+async fn auth_metadata_publishes_the_configured_public_url_over_the_advertised_one() {
+    // `--public-mcp-url`: behind a gateway, the node's own advertised address is
+    // NOT what agents dial, and a conforming client refuses a `resource` whose
+    // origin differs from the URL it dialled — before it ever asks for a token.
+    // So the configured value must win over both the advertised and bound ones,
+    // in the document AND in the challenge.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let public = latiq_mcp::resolve_public_mcp_url(
+        Some("https://latiq.example.com/mcp"),
+        "http://pond-node-1:51401",
+        "0.0.0.0:51402".parse().unwrap(),
+    )
+    .expect("a well-formed public url resolves");
+    let base = serve(idp.auth_config(), Some(&public)).await;
+    let bound = base.trim_start_matches("http://").to_string();
+
+    let doc: serde_json::Value =
+        reqwest::get(format!("{base}/.well-known/oauth-protected-resource"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(doc["resource"], "https://latiq.example.com/mcp");
+    let doc_text = doc.to_string();
+    assert!(
+        !doc_text.contains(&bound) && !doc_text.contains("pond-node-1"),
+        "neither the bound socket nor the internal address may leak: {doc_text}"
+    );
+
+    let res = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 401);
+    let challenge = res
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(
+        challenge,
+        r#"Bearer resource_metadata="https://latiq.example.com/.well-known/oauth-protected-resource""#
+    );
+}
+
+#[tokio::test]
 async fn auth_metadata_falls_back_to_the_bound_address_when_nothing_is_advertised() {
     let idp = latiq_auth::test_support::TestIdp::start().await;
     let base = serve(idp.auth_config(), None).await;

@@ -35,6 +35,15 @@ pub struct PondNodeConfig {
     pub data_addr: SocketAddr,
     /// Internal endpoint advertised to the control plane (single-node routing).
     pub internal_endpoint: String,
+    /// The public URL agents use to reach this node's MCP endpoint, e.g.
+    /// `https://latiq.example.com/mcp`. Published as the RFC 9728 `resource`
+    /// identifier and in the 401 challenge, so it MUST be the address clients
+    /// actually dial -- behind a gateway that is the gateway's URL, not this
+    /// node's. Distinct from `internal_endpoint` (`--advertise-addr`), which is
+    /// the internal address peer nodes use to forward pond requests. `None`
+    /// derives it from `internal_endpoint`, which is correct only when clients
+    /// reach nodes directly.
+    pub public_mcp_url: Option<String>,
     /// Control-plane Control gRPC endpoint, e.g. `http://127.0.0.1:9090`.
     pub control_endpoint: String,
     /// Local-FS root for pond storage.
@@ -159,6 +168,16 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         None => None,
     };
 
+    // Resolved BEFORE the node registers or serves, like the verifier: a bad
+    // public URL means every client's discovery fails with an error that points
+    // nowhere near this setting, so it must stop the node loudly instead.
+    let mcp_public_url = latiq_mcp::resolve_public_mcp_url(
+        cfg.public_mcp_url.as_deref(),
+        &cfg.internal_endpoint,
+        cfg.mcp_addr,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     let mcp_endpoint = format!("http://{}/mcp", cfg.mcp_addr);
     let ops = build_ops(
         &cfg.node_id,
@@ -220,23 +239,15 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     let data_verifier = verifier.clone();
     // ASSUMPTION: the RFC 9728 document lives on this node's MCP surface, so the
     // Data/Stream challenge points there. Both surfaces derive it from ONE
-    // string — the URL this node ADVERTISES (`--advertise-addr`), not the socket
-    // it bound, since every compose file we ship binds 0.0.0.0 and a challenge
-    // pointing at 0.0.0.0 is undiscoverable. Derived rather than configured
-    // because a second flag for it would be one more thing to get wrong.
+    // string — `mcp_public_url`, the URL clients actually dial (see
+    // `resolve_public_mcp_url`) — never the socket we bound: every compose file
+    // we ship binds 0.0.0.0, and two challenges naming different documents would
+    // be worse than one wrong one.
     // `None` when no verifier is configured: a node that never opted into auth
     // must not advertise an authorization server.
-    let mcp_public_url = latiq_mcp::advertised_mcp_url(&cfg.internal_endpoint, cfg.mcp_addr)
-        .unwrap_or_else(|| format!("http://{}/mcp", cfg.mcp_addr));
-    let data_metadata_url = verifier.as_ref().map(|_| {
-        format!(
-            "{}{}",
-            mcp_public_url
-                .strip_suffix("/mcp")
-                .unwrap_or(&mcp_public_url),
-            latiq_mcp::server::PROTECTED_RESOURCE_PATH
-        )
-    });
+    let data_metadata_url = verifier
+        .as_ref()
+        .map(|_| latiq_mcp::protected_resource_metadata_url(&mcp_public_url));
     tokio::spawn(async move {
         if let Err(e) = serve_data(data_addr, data_ops, data_verifier, data_metadata_url).await {
             eprintln!("data gRPC server error: {e}");

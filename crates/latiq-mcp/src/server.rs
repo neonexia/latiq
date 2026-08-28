@@ -285,6 +285,57 @@ pub fn advertised_mcp_url(advertised_endpoint: &str, mcp_addr: SocketAddr) -> Op
     Some(url.to_string())
 }
 
+/// The public MCP URL this node publishes as its RFC 9728 `resource` identifier
+/// and points at in its 401 challenge.
+///
+/// Resolution order: an explicitly configured `public_mcp_url` (`--public-mcp-url`)
+/// wins, then the URL derived from `--advertise-addr`, then the bound address.
+/// Only the first is right behind a gateway: `--advertise-addr` is the node's
+/// INTERNAL address, used so peer nodes can forward pond requests, and agents
+/// never dial it. A conforming client compares the `resource` it discovers
+/// against the URL it dialled and refuses on any origin difference, so publishing
+/// the node's own address behind a gateway fails the client before it ever asks
+/// for a token.
+///
+/// A configured value is validated rather than trusted: a relative or hostless
+/// URL here would break discovery for every client with an error that points
+/// nowhere near the deployment's config, so callers should fail startup on `Err`.
+pub fn resolve_public_mcp_url(
+    public_mcp_url: Option<&str>,
+    advertised_endpoint: &str,
+    mcp_addr: SocketAddr,
+) -> Result<String, String> {
+    if let Some(configured) = public_mcp_url {
+        let url = url::Url::parse(configured).map_err(|e| {
+            format!(
+                "--public-mcp-url (or $LATIQ_PUBLIC_MCP_URL) is not a valid absolute URL: \
+                 {configured:?} ({e}). Pass the full URL agents dial, e.g. \
+                 https://latiq.example.com/mcp."
+            )
+        })?;
+        if !url.has_host() {
+            return Err(format!(
+                "--public-mcp-url (or $LATIQ_PUBLIC_MCP_URL) has no host: {configured:?}. Pass the \
+                 full URL agents dial, e.g. https://latiq.example.com/mcp."
+            ));
+        }
+        return Ok(configured.to_string());
+    }
+    Ok(advertised_mcp_url(advertised_endpoint, mcp_addr)
+        .unwrap_or_else(|| format!("http://{mcp_addr}/mcp")))
+}
+
+/// The RFC 9728 document URL for a resource identifier — the well-known path on
+/// the resource's own origin. Derived so the document a challenge points at and
+/// the document we serve can never disagree; a gateway that rewrites paths
+/// (rather than only the host) would need this configured.
+pub fn protected_resource_metadata_url(resource: &str) -> String {
+    format!(
+        "{}{PROTECTED_RESOURCE_PATH}",
+        resource.strip_suffix("/mcp").unwrap_or(resource)
+    )
+}
+
 #[tool_router]
 impl LatiqServer {
     /// Allocate a new pond. Optionally name it; Latiq generates a name if omitted.
@@ -774,13 +825,9 @@ pub async fn serve_mcp_with_listener(
             Some(u) => u,
             None => format!("http://{}/mcp", listener.local_addr()?),
         };
-        // The document sits at the well-known path on the same origin. Derived
-        // from `resource` so the two can never disagree; a gateway that rewrites
-        // paths (rather than only the host) would need this configured.
-        let metadata_url = format!(
-            "{}{PROTECTED_RESOURCE_PATH}",
-            resource.strip_suffix("/mcp").unwrap_or(&resource)
-        );
+        // The document sits at the well-known path on the same origin, and the
+        // Data/Stream challenge derives its URL from the SAME resolved resource.
+        let metadata_url = protected_resource_metadata_url(&resource);
         // ALL configured issuers, from the verifier's NORMALIZED config, so the
         // document advertises exactly what is enforced.
         let issuers: Vec<String> = v
@@ -818,7 +865,7 @@ pub async fn serve_mcp_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::advertised_mcp_url;
+    use super::{advertised_mcp_url, protected_resource_metadata_url, resolve_public_mcp_url};
 
     #[test]
     fn advertised_url_takes_the_host_from_the_advertise_endpoint() {
@@ -848,5 +895,61 @@ mod tests {
         // Callers fall back to the bound address rather than advertising junk.
         let bound = "0.0.0.0:51402".parse().unwrap();
         assert_eq!(advertised_mcp_url("pond-node-1:51401", bound), None);
+    }
+
+    #[test]
+    fn public_url_resolution_prefers_the_configured_value() {
+        // The gateway case: the node advertises its own internal name for
+        // forwarding, but agents dial the gateway, so the configured URL wins
+        // whole — scheme, host, port and path included.
+        let bound = "0.0.0.0:51402".parse().unwrap();
+        assert_eq!(
+            resolve_public_mcp_url(
+                Some("https://latiq.example.com/mcp"),
+                "http://pond-node-1:51401",
+                bound,
+            ),
+            Ok("https://latiq.example.com/mcp".to_string())
+        );
+    }
+
+    #[test]
+    fn public_url_resolution_falls_back_to_advertise_then_bound() {
+        let bound = "0.0.0.0:51402".parse().unwrap();
+        // Nothing configured: derive from --advertise-addr, as before.
+        assert_eq!(
+            resolve_public_mcp_url(None, "http://pond-node-1:51401", bound),
+            Ok("http://pond-node-1:51402/mcp".to_string())
+        );
+        // Nothing configured AND an unusable advertised endpoint: the bound
+        // address, which is what this has always done.
+        assert_eq!(
+            resolve_public_mcp_url(None, "pond-node-1:51401", bound),
+            Ok("http://0.0.0.0:51402/mcp".to_string())
+        );
+    }
+
+    #[test]
+    fn public_url_resolution_rejects_a_malformed_value() {
+        let bound = "0.0.0.0:51402".parse().unwrap();
+        // Not absolute: every client's discovery would fail with an error that
+        // points nowhere near this setting, so we fail at startup instead.
+        assert!(resolve_public_mcp_url(Some("gateway:51510/mcp"), "http://n:1", bound).is_err());
+        assert!(resolve_public_mcp_url(Some("/mcp"), "http://n:1", bound).is_err());
+        // Absolute but hostless — parses, yet names no origin to compare against.
+        assert!(resolve_public_mcp_url(Some("file:///mcp"), "http://n:1", bound).is_err());
+    }
+
+    #[test]
+    fn metadata_url_sits_on_the_resource_origin() {
+        assert_eq!(
+            protected_resource_metadata_url("https://latiq.example.com/mcp"),
+            "https://latiq.example.com/.well-known/oauth-protected-resource"
+        );
+        // A resource that is not path-suffixed with /mcp keeps its own path base.
+        assert_eq!(
+            protected_resource_metadata_url("https://latiq.example.com"),
+            "https://latiq.example.com/.well-known/oauth-protected-resource"
+        );
     }
 }
