@@ -2,7 +2,8 @@
 
 *Design note. Pairs with [`identity.md`](identity.md) — lineage is where the
 identity chain that authorization deliberately does **not** model gets recorded.
-Nothing below is implemented yet.*
+Nothing below is implemented yet; the shape is settled (see
+[Decisions](#decisions)).*
 
 ---
 
@@ -154,23 +155,44 @@ worth far more than getting it perfectly right later.
 
 ---
 
-## Open questions
+## Decisions
+
+Settled before implementation. Recorded here because an unanswered question in a
+design note becomes an unexamined assumption in the code.
+
+**One sidecar per pond.** Not one per node. The deciding argument is the one this
+note anticipated: authorization does not exist yet, so a node-wide sidecar would
+show every pond's provenance to every agent, and any filtering would be advisory
+rather than enforced. Per-pond makes the isolation structural — an agent attached
+to its pond can only see its own lineage. The costs are real and accepted: many
+small files, and no cross-pond question ("what read this dataset anywhere?") until
+a node-wide view is added deliberately, behind authorization.
+
+**Reads emit as well as writes.** "Which agent read this before the bad decision"
+is a question people genuinely ask, and reads are where agents spend most of their
+time — a write-only graph answers who *produced* a dataset but never who
+*consumed* it. Emission is asynchronous and off the query's critical path, so the
+cost is disk and volume rather than latency. If volume turns out to hurt, the
+lever is a sampling or opt-out setting, not a redesign.
+
+**Lineage is reaped with the pond.** No TTL, no reaper, no unbounded growth — the
+sidecar's lifecycle is the pond's. **The cost is stated plainly: dropping a pond
+destroys its provenance, which is exactly the post-mortem history someone will
+want afterwards.** The escape hatch is the HTTP sink: an operator who needs
+lineage to outlive its pond configures an OpenLineage backend, and durability
+becomes that backend's job rather than ours. That is the right split — we are not
+a lineage archive, and building one would mean a reaper, an orphan store, and a
+retention policy we have no basis to choose yet.
+
+---
+
+## Still open
 
 - **Column-level lineage** — a stated OpenLineage facet, and much harder than
   table-level. Table-level first; column-level only if agents ask for it.
-- **Retention.** The sidecar grows without bound. Per-pond TTL, row cap, or reap
-  with the pond? Reaping with the pond loses exactly the post-mortem history
-  someone will want.
-- **Sidecar granularity** — one database per pond (simple lifecycle, natural
-  isolation, many files) or one per node partitioned by pond (fewer files, one
-  more thing to reap). One per node reads better for the multi-pond case.
-- **Does the agent see other ponds' lineage?** Until authorization exists, an
-  attached node-wide sidecar would expose every pond's provenance to every agent.
-  A per-pond sidecar sidesteps this entirely — which may decide the previous
-  question on its own.
-- **Do reads emit at all,** or only writes? Reads are the majority of traffic and
-  the cheapest thing to drop if volume hurts. But "which agent read this before
-  the bad decision" is a question people genuinely ask.
 - **MCP surface** — is lineage just the attached `lineage` catalog, or also a
-  tool/resource? The attached catalog needs no new tool, which argues for
-  starting there.
+  tool/resource? The attached catalog needs no new tool, which argues for starting
+  there and adding a tool only if agents do not find it.
+- **Cross-pond lineage** — deliberately impossible under the per-pond decision
+  above. If it is ever wanted, it arrives with authorization, as a filtered
+  node-wide view rather than by widening the sidecar.
