@@ -49,6 +49,10 @@ pub struct AllocateArgs {
         description = "Optional DuckDB extensions to load on this pond, e.g. [\"spatial\",\"fts\"]. Signed/official extensions only; must be available on the deployment. See the latiq://guidance resource for the supported set."
     )]
     pub extensions: Option<Vec<String>>,
+    #[schemars(
+        description = "Record OpenLineage provenance for every query on this pond, queryable as `lineage.events` (default false). Chosen here and FIXED for the pond's lifetime — there is no way to turn it on later. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'."
+    )]
+    pub lineage: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -370,7 +374,11 @@ Then write_query to create tables and load data, and read_query to query. See la
             }
         };
         Ok(with_bearer(tok, async {
-            match self.ops.allocate_pond(&id, a.name, "{}", tier, &exts).await {
+            match self
+                .ops
+                .allocate_pond(&id, a.name, "{}", tier, &exts, a.lineage.unwrap_or(false))
+                .await
+            {
                 Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
                 Err(e) => err_envelope(e.envelope()),
             }

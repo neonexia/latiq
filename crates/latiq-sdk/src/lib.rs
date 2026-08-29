@@ -67,6 +67,8 @@ pub struct PondInfo {
     pub node_id: String,
     pub tier: String,
     pub description: String,
+    /// Whether this pond records lineage (`lineage.events`). Fixed at creation.
+    pub lineage: bool,
 }
 
 /// A handle to a pond: metadata + SQL. `db.get_pond("x").query("SELECT …")`.
@@ -240,11 +242,27 @@ impl Latiq {
     }
 
     /// Allocate a pond and return a handle. `description` is agent-discovery text.
+    /// Lineage is off; `create_pond_with_lineage` opts in.
     pub fn create_pond(
         &self,
         name: Option<&str>,
         tier: &str,
         description: &str,
+    ) -> Result<Pond<'_>> {
+        self.create_pond_with_lineage(name, tier, description, false)
+    }
+
+    /// Allocate a pond, choosing whether it records OpenLineage provenance for
+    /// every query (queryable in the pond as `lineage.events`). The choice is
+    /// made here and is **fixed for the pond's lifetime** — there is no call to
+    /// change it, because turning it on later would leave a hole at the start of
+    /// the record. Off costs nothing.
+    pub fn create_pond_with_lineage(
+        &self,
+        name: Option<&str>,
+        tier: &str,
+        description: &str,
+        lineage: bool,
     ) -> Result<Pond<'_>> {
         let info = self.rt.block_on(async {
             let mut c = self.control().await?;
@@ -256,6 +274,7 @@ impl Latiq {
                     tier: tier.to_string(),
                     extensions: vec![],
                     description: description.to_string(),
+                    lineage,
                 })
                 .await?
                 .into_inner();
@@ -300,6 +319,7 @@ impl Latiq {
             node_id: String::new(),
             tier: m.tier,
             description: m.description,
+            lineage: m.lineage,
         })
     }
 
@@ -320,6 +340,7 @@ impl Latiq {
                             node_id: p.node_id,
                             tier: p.tier,
                             description: p.description,
+                            lineage: p.lineage,
                         },
                     )
                 })

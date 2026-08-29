@@ -13,6 +13,9 @@ pub trait ControlPlane: Send + Sync {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        // Opt-in lineage recording. Fixed for the pond's lifetime — there is
+        // deliberately no setter anywhere on this trait.
+        lineage: bool,
     ) -> Result<PondInfo, AgentError>;
 
     /// Resolve a pond ref (id or name) to its pond_id, erroring if absent.

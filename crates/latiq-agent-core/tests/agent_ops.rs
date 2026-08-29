@@ -41,7 +41,7 @@ async fn full_agent_loop() {
     let id = Identity::claimed(Some("agent-loop"));
 
     let alloc = ops
-        .allocate_pond(&id, Some("incident-9".into()), "{}", "medium", &[])
+        .allocate_pond(&id, Some("incident-9".into()), "{}", "medium", &[], false)
         .await
         .unwrap();
     assert_eq!(alloc.pond_name, "incident-9");
@@ -98,7 +98,7 @@ async fn read_arrow_streams_rows_locally() {
     use tokio_stream::StreamExt;
     let ops = ops();
     let id = Identity::claimed(Some("a"));
-    ops.allocate_pond(&id, Some("ar".into()), "{}", "medium", &[])
+    ops.allocate_pond(&id, Some("ar".into()), "{}", "medium", &[], false)
         .await
         .unwrap();
     ops.write_query(
@@ -136,7 +136,7 @@ async fn read_arrow_streams_rows_locally() {
 async fn pond_lifecycle_drop_requires_confirm() {
     let ops = ops();
     let id = Identity::claimed(Some("agent-loop"));
-    ops.allocate_pond(&id, Some("keepme".into()), "{}", "medium", &[])
+    ops.allocate_pond(&id, Some("keepme".into()), "{}", "medium", &[], false)
         .await
         .unwrap();
 
@@ -174,7 +174,15 @@ async fn lazy_materialize_pond_assigned_without_eager_storage() {
         .unwrap();
     // Registry-only allocation — deliberately NOT ops.allocate_pond (no storage).
     registry
-        .create_pond(Some("lazy".into()), "agent-x", "{}", "medium", &[], "")
+        .create_pond(
+            Some("lazy".into()),
+            "agent-x",
+            "{}",
+            "medium",
+            &[],
+            "",
+            false,
+        )
         .unwrap();
 
     let control = Arc::new(RegistryControlPlane::new(registry));
@@ -200,7 +208,7 @@ async fn lazy_materialize_pond_assigned_without_eager_storage() {
 async fn read_query_rejects_writes_with_structured_error() {
     let ops = ops();
     let id = Identity::claimed(None);
-    ops.allocate_pond(&id, Some("p".into()), "{}", "medium", &[])
+    ops.allocate_pond(&id, Some("p".into()), "{}", "medium", &[], false)
         .await
         .unwrap();
     let err = ops
@@ -231,7 +239,7 @@ async fn pond_lifecycle_allocate_rejects_the_uncapped_tier() {
     let id = Identity::claimed(Some("greedy-agent"));
 
     let err = ops
-        .allocate_pond(&id, Some("grabby".into()), "{}", "none", &[])
+        .allocate_pond(&id, Some("grabby".into()), "{}", "none", &[], false)
         .await
         .expect_err("an agent must not be able to allocate an uncapped pond");
     let msg = err.envelope().message.to_lowercase();
@@ -247,7 +255,7 @@ async fn pond_lifecycle_allocate_rejects_the_uncapped_tier() {
     // confusion this case exists to rule out: the alias must resolve to the
     // uncapped tier and then be refused as an operator grant.
     let err = ops
-        .allocate_pond(&id, Some("grabby2".into()), "{}", "uncapped", &[])
+        .allocate_pond(&id, Some("grabby2".into()), "{}", "uncapped", &[], false)
         .await
         .expect_err("the `uncapped` alias must be refused too");
     let msg = err.envelope().message.to_lowercase();
@@ -261,7 +269,7 @@ async fn pond_lifecycle_allocate_rejects_the_uncapped_tier() {
     );
 
     // A normal tier still allocates.
-    ops.allocate_pond(&id, Some("fine".into()), "{}", "large", &[])
+    ops.allocate_pond(&id, Some("fine".into()), "{}", "large", &[], false)
         .await
         .unwrap();
 }
@@ -276,7 +284,7 @@ mod m7 {
     async fn query_by_uri_local_csv_ingestion() {
         let ops = ops();
         let id = Identity::claimed(Some("ingestor"));
-        ops.allocate_pond(&id, Some("ing".into()), "{}", "medium", &[])
+        ops.allocate_pond(&id, Some("ing".into()), "{}", "medium", &[], false)
             .await
             .unwrap();
 
@@ -301,7 +309,7 @@ mod m7 {
     async fn concurrent_multi_agent_writes_are_consistent_and_attributed() {
         let ops = ops();
         let setup = Identity::claimed(Some("setup"));
-        ops.allocate_pond(&setup, Some("shared".into()), "{}", "medium", &[])
+        ops.allocate_pond(&setup, Some("shared".into()), "{}", "medium", &[], false)
             .await
             .unwrap();
         ops.write_query(
@@ -402,6 +410,7 @@ mod forwarding {
             _: &str,
             _: &str,
             _: &[String],
+            _: bool,
         ) -> Result<PondInfo, AgentError> {
             unreachable!("not exercised")
         }
@@ -421,6 +430,7 @@ mod forwarding {
                 node_endpoint: self.endpoint.clone(),
                 tier: "medium".to_string(),
                 extensions: vec![],
+                lineage: false,
                 description: String::new(),
             })
         }
@@ -547,6 +557,7 @@ mod forwarding {
                     node_endpoint: Some(e.to_string()),
                     tier: "medium".to_string(),
                     extensions: vec![],
+                    lineage: false,
                     description: String::new(),
                 },
                 schema: SchemaSummary::default(),

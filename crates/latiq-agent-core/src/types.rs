@@ -23,6 +23,14 @@ pub struct PondInfo {
     /// Agent-discovery text: what this pond is for (empty = none).
     #[serde(default)]
     pub description: String,
+    /// Whether this pond records OpenLineage events into its queryable sidecar.
+    /// Opt-in at creation and fixed for the pond's lifetime; off by default, so
+    /// a deployment that does not want it pays nothing. Carried from the registry
+    /// to the node the same way `tier` and `extensions` are — the engine reads it
+    /// to decide whether the pond has a sidecar, and describe reports it so a
+    /// caller can tell whether `lineage.events` exists before querying it.
+    #[serde(default)]
+    pub lineage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

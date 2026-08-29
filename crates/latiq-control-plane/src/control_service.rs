@@ -68,6 +68,7 @@ impl Control for ControlService {
                 tier,
                 &r.extensions,
                 &r.description,
+                r.lineage,
             )
             .map_err(to_status)?;
         let (_pid, endpoint) = self
@@ -129,6 +130,7 @@ impl Control for ControlService {
                 tier: row.tier,
                 extensions: row.extensions,
                 description: row.description,
+                lineage: row.lineage,
             });
         }
         Ok(Response::new(ListPondsResponse { ponds }))
@@ -153,6 +155,7 @@ impl Control for ControlService {
                 tier: row.tier,
                 extensions: row.extensions,
                 description: row.description,
+                lineage: row.lineage,
             }),
         }))
     }

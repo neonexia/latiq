@@ -124,6 +124,13 @@ pub const MIGRATIONS: &[&str] = &[
     // Optional agent-discovery description (what the pond is for, so other agents
     // can find it). Nullable + default so existing rows read as empty.
     "ALTER TABLE ponds ADD COLUMN description VARCHAR DEFAULT '';",
+    // Per-pond lineage opt-in. Off by default: lineage costs disk (every read and
+    // write emits) and per-query plan extraction, so a deployment pays for it only
+    // where provenance matters. Chosen at creation and fixed for the pond's
+    // lifetime — the sidecar is seeded then, and enabling it later would leave a
+    // hole at the start of the record. Existing ponds read as false, which is
+    // correct: nothing was recorded for them.
+    "ALTER TABLE ponds ADD COLUMN lineage BOOLEAN DEFAULT FALSE;",
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {
