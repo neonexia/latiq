@@ -23,4 +23,10 @@ pub struct PondLocation {
     /// LOADed from the deployment image — never installed in the pond path.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Whether this pond records lineage — the per-pond opt-in from its registry
+    /// record, off by default. Storage leaves this false; AgentOps sets it from
+    /// the pond info, the same path `tier` and `extensions` take. The engine
+    /// reads it on open to decide whether the pond has a lineage sidecar.
+    #[serde(default)]
+    pub lineage: bool,
 }

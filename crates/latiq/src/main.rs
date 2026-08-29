@@ -311,6 +311,12 @@ enum PondCmd {
         /// discover it (shown in `pond list`/`describe`).
         #[arg(short, long)]
         description: Option<String>,
+        /// Record OpenLineage provenance for every query on this pond, queryable
+        /// as `lineage.events`. Off by default (it costs disk and a little
+        /// per-query time). Chosen here and FIXED for the pond's lifetime —
+        /// there is no way to turn it on afterwards.
+        #[arg(long)]
+        lineage: bool,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
     List {
@@ -1085,6 +1091,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             extensions,
             agent_id,
             description,
+            lineage,
         } => {
             // Validate the requested extensions against the allowlist before we
             // call the control plane, so a typo/community name fails locally.
@@ -1106,6 +1113,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                     tier,
                     extensions: exts,
                     description: description.unwrap_or_default(),
+                    lineage,
                 })
                 .await
             {
@@ -1140,7 +1148,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                             serde_json::json!({
                                 "pond_id": p.pond_id, "name": p.name, "owner": p.owner,
                                 "node_id": p.node_id, "tier": p.tier, "created_at": p.created_at,
-                                "description": p.description,
+                                "description": p.description, "lineage": p.lineage,
                             })
                         })
                         .collect();

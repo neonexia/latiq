@@ -420,6 +420,7 @@ async fn auth_mcp_unauthenticated_node_does_not_replay_a_client_token() {
         name: "leakmcp".into(),
         policy_json: String::new(),
         tier: String::new(),
+        lineage: false,
     });
     alloc
         .metadata_mut()
@@ -517,6 +518,7 @@ async fn mcp_cross_node_write_forwards_the_bearer_on_an_auth_enabled_cluster() {
         name: "mcpfwd".into(),
         policy_json: String::new(),
         tier: String::new(),
+        lineage: false,
     });
     alloc
         .metadata_mut()
@@ -560,4 +562,64 @@ async fn mcp_cross_node_write_forwards_the_bearer_on_an_auth_enabled_cluster() {
         "the owner should attribute the forwarded write to the token subject: {authors:?}"
     );
     c.close().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+/// Lineage on the agent surface: an agent may want provenance for its own work,
+/// so `allocate_pond` takes the flag and `describe_pond` reports it — an agent
+/// can tell whether `lineage.events` will exist before querying it. Off unless
+/// asked for. A submodule, not a new binary (tests/CLAUDE.md rule 5).
+// ---------------------------------------------------------------------------
+mod lineage {
+    use crate::common::start_stack;
+    use latiq_client::LatiqClient;
+    use serde_json::{json, Map, Value};
+
+    async fn allocate(c: &LatiqClient, name: &str, lineage: Option<bool>) {
+        let mut args = Map::new();
+        args.insert("name".into(), name.into());
+        if let Some(l) = lineage {
+            args.insert("lineage".into(), Value::Bool(l));
+        }
+        let a = c.call_tool("allocate_pond", args).await.unwrap();
+        assert!(!a.is_error, "allocate {name}: {:?}", a.value);
+        assert_eq!(a.value["pond_name"], name);
+    }
+
+    async fn described_lineage(c: &LatiqClient, pond: &str) -> Value {
+        let d = c.describe_pond(pond).await.unwrap();
+        assert!(!d.is_error, "describe {pond}: {:?}", d.value);
+        d.value["pond"]["lineage"].clone()
+    }
+
+    #[tokio::test]
+    async fn lineage_agent_can_request_it_at_allocate_and_see_it_in_describe() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
+            .await
+            .unwrap();
+
+        // Asked for → on, and visible to the agent that asked.
+        allocate(&c, "provenance", Some(true)).await;
+        assert_eq!(
+            described_lineage(&c, "provenance").await,
+            json!(true),
+            "an agent that asks for lineage must be told it has it"
+        );
+
+        // Not asked for → off. The default deployment pays nothing, and an agent
+        // must not be told `lineage.events` exists when it does not.
+        allocate(&c, "plain", None).await;
+        assert_eq!(
+            described_lineage(&c, "plain").await,
+            json!(false),
+            "omitting the flag must leave lineage off"
+        );
+
+        // Explicitly declined reads the same as omitted.
+        allocate(&c, "declined", Some(false)).await;
+        assert_eq!(described_lineage(&c, "declined").await, json!(false));
+
+        c.close().await.unwrap();
+    }
 }

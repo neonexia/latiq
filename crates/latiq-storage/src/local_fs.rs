@@ -28,6 +28,7 @@ impl LocalFs {
             limits: None,
             // AgentOps sets these from the pond's registry record.
             extensions: Vec::new(),
+            lineage: false,
         }
     }
 }

@@ -39,6 +39,10 @@ message PondInfoMsg {
   repeated string extensions = 8;
   // Agent-discovery text: what this pond is for (empty = none).
   string description = 9;
+  // Whether this pond records OpenLineage events into its queryable sidecar.
+  // Opt-in at creation, fixed for the pond's lifetime; false by default so the
+  // default deployment pays nothing.
+  bool lineage = 10;
 }
 message ListPondsRequest { }
 message ListPondsResponse { repeated PondInfoMsg ponds = 1; }
@@ -49,7 +53,9 @@ message RegisterNodeRequest { string node_id = 1; string mcp_endpoint = 2; strin
 message RegisterNodeResponse { }
 message HeartbeatRequest { string node_id = 1; uint32 pond_count = 2; }
 message HeartbeatResponse { }
-message CreatePondAssignmentRequest { string name = 1; string owner_identity = 2; string policy_json = 3; string tier = 4; repeated string extensions = 5; string description = 6; }
+// The CLI's `pond create` and the SDK's allocate call this directly (they do not
+// go through AgentOps), so every per-pond setting must be carried here too.
+message CreatePondAssignmentRequest { string name = 1; string owner_identity = 2; string policy_json = 3; string tier = 4; repeated string extensions = 5; string description = 6; bool lineage = 7; }
 message CreatePondAssignmentResponse { string pond_id = 1; string assigned_node_endpoint = 2; }
 message GetPondLocationRequest { string pond_ref = 1; }
 message GetPondLocationResponse { string pond_id = 1; string node_endpoint = 2; }

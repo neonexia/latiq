@@ -233,7 +233,9 @@ impl Data for DataService {
         };
         let res = self
             .ops
-            .allocate_pond(&id, name, &policy, &tier, &[])
+            // Lineage is chosen here and never again: the flag is stored on the
+            // pond row and there is no RPC to change it.
+            .allocate_pond(&id, name, &policy, &tier, &[], r.lineage)
             .await
             .map_err(to_status)?;
         Ok(Response::new(AllocatePondResponse {

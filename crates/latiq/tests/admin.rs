@@ -35,6 +35,7 @@ async fn pond_list_reads_from_control_plane() {
             name: "alpha".into(),
             policy_json: String::new(),
             tier: String::new(),
+            lineage: false,
         },
         "alice",
     ))
@@ -74,6 +75,7 @@ async fn pond_lifecycle_description_shown_in_list() {
             tier: "medium".into(),
             extensions: vec![],
             description: "nightly etl scratch".into(),
+            lineage: false,
         })
         .await
         .unwrap();
@@ -543,6 +545,7 @@ mod catalogs {
                 name: "work".into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "agent-x",
         ))
@@ -623,6 +626,7 @@ mod catalogs {
                 name: "shop".into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "agent-x",
         ))
@@ -838,6 +842,7 @@ mod catalogs_iceberg {
                 name: "shop".into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "agent-x",
         ))

@@ -70,6 +70,7 @@ fn to_info(
         tier: row.tier,
         extensions: row.extensions,
         description: row.description,
+        lineage: row.lineage,
     }
 }
 
@@ -82,10 +83,11 @@ impl ControlPlane for RegistryControlPlane {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        lineage: bool,
     ) -> Result<PondInfo, AgentError> {
         let row = self
             .registry
-            .create_pond(name, owner, policy_json, tier, extensions, "")
+            .create_pond(name, owner, policy_json, tier, extensions, "", lineage)
             .map_err(cp_err)?;
         let (row, created_at, policy, endpoint) =
             self.registry.pond_info(&row.pond_id).map_err(cp_err)?;
@@ -182,7 +184,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..40 {
             let info = cp
-                .create_pond(Some(format!("p{i}")), "agent-x", "{}", "medium", &[])
+                .create_pond(Some(format!("p{i}")), "agent-x", "{}", "medium", &[], false)
                 .await
                 .unwrap();
             ids.push(info.pond_id);

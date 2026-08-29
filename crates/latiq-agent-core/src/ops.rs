@@ -120,10 +120,11 @@ impl AgentOps {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        lineage: bool,
     ) -> Result<AllocateResult, AgentError> {
         let started = Instant::now();
         let res = self
-            .allocate_pond_inner(identity, name, policy_json, tier, extensions)
+            .allocate_pond_inner(identity, name, policy_json, tier, extensions, lineage)
             .await;
         self.audit(
             identity,
@@ -144,10 +145,18 @@ impl AgentOps {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        lineage: bool,
     ) -> Result<AllocateResult, AgentError> {
         let info = self
             .control
-            .create_pond(name, &identity.agent_id, policy_json, tier, extensions)
+            .create_pond(
+                name,
+                &identity.agent_id,
+                policy_json,
+                tier,
+                extensions,
+                lineage,
+            )
             .await?;
         // The control plane may place the pond on a different node than the one
         // that received this call. In that case, don't eagerly create storage here
@@ -168,6 +177,7 @@ impl AgentOps {
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
 
         let engine = self.engine.clone();
         let loc2 = loc.clone();
@@ -239,6 +249,7 @@ impl AgentOps {
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         Ok(
@@ -588,6 +599,7 @@ impl AgentOps {
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         Ok((loc, cat, merged))
     }
 
@@ -675,6 +687,7 @@ impl AgentOps {
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let (op_id, token) = self.inflight.register(Some(pond_id));
 
         let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
@@ -870,6 +883,7 @@ impl AgentOps {
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let (op_id, token) = self.inflight.register(Some(pond_id.clone()));
 
         let engine = self.engine.clone();
@@ -961,6 +975,7 @@ impl AgentOps {
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let sql2 = sql.to_string();

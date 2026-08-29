@@ -40,7 +40,9 @@ message CatalogRemoveResponse { }
 message CatalogListRequest { string query = 1; }
 message CatalogListResponse { repeated CatalogMsg catalogs = 1; }
 
-message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; string description = 7; }
+// `lineage` reports whether the pond records provenance; it is chosen at
+// creation and fixed for the pond's lifetime (no admin RPC changes it).
+message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; string description = 7; bool lineage = 8; }
 message PondListRequest { }
 message PondListResponse { repeated PondSummary ponds = 1; }
 // pond: name or id. tier: x-small|small|medium|large|x-large (rejected if unknown
