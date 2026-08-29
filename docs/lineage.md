@@ -62,22 +62,60 @@ three specific things:
 3. **It breaks invariant 6** — `_latiq` objects visible in the agent's
    `SHOW TABLES`, in a catalog we promise is pure DuckLake.
 
-**Instead:** Latiq keeps a **separate, node-owned DuckDB/DuckLake database** and
-`ATTACH`es it **read-only** into the agent's session as `lineage`. The agent gets
-exactly the ergonomics it wanted —
+**Instead:** lineage events are written as **files in the pond's own directory**,
+and exposed through a tiny per-pond `lineage.duckdb` that holds a single view over
+them, attached `READ_ONLY` into the agent's session. The agent gets exactly the
+ergonomics it wanted —
 
 ```sql
 SELECT * FROM lineage.events WHERE pond = 'pond-8812' ORDER BY event_time DESC;
 ```
 
-— with zero pond snapshots, no contention with the writer mutex, and writes that
-can be batched and asynchronous because they are off the query's critical path.
-Invariant 6 stays literally true: nothing Latiq-owned lives in the *pond's*
-catalog. **Invariant 6's wording should be amended to say this explicitly**,
-otherwise "agents query lineage in SQL" reads like a violation to the next person.
+— with zero pond snapshots and no contention with the writer mutex.
 
-Read-only is load-bearing: an agent must not be able to rewrite its own
-provenance.
+**Why a view over files rather than a table.** The obvious shape — a node-owned
+DuckDB table the agent attaches read-only — is genuinely read-only but **stale**:
+a read-only attach pins a snapshot at attach time, so a reader never sees rows
+written afterwards. Measured: the writer inserts, the reader still returns the old
+set, and only `DETACH` + re-`ATTACH` refreshes it. Since `ATTACH` is *database*
+state shared by every pooled read connection, refreshing per query would mean
+mutating shared state under the pond mutex. Stale provenance is worse than none.
+
+A view over files has neither problem. The sidecar database is written **once** at
+pond creation and never again, so every connection can hold it read-only forever,
+and the view's glob re-evaluates per query — new files appear immediately, on the
+same connection, including on connections cloned before the attach. There is no
+second writer on any database, so DuckDB's one-writer rule is never engaged.
+
+Four things the shape forces, all measured:
+
+- **`CREATE VIEW` fails on an empty glob**, so a fresh pond needs a seeded sentinel
+  event that the view filters out.
+- **`SELECT *` is not a stable schema.** Column count, order and *types* re-bind per
+  query from whatever files exist; a later file with a conflicting type silently
+  rewrites earlier rows' rendering. The view must pin an explicit column list, with
+  variable OpenLineage facets in one JSON column.
+- **File count dominates cost** — ~0.11 ms per file with no warm-up, so 5000 small
+  files is over a second per query where a single Parquet is 1.2 ms flat. The writer
+  batches, and a compactor rewrites batches into Parquet; rename-then-delete is
+  picked up correctly by the live view.
+- **A torn write breaks the view for every reader.** Write to a temp file and
+  rename; keep `ignore_errors` as a backstop.
+
+### Read-only is defence in depth, not a boundary — for now
+
+`READ_ONLY` protects the sidecar *catalog*: `INSERT`, `CREATE`, `DROP` against it
+are all refused. It does **not** protect the files the view reads. `write_query`
+executes arbitrary SQL by design (#53), and DuckDB SQL can write files — so an
+agent can today forge events, overwrite real ones, or break the view outright, and
+can read the event directory path out of `duckdb_views()`. **[#79](https://github.com/neonexia/latiq/issues/79)** tracks this;
+it is a pre-existing capability that lineage does not create but does make matter.
+
+**M1 assumes trusted agents**, consistent with the rest of the posture, so lineage
+ships without that guard. The claim "an agent cannot rewrite its own provenance"
+is therefore **not yet true**, and must not be written down as though it were.
+It becomes true when #79's per-pond sandbox lands, which is a prerequisite for
+beta rather than for this slice.
 
 ### Sinks
 
