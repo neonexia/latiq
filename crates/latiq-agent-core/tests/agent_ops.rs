@@ -519,10 +519,10 @@ mod forwarding {
         ) -> Result<ArrowReadStream, AgentError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.note(e, p, s);
-            Ok(ArrowReadStream {
-                schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-                batches: Box::pin(tokio_stream::iter(Vec::new())),
-            })
+            Ok(ArrowReadStream::new(
+                std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                Box::pin(tokio_stream::iter(Vec::new())),
+            ))
         }
         async fn explain(
             &self,
@@ -1118,6 +1118,114 @@ mod lineage {
     }
 
     #[tokio::test]
+    async fn lineage_events_carry_the_datasets_the_query_touched() {
+        // Without datasets an event says a query happened, not what it read or
+        // produced — which is the whole point of lineage. Two things are pinned
+        // here because each has its own way of silently emitting nothing:
+        //
+        //  * a WRITE's target must land in `outputs`, and its inputs must NOT
+        //    be filed as outputs (that would reverse every edge);
+        //  * `read_collected` — the CLI/SDK read path — rides the Arrow hop,
+        //    which returns batches and not a meta. If the engine's meta is not
+        //    carried across that hop, this path emits dataset-less events even
+        //    though extraction worked perfectly.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("graph".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "graph", "CREATE TABLE src(i INTEGER)")
+            .await
+            .unwrap();
+        ops.write_query(&id, "graph", "INSERT INTO src VALUES (1)")
+            .await
+            .unwrap();
+        ops.write_query(&id, "graph", "CREATE TABLE dst(i INTEGER)")
+            .await
+            .unwrap();
+        ops.write_query(&id, "graph", "INSERT INTO dst SELECT i FROM src")
+            .await
+            .unwrap();
+        ops.read_collected(&id, "graph", "SELECT i FROM dst")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        let namespace = format!("ducklake://{}", pond.pond_id);
+        let names = |e: &Value, side: &str| -> Vec<String> {
+            e[side]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|d| {
+                    assert_eq!(
+                        d["namespace"],
+                        json!(namespace),
+                        "a pond table must be namespaced by the pond it lives in"
+                    );
+                    d["name"].as_str().expect("a dataset name").to_string()
+                })
+                .collect()
+        };
+
+        // The INSERT … SELECT: one dataset read, a different one written.
+        // Selected by its SQL, because `CREATE TABLE dst` is deliberately the
+        // same JOB (same pond, same op, same target) and shares the job name.
+        let insert: Vec<&Value> = events
+            .iter()
+            .filter(|e| {
+                facet(e, "job", "sql")["query"] == json!("INSERT INTO dst SELECT i FROM src")
+            })
+            .collect();
+        assert_eq!(insert.len(), 2, "the insert is one START/terminal pair");
+        let terminal = insert
+            .iter()
+            .find(|e| event_type(e) == "COMPLETE")
+            .expect("the write completed");
+        assert_eq!(names(terminal, "outputs"), vec!["graph.main.dst"]);
+        assert_eq!(names(terminal, "inputs"), vec!["graph.main.src"]);
+        let start = insert
+            .iter()
+            .find(|e| event_type(e) == "START")
+            .expect("the write started");
+        assert_eq!(
+            names(start, "inputs"),
+            vec!["graph.main.src"],
+            "a START knows what it is about to read"
+        );
+        assert!(
+            start["outputs"].as_array().is_none_or(|o| o.is_empty()),
+            "a START must not claim outputs that do not exist yet: {start:#}"
+        );
+        // The written dataset carries the snapshot the write PRODUCED.
+        let produced = terminal["outputs"][0]["facets"]["version"]["datasetVersion"].clone();
+        assert!(
+            produced.as_str().is_some_and(|v| v.parse::<i64>().is_ok()),
+            "a written dataset must name the snapshot it produced, got {produced}"
+        );
+
+        // The collected read — the path that had no meta to carry.
+        let read = events_for_op(&events, "graph.read_query");
+        assert_eq!(read.len(), 2, "one read, one event pair: {events:#?}");
+        for event in &read {
+            assert_eq!(
+                names(event, "inputs"),
+                vec!["graph.main.dst"],
+                "read_collected must report what it read: {event:#}"
+            );
+        }
+        // The read happened after that write and nothing wrote since, so the
+        // version it reports must be exactly the one the write produced —
+        // which is what makes the two events joinable into an edge.
+        assert_eq!(
+            read[1]["inputs"][0]["facets"]["version"]["datasetVersion"], produced,
+            "the read must name the snapshot it actually read"
+        );
+    }
+
+    #[tokio::test]
     async fn lineage_read_arrow_records_at_establishment() {
         // The stream's completion is unobservable on both paths (see
         // `read_arrow`'s audit-timing doc), so its events fire when the stream
@@ -1364,6 +1472,10 @@ mod lineage {
                 ),
             ),
             (
+                "processing_engine",
+                include_str!("../../latiq-lineage/spec/facets/ProcessingEngineRunFacet-1-1-1.json"),
+            ),
+            (
                 "latiq_identity",
                 include_str!("../../latiq-lineage/spec/facets/1-0-0/LatiqIdentityFacet.json"),
             ),
@@ -1503,6 +1615,7 @@ mod lineage {
             "latiq_identity",
             "latiq_pond",
             "latiq_query",
+            "processing_engine",
             "sql",
             "jobType",
             "errorMessage",

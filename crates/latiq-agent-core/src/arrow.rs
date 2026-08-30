@@ -5,6 +5,7 @@
 use crate::error::AgentError;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use latiq_common::QueryMeta;
 use std::pin::Pin;
 use tokio_stream::Stream;
 
@@ -14,4 +15,24 @@ pub type BatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, AgentError>
 pub struct ArrowReadStream {
     pub schema: SchemaRef,
     pub batches: BatchStream,
+    /// The engine's `QueryMeta` for this read, delivered once the engine is
+    /// done producing batches — so a caller that drains the stream (the
+    /// collecting edge) reports what the ENGINE said about the read, datasets
+    /// included, instead of synthesising a meta from the rows it happened to
+    /// see. `None` where no producer supplies one: a stream decoded from a
+    /// peer's wire chunks carries no meta, and the peer that ran the query is
+    /// the one that records its lineage anyway.
+    pub meta: Option<tokio::sync::oneshot::Receiver<QueryMeta>>,
+}
+
+impl ArrowReadStream {
+    /// A stream with no meta behind it — everything a producer that cannot
+    /// speak for the engine should build.
+    pub fn new(schema: SchemaRef, batches: BatchStream) -> Self {
+        Self {
+            schema,
+            batches,
+            meta: None,
+        }
+    }
 }

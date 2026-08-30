@@ -23,6 +23,13 @@ pub enum EngineError {
 /// blocking thread. `abort` MUST interrupt execution and release engine resources
 /// within a bounded window (see spec §6).
 pub trait QueryEngine: Send + Sync {
+    /// The engine's own version, e.g. `v1.5.3` — provenance about *what ran the
+    /// query*, which the lineage trail records and a caller cannot obtain any
+    /// other way (the core is engine-neutral by design). Read from the engine
+    /// itself, never hard-coded, or it goes stale the first time we upgrade.
+    /// Cheap: implementations cache it. Never fails — an engine that cannot say
+    /// returns an empty string rather than breaking a query.
+    fn version(&self) -> String;
     /// Initialize a freshly-created pond (attach its DuckLake catalog, load extensions).
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError>;
     /// Run a read-only query (SELECT / read-only metadata). Rejects writes.
@@ -35,13 +42,18 @@ pub trait QueryEngine: Send + Sync {
     /// Run a read-only query, streaming results as Arrow `RecordBatch`es into
     /// `sink` (schema first, then batches) instead of materializing them. Rejects
     /// writes, like `read_query`. `abort` must stop the stream promptly.
+    ///
+    /// Returns the read's `QueryMeta` once the stream is done. A streamed read
+    /// has no `QueryResult` to hang it on, so without this the caller that
+    /// collects the batches would have to invent one — and would report no
+    /// datasets for the whole CLI/SDK read path.
     fn read_arrow(
         &self,
         loc: &PondLocation,
         sql: &str,
         abort: AbortToken,
         sink: &mut dyn ArrowSink,
-    ) -> Result<(), EngineError>;
+    ) -> Result<latiq_common::QueryMeta, EngineError>;
     /// Run a write/DDL query, transaction-wrapped with native attribution.
     fn write_query(
         &self,

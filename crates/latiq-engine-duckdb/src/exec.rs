@@ -2,7 +2,7 @@
 //! write (txn-wrapped + native DuckLake attribution), and explain.
 use crate::instance::PondInstance;
 use duckdb::types::ValueRef;
-use latiq_common::{Identity, QueryMeta};
+use latiq_common::{DatasetRef, Identity, QueryMeta};
 use latiq_engine::{is_read_only, AbortToken, ArrowSink, EngineError, ExplainResult, QueryResult};
 use std::time::Instant;
 
@@ -203,10 +203,11 @@ pub fn run_read_arrow(
     sql: &str,
     abort: &AbortToken,
     sink: &mut dyn ArrowSink,
-) -> Result<(), EngineError> {
+) -> Result<QueryMeta, EngineError> {
     if !is_read_only(sql) {
         return Err(EngineError::ReadOnlyViolation);
     }
+    let t0 = Instant::now();
     let mut stmt = inst
         .conn
         .prepare(sql)
@@ -214,20 +215,26 @@ pub fn run_read_arrow(
     let arrow = stmt
         .query_arrow([])
         .map_err(|e| EngineError::Engine(e.to_string()))?;
+    // A meta even for a stream: it is how the streamed read's provenance (and
+    // its row count) reaches the caller, which otherwise sees only batches.
+    let mut meta = QueryMeta::default();
     // Schema is available even for an empty result, so downstream IPC/JSON always
     // has columns.
     if sink.schema(arrow.get_schema()).is_break() {
-        return Ok(());
+        meta.duration_ms = t0.elapsed().as_millis() as u64;
+        return Ok(meta);
     }
     for batch in arrow {
         if abort.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
+        meta.rows += batch.num_rows() as u64;
         if sink.batch(batch).is_break() {
             break;
         }
     }
-    Ok(())
+    meta.duration_ms = t0.elapsed().as_millis() as u64;
+    Ok(meta)
 }
 
 /// Run a read-only query, materializing rows aligned to column names.
@@ -360,6 +367,166 @@ pub fn run_write(
             },
         })
     }
+}
+
+// ------------------------------------------------------------- provenance
+//
+// What a statement reads and writes, taken from DuckDB's **bound plan**
+// (`json_serialize_plan`). Everything below is best-effort: it must never fail
+// a query and must never execute one.
+
+/// Largest plan JSON we will parse. The plan scales with the number of
+/// *literals*, not tables — a 1000-element `IN` list serializes to ~338 KB —
+/// so a cap is what keeps a pathological query from paying a multi-megabyte
+/// JSON parse for provenance. Over the cap we record nothing, which is the
+/// same outcome as any other extraction failure.
+const MAX_PLAN_JSON_BYTES: usize = 512 * 1024;
+
+/// The datasets a statement reads and writes, as `(inputs, outputs)`, from the
+/// **bound** plan.
+///
+/// Bound, not parsed: `SELECT * FROM v` where `v` joins two tables resolves to
+/// those two base tables here, where the parse tree only ever says `v`. Writes
+/// resolve too (`json_serialize_sql` refuses them outright).
+///
+/// Three properties this must keep, in order of how badly a regression hurts:
+///
+/// 1. **It never fails a query.** No `Result`, no panic, no unwrap:
+///    unparseable SQL, an unknown table, a renamed plan key and a plan too big
+///    to parse all yield no datasets.
+/// 2. **It never executes the statement.** `json_serialize_plan` binds and
+///    plans; it does not run. That is what disqualified `EXPLAIN ANALYZE` and
+///    profiling, and it is pinned by a test.
+/// 3. **The SQL is a bound parameter**, cast explicitly (a bare `?` is
+///    rejected) — never concatenated into the extraction query.
+pub fn referenced_tables(inst: &PondInstance, sql: &str) -> (Vec<DatasetRef>, Vec<DatasetRef>) {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    if let Some(plan) = serialized_plan(inst, sql) {
+        walk_plan(&plan, &mut inputs, &mut outputs);
+    }
+    (dedup(inputs), dedup(outputs))
+}
+
+/// The bound plan as JSON, or `None` if it could not be obtained *for any
+/// reason*. `json_serialize_plan` reports failure **in band** — it returns
+/// `{"error":true,…}` for a syntax error or a missing table rather than
+/// raising — so that shape is handled here, not by a caller.
+fn serialized_plan(inst: &PondInstance, sql: &str) -> Option<serde_json::Value> {
+    // The cap is applied INSIDE DuckDB so an oversized plan is never carried
+    // across the boundary and never handed to serde_json.
+    let query = format!(
+        "SELECT CASE WHEN length(p) <= {MAX_PLAN_JSON_BYTES} THEN p END \
+         FROM (SELECT json_serialize_plan(?::VARCHAR)::VARCHAR AS p)"
+    );
+    let json: Option<String> = inst.conn.query_row(&query, [sql], |r| r.get(0)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json?).ok()?;
+    if value.get("error").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(value)
+}
+
+/// Walk every node of the plan, collecting scans as inputs and write/DDL
+/// targets as outputs. Recursive over the whole document rather than only
+/// `children`, because the operators we care about hang off several different
+/// keys and a missed branch is a silently under-reported lineage.
+fn walk_plan(
+    node: &serde_json::Value,
+    inputs: &mut Vec<DatasetRef>,
+    outputs: &mut Vec<DatasetRef>,
+) {
+    match node {
+        serde_json::Value::Object(obj) => {
+            match obj.get("type").and_then(serde_json::Value::as_str) {
+                Some("LOGICAL_GET") => inputs.extend(scan_datasets(obj)),
+                // The write targets: the table entry sits under `table_info`…
+                Some("LOGICAL_INSERT" | "LOGICAL_UPDATE" | "LOGICAL_DELETE") => {
+                    outputs.extend(obj.get("table_info").and_then(entry_dataset));
+                }
+                // …and under `info` for DDL.
+                Some("LOGICAL_CREATE_TABLE" | "LOGICAL_CREATE_VIEW" | "LOGICAL_DROP") => {
+                    outputs.extend(obj.get("info").and_then(entry_dataset));
+                }
+                _ => {}
+            }
+            for value in obj.values() {
+                walk_plan(value, inputs, outputs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_plan(item, inputs, outputs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a `LOGICAL_GET` reads. **The key names differ per table function**, and
+/// they are serialisation internals with no stability guarantee — a DuckDB
+/// upgrade that renames one would silently under-report, which is exactly the
+/// failure mode that disqualified the C API. `lineage_plan_key_names_still_*`
+/// in `tests/engine_e2e.rs` fails loudly when that happens.
+///
+/// Note which catalog is which: for `ducklake_scan` the GET's own
+/// `catalog_name`/`schema_name` name the *table function* (`system.main`), and
+/// the table is in `function_data`. Reading the outer pair would file every
+/// pond table under `system`.
+fn scan_datasets(get: &serde_json::Map<String, serde_json::Value>) -> Vec<DatasetRef> {
+    let Some(fd) = get.get("function_data").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let text = |k: &str| fd.get(k).and_then(serde_json::Value::as_str);
+    // ducklake_scan — and its snapshot, which is the version this input was
+    // read at, free of charge.
+    if let (Some(c), Some(s), Some(t)) = (
+        text("catalog_name"),
+        text("schema_name"),
+        text("table_name"),
+    ) {
+        let mut ds = DatasetRef::table(c, s, t);
+        ds.version = fd
+            .get("snapshot")
+            .and_then(|s| s.get("snapshot_id"))
+            .and_then(serde_json::Value::as_i64);
+        return vec![ds];
+    }
+    // Core `seq_scan` (a temp table, or a plain attached DuckDB catalog).
+    if let (Some(c), Some(s), Some(t)) = (text("catalog"), text("schema"), text("table")) {
+        return vec![DatasetRef::table(c, s, t)];
+    }
+    // `read_parquet` / `read_csv` and friends: external files, which keep their
+    // standard scheme so another tool's lineage can join on them.
+    fd.get("files")
+        .and_then(serde_json::Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(DatasetRef::external)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A catalog entry (`TABLE_ENTRY`, `VIEW_ENTRY`, a `DROP_INFO`) as a dataset.
+/// The name lives under a different key per entry kind — `table` for a table,
+/// `view_name` for a view, `name` for a drop.
+fn entry_dataset(entry: &serde_json::Value) -> Option<DatasetRef> {
+    let obj = entry.as_object()?;
+    let text = |k: &str| obj.get(k).and_then(serde_json::Value::as_str);
+    let name = text("table")
+        .or_else(|| text("view_name"))
+        .or_else(|| text("name"))?;
+    Some(DatasetRef::table(text("catalog")?, text("schema")?, name))
+}
+
+/// Same dataset twice (an `UPDATE`'s target, a self-join) is one dataset.
+fn dedup(mut datasets: Vec<DatasetRef>) -> Vec<DatasetRef> {
+    let mut seen = std::collections::HashSet::new();
+    datasets.retain(|d| seen.insert((d.namespace.clone(), d.name.clone())));
+    datasets
 }
 
 /// Wrap DuckDB `EXPLAIN`, returning the raw plan text. Richer estimate parsing

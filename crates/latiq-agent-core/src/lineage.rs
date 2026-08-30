@@ -29,16 +29,11 @@
 //!   tool/RPC argument (invariant 9). Inventing a SQL-level or argument-level
 //!   workflow id here would be a design violation, so the facet stays absent
 //!   until a transport field exists to fill it.
-//! - **No `processing_engine` facet.** It requires the DuckDB version, and this
-//!   crate is protocol- and engine-neutral (invariant 5): there is no
-//!   engine-version accessor on the `QueryEngine` trait to read one from. It
-//!   belongs here the moment there is.
 //!
-//! Datasets come from `QueryMeta.tables_touched`, which **nothing populates
-//! today** — task 4 fills it from DuckDB's bound plan. Until then most events
-//! carry no datasets, and that is expected: an invented input is worse than a
-//! missing one.
-use latiq_common::{Identity, QueryMeta};
+//! Datasets come from `QueryMeta.inputs`/`outputs`, which the engine fills from
+//! its bound plan. An operation whose plan did not resolve carries no datasets
+//! rather than guessed ones: an invented input is worse than a missing one.
+use latiq_common::{DatasetRef, Identity, QueryMeta};
 use latiq_lineage::event::{
     dataset_namespace, facets, job_name, rfc3339_millis_ago, DurationMeaning, EventType, Outcome,
     JOB_NAMESPACE,
@@ -75,6 +70,10 @@ pub(crate) struct QueryRecord<'a> {
     /// `None` where there is no result to describe yet (a stream at
     /// establishment).
     pub meta: Option<&'a QueryMeta>,
+    /// The version of the engine that ran it, e.g. `v1.5.3`. Read from the
+    /// engine (this crate is engine-neutral and cannot know it), and passed in
+    /// rather than looked up so the emitter stays a pure function of the record.
+    pub engine_version: &'a str,
 }
 
 /// Buffer this operation's `START` and terminal event. Both go in one call so a
@@ -86,65 +85,83 @@ pub(crate) struct QueryRecord<'a> {
 #[must_use = "a due batch must be flushed, or events sit in memory until shutdown"]
 pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>) -> bool {
     let info = rec.info;
-    let is_write = rec.op == "write_query";
 
-    // One flat list today (see the module doc). A write's tables are what it
-    // produced; a read's are what it consumed.
-    let tables: &[String] = rec.meta.map(|m| m.tables_touched.as_slice()).unwrap_or(&[]);
-    let snapshot = rec.meta.and_then(|m| m.snapshot_id);
-    let datasets: Vec<Dataset> = tables
-        .iter()
-        .map(|t| {
-            let ds = Dataset::new(dataset_namespace(&info.pond_id), t.clone());
-            // The DuckLake snapshot rides the standard dataset-version facet;
-            // there is no top-level snapshot field in the spec.
-            match snapshot {
-                Some(id) => ds.with(facets::dataset_version(id)),
-                None => ds,
-            }
-        })
-        .collect();
+    // What the statement read and what it wrote are two different edges of the
+    // graph, and the engine's plan tells them apart: an `INSERT INTO a SELECT
+    // FROM b` that reported one flat list would make `b` look written.
+    let empty: &[DatasetRef] = &[];
+    let (inputs, outputs) = match rec.meta {
+        Some(m) => (m.inputs.as_slice(), m.outputs.as_slice()),
+        None => (empty, empty),
+    };
+    // A write's outputs have no version in the plan — the snapshot they got is
+    // the one the write COMMITTED, which only the result knows.
+    let produced = rec.meta.and_then(|m| m.snapshot_id);
+    let to_datasets = |refs: &[DatasetRef], fallback: Option<i64>| -> Vec<Dataset> {
+        refs.iter()
+            .map(|r| {
+                // Only a pond's own tables get the pond namespace; an external
+                // source keeps the standard scheme it arrived with, because
+                // that is what another tool's lineage joins on.
+                let namespace = r
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| dataset_namespace(&info.pond_id));
+                let ds = Dataset::new(namespace, r.name.clone());
+                // The DuckLake snapshot rides the standard dataset-version
+                // facet; there is no top-level snapshot field in the spec.
+                match r.version.or(fallback) {
+                    Some(id) => ds.with(facets::dataset_version(id)),
+                    None => ds,
+                }
+            })
+            .collect()
+    };
+    let input_datasets = to_datasets(inputs, None);
+    let output_datasets = to_datasets(outputs, produced);
 
     // Built ONCE and cloned: the job is identical on both events of a run, and
     // rebuilding it would re-run `redact_sql` (a full char-by-char rescan) and
     // re-serialize three facet bodies for one query.
-    let job = Job::new(
-        JOB_NAMESPACE,
-        job_name(&info.name, rec.op, tables.first().map(String::as_str)),
-    )
-    .with(facets::sql(&crate::ops::redact_sql(rec.sql)))
-    .with(facets::job_type("QUERY"))
-    .with(facets::pond(&info.pond_id, &info.name, node_id));
+    //
+    // The job's target is what the operation produced, or failing that what it
+    // read: a write's job is about the table it writes, not the one it scans.
+    let target = outputs.first().or(inputs.first()).map(|d| d.name.as_str());
+    let job = Job::new(JOB_NAMESPACE, job_name(&info.name, rec.op, target))
+        .with(facets::sql(&crate::ops::redact_sql(rec.sql)))
+        .with(facets::job_type("QUERY"))
+        .with(facets::pond(&info.pond_id, &info.name, node_id));
 
     // The run id is minted once and shared: a START and its terminal event are
     // one run, and a consumer joins them on nothing else.
-    let base = Run::new().with(facets::identity(
-        rec.identity.verified,
-        &rec.identity.subject,
-        non_empty(&rec.identity.issuer),
-        // CLAIMED, and stamped `agentIdVerified: false` by `latiq-lineage`.
-        Some(rec.identity.agent_id.as_str()),
-    ));
+    let base = Run::new()
+        .with(facets::identity(
+            rec.identity.verified,
+            &rec.identity.subject,
+            non_empty(&rec.identity.issuer),
+            // CLAIMED, and stamped `agentIdVerified: false` by `latiq-lineage`.
+            Some(rec.identity.agent_id.as_str()),
+        ))
+        // WHAT ran the query, read from the engine itself: a consumer comparing
+        // two runs of the same job needs to know the engine changed under them.
+        .with(facets::processing_engine(rec.engine_version));
 
-    // START carries inputs only: the outputs do not exist yet, and their
-    // version facet would be the snapshot BEFORE the write rather than the one
-    // the write produced.
-    //
-    // And it is stamped with when the operation BEGAN, not with now. Both
+    // The START is stamped with when the operation BEGAN, not with now. Both
     // events are built here, after the op finished, so a `now` on the START
     // would put the beginning of the run at its end — every consumer that
     // derives a duration from START -> terminal (which is why the spec wants
     // the pair at all) would report ~0 ms, and contradict `latiq_query`'s
     // `durationMs` on the very same events.
-    let mut start = RunEvent::at(
+    //
+    // It carries inputs only: the outputs do not exist yet, and a version facet
+    // on them would name the snapshot BEFORE the write.
+    let start = RunEvent::at(
         rfc3339_millis_ago(rec.duration_ms),
         EventType::Start,
         base.clone(),
         job.clone(),
-    );
-    if !is_write {
-        start = start.with_inputs(datasets.clone());
-    }
+    )
+    .with_inputs(input_datasets.clone());
 
     let (event_type, outcome) = terminal(rec.error);
     let mut run = base.with(facets::query(
@@ -157,12 +174,11 @@ pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>
     if let Some(e) = rec.error {
         run = run.with(facets::error_message(&e.envelope().message));
     }
-    let mut terminal_event = RunEvent::new(event_type, run, job);
-    terminal_event = if is_write {
-        terminal_event.with_outputs(datasets)
-    } else {
-        terminal_event.with_inputs(datasets)
-    };
+    // The terminal event carries both sides: an `INSERT … SELECT` read one
+    // dataset and wrote another, and an edge needs both ends.
+    let terminal_event = RunEvent::new(event_type, run, job)
+        .with_inputs(input_datasets)
+        .with_outputs(output_datasets);
 
     writer.buffer_all(&[start, terminal_event])
 }
