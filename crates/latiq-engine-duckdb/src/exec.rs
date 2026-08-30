@@ -144,6 +144,124 @@ fn max_snapshot(inst: &PondInstance, cat_quoted: &str) -> Option<i64> {
         .flatten()
 }
 
+/// The snapshot this connection is **currently reading at**, or `None` if the
+/// catalog has none. `current_snapshot()` is a direct accessor, and inside an
+/// explicit transaction it returns the transaction's *pinned* snapshot — which
+/// is what makes it the version the read genuinely observed, rather than
+/// whatever the catalog had advanced to by the time we asked.
+///
+/// Not a replacement for [`max_snapshot`]: the write path compares before/after
+/// across a commit boundary, where "the global maximum" is the right question
+/// and a pinned per-transaction value would be the wrong one.
+fn current_snapshot(inst: &PondInstance, cat_quoted: &str) -> Option<i64> {
+    inst.conn
+        .query_row(
+            &format!("SELECT id FROM {cat_quoted}.current_snapshot()"),
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// An open `BEGIN TRANSACTION READ ONLY`, rolled back on drop unless committed.
+///
+/// Drop-based, not `ROLLBACK` at each error site, because these connections are
+/// **pooled and reused**: one missed early return leaves an open transaction
+/// that wedges the connection for every later reader. `?` inside the
+/// transaction must be as safe as an explicit error path, and only `Drop` makes
+/// that true for paths nobody has written yet.
+struct ReadTxn<'a> {
+    inst: &'a PondInstance,
+    open: bool,
+}
+
+impl<'a> ReadTxn<'a> {
+    fn begin(inst: &'a PondInstance) -> Result<Self, EngineError> {
+        inst.conn
+            .execute_batch("BEGIN TRANSACTION READ ONLY")
+            .map_err(|e| EngineError::Engine(e.to_string()))?;
+        Ok(Self { inst, open: true })
+    }
+
+    fn commit(mut self) -> Result<(), EngineError> {
+        self.inst
+            .conn
+            .execute_batch("COMMIT")
+            .map_err(|e| EngineError::Engine(e.to_string()))?;
+        // Only now is there nothing to roll back — a failed COMMIT leaves the
+        // transaction open, and Drop must still clean it up.
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReadTxn<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            // Best effort: on the cancellation path the statement was
+            // interrupted, so this ROLLBACK may itself be refused. The caller
+            // discards a connection whose read errored, so a transaction we
+            // could not close never reaches another reader.
+            let _ = self.inst.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+/// Run `f` inside a read-only transaction on `inst`, returning its value plus
+/// the snapshot the transaction observed (when `catalog` is given — i.e. when
+/// the caller records lineage; a pond that records none does not pay for the
+/// accessor).
+///
+/// The transaction is the point: everything `f` does — provenance extraction,
+/// the read itself — and the accessor below all resolve against **one** pinned
+/// catalog snapshot. Unbracketed they are separate implicit transactions, so a
+/// commit landing between them makes the recorded version describe a state the
+/// query never read, which is precisely the claim the version is there to make.
+///
+/// Measured (200 iterations, 200k-row aggregate, release): plain read
+/// 1.94–1.99 ms, bracketed 1.68–1.72 ms, bracketed + accessor 1.72–1.76 ms.
+/// One transaction amortises the per-statement catalog-snapshot resolution that
+/// auto-commit repeats, so the bracket is a saving, not a cost.
+///
+/// Pinning is **lazy** — taken at the first catalog-touching statement, not at
+/// `BEGIN` — so whichever of `f`'s statements runs first establishes it, and
+/// the accessor then reports that same pin.
+pub fn in_read_txn<T>(
+    inst: &PondInstance,
+    catalog: Option<&str>,
+    f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
+) -> Result<(T, Option<i64>), EngineError> {
+    let txn = ReadTxn::begin(inst)?;
+    // Any error here — including a cancellation — drops `txn` and rolls back.
+    let out = f(inst)?;
+    let observed = catalog.and_then(|c| current_snapshot(inst, &crate::instance::quote_ident(c)));
+    txn.commit()?;
+    Ok((out, observed))
+}
+
+/// Record the snapshot the read actually observed on this pond's own inputs.
+///
+/// Fills a **missing** version only. An input the plan already versioned keeps
+/// it: a time-travel read (`FROM a AT (VERSION => 1)`) names a snapshot that is
+/// deliberately not the one the transaction is pinned at, and overwriting it
+/// would report a state that query did not read. Everything else is left alone
+/// too — a temp table, a Parquet file and another catalog's table have no
+/// DuckLake snapshot, and inventing this pond's for them would be a lie.
+pub fn stamp_observed_version(inputs: &mut [DatasetRef], catalog: &str, observed: Option<i64>) {
+    let Some(observed) = observed else {
+        return;
+    };
+    let prefix = format!("{catalog}.");
+    for ds in inputs {
+        // `namespace: None` is what marks one of the node's own catalogs; the
+        // catalog is the first segment of the `{catalog}.{schema}.{table}` name.
+        if ds.version.is_none() && ds.namespace.is_none() && ds.name.starts_with(&prefix) {
+            ds.version = Some(observed);
+        }
+    }
+}
+
 /// Execute a statement and materialize its result rows aligned to column names.
 /// Works for any statement — a SELECT yields its rows; a write/DDL executes and
 /// yields DuckDB's summary row (which write callers drop). Multi-statement input
@@ -245,6 +363,11 @@ pub fn run_read_arrow(
 /// where read-only *enforcement* as a permission belongs. Its remaining failure
 /// mode is benign: at worst it rejects an unusual read, never lets a write slip
 /// through unattributed.
+///
+/// (The engine read paths now call this inside [`in_read_txn`], where DuckDB
+/// *does* refuse a write — "transaction is launched in read-only mode". Demoting
+/// the heuristic to a fast-fail hint in front of that enforcement is a real
+/// improvement and a deliberately separate change; this one does not touch it.)
 pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineError> {
     if !is_read_only(sql) {
         return Err(EngineError::ReadOnlyViolation);
@@ -758,6 +881,78 @@ mod tests {
         ] {
             assert!(skip.reason().len() > 10, "empty reason for {skip:?}");
         }
+    }
+
+    #[test]
+    fn stamp_observed_version_fills_only_this_ponds_unversioned_inputs() {
+        // The observed snapshot answers "what state did this read see" for the
+        // pond's own tables. Applying it anywhere else invents a version: a
+        // time-travel read deliberately names a different snapshot, and a temp
+        // table, a Parquet file and another catalog's table have no DuckLake
+        // snapshot at all.
+        let mut travelled = DatasetRef::table("pond", "main", "a");
+        travelled.version = Some(1);
+        let mut inputs = vec![
+            DatasetRef::table("pond", "main", "a"),
+            travelled,
+            DatasetRef::table("temp", "main", "t"),
+            DatasetRef::table("side", "main", "a"),
+            DatasetRef::external("s3://bucket/x.parquet"),
+        ];
+        stamp_observed_version(&mut inputs, "pond", Some(7));
+        assert_eq!(
+            inputs[0].version,
+            Some(7),
+            "this pond's unversioned input gets the snapshot the read observed"
+        );
+        assert_eq!(
+            inputs[1].version,
+            Some(1),
+            "a time-travel version must survive — it names the state that read"
+        );
+        for other in &inputs[2..] {
+            assert_eq!(
+                other.version, None,
+                "nothing outside this pond's catalog gets a version: {other:?}"
+            );
+        }
+        // No observed snapshot (a pond with no snapshots yet) invents nothing.
+        let mut fresh = vec![DatasetRef::table("pond", "main", "a")];
+        stamp_observed_version(&mut fresh, "pond", None);
+        assert_eq!(fresh[0].version, None);
+        // A catalog whose name is a prefix of this one is a different catalog.
+        let mut neighbour = vec![DatasetRef::table("pondx", "main", "a")];
+        stamp_observed_version(&mut neighbour, "pond", Some(7));
+        assert_eq!(neighbour[0].version, None, "prefix match is not a match");
+    }
+
+    #[test]
+    fn read_transaction_reports_the_snapshot_and_leaves_none_open() {
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("a"));
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        let latest: i64 = inst
+            .conn
+            .query_row("SELECT max(snapshot_id) FROM pond.snapshots()", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let (rows, observed) = in_read_txn(&inst, Some("pond"), |i| {
+            Ok(run_read(i, "SELECT * FROM t")?.rows.len())
+        })
+        .unwrap();
+        assert_eq!(rows, 0);
+        assert_eq!(
+            observed,
+            Some(latest),
+            "the accessor must name the snapshot the transaction read at"
+        );
+        // A pond that records no lineage does not pay for the accessor.
+        let (_, none) = in_read_txn(&inst, None, |i| run_read(i, "SELECT * FROM t")).unwrap();
+        assert_eq!(none, None, "no catalog asked for, no snapshot resolved");
+        // The connection is not left mid-transaction: a write would fail inside
+        // one, both because it is read-only and because COMMIT never ran.
+        run_write(&inst, "INSERT INTO t VALUES (1)", &id, "pond").unwrap();
     }
 
     #[test]

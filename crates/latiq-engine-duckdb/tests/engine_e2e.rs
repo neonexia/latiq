@@ -256,7 +256,7 @@ fn attribution_unverified_caller_has_empty_verified_fields() {
 mod lineage {
     use super::*;
     use latiq_common::DatasetRef;
-    use latiq_engine_duckdb::exec::referenced_tables;
+    use latiq_engine_duckdb::exec::{in_read_txn, referenced_tables, run_read};
     use latiq_engine_duckdb::instance::PondInstance;
 
     /// A pond with `a`, `b` and a view `vw` that joins them.
@@ -405,6 +405,77 @@ mod lineage {
             temp_inputs[0].version, None,
             "a table with no snapshot must not be given one"
         );
+    }
+
+    #[test]
+    fn lineage_read_reports_the_snapshot_it_actually_saw() {
+        // The claim a version facet makes is "this run consumed THAT state".
+        // Unbracketed, the extraction, the read and the snapshot accessor are
+        // three separate implicit transactions, so a commit landing between any
+        // two of them makes the recorded version describe a state the query
+        // never read — under-reported provenance that still looks complete.
+        //
+        // `in_read_txn` is what `read_query`/`read_arrow` bracket their work
+        // with, and this drives it with the same closure body they use, with a
+        // second connection committing in the middle of it.
+        let (_fs, _id, writer) = pond_with_a_view();
+        let reader = writer.clone_for_read().unwrap();
+        let latest = |i: &PondInstance| scalar(i, "SELECT max(snapshot_id) FROM pond.snapshots()");
+        let pinned = latest(&writer);
+
+        let ((rows, inputs), observed) = in_read_txn(&reader, Some("pond"), |i| {
+            let (inputs, _) = refs(i, "SELECT * FROM a");
+            // Between the extraction and the read — the exact interleaving.
+            writer
+                .conn
+                .execute_batch("INSERT INTO a VALUES (2,'z')")
+                .unwrap();
+            let res = run_read(i, "SELECT * FROM a")?;
+            Ok((res.rows.len(), inputs))
+        })
+        .unwrap();
+
+        // Anti-vacuity: a newer snapshot really does exist by now, so agreeing
+        // on `pinned` below is a pin and not an absence of anything to disagree
+        // with.
+        assert!(
+            latest(&writer) > pinned,
+            "the interleaved commit must have advanced the catalog"
+        );
+        // The rows the read returned are the state at `pinned` (one row), and
+        // both recorded versions name that same snapshot.
+        assert_eq!(rows, 1, "the read must see the snapshot it was pinned at");
+        assert_eq!(
+            observed,
+            Some(pinned),
+            "the accessor must report the transaction's pinned snapshot, not the catalog's newest"
+        );
+        assert_eq!(
+            inputs[0].version,
+            Some(pinned),
+            "the input's version must be the snapshot the rows came from"
+        );
+    }
+
+    #[test]
+    fn lineage_read_only_transaction_never_outlives_a_failed_read() {
+        // These connections are pooled and reused: an open transaction left
+        // behind by an error path wedges the connection for every later reader.
+        // Both exits are covered — the closure returning `Err`, and the caller's
+        // `?` unwinding out of it.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let failed: Result<((), Option<i64>), _> = in_read_txn(&inst, Some("pond"), |i| {
+            let _ = run_read(i, "SELECT * FROM a")?;
+            Err(latiq_engine::EngineError::Cancelled)
+        });
+        assert!(matches!(failed, Err(latiq_engine::EngineError::Cancelled)));
+        // A second transaction can only begin if the first one closed — DuckDB
+        // rejects a nested BEGIN, so this is the whole assertion.
+        let (n, _) = in_read_txn(&inst, None, |i| {
+            Ok(run_read(i, "SELECT * FROM a")?.rows.len())
+        })
+        .expect("a rolled-back transaction must leave the connection usable");
+        assert_eq!(n, 1);
     }
 
     #[test]
@@ -729,6 +800,18 @@ mod lineage {
             .read_query(&loc, "SELECT i FROM t", AbortToken::new())
             .unwrap();
         assert_eq!(read.meta.tables_touched, vec!["pond.main.t"]);
+        // The observed read version rides on the INPUT, never on the meta's
+        // `snapshot_id`: `latiq-pond-node`'s wire encoder labels a statement
+        // `write_query` exactly when `snapshot_id` is set, so a read that
+        // recorded one there would be labelled a write on the Data gRPC wire.
+        assert!(
+            read.meta.snapshot_id.is_none(),
+            "a read must not claim a snapshot id — the wire reads it as a write"
+        );
+        assert!(
+            read.meta.inputs[0].version.is_some(),
+            "and the version it observed must still be recorded, on the input"
+        );
 
         struct Silent;
         impl ArrowSink for Silent {
