@@ -55,6 +55,36 @@ fn plan_datasets(loc: &PondLocation, inst: &PondInstance, sql: &str) -> PlanData
         .then(|| referenced_tables(inst, sql, &loc.catalog_name))
 }
 
+/// Run a read (and its provenance extraction) inside one read-only transaction,
+/// so the plan, the rows and the snapshot accessor all see a single pinned
+/// catalog snapshot.
+///
+/// **Every** read is bracketed, not only a lineage pond's: it is measurably
+/// *faster* than the unbracketed read it replaces (one transaction amortises
+/// the catalog-snapshot resolution auto-commit repeats per statement — see
+/// `exec::in_read_txn`), and it makes a multi-scan read and a streamed batch
+/// sequence snapshot-consistent for every caller. Only the snapshot accessor is
+/// gated on `loc.lineage`, because only lineage records the value.
+fn read_txn<T>(
+    loc: &PondLocation,
+    inst: &PondInstance,
+    f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
+) -> Result<(T, Option<i64>), EngineError> {
+    crate::exec::in_read_txn(inst, loc.lineage.then_some(loc.catalog_name.as_str()), f)
+}
+
+/// Stamp the snapshot the read actually observed onto this pond's inputs.
+fn observed_datasets(
+    loc: &PondLocation,
+    datasets: PlanDatasets,
+    observed: Option<i64>,
+) -> PlanDatasets {
+    datasets.map(|(mut inputs, outputs)| {
+        crate::exec::stamp_observed_version(&mut inputs, &loc.catalog_name, observed);
+        (inputs, outputs)
+    })
+}
+
 /// Attach what the plan found to the statement's meta. A no-op for a pond
 /// without lineage, so `tables_touched` stays empty exactly where nothing asked
 /// for it.
@@ -329,18 +359,17 @@ impl QueryEngine for DuckEngine {
             // Both under ONE abort watcher: the extra bind is real work (a
             // remote glob can dominate the query) and must be interruptible.
             Self::run_with_abort(i, &abort, |i| {
-                // Before the run, not after: extraction binds the statement,
-                // and a statement that has already run may no longer bind (a
-                // dropped table, a table the same batch created). Same order on
-                // every path, so provenance does not depend on the statement.
-                //
-                // TASK 5: extraction and the read are two statements and so two
-                // implicit transactions — a commit landing between them makes
-                // the recorded `version` describe a state the read did not see.
-                // The read-only transaction task 5 adds must wrap BOTH.
-                let datasets = plan_datasets(loc, i, sql);
-                let mut res = run_read(i, sql)?;
-                apply_datasets(&mut res.meta, datasets);
+                let ((mut res, datasets), observed) = read_txn(loc, i, |i| {
+                    // Before the run, not after: extraction binds the
+                    // statement, and a statement that has already run may no
+                    // longer bind (a dropped table, a table the same batch
+                    // created). Same order on every path, so provenance does
+                    // not depend on the statement.
+                    let datasets = plan_datasets(loc, i, sql);
+                    let res = run_read(i, sql)?;
+                    Ok((res, datasets))
+                })?;
+                apply_datasets(&mut res.meta, observed_datasets(loc, datasets, observed));
                 Ok(res)
             })
         })
@@ -358,13 +387,19 @@ impl QueryEngine for DuckEngine {
             return Err(EngineError::ReadOnlyViolation);
         }
         self.with_read(loc, |i| {
-            // One abort watcher over both, and the same TASK 5 gap as
-            // `read_query`: the extraction must move inside the read-only
-            // transaction when there is one.
+            // One abort watcher over both, as in `read_query`. The transaction
+            // stays open across the whole batch stream — a correctness gain, in
+            // that the stream is now snapshot-consistent rather than resolving
+            // the catalog per statement — and a cancellation mid-stream unwinds
+            // through `read_txn`, which rolls back before the connection is
+            // discarded.
             Self::run_with_abort(i, &abort, |i| {
-                let datasets = plan_datasets(loc, i, sql);
-                let mut meta = run_read_arrow(i, sql, &abort, sink)?;
-                apply_datasets(&mut meta, datasets);
+                let ((mut meta, datasets), observed) = read_txn(loc, i, |i| {
+                    let datasets = plan_datasets(loc, i, sql);
+                    let meta = run_read_arrow(i, sql, &abort, sink)?;
+                    Ok((meta, datasets))
+                })?;
+                apply_datasets(&mut meta, observed_datasets(loc, datasets, observed));
                 Ok(meta)
             })
         })
