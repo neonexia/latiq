@@ -400,6 +400,14 @@ pub mod facets {
     /// hard-coded false and is **not** a parameter: the agent id is a claimed
     /// leaf that rides an HTTP header, and authority only ever comes from the
     /// verified subject. Making it settable would invite a caller to assert it.
+    ///
+    /// `subject` is `null` — never `""`, never `"anonymous"` — whenever
+    /// `verified` is false, matching `issuer` on the same condition: a JSON
+    /// document says "no verified identity" with a null, and an empty string
+    /// renders as a blank owner in a consumer. Nulling it here, off `verified`
+    /// itself, is what makes the two fields impossible to disagree. (The flat
+    /// `latiq::access` log line keeps its own convention — empty `subject=` —
+    /// deliberately; see that module's docs.)
     pub fn identity(
         verified: bool,
         subject: &str,
@@ -411,7 +419,7 @@ pub mod facets {
             latiq_url("LatiqIdentityFacet", IDENTITY_FACET_VERSION),
             &serde_json::json!({
                 "verified": verified,
-                "subject": subject,
+                "subject": verified.then_some(subject),
                 "issuer": issuer,
                 "agentId": agent_id,
                 "agentIdVerified": false,
@@ -530,6 +538,40 @@ mod tests {
             (4_900..=6_000).contains(&delta),
             "expected ~5s in the past, got {delta}ms"
         );
+    }
+
+    #[test]
+    fn identity_facet_nulls_an_unverified_subject_and_keeps_a_verified_one() {
+        // Regression pin: the relaxed path emitted `subject: ""` next to
+        // `issuer: null`, which renders in a consumer as a blank owner rather
+        // than as "no verified identity", and is inconsistent inside its own
+        // facet. `agentId` still carries the claimed leaf either way.
+        let relaxed =
+            serde_json::to_value(facets::identity(false, "", None, Some("agent-analytics")))
+                .expect("facet serializes");
+        assert_eq!(relaxed["subject"], serde_json::Value::Null);
+        assert_eq!(relaxed["issuer"], serde_json::Value::Null);
+        assert_eq!(relaxed["verified"], serde_json::json!(false));
+        assert_eq!(
+            relaxed["agentId"],
+            serde_json::json!("agent-analytics"),
+            "the claimed leaf is attribution and must survive the nulling"
+        );
+
+        // The other half: nulling must not swallow an authenticated identity.
+        let verified = serde_json::to_value(facets::identity(
+            true,
+            "svc-orchestrator",
+            Some("https://idp.example/realms/latiq"),
+            Some("planner-7"),
+        ))
+        .expect("facet serializes");
+        assert_eq!(verified["subject"], serde_json::json!("svc-orchestrator"));
+        assert_eq!(
+            verified["issuer"],
+            serde_json::json!("https://idp.example/realms/latiq")
+        );
+        assert_eq!(verified["verified"], serde_json::json!(true));
     }
 
     #[test]
