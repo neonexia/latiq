@@ -92,7 +92,17 @@ mod http {
     /// would stop forever on one event and the queue would fill behind it,
     /// silently. With it, a hung backend costs this much per event and then
     /// recovers.
-    const POST_TIMEOUT: Duration = Duration::from_secs(10);
+    ///
+    /// **It composes with the caller's shutdown budget, and the two are not
+    /// independent.** [`super::EventSink::drain`] is bounded by whatever budget
+    /// the node hands it, and it cannot outrun a POST that is already in
+    /// flight — so a budget shorter than this makes the drain unreachable in
+    /// exactly the case it exists for (a backend that hangs), and one hung
+    /// request would discard the whole backlog. Public for that reason:
+    /// `latiq-pond-node` asserts its `SHUTDOWN_BUDGET` against it at compile
+    /// time, so lowering the budget below this fails the build rather than
+    /// quietly disabling the drain.
+    pub const POST_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// The queue, its counters, and the two wakeups. Shared by the sink handle
     /// (which pushes) and the poster task (which pops), so the poster can be
@@ -490,4 +500,4 @@ mod http {
 }
 
 #[cfg(feature = "http-sink")]
-pub use http::HttpSink;
+pub use http::{HttpSink, POST_TIMEOUT};

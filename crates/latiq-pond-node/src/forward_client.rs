@@ -379,8 +379,10 @@ impl Forwarder for GrpcForwarder {
         let req = with_identity(
             GetLineageRequest {
                 pond: pond.to_string(),
-                // The core clamps this; `as u32` cannot lose a value that has
-                // already passed through `MAX_LIMIT`.
+                // The `min` is load-bearing, not belt-and-braces: the core has
+                // only rejected `limit == 0` by this point, and `MAX_LIMIT` is
+                // applied by the reader on the OWNER — after this hop. Without
+                // it, a caller's `u32::MAX + 1` would arrive as a 1-event page.
                 limit: limit.min(u32::MAX as usize) as u32,
                 since: since.unwrap_or_default().to_string(),
                 before: before.unwrap_or_default().to_string(),
