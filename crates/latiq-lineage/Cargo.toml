@@ -3,12 +3,25 @@ name = "latiq-lineage"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# The optional OpenLineage HTTP backend (`sink::HttpSink`). OFF by default so
+# the rest of the crate stays protocol-neutral by construction: with the feature
+# off, no transport crate is even in this crate's dependency graph. Only
+# `latiq-pond-node` (which owns the node's config and its background tasks)
+# turns it on.
+http-sink = ["dep:reqwest", "dep:tokio"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+# `http-sink` only. Both are already in the workspace tree (reqwest via rmcp and
+# latiq-auth, tokio everywhere), so the feature adds no new dependency tree --
+# it only decides whether THIS crate links them.
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Compliance proof only. It must never ship in the binary, so it stays a

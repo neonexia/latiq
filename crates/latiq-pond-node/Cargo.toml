@@ -12,6 +12,10 @@ latiq-mcp = { path = "../latiq-mcp" }
 latiq-storage = { path = "../latiq-storage" }
 latiq-engine = { path = "../latiq-engine" }
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
+# The ONE crate that enables the HTTP sink: it owns the node's configuration and
+# its background tasks, and `latiq-lineage` stays protocol-neutral everywhere
+# else (see that crate's `sink` module).
+latiq-lineage = { path = "../latiq-lineage", features = ["http-sink"] }
 latiq-metrics = { path = "../latiq-metrics" }
 metrics = { workspace = true }
 tracing = { workspace = true }

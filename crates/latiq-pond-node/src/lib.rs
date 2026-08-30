@@ -53,6 +53,14 @@ pub struct PondNodeConfig {
     /// When set, every surface on this node requires a verified bearer token.
     /// `None` keeps the relaxed identity of the embedded and dev paths.
     pub auth: Option<latiq_auth::AuthConfig>,
+    /// An OpenLineage-compatible receiver to ALSO post events to, e.g.
+    /// `http://marquez:5000/api/v1/lineage`. The full endpoint, not a base URL.
+    ///
+    /// Purely additive and off by default: lineage-enabled ponds always write
+    /// their own files, and this is what makes those events outlive the pond
+    /// that produced them (dropping a pond destroys its local trail). A backend
+    /// that is down, slow or dead can never fail, slow or block a query.
+    pub lineage_backend_url: Option<String>,
 }
 
 /// Install the standard + optional DuckDB extensions into the local cache so a
@@ -88,6 +96,7 @@ pub async fn build_ops(
     internal_endpoint: &str,
     control_endpoint: &str,
     data_dir: &std::path::Path,
+    lineage_sink: Option<Arc<dyn latiq_lineage::EventSink>>,
 ) -> anyhow::Result<Arc<AgentOps>> {
     let mut reg = ControlClient::connect(control_endpoint.to_string()).await?;
     reg.register_node(RegisterNodeRequest {
@@ -104,10 +113,15 @@ pub async fn build_ops(
     // Forward requests for ponds this node doesn't own to the owning node. The
     // node's own `internal_endpoint` is the identity it compares against, so a
     // pond whose registry endpoint matches runs locally; everything else forwards.
-    let ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
+    let mut ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
         internal_endpoint.to_string(),
         Arc::new(GrpcForwarder::new()),
     );
+    // `None` = no backend configured, which is the default: lineage-enabled
+    // ponds still write their own files, and nothing is posted anywhere.
+    if let Some(sink) = lineage_sink {
+        ops = ops.with_lineage_sink(sink);
+    }
     Ok(Arc::new(ops))
 }
 
@@ -178,6 +192,19 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
+    // Built BEFORE the node registers or serves, like the verifier and the
+    // public URL: a malformed backend URL must stop the node loudly, not become
+    // a warning on every query for the life of the process. `None` = no backend
+    // configured, the default.
+    let lineage_sink: Option<Arc<dyn latiq_lineage::EventSink>> =
+        match cfg.lineage_backend_url.as_deref() {
+            Some(url) => {
+                let sink = latiq_lineage::HttpSink::new(url).map_err(|e| anyhow::anyhow!("{e}"))?;
+                Some(Arc::new(sink))
+            }
+            None => None,
+        };
+
     let mcp_endpoint = format!("http://{}/mcp", cfg.mcp_addr);
     let ops = build_ops(
         &cfg.node_id,
@@ -185,6 +212,7 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         &cfg.internal_endpoint,
         &cfg.control_endpoint,
         &cfg.data_dir,
+        lineage_sink,
     )
     .await?;
 
@@ -259,11 +287,66 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         cfg.node_id, cfg.data_addr
     );
     println!("  pond storage: {}", cfg.data_dir.display());
+    if let Some(url) = cfg.lineage_backend_url.as_deref() {
+        println!("  lineage:      also posting events to {url}");
+    }
     // The MCP surface gets the SAME verifier as Data/Stream (a surface left
     // unauthenticated is the whole node's auth) and the SAME advertised URL, so
     // the two challenges can never point at different documents.
-    serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url))
-        .await
-        .map_err(|e| anyhow::anyhow!("mcp server error: {e}"))?;
-    Ok(())
+    let served = ops.clone();
+    let result = tokio::select! {
+        r = serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url)) => {
+            r.map_err(|e| anyhow::anyhow!("mcp server error: {e}"))
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("shutdown signal received; flushing buffered lineage");
+            Ok(())
+        }
+    };
+
+    // The node's ONLY shutdown work, and the reason `shutdown_signal` exists at
+    // all. `LineageWriter` flushes on `Drop`, so a teardown that drops the last
+    // `AgentOps` already loses nothing -- but a SIGTERM does not drop anything,
+    // it ends the process, and up to one batch per pond (64 events) would go
+    // with it. That batch is the last few queries before the node went down,
+    // which is precisely the window an incident asks about.
+    //
+    // It does BLOCKING, fsyncing io (see `AgentOps::flush_lineage`), so it runs
+    // on the blocking pool and not on the worker that was serving.
+    let _ = tokio::task::spawn_blocking(move || served.flush_lineage()).await;
+    result
+}
+
+/// Resolves when the process is asked to stop: SIGTERM (how a container runtime
+/// stops a node) or Ctrl-C.
+///
+/// There is **no other shutdown hook on this node today** -- the serve futures
+/// run until the process ends, and `latiq-pond-node/CLAUDE.md` still lists
+/// graceful shutdown (stop accepting -> abort in-flight -> checkpoint ->
+/// deregister) as a target. This is deliberately not that. It is the smallest
+/// thing that lets the buffered lineage land, and the place the rest of that
+/// sequence goes when it is built.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If the handler cannot be installed there is nothing useful to do but
+        // fall back to Ctrl-C: refusing to serve over it would be worse.
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "could not listen for SIGTERM; only Ctrl-C will flush lineage");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

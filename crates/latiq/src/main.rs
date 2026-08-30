@@ -286,6 +286,14 @@ struct NodeAddArgs {
     /// the issuer identifier is not a reachable address.
     #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
     auth_jwks_uri: Option<String>,
+    /// An OpenLineage-compatible receiver to ALSO post lineage events to, e.g.
+    /// http://marquez:5000/api/v1/lineage. The FULL endpoint, not a base URL.
+    /// Additive and off by default: ponds allocated with lineage always write
+    /// their own event files, and a backend that is down or slow can never
+    /// affect a query. Set it when lineage must outlive the pond -- dropping a
+    /// pond destroys its local trail. No credentials are sent.
+    #[arg(long, env = "LATIQ_LINEAGE_BACKEND_URL")]
+    lineage_backend_url: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -931,6 +939,10 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         // `None` unless --auth-issuer was given: no flags means the relaxed
         // (claimed) identity path this node has always run.
         auth,
+        // Blank means absent, like --public-mcp-url: compose interpolation
+        // passes the variable through empty, and an empty string must mean "no
+        // backend", never a URL the node then fails to parse at startup.
+        lineage_backend_url: non_blank(a.lineage_backend_url),
     })
     .await
 }

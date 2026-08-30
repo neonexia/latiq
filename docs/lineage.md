@@ -1,9 +1,8 @@
-# Latiq — Lineage (OpenLineage events, agent-queryable by default)
+# Latiq — Lineage (OpenLineage events, per pond, opt-in)
 
-*Design note. Pairs with [`identity.md`](identity.md) — lineage is where the
-identity chain that authorization deliberately does **not** model gets recorded.
-Nothing below is implemented yet; the shape is settled (see
-[Decisions](#decisions)).*
+*Design note, describing **what shipped**. Pairs with [`identity.md`](identity.md)
+— lineage is where the identity chain that authorization deliberately does not
+model gets recorded.*
 
 ---
 
@@ -16,12 +15,12 @@ human to open a web UI.
 That is the requirement that shapes everything here: **Latiq often runs fully
 contained inside the agent's environment**, with no network path to a lineage
 backend. Lineage that exists only as an emitted event is, in that deployment,
-lineage nobody can read. So the local, queryable store is the *default* and the
-external backend is the *option* — not the other way round.
+lineage nobody can read. So the local trail is the *default* and the external
+backend is the *option* — not the other way round.
 
-We emit **[OpenLineage](https://openlineage.io)** events because it is the
-existing standard for exactly this, and inventing a schema here would repeat the
-mistake identity.md just backed out of.
+We emit **[OpenLineage](https://openlineage.io)** events (core spec `2-0-2`)
+because it is the existing standard for exactly this, and inventing a schema
+here would repeat the mistake identity.md backed out of.
 
 ---
 
@@ -29,137 +28,131 @@ mistake identity.md just backed out of.
 
 Two things that look similar and are not:
 
-| | `latiq::access` trail (**today**) | Lineage (**this note**) |
+| | `latiq::access` trail | Lineage |
 |---|---|---|
-| Reader | operators, in their log stack | **agents**, in SQL, mid-run |
+| Reader | operators, in their log stack | **agents**, mid-run |
 | Question | "who did what, when?" | "where did this data come from?" |
 | Shape | one structured log line per op | dataset-level in/out graph |
-| Store | none — it's a log trace | a queryable sidecar catalog |
+| Store | none — it's a log trace | JSONL files in the pond's own directory |
+| Scope | always on, every op | **opt-in per pond**, queries only |
 
-The access trail stays exactly as it is: a structured trace, no audit table, no
-audit RPC, as `product.md` describes. Lineage does not replace it and does not
-make it a store — different reader, different question.
+The access trail is unchanged: a structured trace, no audit table, no audit RPC,
+as `product.md` describes. Lineage does not replace it and does not make it a
+store — different reader, different question.
 
 ---
 
-## Storage: a sidecar catalog, never a table in the pond
+## What shipped
 
-The obvious design is a lineage table inside the pond, so agents can just query
-it. **It is the wrong design**, and not primarily because of invariant 6.
+**Opt in at allocation, off by default.** `allocate_pond(..., lineage=true)`.
+It is fixed for the pond's lifetime: an existing pond cannot be switched on, and
+`describe_pond` reports the flag so a caller can tell whether `get_lineage` will
+have anything to say. A pond that did not opt in pays nothing — no event, no
+formatting, no directory lookup, no writer.
 
-Writing lineage into the pond means every read becomes a write, and that costs
-three specific things:
+**One event pair per query.** A `START` and a terminal `COMPLETE` / `FAIL` /
+`ABORT` (a cancelled or timed-out query aborts; a consumer that cannot tell that
+from a failure cannot tell Ctrl-C from a bug). The `START` is stamped with when
+the operation *began*, not with now, so a consumer deriving duration from the
+pair gets the real number. Reads emit as well as writes: "which agent read this
+before the bad decision" is a question people genuinely ask, and a write-only
+graph answers who produced a dataset but never who consumed it.
 
-1. **It destroys attribution.** A logged `SELECT` produces a DuckLake
-   **snapshot**. `pond.snapshots()` — the thing attribution is built on — fills
-   with our bookkeeping instead of the agent's actual data changes. Lineage would
-   make history unreadable, which is the opposite of its purpose.
-2. **It re-serializes reads.** Writes take the pond's writer mutex. Reads
-   currently take a pooled cloned connection *precisely* so they don't serialize
-   (`crates/latiq-engine-duckdb/src/duck_engine.rs`). Routing a lineage write
-   into the read path puts every read back behind that mutex and undoes the
-   read-concurrency work.
-3. **It breaks invariant 6** — `_latiq` objects visible in the agent's
-   `SHOW TABLES`, in a catalog we promise is pure DuckLake.
+**Recorded on the node that ran it.** A forwarded operation records on the owner,
+exactly as the access trail does — emitting on both sides would duplicate the run
+under two pond-local snapshot ids, only one of them real.
 
-**Instead:** lineage events are written as **files in the pond's own directory**,
-and exposed through a tiny per-pond `lineage.duckdb` that holds a single view over
-them, attached `READ_ONLY` into the agent's session. The agent gets exactly the
-ergonomics it wanted —
+**Inputs and outputs from DuckDB's bound plan**, kept apart: an
+`INSERT INTO a SELECT FROM b` that reported one flat list would make `b` look
+written. Table-level, not column-level. A statement whose plan did not resolve
+carries **no** datasets rather than guessed ones — an invented input is worse
+than a missing one.
 
-```sql
-SELECT * FROM lineage.events WHERE pond = 'pond-8812' ORDER BY event_time DESC;
-```
+**Versions are native DuckLake snapshots**, on the standard
+`datasetVersion` facet. A read reports the exact snapshot it observed; a write
+reports the snapshot it committed. This is where being pure DuckLake pays off:
+the version is the engine's, not something we maintain.
 
-— with zero pond snapshots and no contention with the writer mutex.
+**Identity, verified or claimed.** The `latiq_identity` facet carries `subject`,
+`issuer`, `verified`, and the claimed leaf `agentId` stamped
+`agentIdVerified: false`. A reader can always tell provenance from assertion.
 
-**Why a view over files rather than a table.** The obvious shape — a node-owned
-DuckDB table the agent attaches read-only — is genuinely read-only but **stale**:
-a read-only attach pins a snapshot at attach time, so a reader never sees rows
-written afterwards. Measured: the writer inserts, the reader still returns the old
-set, and only `DETACH` + re-`ATTACH` refreshes it. Since `ATTACH` is *database*
-state shared by every pooled read connection, refreshing per query would mean
-mutating shared state under the pond mutex. Stale provenance is worse than none.
+**Files in the pond's own `lineage/` directory.** Batched JSONL, written to a
+temp file, `fsync`ed, and renamed into place, so a reader globbing `*.jsonl`
+sees either nothing or a whole batch — never a torn record. Names carry a
+zero-padded unix-millis prefix, so sorting names sorts by time. The buffer is
+bounded (10 000 events per pond) and a failed batch is retried; nothing here can
+fail a query, and every failure below `record()` is a `warn!`.
 
-A view over files has neither problem. The sidecar database is written **once** at
-pond creation and never again, so every connection can hold it read-only forever,
-and the view's glob re-evaluates per query — new files appear immediately, on the
-same connection, including on connections cloned before the attach. There is no
-second writer on any database, so DuckDB's one-writer rule is never engaged.
+**`get_lineage(pond, limit, since?, before?)`** on the MCP surface, forwarded to
+the pond's owning node. Newest first, events returned **verbatim** — not
+round-tripped through our own struct, so an event written by a different build
+of Latiq keeps every field it was recorded with. `since` is an inclusive lower
+bound, `before` an exclusive upper one, and a page is never cut in the middle of
+one `eventTime`, so walking `before` backwards visits every event exactly once.
+Malformed lines and unreadable batch files are **counted and reported**: a short
+answer must never look like a complete one.
 
-Four things the shape forces, all measured:
+**An optional OpenLineage HTTP backend.** `--lineage-backend-url` /
+`LATIQ_LINEAGE_BACKEND_URL` on `latiq node add` — the full endpoint to POST to,
+e.g. `http://marquez:5000/api/v1/lineage`, validated once at startup so a typo
+stops the node instead of warning on every query forever. When set, every event
+goes to both. **No credentials are sent**; a backend that needs auth is a later,
+explicit decision rather than a scheme invented here.
 
-- **`CREATE VIEW` fails on an empty glob**, so a fresh pond needs a seeded sentinel
-  event that the view filters out.
-- **`SELECT *` is not a stable schema.** Column count, order and *types* re-bind per
-  query from whatever files exist; a later file with a conflicting type silently
-  rewrites earlier rows' rendering. The view must pin an explicit column list, with
-  variable OpenLineage facets in one JSON column.
-- **File count dominates cost** — ~0.11 ms per file with no warm-up, so 5000 small
-  files is over a second per query where a single Parquet is 1.2 ms flat. The writer
-  batches, and a compactor rewrites batches into Parquet; rename-then-delete is
-  picked up correctly by the live view.
-- **A torn write breaks the view for every reader.** Write to a temp file and
-  rename; keep `ignore_errors` as a backstop.
+Three properties of the sink, in the order they matter:
 
-### Read-only is defence in depth, not a boundary — for now
+1. **It can never fail, slow or block a query.** Submitting is one `try_send`
+   onto a bounded queue; every POST happens on a background task nobody awaits,
+   modelled on the node's heartbeat loop (tolerates a dead endpoint, recovers
+   without supervision). A dead, hung, TLS-failing, DNS-failing or 500-ing
+   backend is invisible to the query path. A full queue **drops** with a
+   warning; it never grows and it never waits.
+2. **The posted bytes are the stored bytes.** An event is serialized exactly
+   once and that same string goes to the file buffer and to the sink, so what a
+   backend receives is byte-identical to what the pond's files hold and to what
+   `get_lineage` returns. If the wire form and the stored form could drift,
+   "OpenLineage compliant" would mean nothing.
+3. **Failure logging is rate-limited to the transitions.** A node whose backend
+   is down posts on every query; without this it would drown the log it shares
+   with the access trail.
 
-`READ_ONLY` protects the sidecar *catalog*: `INSERT`, `CREATE`, `DROP` against it
-are all refused. It does **not** protect the files the view reads. `write_query`
-executes arbitrary SQL by design (#53), and DuckDB SQL can write files — so an
-agent can today forge events, overwrite real ones, or break the view outright, and
-can read the event directory path out of `duckdb_views()`. **[#79](https://github.com/neonexia/latiq/issues/79)** tracks this;
-it is a pre-existing capability that lineage does not create but does make matter.
-
-**M1 assumes trusted agents**, consistent with the rest of the posture, so lineage
-ships without that guard. The claim "an agent cannot rewrite its own provenance"
-is therefore **not yet true**, and must not be written down as though it were.
-It becomes true when #79's per-pond sandbox lands, which is a prerequisite for
-beta rather than for this slice.
-
-### Sinks
-
-- **Local sidecar** — always on. The default, and the only one that works in a
-  contained environment.
-- **OpenLineage HTTP backend** (Marquez or any compatible receiver) —
-  configurable, additive. When set, events go to both.
-
-Emission must never fail a query. A sink that is down drops events with a
-`WARN`; it does not propagate.
+**A flush on shutdown.** The writer flushes on `Drop`, so a graceful teardown
+loses nothing — but SIGTERM ends the process rather than dropping anything, and
+up to one batch per pond would go with it. That batch is the last few queries
+before the node went down, which is exactly the window an incident asks about,
+so the node catches SIGTERM/Ctrl-C and flushes. This is the node's *only*
+shutdown work today; the full sequence (stop accepting → abort in-flight →
+checkpoint → deregister) is still a target, and this is where it goes.
 
 ---
 
 ## The run-scope question
 
-The awkward part, and it resolves into OpenLineage's own model rather than a
-choice we have to make.
-
 Two constraints that look contradictory:
 
-- The run id must be **Latiq-minted** — it is provenance, and provenance a caller
-  can fabricate is worthless.
-- Only the **agent environment** knows what a workflow *is*: long-running or
-  short, a graph of steps, each step an agent launched many times.
+- The run id must be **Latiq-minted** — it is provenance, and provenance a
+  caller can fabricate is worthless.
+- Only the **agent environment** knows what a workflow *is*.
 
-OpenLineage already separates these, because it has a run **and** a
-**parent-run facet**:
+OpenLineage already separates these, because it has a run **and** a parent-run
+facet:
 
 | OpenLineage concept | Latiq mapping | Trust |
 |---|---|---|
-| **Job** | the pond + the target dataset — the stable, recurring thing | derived |
+| **Job** | the pond + the op + the target dataset — the stable, recurring thing | derived |
 | **Run** | **one query execution**, id minted by Latiq | **ours, unforgeable** |
-| **Parent run** | the caller's `workflow_id` / `step_id`, opaque | **claimed, never verified** |
+| **Parent run** | the caller's workflow / step, opaque | **claimed, never verified** |
 
-So we guarantee what we can guarantee, and we record what only the environment
-knows — labelled as claimed, never load-bearing for authorization. When the
-environment supplies a parent, the graph assembles correctly across hundreds of
-agents. When it doesn't — today's single and loop agents — lineage is still
-complete per query, just flat.
+Same discipline as identity: verify what's verifiable, record the rest as
+claimed, and never let a claim carry authority.
 
-Same discipline as identity: **verify what's verifiable, record the rest as
-claimed, and never let a claim carry authority.** It also means we do not have to
-guess the shape of workflows now, and nothing needs retrofitting when graph
-agents arrive.
+**The parent facet is not emitted yet**, and that absence is deliberate rather
+than an oversight: **no transport carries a workflow id today**, and
+identity-shaped context arrives in the transport and never in a tool or RPC
+argument (invariant 9). Inventing a SQL-level or argument-level workflow id
+would be a design violation. The UUIDv5 derivation is written and tested; it
+stays unused until a transport field exists to fill it.
 
 **Explicitly rejected: scoping the run to the pond's lifetime.** A pond can
 outlive a workflow or be shared by several. It is a good *job* name and a wrong
@@ -167,70 +160,84 @@ outlive a workflow or be shared by several. It is a good *job* name and a wrong
 
 ---
 
-## What an event carries
+## Cut: the SQL catalog over the events
 
-Sketch, not a schema:
+An earlier draft of this note designed a per-pond `lineage.duckdb` sidecar
+holding a view over the event files, attached `READ_ONLY` into the agent's
+session so an agent could write `SELECT * FROM lineage.events WHERE …`. **None
+of that shipped, and it was cut deliberately** — publish compliant OpenLineage
+first, optimise access later. It is recorded here so the next reader knows it
+was a decision and not an omission.
 
-- **Run** — Latiq run id, event type (`START` / `COMPLETE` / `FAIL`), event time,
-  duration.
-- **Job** — pond id, pond name, target dataset.
-- **Inputs / outputs** — datasets read and written, with the DuckLake
-  **snapshot id** as the dataset version. This is where being pure DuckLake pays
-  off: the version is native, not something we maintain.
-- **Identity** (from [`identity.md`](identity.md)) — `subject`, `issuer`,
-  `verified`, and the claimed leaf `agent_id`. **`verified` must be carried into
-  the event**, so a reader can tell provenance from assertion.
-- **Parent run** — claimed workflow / step labels, if supplied.
-- **SQL** — redacted the same way the access trail redacts it (literals
-  replaced). The existing `redact_sql` applies.
-- **Trace id** — the existing `latiq-trace-id`, so a lineage row joins to the
-  logs.
+What the cut removes: the sidecar catalog, the view, the seeded sentinel event a
+`CREATE VIEW` over an empty glob needs, the pinned column list (`SELECT *` over a
+glob re-binds column count, order *and types* per query), the read-only attach,
+an extra attached database per open pond — and any need to amend invariant 6,
+since nothing Latiq-owned goes into the pond catalog either way.
 
-Extracting inputs and outputs is the real work: DuckDB's `EXPLAIN` /
-`json_serialize_sql` can surface referenced tables, and we already run an explain
-path. Getting it *approximately* right (tables touched, not column-level) is
-worth far more than getting it perfectly right later.
+**The accepted cost, plainly.** An agent that wants to filter or aggregate its
+lineage has two options, and neither is a view:
 
----
+- pull events through `get_lineage` and do it itself, or
+- run its own `read_json_auto` over the pond's lineage directory — which
+  `get_lineage` hands back as `lineage_dir` for exactly this reason. The catch
+  worth knowing up front: the facets map differs per event, so DuckDB's inferred
+  struct will unify across whatever files exist and the schema can shift between
+  two runs of the same query.
 
-## Decisions
-
-Settled before implementation. Recorded here because an unanswered question in a
-design note becomes an unexamined assumption in the code.
-
-**One sidecar per pond.** Not one per node. The deciding argument is the one this
-note anticipated: authorization does not exist yet, so a node-wide sidecar would
-show every pond's provenance to every agent, and any filtering would be advisory
-rather than enforced. Per-pond makes the isolation structural — an agent attached
-to its pond can only see its own lineage. The costs are real and accepted: many
-small files, and no cross-pond question ("what read this dataset anywhere?") until
-a node-wide view is added deliberately, behind authorization.
-
-**Reads emit as well as writes.** "Which agent read this before the bad decision"
-is a question people genuinely ask, and reads are where agents spend most of their
-time — a write-only graph answers who *produced* a dataset but never who
-*consumed* it. Emission is asynchronous and off the query's critical path, so the
-cost is disk and volume rather than latency. If volume turns out to hurt, the
-lever is a sampling or opt-out setting, not a redesign.
-
-**Lineage is reaped with the pond.** No TTL, no reaper, no unbounded growth — the
-sidecar's lifecycle is the pond's. **The cost is stated plainly: dropping a pond
-destroys its provenance, which is exactly the post-mortem history someone will
-want afterwards.** The escape hatch is the HTTP sink: an operator who needs
-lineage to outlive its pond configures an OpenLineage backend, and durability
-becomes that backend's job rather than ours. That is the right split — we are not
-a lineage archive, and building one would mean a reaper, an orphan store, and a
-retention policy we have no basis to choose yet.
+A view over these same files is purely additive. Nothing here forecloses it.
 
 ---
 
-## Still open
+## What lineage does not promise
 
-- **Column-level lineage** — a stated OpenLineage facet, and much harder than
-  table-level. Table-level first; column-level only if agents ask for it.
-- **MCP surface** — is lineage just the attached `lineage` catalog, or also a
-  tool/resource? The attached catalog needs no new tool, which argues for starting
-  there and adding a tool only if agents do not find it.
-- **Cross-pond lineage** — deliberately impossible under the per-pond decision
-  above. If it is ever wanted, it arrives with authorization, as a filtered
-  node-wide view rather than by widening the sidecar.
+**An agent can rewrite its own provenance.** `write_query` executes arbitrary
+SQL by design (#53), and DuckDB SQL can write files — so an agent can today
+forge events, overwrite real ones, or delete the directory, and it can read the
+path out of `get_lineage`'s own response.
+**[#79](https://github.com/neonexia/latiq/issues/79)** tracks the per-pond
+sandbox that fixes it, and is a prerequisite for beta rather than for this
+slice. M1 assumes trusted agents, consistent with the rest of the posture. The
+claim "an agent cannot rewrite its own provenance" is **not true today** and
+must not be written down as though it were.
+
+**Dropping a pond destroys its provenance.** Lineage is reaped with the pond —
+no TTL, no reaper, no orphan store, no retention policy we have no basis to
+choose yet. The cost is real and it is the obvious one: the post-mortem history
+someone wants is gone at exactly the moment they think to ask for it. **The HTTP
+sink is the durability answer**: an operator who needs lineage to outlive its
+pond configures a backend, and durability becomes that backend's job rather than
+ours. We are not a lineage archive.
+
+**Per-pond, so no cross-pond questions.** "What read this dataset anywhere?" has
+no answer from inside Latiq. That is the price of making isolation structural
+while authorization does not exist: a node-wide store would show every pond's
+provenance to every agent, and any filtering would be advisory rather than
+enforced. If it is ever wanted it arrives *with* authorization, as a filtered
+node-wide read, not by widening a pond's trail.
+
+**Table-level, not column-level.** Column-level lineage is a stated OpenLineage
+facet and much harder. Getting tables approximately right is worth far more now
+than getting columns perfectly right later.
+
+---
+
+## Where it lives
+
+| Piece | Code |
+|---|---|
+| Events + facets, the file writer, the reader, the HTTP sink | `crates/latiq-lineage` |
+| The emitter (one pair per op, on the local path only) | `crates/latiq-agent-core/src/lineage.rs` |
+| Inputs/outputs from the bound plan | `crates/latiq-engine-duckdb` |
+| `get_lineage` (neutral) and the writer registry | `crates/latiq-agent-core/src/ops.rs` |
+| The `get_lineage` MCP tool | `crates/latiq-mcp` |
+| `--lineage-backend-url`, the sink, the shutdown flush | `crates/latiq-pond-node`, `crates/latiq/src/main.rs` |
+| Vendored OpenLineage + Latiq facet schemas | `crates/latiq-lineage/spec/` |
+
+`latiq-lineage` is protocol-neutral like `latiq-agent-core` that depends on it
+(invariant 5). The HTTP sink is the one deliberate exception — it is HTTP by
+definition — and it sits behind the `http-sink` Cargo feature that only
+`latiq-pond-node` enables. With the feature off the crate does not even depend
+on `reqwest`, so the neutrality of the rest is enforced by Cargo rather than by
+a reviewer noticing. What the writer and the core see is `EventSink`, a trait
+over `&str` with no transport in it.
