@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/v0.1.0/crates/latiq-lineage/spec/facets/1-0-0/LatiqPondFacet.json",
+  "$defs": {
+    "LatiqPondFacet": {
+      "description": "The pond this job ran against and the node that executed it. On the job (not the run) because a pond is the stable, recurring thing a job is named after.",
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "pondId": {
+              "description": "The pond's stable id.",
+              "type": "string"
+            },
+            "pondName": {
+              "description": "The pond's name, as attached in DuckDB.",
+              "type": "string"
+            },
+            "nodeId": {
+              "description": "The pond node that executed the query.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pondId",
+            "pondName",
+            "nodeId"
+          ]
+        }
+      ],
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "latiq_pond": {
+      "$ref": "#/$defs/LatiqPondFacet"
+    }
+  }
+}

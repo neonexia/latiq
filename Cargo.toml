@@ -14,6 +14,7 @@ members = [
   "crates/latiq-pond-node",
   "crates/latiq-control-plane",
   "crates/latiq-metrics",
+  "crates/latiq-lineage",
   "crates/latiq-sdk",
 ]
 # The PyO3 wheel is its own workspace (built by maturin) so its extension-module
@@ -32,7 +33,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 anyhow = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+# v5 derives a stable UUID from an opaque string (lineage's claimed workflow id
+# -> parent.run.runId, which the OpenLineage spec requires to be a UUID).
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -76,3 +79,11 @@ schemars = "0.8"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 sysinfo = "0.32"
+# Already in the tree via duckdb/arrow. Lineage needs an RFC-3339 timestamp with
+# an explicit offset -- OpenLineage rejects a naive local one.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# Dev-only (the lineage compliance test). default-features off: the vendored
+# schemas are registered in-process, so the HTTP/file retrievers and their TLS
+# stack are dead weight -- and an unresolvable $ref should fail the test rather
+# than reach the network.
+jsonschema = { version = "0.52", default-features = false }
