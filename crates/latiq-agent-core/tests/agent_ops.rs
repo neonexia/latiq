@@ -1880,6 +1880,18 @@ mod lineage {
     /// exists to catch. It answers 200 and keeps the connection open, because
     /// `reqwest` pools and will send several events down one socket.
     async fn capture_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        capture_server_with("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", None).await
+    }
+
+    /// `capture_server`, answering with `response` after an optional delay.
+    /// The delay is what makes the drain test deterministic (without a drain,
+    /// the events are provably still in flight when the assertion runs) and
+    /// `response` is what lets one server stand in for a backend that rejects
+    /// everything.
+    async fn capture_server_with(
+        response: &'static str,
+        delay: Option<std::time::Duration>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind capture server");
@@ -1921,11 +1933,10 @@ mod lineage {
                             String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
                         bodies.lock().expect("capture lock").push(body);
                         buf.drain(..head_end + len);
-                        if stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                            .await
-                            .is_err()
-                        {
+                        if let Some(delay) = delay {
+                            tokio::time::sleep(delay).await;
+                        }
+                        if stream.write_all(response.as_bytes()).await.is_err() {
                             return;
                         }
                     }
@@ -1951,6 +1962,17 @@ mod lineage {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         bodies.lock().expect("capture lock").clone()
+    }
+
+    /// An endpoint that accepts the connection and then never answers — the
+    /// worst case for a sink, and the one a plain refused connection does not
+    /// exercise at all. The listener is returned so the caller keeps it alive.
+    async fn hung_endpoint() -> (String, tokio::net::TcpListener) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hung endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        (format!("http://127.0.0.1:{port}/api/v1/lineage"), listener)
     }
 
     /// A port nothing is listening on. Bound and released, so it is a port the
@@ -2080,6 +2102,157 @@ mod lineage {
         assert_eq!(
             posted_values, returned,
             "the backend must receive exactly the events get_lineage returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_sink_survives_a_backend_that_rejects_every_event() {
+        // Connection-refused is the easy failure. A backend that is UP, accepts
+        // the body and answers 500 exercises a different branch — the response
+        // path rather than the transport one — and it is the shape a
+        // misconfigured Marquez actually takes. Nothing is retried, so the
+        // events are gone from the backend and intact on disk.
+        let (url, bodies) = capture_server_with(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            None,
+        )
+        .await;
+        let sink = Arc::new(latiq_lineage::HttpSink::new(&url).expect("valid url"));
+        let (ops, storage) = ops_with_sink(Some(sink.clone() as Arc<dyn latiq_lineage::EventSink>));
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("rejected".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "rejected", "CREATE TABLE t AS SELECT 7 AS i")
+            .await
+            .expect("a 500 from the backend must not fail the write");
+        let read = ops
+            .read_query(&id, "rejected", "SELECT i FROM t")
+            .await
+            .expect("a 500 from the backend must not fail the read");
+        assert_eq!(
+            read.rows[0][0],
+            json!(7),
+            "the query returns its real answer"
+        );
+
+        ops.flush_lineage();
+        let stored = lines_in(&storage, &pond.pond_id);
+        assert!(
+            stored.len() >= 4,
+            "the local files must hold both operations' events, got {}",
+            stored.len()
+        );
+        // The backend really did receive and reject them: without this the test
+        // would pass against a sink that posted nothing at all.
+        let posted = wait_for_posts(&bodies, stored.len()).await;
+        assert!(
+            posted.len() >= 4,
+            "every event must have been offered to the backend, got {}",
+            posted.len()
+        );
+        assert_eq!(
+            sink.dropped(),
+            0,
+            "a rejected POST is discarded by the poster, never counted as a queue overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_sink_survives_a_backend_that_never_answers() {
+        // The failure the per-request timeout exists for, and the one a refused
+        // connection cannot show: the socket connects, the body is accepted,
+        // and nothing ever comes back. The queries must return at their normal
+        // speed regardless — the whole design is that nobody awaits the POST.
+        let (url, _listener) = hung_endpoint().await;
+        let sink = Arc::new(latiq_lineage::HttpSink::new(&url).expect("valid url"));
+        let (ops, storage) = ops_with_sink(Some(sink.clone() as Arc<dyn latiq_lineage::EventSink>));
+        let id = Identity::claimed(Some("agent-a"));
+
+        // Comfortably under the sink's own 10s per-POST timeout, so a query
+        // that waited on the backend could not fit inside this.
+        let work = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let pond = ops
+                .allocate_pond(&id, Some("hung".into()), "{}", "medium", &[], true)
+                .await
+                .unwrap();
+            ops.write_query(&id, "hung", "CREATE TABLE t AS SELECT 5 AS i")
+                .await
+                .expect("write");
+            let read = ops
+                .read_query(&id, "hung", "SELECT i FROM t")
+                .await
+                .expect("read");
+            assert_eq!(read.rows[0][0], json!(5));
+            pond
+        })
+        .await
+        .expect("a hung backend must not delay the query path");
+
+        ops.flush_lineage();
+        assert!(
+            lines_in(&storage, &work.pond_id).len() >= 4,
+            "the local files must be complete while the backend hangs"
+        );
+        assert!(
+            sink.submitted() >= 4,
+            "anti-vacuity: the sink must really have been handed the events it is hanging on"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_sink_drain_posts_the_backlog_before_the_node_exits() {
+        // What SIGTERM would otherwise throw away. The backend answers slowly,
+        // so at the moment the queries return the backlog is provably still in
+        // flight; `drain` is the only thing that gets it out before the process
+        // ends. Without the drain seam this asserts a race and fails.
+        let (url, bodies) = capture_server_with(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            Some(std::time::Duration::from_millis(200)),
+        )
+        .await;
+        let sink = Arc::new(latiq_lineage::HttpSink::new(&url).expect("valid url"));
+        let (ops, storage) = ops_with_sink(Some(sink.clone() as Arc<dyn latiq_lineage::EventSink>));
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("draining".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "draining", "CREATE TABLE t AS SELECT 1 AS i")
+            .await
+            .unwrap();
+        ops.read_query(&id, "draining", "SELECT i FROM t")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let stored = lines_in(&storage, &pond.pond_id);
+        assert!(stored.len() >= 4, "two operations, two event pairs");
+        let in_flight = bodies.lock().expect("capture lock").len();
+        assert!(
+            in_flight < stored.len(),
+            "the backlog must still be in flight when the shutdown begins, or this test \
+             cannot tell a drain from luck: {in_flight} of {} already posted",
+            stored.len()
+        );
+
+        // The node's shutdown budget, as `shutdown_lineage` passes it.
+        ops.drain_lineage_sink(std::time::Duration::from_secs(5))
+            .await;
+        let posted = bodies.lock().expect("capture lock").clone();
+        assert_eq!(
+            posted.len(),
+            stored.len(),
+            "the drain must post the whole backlog before the node exits"
+        );
+        let mut posted = posted;
+        let mut stored = stored;
+        posted.sort();
+        stored.sort();
+        assert_eq!(
+            posted, stored,
+            "and post it verbatim, exactly as `submit` would have"
         );
     }
 }
