@@ -1,0 +1,17 @@
+[package]
+name = "latiq-lineage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Compliance proof only. It must never ship in the binary, so it stays a
+# dev-dependency and nothing in src/ may reference it.
+jsonschema = { workspace = true }
+tempfile = { workspace = true }
