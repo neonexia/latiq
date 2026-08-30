@@ -21,7 +21,11 @@ work.query(sql="CREATE TABLE t(id INT)")
 work.query(sql="INSERT INTO t VALUES (1),(2)")
 tbl = work.query(sql="SELECT count(*) FROM t")     # → pyarrow.Table (reads stream, uncapped)
 
-db.list_ponds()                                    # → {"work": {pond_id, tier, node_id, description}}
+# Opt a pond into OpenLineage provenance for every query (off by default, fixed
+# for the pond's lifetime; agents read the events with the get_lineage MCP tool).
+traced = db.create_pond(name="traced", lineage=True)
+
+db.list_ponds()                                    # → {"work": {pond_id, tier, node_id, description, lineage}}
 print(work.name, work.tier, work.description)      # metadata as attributes
 work.describe()                                    # structured table/column schema
 
@@ -47,7 +51,7 @@ in-process), so the wheel is large; that's the cost of zero-dependency local mod
 
 `connect(server, root, query_gateway)` · `Database.{server, create_pond, get_pond,
 list_ponds, list_datasets, list_catalogs, drop_pond}` · `Pond.{name, id, tier,
-description, query, explain, snapshots, load_dataset, describe_catalog,
+description, lineage, query, explain, snapshots, load_dataset, describe_catalog,
 pull_catalog, describe, drop}`. Reads return a `pyarrow.Table` over the streaming
 `ReadArrow` RPC (`query(sql, stream=True)` → a `RecordBatchReader`); writes are
 visible via `snapshots()`. The data path uses the front door + greeter forwarding
