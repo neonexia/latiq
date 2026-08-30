@@ -36,9 +36,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::event::RunEvent;
+use crate::sink::EventSink;
 
 /// Events buffered before a batch is written. Small enough that a quiet pond's
 /// events land promptly (a shutdown flush covers the rest), large enough that a
@@ -77,6 +79,13 @@ pub struct LineageWriter {
     failing: AtomicBool,
     /// A poisoned mutex is permanent, so this warns exactly once per writer.
     poison_warned: AtomicBool,
+    /// The optional second sink (an OpenLineage HTTP backend). It is handed the
+    /// **same serialized string** the file buffer takes, which is the whole
+    /// reason it lives here rather than beside the writer: a second
+    /// `serde_json::to_string` somewhere else is exactly how the posted bytes
+    /// and the stored bytes would come to differ. `None` — no backend
+    /// configured — is the default and costs one `Option` check per event.
+    sink: Option<Arc<dyn EventSink>>,
 }
 
 impl LineageWriter {
@@ -115,7 +124,18 @@ impl LineageWriter {
             buffer: Mutex::new(Buffer::default()),
             failing: AtomicBool::new(false),
             poison_warned: AtomicBool::new(false),
+            sink: None,
         }
+    }
+
+    /// Also hand every event to `sink` — the optional OpenLineage HTTP backend.
+    ///
+    /// Additive: the pond's files are written exactly as before, and a sink
+    /// that is down, slow or dead changes nothing about them. See
+    /// [`crate::sink`] for why it cannot reach the query.
+    pub fn with_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Whether this writer will ever write. False for a rejected directory.
@@ -154,7 +174,7 @@ impl LineageWriter {
     /// rather than paying for it inline. Nothing here can block on IO, so
     /// "recorded" is observable to a later `flush()` the moment this returns.
     pub fn buffer_all(&self, events: &[RunEvent]) -> bool {
-        if self.dir.is_none() || events.is_empty() {
+        if events.is_empty() || (self.dir.is_none() && self.sink.is_none()) {
             return false;
         }
         let lines: Vec<String> = events
@@ -170,6 +190,19 @@ impl LineageWriter {
                 }
             })
             .collect();
+
+        // The sink sees the SAME strings the files get, before anything else
+        // can touch them — and it sees them even when the file half is
+        // disabled (a rejected directory), because a configured backend is the
+        // last place those events could still land.
+        if let Some(sink) = self.sink.as_deref() {
+            for line in &lines {
+                sink.submit(line);
+            }
+        }
+        if self.dir.is_none() {
+            return false;
+        }
 
         let Some(mut buffer) = self.lock() else {
             return false;

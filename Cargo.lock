@@ -2018,9 +2018,11 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "jsonschema",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -2074,6 +2076,7 @@ dependencies = [
  "latiq-control-plane",
  "latiq-engine",
  "latiq-engine-duckdb",
+ "latiq-lineage",
  "latiq-mcp",
  "latiq-metrics",
  "latiq-proto",

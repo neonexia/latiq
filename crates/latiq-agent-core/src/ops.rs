@@ -21,7 +21,7 @@ use latiq_common::QueryMeta;
 use latiq_common::{PondTier, ResourceLimits};
 use latiq_engine::{AbortToken, ArrowSink, ExplainResult, QueryEngine, QueryResult};
 use latiq_lineage::event::DurationMeaning;
-use latiq_lineage::LineageWriter;
+use latiq_lineage::{EventSink, LineageWriter};
 use latiq_storage::PondStorage;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -78,6 +78,11 @@ pub struct AgentOps {
     /// rather than once per query (the same discipline `LineageWriter` uses for
     /// its own buffer lock).
     lineage_poison_warned: Arc<AtomicBool>,
+    /// The node's optional OpenLineage HTTP backend, handed to every writer
+    /// this node builds. A trait object, so this crate stays protocol-neutral
+    /// (invariant 5): the transport is `latiq-lineage`'s feature-gated
+    /// `HttpSink`, and nothing in here knows that HTTP is what it does.
+    lineage_sink: Option<Arc<dyn EventSink>>,
     /// The engine's version, asked once here rather than per query: it goes on
     /// every lineage event, and a pond WITHOUT lineage must not pay so much as
     /// an allocation for a field it will never emit.
@@ -102,7 +107,20 @@ impl AgentOps {
             forwarder: None,
             lineage_writers: Arc::new(RwLock::new(HashMap::new())),
             lineage_poison_warned: Arc::new(AtomicBool::new(false)),
+            lineage_sink: None,
         }
+    }
+
+    /// Also publish every lineage event this node records to `sink` — the
+    /// optional OpenLineage HTTP backend.
+    ///
+    /// Purely additive: the pond's own files are written exactly as before, and
+    /// a sink that is down, slow or dead cannot fail, slow or block a query
+    /// (see `latiq_lineage::sink`). It is the durability answer for a pond that
+    /// gets dropped, whose files go with it.
+    pub fn with_lineage_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.lineage_sink = Some(sink);
+        self
     }
 
     /// Enable node-to-node forwarding: requests for ponds owned by a node other
@@ -201,7 +219,11 @@ impl AgentOps {
                 tracing::warn!(pond = %info.pond_id, %e, "no lineage for this pond: unresolved location");
             })
             .ok()?;
-        let writer = Arc::new(LineageWriter::new(&loc.lineage_dir));
+        let mut writer = LineageWriter::new(&loc.lineage_dir);
+        if let Some(sink) = self.lineage_sink.clone() {
+            writer = writer.with_sink(sink);
+        }
+        let writer = Arc::new(writer);
         let mut map = self.lineage_writers_write()?;
         Some(
             map.entry(info.pond_id.clone())

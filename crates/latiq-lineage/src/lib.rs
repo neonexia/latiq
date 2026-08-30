@@ -1,8 +1,15 @@
 //! latiq-lineage — OpenLineage events and the file writer that persists them.
 //!
 //! PROTOCOL-NEUTRAL, like `latiq-agent-core` which depends on it: no MCP, gRPC
-//! or HTTP types appear here. Events are values; the writer's only sink is the
-//! pond's own `lineage` directory.
+//! or HTTP types appear here. Events are values; the writer's default sink is
+//! the pond's own `lineage` directory.
+//!
+//! The **one exception** is [`sink::HttpSink`], which is HTTP by definition. It
+//! is behind the `http-sink` Cargo feature that only `latiq-pond-node` enables,
+//! so with the feature off this crate does not even depend on `reqwest` — the
+//! neutrality of everything else is enforced by Cargo, not by convention. What
+//! the writer and `latiq-agent-core` see is [`sink::EventSink`], a trait over
+//! `&str` with no transport in it.
 //!
 //! Two invariants this crate exists to hold:
 //!
@@ -19,8 +26,12 @@
 //!    panic. Every failure below it is a `warn!` and a dropped event.
 pub mod event;
 pub mod reader;
+pub mod sink;
 pub mod writer;
 
 pub use event::{Dataset, EventType, Job, ParentClaim, Run, RunEvent};
 pub use reader::{read_newest, EventPage, PageRequest, ReadError};
+pub use sink::EventSink;
+#[cfg(feature = "http-sink")]
+pub use sink::HttpSink;
 pub use writer::LineageWriter;

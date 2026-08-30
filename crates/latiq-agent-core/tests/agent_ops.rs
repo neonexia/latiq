@@ -975,6 +975,13 @@ mod lineage {
     /// As the file-level `ops()`, but keeping the storage handle: the events
     /// live in the pond's own directory, so a test has to be able to find it.
     pub(super) fn ops_with_storage() -> (AgentOps, Arc<TempFs>) {
+        ops_with_sink(None)
+    }
+
+    /// `ops_with_storage`, with the optional OpenLineage HTTP backend attached.
+    pub(super) fn ops_with_sink(
+        sink: Option<Arc<dyn latiq_lineage::EventSink>>,
+    ) -> (AgentOps, Arc<TempFs>) {
         let registry = Registry::open(None).unwrap();
         registry
             .register_node(
@@ -987,7 +994,10 @@ mod lineage {
         let control = Arc::new(RegistryControlPlane::new(registry));
         let storage = Arc::new(TempFs::new());
         let engine = Arc::new(DuckEngine::new());
-        let ops = AgentOps::new(control, storage.clone(), engine, AgentConfig::default());
+        let mut ops = AgentOps::new(control, storage.clone(), engine, AgentConfig::default());
+        if let Some(sink) = sink {
+            ops = ops.with_lineage_sink(sink);
+        }
         (ops, storage)
     }
 
@@ -1029,6 +1039,39 @@ mod lineage {
             }
         }
         out
+    }
+
+    /// Every event the pond has on disk as the RAW LINE it was written as, in
+    /// the same order as `events_in`. The byte form matters where `events_in`'s
+    /// parsed form does not: what a backend receives has to be what the files
+    /// hold, and a `Value` comparison would hide a re-serialization.
+    pub(super) fn lines_in(storage: &TempFs, pond_id: &str) -> Vec<String> {
+        let Some(dir) = lineage_dir(storage, pond_id) else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        names.sort();
+        names
+            .iter()
+            .flat_map(|name| {
+                std::fs::read_to_string(dir.join(name))
+                    .expect("event file readable")
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// One facet body, e.g. `facet(e, "run", "latiq_identity")`.
@@ -1825,5 +1868,218 @@ mod lineage {
                 "the query path never emitted the `{required}` facet; saw {seen:?}"
             );
         }
+    }
+
+    // ------------------------------------------------ the optional HTTP sink
+
+    /// A minimal HTTP/1.1 receiver that records every POST body verbatim.
+    ///
+    /// A hand-rolled `TcpListener` rather than a web framework on purpose: the
+    /// assertion below is about BYTES, and anything that parsed the JSON and
+    /// handed back a re-serialized form would hide the exact drift the test
+    /// exists to catch. It answers 200 and keeps the connection open, because
+    /// `reqwest` pools and will send several events down one socket.
+    async fn capture_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capture server");
+        let port = listener.local_addr().expect("local addr").port();
+        let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepted = bodies.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let bodies = accepted.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        // Headers, then exactly Content-Length bytes of body.
+                        let head_end = loop {
+                            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break i + 4;
+                            }
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                        let len: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        while buf.len() < head_end + len {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let body =
+                            String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned();
+                        bodies.lock().expect("capture lock").push(body);
+                        buf.drain(..head_end + len);
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/api/v1/lineage"), bodies)
+    }
+
+    /// Wait until the receiver has `want` bodies, or give up. The POSTs happen
+    /// on a task nobody awaits — that is the whole design — so a test has to
+    /// wait for them, and a test that just slept would be flaky in the
+    /// direction that hides a bug.
+    async fn wait_for_posts(
+        bodies: &Arc<std::sync::Mutex<Vec<String>>>,
+        want: usize,
+    ) -> Vec<String> {
+        for _ in 0..200 {
+            let got = bodies.lock().expect("capture lock").clone();
+            if got.len() >= want {
+                return got;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        bodies.lock().expect("capture lock").clone()
+    }
+
+    /// A port nothing is listening on. Bound and released, so it is a port the
+    /// OS just confirmed is free rather than one a hard-coded guess might hit.
+    async fn dead_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind to find a free port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/api/v1/lineage")
+    }
+
+    #[tokio::test]
+    async fn lineage_sink_failure_never_fails_a_query() {
+        // A sink that can break queries is worse than no sink. The endpoint is
+        // dead, so every POST fails connecting — and the queries must still
+        // return their answers, and the pond's own files must still hold the
+        // events. `submitted()` is the anti-vacuity guard: without it a
+        // `with_lineage_sink` that quietly dropped the sink on the floor would
+        // pass this test while proving nothing.
+        let sink =
+            Arc::new(latiq_lineage::HttpSink::new(&dead_endpoint().await).expect("valid url"));
+        let (ops, storage) = ops_with_sink(Some(sink.clone() as Arc<dyn latiq_lineage::EventSink>));
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("deadsink".into()), "{}", "medium", &[], true)
+            .await
+            .expect("allocate is unaffected by a dead lineage backend");
+        ops.write_query(&id, "deadsink", "CREATE TABLE t AS SELECT 42 AS i")
+            .await
+            .expect("the write must succeed with the backend down");
+        let read = ops
+            .read_query(&id, "deadsink", "SELECT i FROM t")
+            .await
+            .expect("the read must succeed with the backend down");
+        assert_eq!(
+            read.rows[0][0],
+            json!(42),
+            "the query must return its real answer, not a degraded one"
+        );
+
+        ops.flush_lineage();
+        let events = events_in(&storage, &pond.pond_id);
+        assert!(
+            events.len() >= 4,
+            "the local files must still hold both operations' events, got {}",
+            events.len()
+        );
+        let complete: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["eventType"] == json!("COMPLETE"))
+            .collect();
+        assert_eq!(
+            complete.len(),
+            2,
+            "both operations must have completed locally despite the dead sink"
+        );
+        assert!(
+            sink.submitted() >= 4,
+            "the sink must really have been wired and really have been handed \
+             every event -- otherwise the survival above proves nothing; got {}",
+            sink.submitted()
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_sink_posts_the_event_verbatim() {
+        // Byte-identical to what the files hold and to what `get_lineage`
+        // returns. If the wire form and the stored form can drift, "OpenLineage
+        // compliant" means nothing: the events a consumer validated against the
+        // spec would not be the events its backend received.
+        let (url, bodies) = capture_server().await;
+        let (ops, storage) = ops_with_sink(Some(Arc::new(
+            latiq_lineage::HttpSink::new(&url).expect("valid url"),
+        ) as Arc<dyn latiq_lineage::EventSink>));
+        let id = Identity::verified("svc-a", "https://idp.example", Some("planner-7"));
+        let pond = ops
+            .allocate_pond(&id, Some("posted".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "posted", "CREATE TABLE t AS SELECT 1 AS i")
+            .await
+            .unwrap();
+        ops.read_query(&id, "posted", "SELECT i FROM t")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let mut stored = lines_in(&storage, &pond.pond_id);
+        assert!(
+            stored.len() >= 4,
+            "two operations must have written two event pairs, got {}",
+            stored.len()
+        );
+        let mut posted = wait_for_posts(&bodies, stored.len()).await;
+        stored.sort();
+        posted.sort();
+        assert_eq!(
+            posted, stored,
+            "every posted body must be byte-identical to the line stored in the pond"
+        );
+
+        // ... and to what the agent reads back, which is the form a consumer
+        // actually validates. The reader hands lines on verbatim, so this ties
+        // the wire form to the tool's answer rather than to the file format.
+        let page = ops
+            .get_lineage(&id, "posted", 500, None, None)
+            .await
+            .expect("the pond records lineage");
+        let mut returned: Vec<String> = page
+            .events
+            .iter()
+            .map(|e| serde_json::to_string(e).expect("re-serializable"))
+            .collect();
+        let mut posted_values: Vec<String> = posted
+            .iter()
+            .map(|b| {
+                serde_json::to_string(
+                    &serde_json::from_str::<Value>(b).expect("a posted body is JSON"),
+                )
+                .expect("re-serializable")
+            })
+            .collect();
+        returned.sort();
+        posted_values.sort();
+        assert_eq!(
+            posted_values, returned,
+            "the backend must receive exactly the events get_lineage returns"
+        );
     }
 }

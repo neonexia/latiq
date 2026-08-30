@@ -700,6 +700,10 @@ impl LocalCluster {
             metrics_addr: None,
             // The embedded stack is in-process and single-user: relaxed identity.
             auth: None,
+            // The embedded stack has no configuration surface for a backend and
+            // often no network at all; lineage-enabled ponds still write their
+            // own files, which is what `get_lineage` reads.
+            lineage_backend_url: None,
         };
         rt.spawn(async move {
             let _ = run_pond_node(cfg).await;
