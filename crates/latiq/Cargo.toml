@@ -53,3 +53,6 @@ tempfile = { workspace = true }
 arrow = { workspace = true }
 # Seeds a local external DuckLake catalog in the catalogs e2e test.
 duckdb = { workspace = true }
+# Holds the events the MCP lineage tool returns to the real OpenLineage spec,
+# validated against the schemas vendored once in `latiq-lineage/spec/`.
+jsonschema = { workspace = true }

@@ -50,7 +50,7 @@ pub struct AllocateArgs {
     )]
     pub extensions: Option<Vec<String>>,
     #[schemars(
-        description = "Record OpenLineage provenance for every query on this pond, queryable as `lineage.events` (default false). Chosen here and FIXED for the pond's lifetime — there is no way to turn it on later. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'."
+        description = "Record OpenLineage provenance for every query on this pond, readable with get_lineage (default false). Chosen here and FIXED for the pond's lifetime — there is no way to turn it on later. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'. See latiq://recipes/lineage."
     )]
     pub lineage: Option<bool>,
 }
@@ -125,6 +125,21 @@ pub struct CatalogPullArgs {
         description = "Runtime config + credentials as key→value, e.g. {\"token\":\"<bearer>\"}. NOT stored."
     )]
     pub set: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LineageArgs {
+    #[schemars(description = "Pond id or name")]
+    pub pond: String,
+    #[schemars(
+        description = "How many events to return, newest first (default 50, max 500). Two events are recorded per operation."
+    )]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "Only events at or after this RFC-3339 instant, e.g. `2026-08-14T10:00:00Z`. Use the newest `eventTime` you already have to page backwards through a busy pond."
+    )]
+    pub since: Option<String>,
 }
 
 /// The HTTP header carrying the CLAIMED leaf id. Same name as the gRPC metadata
@@ -729,7 +744,52 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
         })
         .await)
     }
+
+    /// Read the pond's OpenLineage trail — canonical events, newest first.
+    #[tool(
+        description = "Read a pond's PROVENANCE — the OpenLineage events Latiq recorded for every query on it, NEWEST FIRST. \
+Use it to answer 'where did this table come from?', 'who wrote it, and was that identity verified?', 'what did that run read?'. \
+Only ponds allocated with `lineage: true` record anything; asking a pond that does not returns an error saying so — that is deliberately \
+distinct from an empty list, so you can tell 'we were not recording' from 'nothing happened'. \
+Each operation contributes a START and a terminal (COMPLETE/FAIL/ABORT) event sharing one `run.runId`; the identity, SQL shape, datasets read/written and the DuckLake snapshot ride the facets. \
+Bounded on purpose: `limit` defaults to 50 (max 500) and the page also stops at ~256 KB, so a busy pond cannot flood your context — \
+page backwards with `since` (pass the oldest `eventTime` you got), and read `truncated` to know there is more. \
+Events are returned verbatim: valid OpenLineage 2-0-2, replayable into any OpenLineage consumer unchanged. \
+To FILTER or AGGREGATE the whole trail instead of paging it, read_query over the returned `lineage_dir`: \
+`SELECT * FROM read_json_auto('<lineage_dir>/*.jsonl')`. See latiq://recipes/lineage.",
+        annotations(
+            title = "Get lineage",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn get_lineage(
+        &self,
+        Parameters(a): Parameters<LineageArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (id, tok) = self.identity(&ctx)?;
+        // The core clamps this; the default lives here because "how much of an
+        // agent's context may one answer cost" is an adapter question.
+        let limit = a.limit.unwrap_or(DEFAULT_LINEAGE_LIMIT) as usize;
+        Ok(with_bearer(tok, async {
+            match self
+                .ops
+                .get_lineage(&id, &a.pond, limit, a.since.as_deref())
+                .await
+            {
+                Ok(page) => ok_value(serde_json::to_value(page).unwrap_or_default()),
+                Err(e) => err_envelope(e.envelope()),
+            }
+        })
+        .await)
+    }
 }
+
+/// Events one `get_lineage` returns when the agent does not choose. Modest: an
+/// agent asking for provenance is spending its context window on the answer.
+const DEFAULT_LINEAGE_LIMIT: u32 = 50;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LatiqServer {

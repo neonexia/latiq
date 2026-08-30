@@ -25,6 +25,7 @@ const RESOURCES: &[Res] = &[
 - **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')`. `author` is the identity; `commit_extra_info` carries the evidence for it (issuer/subject when the caller was verified) — read BOTH, because an unverified caller can claim any author.\n\
 - **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
 - **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
+- **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first). See latiq://recipes/lineage.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
 - **Plan first:** call explain_query before an expensive query to estimate cost, then refine.\n\
 - **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.",
@@ -96,6 +97,26 @@ Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB download
 Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
 Use this to coordinate: see who created a table before extending it.\n\
 **Always read `commit_extra_info` alongside `author`.** `author` alone cannot tell a VERIFIED writer from one merely claiming that name — the evidence (issuer/subject, and whether the identity was verified) lives in `commit_extra_info`.",
+    },
+    Res {
+        uri: "latiq://recipes/lineage",
+        name: "Recipe: lineage lookup",
+        desc: "Where a table came from — the pond's OpenLineage trail",
+        body: "# Recipe — lineage lookup\n\n\
+**When:** you need the provenance of a table: what a run read, what it wrote, who ran it, and which snapshot it produced.\n\n\
+**First, the pond must be recording.** Lineage is opt-in at allocation and FIXED for the pond's lifetime:\n\
+```\nallocate_pond {name:'audited', lineage:true}\n```\n\
+`describe_pond` reports `lineage`. Calling get_lineage on a pond without it returns an error, not an empty list — 'we were not recording' and 'nothing happened' are different answers, and only one of them means the data appeared from nowhere.\n\n\
+**Read it, newest first:**\n\
+```\nget_lineage {pond:'audited'}                                  # newest 50 events\nget_lineage {pond:'audited', limit:200, since:'2026-08-14T10:00:00Z'}\n```\n\
+Each operation records a START and a terminal (COMPLETE / FAIL / ABORT) event sharing one `run.runId`. \
+Standard facets carry the SQL shape (`job.facets.sql`, literals redacted), the engine, the error message on a failure, and each dataset's DuckLake snapshot (`inputs[].facets.version`). \
+Latiq's own facets carry the caller (`run.facets.latiq_identity` — read `verified` before you trust `subject`), the pond (`job.facets.latiq_pond`), and the outcome + duration (`run.facets.latiq_query`).\n\
+The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consumer unchanged.\n\n\
+**Complements attribution, not a replacement.** `ducklake_snapshots('<pond>')` says who committed a snapshot; lineage says which run produced it and what that run read. See latiq://recipes/attribution-lookup.\n\n\
+**To filter or aggregate the WHOLE trail** rather than page it, query the files directly — get_lineage returns their directory as `lineage_dir`:\n\
+```sql\nSELECT job.name, run.facets.latiq_query.outcome, count(*)\nFROM read_json_auto('<lineage_dir>/*.jsonl')\nGROUP BY 1, 2;\n```\n\
+**Watch for:** the facets present differ per event, so DuckDB's inferred struct type can shift between queries — SELECT the fields you need, and don't rely on a stable schema across runs. Only `*.jsonl` files are complete; a `.tmp-` file is a batch still being written.",
     },
     Res {
         uri: "latiq://troubleshooting",
