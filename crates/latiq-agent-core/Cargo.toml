@@ -25,5 +25,7 @@ latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 # against the schemas vendored once in `latiq-lineage/spec/`. Dev-only: it must
 # never ship in the binary.
 jsonschema = { workspace = true }
+# Parsing the RFC-3339 `eventTime` back out of an emitted event.
+chrono = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

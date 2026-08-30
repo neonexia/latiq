@@ -1168,6 +1168,135 @@ mod lineage {
     }
 
     #[tokio::test]
+    async fn lineage_start_event_is_stamped_when_the_query_began() {
+        // Both events are built after the query finished, so a naive `now` on
+        // the START would place the beginning of the run at its end: every
+        // consumer deriving a duration from START -> COMPLETE (which is the
+        // reason the spec wants the pair) would report ~0 ms for a query that
+        // took a third of a second, and contradict `latiq_query.durationMs` on
+        // the very same events.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("slow".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        // ~300 ms in a debug build: comfortably longer than the millisecond
+        // granularity of `eventTime`, so a stamped-at-the-end START cannot pass
+        // this by accident.
+        ops.read_query(
+            &id,
+            "slow",
+            "SELECT count(DISTINCT i) FROM range(3000000) t(i)",
+        )
+        .await
+        .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        assert_eq!(events.len(), 2, "one read, one event pair");
+        let reported = facet(&events[1], "run", "latiq_query")["durationMs"]
+            .as_i64()
+            .expect("durationMs is a number");
+        assert!(
+            reported >= 100,
+            "the query must actually be slow or this test proves nothing, got {reported}ms"
+        );
+
+        let at = |e: &Value| {
+            chrono::DateTime::parse_from_rfc3339(
+                e["eventTime"].as_str().expect("eventTime is a string"),
+            )
+            .expect("eventTime is RFC-3339 with an explicit offset")
+        };
+        let spanned = at(&events[1])
+            .signed_duration_since(at(&events[0]))
+            .num_milliseconds();
+        assert!(
+            (spanned - reported).abs() <= 25,
+            "START -> terminal must span the measured duration ({reported}ms), spanned {spanned}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_a_due_batch_reaches_disk_with_nobody_calling_flush() {
+        // Queries never flush inline (the write fsyncs, and the query is on an
+        // async worker), so a due batch is handed to the blocking pool and not
+        // awaited. If that hand-off were dropped, events would sit in memory
+        // until shutdown and every reader — the MCP tool, the sink — would see
+        // an empty pond on a busy node. No flush_lineage() call in this test on
+        // purpose: the point is that nobody has to make one.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("busy".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        // The default batch is 64 events = 32 operations; go past it.
+        for i in 0..40 {
+            ops.write_query(&id, "busy", &format!("CREATE TABLE t{i}(i INTEGER)"))
+                .await
+                .unwrap();
+        }
+
+        // The write lands on another thread, so wait for it — bounded, and a
+        // failure here means it never happened rather than that it was slow.
+        let mut landed = 0;
+        for _ in 0..100 {
+            landed = events_in(&storage, &pond.pond_id).len();
+            if landed >= 64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            landed >= 64,
+            "a due batch must reach disk on its own; only {landed} events did"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_concurrent_emits_share_one_cached_writer() {
+        // What this pins: a pond gets ONE cached writer however many emits race
+        // to create it (the location is resolved outside the registry lock, so
+        // several can build one and only one may be installed), and no emit
+        // loses an event to the contention. It does not distinguish "keep the
+        // winner" from "clobber the winner" — both leave one entry — because
+        // that difference is not observable through the public surface; the
+        // `or_insert` is what makes it the winner.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("racy".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..16 {
+            let ops = ops.clone();
+            let id = id.clone();
+            tasks.push(tokio::spawn(async move {
+                ops.write_query(&id, "racy", &format!("CREATE TABLE t{i}(i INTEGER)"))
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.expect("no panic").expect("the write succeeds");
+        }
+        ops.flush_lineage();
+
+        assert_eq!(
+            ops.lineage_writer_count(),
+            1,
+            "one pond, one writer, however many emits raced for it"
+        );
+        assert_eq!(
+            events_in(&storage, &pond.pond_id).len(),
+            32,
+            "every concurrent write is recorded exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn lineage_dropping_the_pond_evicts_its_writer() {
         // The writer is keyed by pond and lives for the process; without
         // eviction the map leaks an entry per dropped pond, and a writer that
