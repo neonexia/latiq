@@ -50,7 +50,7 @@ pub struct AllocateArgs {
     )]
     pub extensions: Option<Vec<String>>,
     #[schemars(
-        description = "Record OpenLineage provenance for every query on this pond, readable with get_lineage (default false). Chosen here and FIXED for the pond's lifetime — there is no way to turn it on later. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'. See latiq://recipes/lineage."
+        description = "Record OpenLineage provenance for every query on this pond, readable with get_lineage (default false). Chosen here and FIXED for the pond's lifetime — no RPC turns it on later, so a pond allocated without it can never explain its own history; the only recovery is a new pond. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'. See latiq://recipes/lineage."
     )]
     pub lineage: Option<bool>,
 }
@@ -367,7 +367,9 @@ impl LatiqServer {
         description = "Allocate a new pond — a private DuckLake workspace you can write to and query with SQL. \
 Optionally pass a `name` (Latiq generates one if omitted). Returns `pond_id` + `pond_name`. \
 Use this first when you have a task that needs its own data space; use list_ponds to find or join an existing one. \
-Then write_query to create tables and load data, and read_query to query. See latiq://guidance.",
+Then write_query to create tables and load data, and read_query to query. \
+DECIDE `lineage` NOW: provenance recording is set here and can never be turned on later — if this pond's work may have to explain where its data came from, pass `lineage: true`, because the only recovery is starting over in a new pond. \
+See latiq://guidance.",
         annotations(
             title = "Allocate pond",
             read_only_hint = false,
@@ -409,6 +411,7 @@ Then write_query to create tables and load data, and read_query to query. See la
     #[tool(
         description = "Describe a pond: its metadata (name, owner, created_at) plus a summary of its tables. \
 Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying. \
+The response's `lineage` flag says whether this pond records provenance — check it before get_lineage, and before you rely on a pond to be explainable later (it cannot be switched on). \
 To discover tables/columns in detail, read_query `SHOW TABLES` or `SELECT * FROM information_schema.columns`.",
         annotations(
             title = "Describe pond",
@@ -460,7 +463,7 @@ Follow with describe_pond on a candidate to inspect its tables.",
 
     /// Drop a pond and reclaim its storage. Destructive.
     #[tool(
-        description = "Drop a pond and reclaim its storage. DESTRUCTIVE and not reversible — all tables and data in the pond are removed (the audit trail is preserved). \
+        description = "Drop a pond and reclaim its storage. DESTRUCTIVE and not reversible — all tables and data in the pond are removed, and its lineage trail goes with them (the deployment's access log is preserved). Read what you still need from get_lineage BEFORE dropping. \
 Only drop a pond when its work is finished. Do NOT drop a pond other agents may still be using; check list_ponds first.",
         annotations(
             title = "Drop pond",
@@ -760,12 +763,12 @@ Only ponds allocated with `lineage: true` record anything; asking a pond that do
 distinct from an empty list, so you can tell 'we were not recording' from 'nothing happened'. \
 Each operation contributes a START and a terminal (COMPLETE/FAIL/ABORT) event sharing one `run.runId`; the identity, SQL shape, datasets read/written and the DuckLake snapshot ride the facets. \
 Bounded on purpose — `limit` defaults to 50 (max 500) and a page also stops at ~256 KB — so a busy pond cannot flood your context. \
-PAGING: when `truncated` is true there are OLDER events; call again with `before` set to the oldest `eventTime` you just received (exclusive) and repeat until `truncated` is false. \
-`since` is the opposite bound and is INCLUSIVE — use it to catch up on what is new, not to page backwards. \
+PAGING: `truncated` true means OLDER events remain — page backwards with `before`, catch up with `since` (both documented on the arguments). \
 Read `malformed_lines` / `unreadable_files`: non-zero means this page is missing events that were recorded. \
 Events are returned verbatim: valid OpenLineage 2-0-2, replayable into any OpenLineage consumer unchanged. \
 To FILTER or AGGREGATE the whole trail instead of paging it, read_query over the returned `lineage_dir`: \
-`SELECT * FROM read_json_auto('<lineage_dir>/*.jsonl')`. See latiq://recipes/lineage.",
+`SELECT * FROM read_json_auto('<lineage_dir>/*.jsonl')` — facets differ per event, so the inferred schema can shift between queries; SELECT the fields you need. \
+A record, not proof: these are files in the pond, reachable by anything that can write SQL there. See latiq://recipes/lineage.",
         annotations(
             title = "Get lineage",
             read_only_hint = true,
@@ -818,6 +821,8 @@ FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new 
 TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
 pull_catalog for an external database/lakehouse (iceberg) — you pull a subset into the pond, then work there \
 (external catalogs are never queried live). \
+WHO YOU ARE: your identity arrives in the transport (bearer token + the `latiq-agent-id` header), never as a tool argument — no tool takes one, so don't look for it. \
+PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be explainable later; it cannot be enabled afterwards. \
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow; tool errors carry \
 suggest/see links to latiq:// resources. Prompts provide SOPs for common multi-agent workflows.",
         )
