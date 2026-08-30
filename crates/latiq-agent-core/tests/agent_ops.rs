@@ -982,6 +982,15 @@ mod lineage {
     pub(super) fn ops_with_sink(
         sink: Option<Arc<dyn latiq_lineage::EventSink>>,
     ) -> (AgentOps, Arc<TempFs>) {
+        let (ops, storage, _registry) = ops_with_registry(sink);
+        (ops, storage)
+    }
+
+    /// `ops_with_sink`, keeping the registry too — registering an external
+    /// catalog is an operator act, and `AgentOps` has no method for it.
+    pub(super) fn ops_with_registry(
+        sink: Option<Arc<dyn latiq_lineage::EventSink>>,
+    ) -> (AgentOps, Arc<TempFs>, Registry) {
         let registry = Registry::open(None).unwrap();
         registry
             .register_node(
@@ -991,14 +1000,14 @@ mod lineage {
                 100,
             )
             .unwrap();
-        let control = Arc::new(RegistryControlPlane::new(registry));
+        let control = Arc::new(RegistryControlPlane::new(registry.clone()));
         let storage = Arc::new(TempFs::new());
         let engine = Arc::new(DuckEngine::new());
         let mut ops = AgentOps::new(control, storage.clone(), engine, AgentConfig::default());
         if let Some(sink) = sink {
             ops = ops.with_lineage_sink(sink);
         }
-        (ops, storage)
+        (ops, storage, registry)
     }
 
     /// The pond's lineage directory, or `None` once (or before) the pond has
@@ -1407,6 +1416,125 @@ mod lineage {
         assert_eq!(
             read[1]["inputs"][0]["facets"]["version"]["datasetVersion"], produced,
             "the read must name the snapshot it actually read"
+        );
+    }
+
+    /// A local DuckLake catalog with one table, as an operator would register
+    /// it: `(metadata_path, data_path)`. A throwaway in-memory DuckDB builds
+    /// it, so it is a real external source rather than a fixture — the plan has
+    /// to bind against something that is genuinely attached.
+    fn seed_ducklake(dir: &std::path::Path) -> (String, String) {
+        let meta = dir.join("meta.duckdb");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake;
+             ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
+             CREATE TABLE ext.widgets AS
+               SELECT * FROM (VALUES (1,'gear',9.99),(2,'bolt',0.99)) t(id,name,price);",
+            meta.display(),
+            data.display(),
+        ))
+        .unwrap();
+        (meta.display().to_string(), data.display().to_string())
+    }
+
+    #[tokio::test]
+    async fn lineage_catalog_pull_names_the_external_source_and_the_pond_table() {
+        // The pull is the ONE op whose input is not in the pond, and the edge
+        // with the most provenance value: the catalog is detached before the
+        // call returns, so after this nothing in the pond — not the catalog,
+        // not the snapshots — remembers where its rows came from. If the pull
+        // emitted no event, "how did this table get here" would be answerable
+        // for every table except the imported ones.
+        //
+        // Both sides are asserted, because each fails on its own: an input left
+        // under the pond's namespace would claim the lakehouse's table as ours
+        // and make our events unjoinable with the source's own lineage, and a
+        // missing output loses the other end of the edge entirely.
+        let tmp = tempfile::tempdir().unwrap();
+        let (metadata_path, data_path) = seed_ducklake(tmp.path());
+        let (ops, storage, registry) = ops_with_registry(None);
+        registry
+            .add_catalog(&latiq_control_plane::registry::CatalogRow {
+                name: "ext".into(),
+                r#type: "ducklake".into(),
+                params: std::collections::BTreeMap::from([
+                    ("metadata_path".to_string(), metadata_path.clone()),
+                    ("data_path".to_string(), data_path),
+                ]),
+                description: "local ducklake".into(),
+                tags: vec![],
+                created_by: String::new(),
+                created_at: String::new(),
+            })
+            .unwrap();
+
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("shop".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.catalog_pull(
+            &id,
+            "shop",
+            "ext",
+            "CREATE TABLE cheap AS SELECT id, name FROM ext.main.widgets WHERE price < 10",
+            std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        let pull = events_for_op(&events, "shop.catalog_pull");
+        assert_eq!(
+            pull.len(),
+            2,
+            "one pull, one START/terminal pair: {events:#?}"
+        );
+        let terminal = pull
+            .iter()
+            .find(|e| event_type(e) == "COMPLETE")
+            .expect("the pull completed");
+
+        // The external side keeps the SOURCE's own locator as its namespace —
+        // the alias `ext` is a pond-local registry name nobody else can join on.
+        assert_eq!(
+            terminal["inputs"],
+            json!([{
+                "namespace": format!("ducklake:{metadata_path}"),
+                "name": "main.widgets",
+                "facets": terminal["inputs"][0]["facets"],
+            }]),
+            "the pull must name the external table it read: {terminal:#}"
+        );
+        // Free of charge from a DuckLake source: the snapshot it was read at.
+        let read_at = &terminal["inputs"][0]["facets"]["version"]["datasetVersion"];
+        assert!(
+            read_at.as_str().is_some_and(|v| v.parse::<i64>().is_ok()),
+            "an external DuckLake input names the snapshot it was read at, got {read_at}"
+        );
+        // …and the table it produced is a pond table, namespaced by its pond.
+        assert_eq!(
+            terminal["outputs"][0]["namespace"],
+            json!(format!("ducklake://{}", pond.pond_id))
+        );
+        assert_eq!(terminal["outputs"][0]["name"], json!("shop.main.cheap"));
+
+        let start = pull
+            .iter()
+            .find(|e| event_type(e) == "START")
+            .expect("the pull started");
+        assert_eq!(
+            start["inputs"][0]["name"],
+            json!("main.widgets"),
+            "a START knows what it is about to read"
+        );
+        assert!(
+            start["outputs"].as_array().is_none_or(|o| o.is_empty()),
+            "a START must not claim a table that does not exist yet: {start:#}"
         );
     }
 

@@ -83,6 +83,12 @@ pub trait QueryEngine: Send + Sync {
     /// type's extensions + create its secrets, `ATTACH` it as `alias`, run `query`
     /// (a `CREATE TABLE … AS SELECT … FROM <alias>.…`), then `DETACH` + drop the
     /// secrets — regardless of success. Nothing about the catalog persists.
+    ///
+    /// The meta carries the pull's `inputs`/`outputs` when the pond opted into
+    /// lineage, and is empty otherwise (same gate as every other path). The
+    /// external side is named while the catalog is still ATTACHED — after the
+    /// detach nothing in the pond remembers where its rows came from, which is
+    /// exactly why this edge is worth recording.
     fn pull_catalog(
         &self,
         loc: &PondLocation,
@@ -90,7 +96,7 @@ pub trait QueryEngine: Send + Sync {
         alias: &str,
         params: &std::collections::BTreeMap<String, String>,
         query: &str,
-    ) -> Result<(), EngineError>;
+    ) -> Result<latiq_common::QueryMeta, EngineError>;
     /// Transiently attach a catalog and list its `(schema.table)` entries.
     fn describe_catalog(
         &self,

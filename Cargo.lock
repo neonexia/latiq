@@ -1902,6 +1902,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "chrono",
+ "duckdb",
  "jsonschema",
  "latiq-common",
  "latiq-control-plane",
