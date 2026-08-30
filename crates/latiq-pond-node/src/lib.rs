@@ -357,7 +357,24 @@ pub async fn run_pond_node_until(
 /// a second Ctrl-C -- which is gone the moment anything installs a signal
 /// handler -- so the bound has to come from us. **Losing some events is
 /// strictly better than a node that will not die.**
-const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+///
+/// It is a CEILING, not a cost: a node with no backend configured drains
+/// instantly and a healthy one nearly so, so this is only ever spent when
+/// something is already stuck. That is what makes it affordable to exceed
+/// `latiq_lineage`'s `POST_TIMEOUT`, which it must: the drain cannot outrun a
+/// POST that is already in flight, so a budget below that ceiling would mean
+/// one hung backend at shutdown discards the entire backlog -- the exact case
+/// the drain exists for. The `const` assertion below keeps the two composed.
+/// The upper bound is the orchestrator's termination grace period (30s by
+/// default on k8s), which SIGKILLs the node regardless.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(15);
+
+/// The relationship above, enforced rather than described.
+const _: () = assert!(
+    SHUTDOWN_BUDGET.as_secs() > latiq_lineage::sink::POST_TIMEOUT.as_secs(),
+    "SHUTDOWN_BUDGET must exceed the sink's POST_TIMEOUT, or the drain cannot outlast one \
+     in-flight POST and a hung backend loses the whole backlog"
+);
 
 /// Land what lineage is buffered, then go. **This is not a graceful drain**, and
 /// the difference matters: the Data/Stream gRPC server is a separate spawned
