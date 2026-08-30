@@ -39,13 +39,20 @@ pub struct DuckEngine {
 /// pond did not opt into lineage.
 ///
 /// The `Option` is the opt-in, made unmissable: extraction costs a second bind
-/// (~380 µs against a 2.16 ms query, ~18%), and not paying it for a pond that
-/// records no lineage is the entire justification for the per-pond flag. Every
-/// call site therefore goes through here rather than deciding for itself.
+/// (~380 µs against a 2.16 ms query, ~14–18% on LOCAL tables — much more on
+/// remote files, where the second bind repeats the glob and schema sniff; see
+/// `exec::referenced_tables`), and not paying it for a pond that records no
+/// lineage is the entire justification for the per-pond flag. Every call site
+/// therefore goes through here rather than deciding for itself.
 type PlanDatasets = Option<(Vec<DatasetRef>, Vec<DatasetRef>)>;
 
+/// Runs inside the caller's `run_with_abort`, so the extra bind is **abortable**
+/// — a remote glob at bind time can take as long as the query, and an
+/// uncancellable one would leave a client's cancel waiting on work it cannot
+/// see.
 fn plan_datasets(loc: &PondLocation, inst: &PondInstance, sql: &str) -> PlanDatasets {
-    loc.lineage.then(|| referenced_tables(inst, sql))
+    loc.lineage
+        .then(|| referenced_tables(inst, sql, &loc.catalog_name))
 }
 
 /// Attach what the plan found to the statement's meta. A no-op for a pond
@@ -312,15 +319,30 @@ impl QueryEngine for DuckEngine {
         sql: &str,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
+        // The read-only guard first, so a write submitted here is rejected
+        // before the binder is handed a statement this surface does not accept
+        // — and before it pays for provenance it is going to discard.
+        if !latiq_engine::is_read_only(sql) {
+            return Err(EngineError::ReadOnlyViolation);
+        }
         self.with_read(loc, |i| {
-            // Before the run, not after: extraction binds the statement, and a
-            // statement that has already run may no longer bind (a dropped
-            // table, a table the same batch created). Same order on every path,
-            // so provenance does not depend on what the statement happened to be.
-            let datasets = plan_datasets(loc, i, sql);
-            let mut res = Self::run_with_abort(i, &abort, |i| run_read(i, sql))?;
-            apply_datasets(&mut res.meta, datasets);
-            Ok(res)
+            // Both under ONE abort watcher: the extra bind is real work (a
+            // remote glob can dominate the query) and must be interruptible.
+            Self::run_with_abort(i, &abort, |i| {
+                // Before the run, not after: extraction binds the statement,
+                // and a statement that has already run may no longer bind (a
+                // dropped table, a table the same batch created). Same order on
+                // every path, so provenance does not depend on the statement.
+                //
+                // TASK 5: extraction and the read are two statements and so two
+                // implicit transactions — a commit landing between them makes
+                // the recorded `version` describe a state the read did not see.
+                // The read-only transaction task 5 adds must wrap BOTH.
+                let datasets = plan_datasets(loc, i, sql);
+                let mut res = run_read(i, sql)?;
+                apply_datasets(&mut res.meta, datasets);
+                Ok(res)
+            })
         })
     }
 
@@ -331,12 +353,20 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
         sink: &mut dyn ArrowSink,
     ) -> Result<QueryMeta, EngineError> {
+        // Guard first, as in `read_query` — same reason.
+        if !latiq_engine::is_read_only(sql) {
+            return Err(EngineError::ReadOnlyViolation);
+        }
         self.with_read(loc, |i| {
-            let datasets = plan_datasets(loc, i, sql);
-            let mut meta =
-                Self::run_with_abort(i, &abort, |i| run_read_arrow(i, sql, &abort, sink))?;
-            apply_datasets(&mut meta, datasets);
-            Ok(meta)
+            // One abort watcher over both, and the same TASK 5 gap as
+            // `read_query`: the extraction must move inside the read-only
+            // transaction when there is one.
+            Self::run_with_abort(i, &abort, |i| {
+                let datasets = plan_datasets(loc, i, sql);
+                let mut meta = run_read_arrow(i, sql, &abort, sink)?;
+                apply_datasets(&mut meta, datasets);
+                Ok(meta)
+            })
         })
     }
 
@@ -349,19 +379,44 @@ impl QueryEngine for DuckEngine {
     ) -> Result<QueryResult, EngineError> {
         let pond = self.pond(loc)?;
         let guard = lock_recover(&pond.writer);
-        // Before the write, necessarily: a `DROP TABLE t` no longer binds once
-        // it has run, so extraction afterwards would report no output for
-        // exactly the statements whose output matters most.
-        let datasets = plan_datasets(loc, &guard, sql);
-        let mut res = Self::run_with_abort(&guard, &abort, |i| {
-            run_write(i, sql, identity, &loc.catalog_name)
-        })?;
-        apply_datasets(&mut res.meta, datasets);
-        Ok(res)
+        // One abort watcher over the extraction AND the write. The extraction
+        // holds the pond's writer mutex — deliberately, because it must happen
+        // before the write (a `DROP TABLE t` no longer binds once it has run,
+        // so extracting afterwards loses the output of exactly the statements
+        // whose output matters most) and moving it outside the lock would let
+        // another write land in between and change what it resolves against.
+        // The cost is that a slow bind delays other writers to this pond; being
+        // abortable is what keeps that bounded.
+        Self::run_with_abort(&guard, &abort, |i| {
+            let datasets = plan_datasets(loc, i, sql);
+            let mut res = run_write(i, sql, identity, &loc.catalog_name)?;
+            apply_datasets(&mut res.meta, datasets);
+            Ok(res)
+        })
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
         self.with_read(loc, |i| run_explain(i, sql))
+    }
+
+    fn plan_datasets(&self, loc: &PondLocation, sql: &str) -> Option<QueryMeta> {
+        if !loc.lineage {
+            return None;
+        }
+        // A READ connection, not the writer: this runs after a write already
+        // failed, and making the recovery of its provenance queue ahead of the
+        // next write would charge every other writer for one failure. There is
+        // no abort token here — the operation is over — so this bind is not
+        // interruptible; it is bounded by being on the failure path only.
+        let (inputs, outputs) = self
+            .with_read(loc, |i| Ok(referenced_tables(i, sql, &loc.catalog_name)))
+            .ok()?;
+        if inputs.is_empty() && outputs.is_empty() {
+            return None;
+        }
+        let mut meta = QueryMeta::default();
+        meta.set_datasets(inputs, outputs);
+        Some(meta)
     }
 
     fn open_pond_count(&self) -> usize {

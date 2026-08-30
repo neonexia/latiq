@@ -64,6 +64,19 @@ pub trait QueryEngine: Send + Sync {
     ) -> Result<QueryResult, EngineError>;
     /// Plan a query without executing it.
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError>;
+    /// Best-effort provenance for a statement **without running it**: a
+    /// `QueryMeta` carrying only what it would read and write. `None` when the
+    /// pond did not opt into lineage, when the engine cannot say, or when the
+    /// statement touches nothing.
+    ///
+    /// This costs a bind, so it is for the one case where the statement's own
+    /// execution produced no meta to read: a write that FAILED. Its intended
+    /// target is precisely what makes a FAIL event worth having, and the normal
+    /// paths must never call this — they get their datasets from the meta the
+    /// query already returned.
+    fn plan_datasets(&self, _loc: &PondLocation, _sql: &str) -> Option<latiq_common::QueryMeta> {
+        None
+    }
     /// Summarize the pond's user tables (for describe_pond).
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError>;
     /// Transient pull from an external catalog: on the pond's instance, LOAD the

@@ -378,53 +378,130 @@ pub fn run_write(
 /// Largest plan JSON we will parse. The plan scales with the number of
 /// *literals*, not tables — a 1000-element `IN` list serializes to ~338 KB —
 /// so a cap is what keeps a pathological query from paying a multi-megabyte
-/// JSON parse for provenance. Over the cap we record nothing, which is the
-/// same outcome as any other extraction failure.
+/// JSON parse for provenance. Over the cap we record nothing, and say so.
+///
+/// Counted in **bytes** (`strlen`), not characters: DuckDB's `length()` counts
+/// characters, so a plan full of non-ASCII literals would cross the boundary at
+/// up to ~4x this and make the constant's name a lie.
 const MAX_PLAN_JSON_BYTES: usize = 512 * 1024;
 
 /// The datasets a statement reads and writes, as `(inputs, outputs)`, from the
-/// **bound** plan.
+/// **bound** plan. `pond` is the pond's catalog name, used only to make the
+/// diagnostics below identifiable.
 ///
 /// Bound, not parsed: `SELECT * FROM v` where `v` joins two tables resolves to
 /// those two base tables here, where the parse tree only ever says `v`. Writes
 /// resolve too (`json_serialize_sql` refuses them outright).
 ///
+/// **Cost — and where the published figure does not apply.** This is a SECOND
+/// bind of the statement (~380 µs against a 2.16 ms query, ~14–18%). That
+/// measurement was taken on **local tables only**. DuckDB's binder globs and
+/// sniffs files at bind time — `json_serialize_plan` on `read_csv('missing')`
+/// comes back with an `io` error, not a plan — so a query over
+/// `read_parquet('s3://…/*.parquet')` pays the remote listing and schema sniff
+/// **twice**. Enabling lineage on a pond that reads from object storage is
+/// therefore materially more expensive than the local figure suggests.
+///
 /// Three properties this must keep, in order of how badly a regression hurts:
 ///
 /// 1. **It never fails a query.** No `Result`, no panic, no unwrap:
 ///    unparseable SQL, an unknown table, a renamed plan key and a plan too big
-///    to parse all yield no datasets.
+///    to parse all yield no datasets. They do not, however, yield SILENCE —
+///    see [`PlanSkip`].
 /// 2. **It never executes the statement.** `json_serialize_plan` binds and
 ///    plans; it does not run. That is what disqualified `EXPLAIN ANALYZE` and
 ///    profiling, and it is pinned by a test.
 /// 3. **The SQL is a bound parameter**, cast explicitly (a bare `?` is
 ///    rejected) — never concatenated into the extraction query.
-pub fn referenced_tables(inst: &PondInstance, sql: &str) -> (Vec<DatasetRef>, Vec<DatasetRef>) {
+pub fn referenced_tables(
+    inst: &PondInstance,
+    sql: &str,
+    pond: &str,
+) -> (Vec<DatasetRef>, Vec<DatasetRef>) {
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
-    if let Some(plan) = serialized_plan(inst, sql) {
-        walk_plan(&plan, &mut inputs, &mut outputs);
+    match serialized_plan(inst, sql) {
+        Ok(plan) => {
+            walk_plan(&plan, &mut inputs, &mut outputs);
+            if inputs.is_empty() && outputs.is_empty() {
+                // Legitimate for `SELECT 1` — and the exact shape a renamed
+                // plan key would also take, which is why it is not silent.
+                tracing::debug!(pond, "lineage: the plan named no datasets");
+            }
+        }
+        Err(skip) => tracing::warn!(
+            pond,
+            reason = skip.reason(),
+            "lineage: no provenance for this statement"
+        ),
     }
     (dedup(inputs), dedup(outputs))
 }
 
-/// The bound plan as JSON, or `None` if it could not be obtained *for any
-/// reason*. `json_serialize_plan` reports failure **in band** — it returns
-/// `{"error":true,…}` for a syntax error or a missing table rather than
-/// raising — so that shape is handled here, not by a caller.
-fn serialized_plan(inst: &PondInstance, sql: &str) -> Option<serde_json::Value> {
+/// Why an extraction produced nothing.
+///
+/// The distinction is the whole point: "this statement touched no datasets" and
+/// "we could not find out what it touched" look identical in an event, and this
+/// feature's own thesis is that silently under-reporting provenance is the
+/// worst failure mode there is. Every variant is logged by
+/// [`referenced_tables`], so a pond whose events lost their datasets says so in
+/// the node's log instead of looking complete.
+#[derive(Debug)]
+enum PlanSkip {
+    /// The plan was larger than [`MAX_PLAN_JSON_BYTES`] and was never parsed.
+    OverCap,
+    /// DuckDB would not bind or serialize the statement — a syntax error, an
+    /// unknown table, a missing file. Carries the plan's `error_type` only:
+    /// binder messages quote the SQL back, and the SQL is redacted everywhere
+    /// else it is recorded, so it must not leak through a log line here.
+    NotPlanned(String),
+    /// The extraction query itself failed — an interrupted statement, a
+    /// connection in a bad state.
+    Unavailable,
+    /// The plan came back as something that is not JSON at all: a serialisation
+    /// change, and the loudest reason of the four.
+    Unreadable,
+}
+
+impl PlanSkip {
+    fn reason(&self) -> String {
+        match self {
+            Self::OverCap => format!("plan larger than {MAX_PLAN_JSON_BYTES} bytes"),
+            Self::NotPlanned(kind) => format!("duckdb would not plan it ({kind})"),
+            Self::Unavailable => "the extraction query did not run".into(),
+            Self::Unreadable => "the plan was not JSON".into(),
+        }
+    }
+}
+
+/// The bound plan as JSON, or why there is none. `json_serialize_plan` reports
+/// failure **in band** — it returns `{"error":true,…}` for a syntax error or a
+/// missing table rather than raising — so that shape is handled here.
+fn serialized_plan(inst: &PondInstance, sql: &str) -> Result<serde_json::Value, PlanSkip> {
     // The cap is applied INSIDE DuckDB so an oversized plan is never carried
-    // across the boundary and never handed to serde_json.
+    // across the boundary and never handed to serde_json. `strlen` is BYTES;
+    // `length` would count characters (verified: `length('héllo')` = 5,
+    // `strlen('héllo')` = 6).
     let query = format!(
-        "SELECT CASE WHEN length(p) <= {MAX_PLAN_JSON_BYTES} THEN p END \
+        "SELECT CASE WHEN strlen(p) <= {MAX_PLAN_JSON_BYTES} THEN p END \
          FROM (SELECT json_serialize_plan(?::VARCHAR)::VARCHAR AS p)"
     );
-    let json: Option<String> = inst.conn.query_row(&query, [sql], |r| r.get(0)).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&json?).ok()?;
+    let json: Option<String> = inst
+        .conn
+        .query_row(&query, [sql], |r| r.get(0))
+        .map_err(|_| PlanSkip::Unavailable)?;
+    let json = json.ok_or(PlanSkip::OverCap)?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|_| PlanSkip::Unreadable)?;
     if value.get("error").and_then(serde_json::Value::as_bool) == Some(true) {
-        return None;
+        return Err(PlanSkip::NotPlanned(
+            value
+                .get("error_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        ));
     }
-    Some(value)
+    Ok(value)
 }
 
 /// Walk every node of the plan, collecting scans as inputs and write/DDL
@@ -447,6 +524,20 @@ fn walk_plan(
                 // …and under `info` for DDL.
                 Some("LOGICAL_CREATE_TABLE" | "LOGICAL_CREATE_VIEW" | "LOGICAL_DROP") => {
                     outputs.extend(obj.get("info").and_then(entry_dataset));
+                }
+                // `COPY … TO` is the pond's export path, and its target is a
+                // real output: without this the event shows what the export
+                // read and nothing it produced, so the edge that leaves the
+                // pond is missing while the event still looks complete. The
+                // target keeps its standard scheme, exactly as an external
+                // input does — `file_path` is the whole destination for a
+                // partitioned write too (it is then a directory).
+                Some("LOGICAL_COPY_TO_FILE") => {
+                    outputs.extend(
+                        obj.get("file_path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(DatasetRef::external),
+                    );
                 }
                 _ => {}
             }
@@ -522,10 +613,13 @@ fn entry_dataset(entry: &serde_json::Value) -> Option<DatasetRef> {
     Some(DatasetRef::table(text("catalog")?, text("schema")?, name))
 }
 
-/// Same dataset twice (an `UPDATE`'s target, a self-join) is one dataset.
+/// Same dataset twice (an `UPDATE`'s target, a self-join) is one dataset — but
+/// the **version** is part of its identity: a time-travel self-join
+/// (`FROM a AT (VERSION => 1) JOIN a`) reads two genuinely different states of
+/// one table, and collapsing them would report a single snapshot for both.
 fn dedup(mut datasets: Vec<DatasetRef>) -> Vec<DatasetRef> {
     let mut seen = std::collections::HashSet::new();
-    datasets.retain(|d| seen.insert((d.namespace.clone(), d.name.clone())));
+    datasets.retain(|d| seen.insert((d.namespace.clone(), d.name.clone(), d.version)));
     datasets
 }
 
@@ -616,6 +710,54 @@ mod tests {
             !attr.rows.is_empty(),
             "expected attribution rows for agent-test"
         );
+    }
+
+    #[test]
+    fn lineage_skip_reason_distinguishes_why_there_is_no_provenance() {
+        // "This statement touched nothing" and "we could not find out what it
+        // touched" are the same empty result to a caller, and this feature's
+        // whole thesis is that silently under-reporting provenance is the worst
+        // failure mode. The classification below is what the warn/debug lines
+        // in `referenced_tables` are built on, so it is pinned here rather than
+        // in a log-capture binary (each of those statically links DuckDB).
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("a"));
+        run_write(&inst, "CREATE TABLE a(id INTEGER, v VARCHAR)", &id, "pond").unwrap();
+
+        assert!(
+            serialized_plan(&inst, "SELECT * FROM a").is_ok(),
+            "a statement that plans must not be reported as a skip"
+        );
+        assert!(
+            matches!(
+                serialized_plan(&inst, "SELEC bogus"),
+                Err(PlanSkip::NotPlanned(ref kind)) if kind == "parser"
+            ),
+            "a syntax error is DuckDB refusing to plan, and says which kind"
+        );
+        assert!(
+            matches!(
+                serialized_plan(&inst, "SELECT * FROM nope"),
+                Err(PlanSkip::NotPlanned(ref kind)) if kind == "catalog"
+            ),
+            "an unknown table is a catalog error, not the same as a syntax error"
+        );
+        // Over the cap: the same shape the byte-cap test exercises end to end.
+        let huge = format!("SELECT * FROM a WHERE a.v = '{}'", "x".repeat(600_000));
+        assert!(
+            matches!(serialized_plan(&inst, &huge), Err(PlanSkip::OverCap)),
+            "an oversized plan is skipped deliberately, not a DuckDB failure"
+        );
+        // Every reason is a real sentence an operator can act on — a blank one
+        // would make the log line useless.
+        for skip in [
+            PlanSkip::OverCap,
+            PlanSkip::NotPlanned("io".into()),
+            PlanSkip::Unavailable,
+            PlanSkip::Unreadable,
+        ] {
+            assert!(skip.reason().len() > 10, "empty reason for {skip:?}");
+        }
     }
 
     #[test]

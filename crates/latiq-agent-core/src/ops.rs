@@ -1087,7 +1087,12 @@ impl AgentOps {
         }
         info!(op = "query", pond = pond_ref, "processing locally");
         let t0 = Instant::now();
-        let res = self.run_query_local(&info, sql, identity, write).await;
+        // What the statement's plan said it would touch, filled in only when
+        // the statement failed and so produced no meta of its own.
+        let mut planned = None;
+        let res = self
+            .run_query_local(&info, sql, identity, write, &mut planned)
+            .await;
         let duration_ms = t0.elapsed().as_millis() as u64;
         self.audit(
             identity,
@@ -1106,7 +1111,10 @@ impl AgentOps {
             duration_ms,
             meaning: DurationMeaning::Completion,
             error: res.as_ref().err(),
-            meta: res.as_ref().ok().map(|r| &r.meta),
+            // The result's meta when there is one; the plan's when the
+            // statement failed — a FAIL event that names the table the write
+            // was aiming at is the one a reader actually needs.
+            meta: res.as_ref().ok().map(|r| &r.meta).or(planned.as_ref()),
             engine_version: &self.engine_version,
         });
         res
@@ -1115,12 +1123,18 @@ impl AgentOps {
     /// The local half of `run_query` (see `describe_pond_local` for why it is
     /// split out): every way this can fail is now on the access trail, where
     /// before only the successes were.
+    ///
+    /// `planned` is an out-parameter rather than part of the return type
+    /// because it is filled in exactly where the return type cannot carry it:
+    /// a write that FAILED still knows what it meant to touch, and that is the
+    /// event where knowing the intended target matters most.
     async fn run_query_local(
         &self,
         info: &PondInfo,
         sql: &str,
         identity: &Identity,
         write: bool,
+        planned: &mut Option<QueryMeta>,
     ) -> Result<QueryResult, AgentError> {
         record_query(&info.name, if write { "write" } else { "read" });
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
@@ -1144,18 +1158,29 @@ impl AgentOps {
         let identity2 = identity.clone();
         let t0 = Instant::now();
         let out = tokio::task::spawn_blocking(move || {
-            if write {
+            let res = if write {
                 engine.write_query(&loc2, &sql2, &identity2, token)
             } else {
                 engine.read_query(&loc2, &sql2, token)
-            }
+            };
+            // Only for a FAILED write, and only when the pond opted into
+            // lineage (the engine enforces that gate itself): a healthy query
+            // reports its datasets through its own meta and must not pay for a
+            // second bind. On the same blocking thread, because engine calls
+            // block.
+            let planned = match (&res, write) {
+                (Err(_), true) => engine.plan_datasets(&loc2, &sql2),
+                _ => None,
+            };
+            (res, planned)
         })
         .await
         .map_err(|e| AgentError::internal(format!("join: {e}")));
         self.inflight.complete(&op_id);
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).decrement(1.0);
 
-        let result = out?;
+        let (result, from_plan) = out?;
+        *planned = from_plan;
         let qr = match result {
             Ok(qr) => qr,
             Err(e) => {

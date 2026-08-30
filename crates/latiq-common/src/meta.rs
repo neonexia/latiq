@@ -37,9 +37,11 @@ pub struct DatasetRef {
     /// `{catalog}.{schema}.{table}` for a table; the object key or path for a
     /// file.
     pub name: String,
-    /// The DuckLake snapshot this dataset was read at (inputs) or the one the
-    /// statement produced (outputs). `None` for anything that has no snapshot —
-    /// a temp table, a Parquet file, a catalog that is not DuckLake.
+    /// The DuckLake snapshot this dataset was **read at**. `None` for anything
+    /// the plan gives no snapshot for — a temp table, a Parquet file, a catalog
+    /// that is not DuckLake, and every **output**: the version a write produces
+    /// is only known once it commits, so the emitter supplies that one from the
+    /// statement's own `snapshot_id` rather than finding it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<i64>,
 }
@@ -63,9 +65,10 @@ impl DatasetRef {
             Some(("file", rest)) => ("file".to_string(), rest.to_string()),
             Some((scheme, rest)) => match rest.split_once('/') {
                 Some((authority, path)) => (format!("{scheme}://{authority}"), path.to_string()),
-                // No path at all — keep the whole thing as the name rather than
-                // inventing an empty one.
-                None => (format!("{scheme}://{rest}"), String::new()),
+                // No path at all (`s3://bucket`) — keep the whole URI as the
+                // name. An empty name would be a dataset a consumer cannot
+                // display, group or join on.
+                None => (format!("{scheme}://{rest}"), uri.to_string()),
             },
             // A bare local path.
             None => ("file".to_string(), uri.to_string()),
@@ -146,6 +149,12 @@ mod tests {
         let file_uri = DatasetRef::external("file:///data/events.parquet");
         assert_eq!(file_uri.namespace.as_deref(), Some("file"));
         assert_eq!(file_uri.name, "/data/events.parquet");
+
+        // A URI with no path at all (a whole-bucket export target). A dataset
+        // with an empty name is one a consumer cannot display or join on.
+        let bucket = DatasetRef::external("s3://warehouse");
+        assert_eq!(bucket.namespace.as_deref(), Some("s3://warehouse"));
+        assert_eq!(bucket.name, "s3://warehouse", "a name must never be empty");
     }
 
     #[test]
