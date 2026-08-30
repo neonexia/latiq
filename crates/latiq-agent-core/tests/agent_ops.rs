@@ -1226,6 +1226,64 @@ mod lineage {
     }
 
     #[tokio::test]
+    async fn lineage_a_failed_write_still_names_its_intended_target() {
+        // A write that fails AFTER binding — a constraint violation, a full
+        // disk, a cancel — is exactly the event where a reader needs to know
+        // what it was aiming at. The result carries no meta (there is no
+        // result), so the datasets have to come from the plan instead.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("strict".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "strict", "CREATE TABLE t(i INTEGER)")
+            .await
+            .unwrap();
+        ops.write_query(&id, "strict", "CREATE TABLE src(v VARCHAR)")
+            .await
+            .unwrap();
+        ops.write_query(&id, "strict", "INSERT INTO src VALUES ('not a number')")
+            .await
+            .unwrap();
+        // Binds fine (both tables exist and the cast type-checks); fails when
+        // it RUNS, on the value.
+        ops.write_query(&id, "strict", "INSERT INTO t SELECT v::INTEGER FROM src")
+            .await
+            .expect_err("the conversion must fail at execution");
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        let failed = events
+            .iter()
+            .find(|e| event_type(e) == "FAIL")
+            .expect("the failed write produced a FAIL event");
+        let empty = Vec::new();
+        let outputs: Vec<&str> = failed["outputs"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .map(|d| d["name"].as_str().expect("a dataset name"))
+            .collect();
+        assert_eq!(
+            outputs,
+            vec!["strict.main.t"],
+            "a FAIL event must still name the table the write meant to touch: {failed:#}"
+        );
+        let inputs: Vec<&str> = failed["inputs"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .map(|d| d["name"].as_str().expect("a dataset name"))
+            .collect();
+        assert_eq!(
+            inputs,
+            vec!["strict.main.src"],
+            "and what it was reading from: {failed:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn lineage_read_arrow_records_at_establishment() {
         // The stream's completion is unobservable on both paths (see
         // `read_arrow`'s audit-timing doc), so its events fire when the stream

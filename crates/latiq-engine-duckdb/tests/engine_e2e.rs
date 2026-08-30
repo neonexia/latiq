@@ -277,6 +277,12 @@ mod lineage {
         (fs, pond, inst)
     }
 
+    /// `referenced_tables` with the pond label its diagnostics carry (the
+    /// catalog name, `pond` for a `TempFs` pond).
+    fn refs(inst: &PondInstance, sql: &str) -> (Vec<DatasetRef>, Vec<DatasetRef>) {
+        referenced_tables(inst, sql, "pond")
+    }
+
     fn names(datasets: &[DatasetRef]) -> Vec<&str> {
         let mut out: Vec<&str> = datasets.iter().map(|d| d.name.as_str()).collect();
         out.sort_unstable();
@@ -294,7 +300,7 @@ mod lineage {
         // are unrecoverable from it. A consumer told a query read `vw` learns
         // nothing about which data it actually depended on.
         let (_fs, _id, inst) = pond_with_a_view();
-        let (inputs, outputs) = referenced_tables(&inst, "SELECT * FROM vw");
+        let (inputs, outputs) = refs(&inst, "SELECT * FROM vw");
         assert_eq!(
             names(&inputs),
             vec!["pond.main.a", "pond.main.b"],
@@ -307,8 +313,7 @@ mod lineage {
         assert!(outputs.is_empty(), "a SELECT writes nothing");
 
         // A CTE resolves the same way — same mechanism, and the pin costs a line.
-        let (cte_inputs, _) =
-            referenced_tables(&inst, "WITH c AS (SELECT * FROM a) SELECT * FROM c");
+        let (cte_inputs, _) = refs(&inst, "WITH c AS (SELECT * FROM a) SELECT * FROM c");
         assert_eq!(names(&cte_inputs), vec!["pond.main.a"]);
     }
 
@@ -327,7 +332,7 @@ mod lineage {
             ))
             .unwrap();
 
-        let (inputs, _) = referenced_tables(
+        let (inputs, _) = refs(
             &inst,
             "SELECT a.id FROM a JOIN side.main.a AS s ON a.id = s.id",
         );
@@ -345,21 +350,21 @@ mod lineage {
         // look like it was written, reversing the direction of the edge every
         // lineage graph is built from.
         let (_fs, _id, inst) = pond_with_a_view();
-        let (inputs, outputs) = referenced_tables(&inst, "INSERT INTO a SELECT * FROM b");
+        let (inputs, outputs) = refs(&inst, "INSERT INTO a SELECT * FROM b");
         assert_eq!(names(&inputs), vec!["pond.main.b"]);
         assert_eq!(names(&outputs), vec!["pond.main.a"]);
 
         // A DELETE both reads and writes its target: it must appear on BOTH
         // sides, not be silently classified as one of them.
-        let (del_in, del_out) = referenced_tables(&inst, "DELETE FROM a WHERE id = 1");
+        let (del_in, del_out) = refs(&inst, "DELETE FROM a WHERE id = 1");
         assert_eq!(names(&del_in), vec!["pond.main.a"]);
         assert_eq!(names(&del_out), vec!["pond.main.a"]);
 
         // DDL targets are outputs too, or a pond's tables would appear in the
         // graph only once something inserted into them.
-        let (_, created) = referenced_tables(&inst, "CREATE TABLE c AS SELECT * FROM a");
+        let (_, created) = refs(&inst, "CREATE TABLE c AS SELECT * FROM a");
         assert_eq!(names(&created), vec!["pond.main.c"]);
-        let (_, dropped) = referenced_tables(&inst, "DROP TABLE b");
+        let (_, dropped) = refs(&inst, "DROP TABLE b");
         assert_eq!(names(&dropped), vec!["pond.main.b"]);
     }
 
@@ -373,7 +378,7 @@ mod lineage {
             |inst: &PondInstance| scalar(inst, "SELECT max(snapshot_id) FROM pond.snapshots()");
 
         let before = latest(&inst);
-        let (inputs, _) = referenced_tables(&inst, "SELECT * FROM a");
+        let (inputs, _) = refs(&inst, "SELECT * FROM a");
         assert_eq!(
             inputs[0].version,
             Some(before),
@@ -387,14 +392,14 @@ mod lineage {
             .unwrap();
         let after = latest(&inst);
         assert!(after > before, "the write must advance the snapshot");
-        let (inputs, _) = referenced_tables(&inst, "SELECT * FROM a");
+        let (inputs, _) = refs(&inst, "SELECT * FROM a");
         assert_eq!(inputs[0].version, Some(after));
 
         // Nothing outside DuckLake gets a version invented for it.
         inst.conn
             .execute_batch("CREATE TEMP TABLE t(id INTEGER)")
             .unwrap();
-        let (temp_inputs, _) = referenced_tables(&inst, "SELECT * FROM t");
+        let (temp_inputs, _) = refs(&inst, "SELECT * FROM t");
         assert_eq!(names(&temp_inputs), vec!["temp.main.t"]);
         assert_eq!(
             temp_inputs[0].version, None,
@@ -415,7 +420,7 @@ mod lineage {
             "SELECT * FROM nonexistent_table", // binder error
             "",                                // nothing at all
         ] {
-            let (inputs, outputs) = referenced_tables(&inst, sql);
+            let (inputs, outputs) = refs(&inst, sql);
             assert!(
                 inputs.is_empty() && outputs.is_empty(),
                 "{sql:?} must yield no datasets, got {inputs:?} / {outputs:?}"
@@ -425,7 +430,7 @@ mod lineage {
         // STANDS (the table its first statement would create does not exist
         // yet) yields nothing rather than failing. A known, accepted limit of
         // planning without executing: no lineage beats fabricated lineage.
-        let (batch_in, batch_out) = referenced_tables(
+        let (batch_in, batch_out) = refs(
             &inst,
             "CREATE TABLE later(i INTEGER); INSERT INTO later VALUES (1)",
         );
@@ -435,12 +440,12 @@ mod lineage {
         );
 
         // Anti-vacuity: the same pond, a statement that does resolve.
-        let (inputs, _) = referenced_tables(&inst, "SELECT * FROM a");
+        let (inputs, _) = refs(&inst, "SELECT * FROM a");
         assert_eq!(names(&inputs), vec!["pond.main.a"]);
 
         // And a multi-statement batch that DOES bind reports every statement's
         // datasets — a batch is one operation, not only its first statement.
-        let (multi_in, _) = referenced_tables(&inst, "SELECT * FROM a; SELECT * FROM b");
+        let (multi_in, _) = refs(&inst, "SELECT * FROM a; SELECT * FROM b");
         assert_eq!(names(&multi_in), vec!["pond.main.a", "pond.main.b"]);
     }
 
@@ -457,10 +462,10 @@ mod lineage {
         let rows_before = scalar(&inst, "SELECT count(*) FROM a");
         let snapshot_before = scalar(&inst, "SELECT max(snapshot_id) FROM pond.snapshots()");
 
-        referenced_tables(&inst, "INSERT INTO a VALUES (99,'inserted')");
-        referenced_tables(&inst, "DELETE FROM a");
-        referenced_tables(&inst, "DROP TABLE b");
-        referenced_tables(
+        refs(&inst, "INSERT INTO a VALUES (99,'inserted')");
+        refs(&inst, "DELETE FROM a");
+        refs(&inst, "DROP TABLE b");
+        refs(
             &inst,
             &format!(
                 "COPY (SELECT * FROM a) TO '{}' (FORMAT PARQUET)",
@@ -498,15 +503,110 @@ mod lineage {
             .collect::<Vec<_>>()
             .join(",");
         let big = format!("SELECT * FROM a WHERE id IN ({list})");
-        let (inputs, outputs) = referenced_tables(&inst, &big);
+        let (inputs, outputs) = refs(&inst, &big);
         assert!(
             inputs.is_empty() && outputs.is_empty(),
             "an oversized plan must be skipped, got {inputs:?}"
         );
         // Anti-vacuity: a small IN list over the same shape IS extracted, so
         // the emptiness above is the cap and not a query the walker cannot read.
-        let (small_inputs, _) = referenced_tables(&inst, "SELECT * FROM a WHERE id IN (1,2,3)");
+        let (small_inputs, _) = refs(&inst, "SELECT * FROM a WHERE id IN (1,2,3)");
         assert_eq!(names(&small_inputs), vec!["pond.main.a"]);
+    }
+
+    #[test]
+    fn lineage_the_plan_size_cap_counts_bytes_not_characters() {
+        // The cap exists to bound what crosses the FFI boundary and reaches
+        // serde_json, and that budget is in BYTES. DuckDB's `length()` counts
+        // characters, so measuring with it would let a plan full of non-ASCII
+        // literals through at up to ~4x the cap — on the query hot path.
+        //
+        // The two queries below have the SAME character count and differ only
+        // in bytes per character, so only a byte-counted cap tells them apart.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let query_with = |literal: String| format!("SELECT * FROM a WHERE a.v = '{literal}'");
+        let wide = query_with("\u{1F600}".repeat(150_000)); // 4 bytes/char -> ~600 KB
+        let narrow = query_with("x".repeat(150_000)); // 1 byte/char  -> ~150 KB
+
+        let (over, _) = refs(&inst, &wide);
+        assert!(
+            over.is_empty(),
+            "a plan over the byte cap must be skipped, got {over:?}"
+        );
+        let (under, _) = refs(&inst, &narrow);
+        assert_eq!(
+            names(&under),
+            vec!["pond.main.a"],
+            "the same number of CHARACTERS, under the byte cap, must still be extracted"
+        );
+    }
+
+    #[test]
+    fn lineage_records_a_copy_export_as_an_output() {
+        // `COPY … TO` is how data leaves a pond. Without this the export's
+        // event shows what it read and nothing it produced — the edge out of
+        // the pond is missing while the event still looks complete, which is
+        // the silent under-reporting this whole feature is built to avoid.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let (inputs, outputs) = refs(
+            &inst,
+            "COPY (SELECT * FROM a) TO '/tmp/lineage_export.parquet' (FORMAT PARQUET)",
+        );
+        assert_eq!(names(&inputs), vec!["pond.main.a"], "the export read `a`");
+        assert_eq!(names(&outputs), vec!["/tmp/lineage_export.parquet"]);
+        assert_eq!(
+            outputs[0].namespace.as_deref(),
+            Some("file"),
+            "an export target keeps its standard scheme, like an external input"
+        );
+
+        // A remote target keeps `s3://{bucket}` — the identifier another
+        // tool's lineage joins the same object on.
+        let (_, remote) = refs(
+            &inst,
+            "COPY a TO 's3://warehouse/exports/a.parquet' (FORMAT PARQUET)",
+        );
+        assert_eq!(remote[0].namespace.as_deref(), Some("s3://warehouse"));
+        assert_eq!(names(&remote), vec!["exports/a.parquet"]);
+    }
+
+    #[test]
+    fn lineage_time_travel_reads_of_one_table_are_distinct_datasets() {
+        // Two reads of one table at two snapshots are two different states of
+        // the data. Collapsing them (deduping on name alone) would report a
+        // single version for both and lose the older dependency entirely.
+        let (_fs, _id, inst) = pond_with_a_view();
+        inst.conn
+            .execute_batch("INSERT INTO a VALUES (2,'z')")
+            .unwrap();
+        let latest: i64 = inst
+            .conn
+            .query_row("SELECT max(snapshot_id) FROM pond.snapshots()", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let earlier = latest - 1;
+
+        let (inputs, _) = refs(
+            &inst,
+            &format!("SELECT * FROM a AT (VERSION => {earlier}) UNION ALL SELECT * FROM a"),
+        );
+        let mut versions: Vec<Option<i64>> = inputs.iter().map(|d| d.version).collect();
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            vec![Some(earlier), Some(latest)],
+            "both snapshots of `a` must survive as separate datasets: {inputs:?}"
+        );
+
+        // Anti-vacuity: the same table read TWICE AT THE SAME version is still
+        // one dataset — dedup must not have simply stopped deduping.
+        let (self_join, _) = refs(&inst, "SELECT * FROM a AS x JOIN a AS y ON x.id = y.id");
+        assert_eq!(
+            self_join.len(),
+            1,
+            "a self-join is one dataset: {self_join:?}"
+        );
     }
 
     #[test]
@@ -528,7 +628,7 @@ mod lineage {
             .unwrap();
 
         // ducklake_scan: catalog_name / schema_name / table_name + snapshot.
-        let (ducklake, _) = referenced_tables(&inst, "SELECT * FROM a");
+        let (ducklake, _) = refs(&inst, "SELECT * FROM a");
         assert_eq!(
             names(&ducklake),
             vec!["pond.main.a"],
@@ -541,7 +641,7 @@ mod lineage {
         );
 
         // seq_scan: catalog / schema / table — different key names entirely.
-        let (seq, _) = referenced_tables(&inst, "SELECT * FROM t");
+        let (seq, _) = refs(&inst, "SELECT * FROM t");
         assert_eq!(
             names(&seq),
             vec!["temp.main.t"],
@@ -550,8 +650,7 @@ mod lineage {
         );
 
         // read_parquet: `files`, and the standard `file` namespace kept intact.
-        let (files, _) =
-            referenced_tables(&inst, &format!("SELECT * FROM read_parquet('{parquet}')"));
+        let (files, _) = refs(&inst, &format!("SELECT * FROM read_parquet('{parquet}')"));
         assert_eq!(
             names(&files),
             vec![parquet.as_str()],
