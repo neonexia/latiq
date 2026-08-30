@@ -1872,6 +1872,7 @@ dependencies = [
  "arrow",
  "clap",
  "duckdb",
+ "jsonschema",
  "latiq-agent-core",
  "latiq-auth",
  "latiq-client",

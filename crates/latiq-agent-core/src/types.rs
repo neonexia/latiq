@@ -23,12 +23,12 @@ pub struct PondInfo {
     /// Agent-discovery text: what this pond is for (empty = none).
     #[serde(default)]
     pub description: String,
-    /// Whether this pond records OpenLineage events into its queryable sidecar.
-    /// Opt-in at creation and fixed for the pond's lifetime; off by default, so
-    /// a deployment that does not want it pays nothing. Carried from the registry
-    /// to the node the same way `tier` and `extensions` are — the engine reads it
-    /// to decide whether the pond has a sidecar, and describe reports it so a
-    /// caller can tell whether `lineage.events` exists before querying it.
+    /// Whether this pond records OpenLineage events into its `lineage`
+    /// directory. Opt-in at creation and fixed for the pond's lifetime; off by
+    /// default, so a deployment that does not want it pays nothing. Carried
+    /// from the registry to the node the same way `tier` and `extensions` are,
+    /// and describe reports it so a caller can tell whether `get_lineage` will
+    /// have anything to read before it asks.
     #[serde(default)]
     pub lineage: bool,
 }
@@ -86,6 +86,29 @@ pub struct LoadDatasetResult {
 pub struct PullResult {
     pub catalog: String,
     pub query: String,
+}
+
+/// A page of a pond's OpenLineage trail, newest first — what `get_lineage`
+/// returns. The events are the recorded JSON **verbatim** (see
+/// `latiq_lineage::reader`), so a consumer can replay them into an OpenLineage
+/// backend unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineagePage {
+    pub pond_id: String,
+    pub pond_name: String,
+    /// The directory these events live in, on the node that ran the queries.
+    /// Handed back so a caller that wants SQL over the whole trail — filtering
+    /// or aggregating, which this paged read deliberately does not do — can
+    /// `read_json_auto('<dir>/*.jsonl')` instead of pulling every event through
+    /// its own context.
+    pub lineage_dir: String,
+    pub events: Vec<serde_json::Value>,
+    /// More events matched than fit in this page. Narrow with `since` or ask
+    /// for a larger `limit`.
+    pub truncated: bool,
+    /// Lines skipped because they were not valid JSON. Reported rather than
+    /// swallowed: a short answer must not look like a complete one.
+    pub malformed_lines: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

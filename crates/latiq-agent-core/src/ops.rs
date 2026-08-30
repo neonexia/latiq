@@ -9,8 +9,8 @@ use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
 use crate::lineage::{QueryRecord, IN_PROCESS_NODE};
 use crate::types::{
-    AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult, PondInfo,
-    PullResult,
+    AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LineagePage, LoadDatasetResult,
+    PondInfo, PullResult,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -32,6 +32,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tracing::info;
+
+/// The `see` target for every lineage-shaped error — a real served resource
+/// (`latiq-mcp`'s `resources.rs`), because a `see` that resolves to nothing is
+/// worse than none at all.
+const LINEAGE_RECIPE: &str = "latiq://recipes/lineage";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -1278,6 +1283,140 @@ impl AgentOps {
                 .await
                 .map_err(|e| AgentError::internal(format!("join: {e}")))??,
         )
+    }
+
+    /// A page of the pond's OpenLineage trail, newest first.
+    ///
+    /// The read half of lineage, and protocol-neutral like everything else here
+    /// — the MCP `get_lineage` tool is an adapter over this, and a second
+    /// surface would be another adapter and not a change in here.
+    ///
+    /// Three things it does NOT do, each on purpose:
+    ///
+    /// - **No DuckDB.** The events are JSONL on this node's disk and are
+    ///   returned verbatim; nothing is attached, and no Latiq object is created
+    ///   in the pond's catalog (invariant 6).
+    /// - **No filtering or aggregation** beyond `since` + the caps. A caller
+    ///   that wants either can run `read_json_auto` over `lineage_dir`, which
+    ///   is why the page carries it.
+    /// - **No forwarding.** The events are written by the node that ran the
+    ///   query, so a node that does not hold the pond has nothing to page —
+    ///   and says so rather than returning an empty list.
+    pub async fn get_lineage(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        limit: usize,
+        since: Option<&str>,
+    ) -> Result<LineagePage, AgentError> {
+        let info = self
+            .pond_info_audited(identity, "get_lineage", pond_ref)
+            .await?;
+        let started = Instant::now();
+        let res = self.get_lineage_local(&info, limit, since).await;
+        self.audit(
+            identity,
+            "get_lineage",
+            Some(info.pond_id.as_str()),
+            None,
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    async fn get_lineage_local(
+        &self,
+        info: &PondInfo,
+        limit: usize,
+        since: Option<&str>,
+    ) -> Result<LineagePage, AgentError> {
+        // "We were never recording" is a different answer from "nothing
+        // happened", and a caller that cannot tell them apart will read an
+        // empty list as proof the data appeared from nowhere. So: an error,
+        // with the one action that fixes it.
+        if !info.lineage {
+            return Err(AgentError::new(
+                ErrorKind::InvalidValue,
+                format!(
+                    "Pond '{}' does not record lineage — it was allocated without it, and that is \
+                     fixed for the pond's lifetime. No events exist for it, which is NOT the same \
+                     as nothing having happened here.",
+                    info.name
+                ),
+                "Allocate a new pond with lineage=true and do the work there; an existing pond \
+                 cannot be switched on.",
+                LINEAGE_RECIPE,
+            ));
+        }
+        let pid = Self::parse_id(&info.pond_id)?;
+        // The pond's files are on the node that ran its queries. `pond_location`
+        // failing here means this node holds none of them.
+        let loc = self.storage.pond_location(pid).map_err(|_| {
+            let owner = info.node_endpoint.as_deref().unwrap_or("another node");
+            AgentError::new(
+                ErrorKind::Storage,
+                format!(
+                    "Pond '{}' is not held by this node, so its lineage cannot be read here — the \
+                     events live on the node that ran the queries ({owner}).",
+                    info.name
+                ),
+                "Ask the node that owns the pond (describe_pond reports it), or read the pond's \
+                 lineage directory there directly.",
+                LINEAGE_RECIPE,
+            )
+        })?;
+
+        // The caller's own query may still be in the writer's buffer (a batch
+        // is 64 events, and one operation contributes 2), and a get_lineage
+        // that cannot see the query the agent just ran is the first thing it
+        // will try and the first thing that looks broken. Only THIS pond's
+        // writer is flushed: flushing every pond on the node to answer a
+        // question about one would put unrelated fsyncs on this call. It goes
+        // to the blocking pool for the same reason the emit path does.
+        self.flush_pond_lineage(&info.pond_id).await;
+
+        let dir = loc.lineage_dir.clone();
+        let since = since.map(str::to_string);
+        let page = tokio::task::spawn_blocking(move || {
+            latiq_lineage::read_newest(std::path::Path::new(&dir), limit, since.as_deref())
+        })
+        .await
+        .map_err(|e| AgentError::internal(format!("join: {e}")))?
+        .map_err(|e| match e {
+            latiq_lineage::ReadError::BadSince(s) => AgentError::new(
+                ErrorKind::InvalidValue,
+                format!("`since` is not an RFC-3339 timestamp: '{s}'."),
+                "Pass an RFC-3339 instant, e.g. since='2026-08-14T10:00:00Z', or omit it.",
+                LINEAGE_RECIPE,
+            ),
+            latiq_lineage::ReadError::Io(io) => AgentError::of_kind(
+                ErrorKind::Storage,
+                format!("The pond's lineage directory could not be read: {io}"),
+            ),
+        })?;
+
+        Ok(LineagePage {
+            pond_id: info.pond_id.clone(),
+            pond_name: info.name.clone(),
+            lineage_dir: loc.lineage_dir,
+            events: page.events,
+            truncated: page.truncated,
+            malformed_lines: page.malformed_lines,
+        })
+    }
+
+    /// Write out ONE pond's buffered events, on the blocking pool (the writer
+    /// fsyncs). A pond with no writer on this node has nothing buffered, so
+    /// there is nothing to do and nothing to fail.
+    async fn flush_pond_lineage(&self, pond_id: &str) {
+        let writer = self
+            .lineage_writers_read()
+            .and_then(|map| map.get(pond_id).cloned());
+        if let Some(writer) = writer {
+            let _ = tokio::task::spawn_blocking(move || writer.flush()).await;
+        }
     }
 
     /// Emit one access record on the `latiq::access` target (see the `access`

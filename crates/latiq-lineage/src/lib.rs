@@ -18,7 +18,9 @@
 //!    hot path: it serializes and buffers, returns `()`, and cannot fail or
 //!    panic. Every failure below it is a `warn!` and a dropped event.
 pub mod event;
+pub mod reader;
 pub mod writer;
 
 pub use event::{Dataset, EventType, Job, ParentClaim, Run, RunEvent};
+pub use reader::{read_newest, EventPage, ReadError};
 pub use writer::LineageWriter;
