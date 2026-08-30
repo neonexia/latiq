@@ -11,7 +11,9 @@ use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
-use latiq_agent_core::{AgentError, ArrowReadStream, DescribeResult, Forwarder, PullResult};
+use latiq_agent_core::{
+    AgentError, ArrowReadStream, DescribeResult, Forwarder, LineagePage, PullResult,
+};
 use latiq_common::{ErrorEnvelope, ErrorKind, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
 use latiq_proto::v1::data_client::DataClient;
@@ -362,6 +364,36 @@ impl Forwarder for GrpcForwarder {
         );
         c.drop_pond(req).await.map_err(status_to_error)?;
         Ok(())
+    }
+
+    async fn get_lineage(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        limit: usize,
+        since: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<LineagePage, AgentError> {
+        let mut c = self.client(endpoint).await?;
+        let req = with_identity(
+            GetLineageRequest {
+                pond: pond.to_string(),
+                // The core clamps this; `as u32` cannot lose a value that has
+                // already passed through `MAX_LIMIT`.
+                limit: limit.min(u32::MAX as usize) as u32,
+                since: since.unwrap_or_default().to_string(),
+                before: before.unwrap_or_default().to_string(),
+            },
+            identity,
+        );
+        let resp = c
+            .get_lineage(req)
+            .await
+            .map_err(status_to_error)?
+            .into_inner();
+        serde_json::from_value(parse_json(&resp.json)?)
+            .map_err(|e| AgentError::internal(format!("forward decode get_lineage: {e}")))
     }
 
     async fn catalog_pull(

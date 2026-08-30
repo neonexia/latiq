@@ -596,14 +596,43 @@ mod lineage {
     }
 
     async fn get_lineage(c: &LatiqClient, pond: &str, limit: Option<u32>) -> Value {
+        get_lineage_page(c, pond, limit, None).await
+    }
+
+    /// One page, with the backward cursor an agent pages with.
+    async fn get_lineage_page(
+        c: &LatiqClient,
+        pond: &str,
+        limit: Option<u32>,
+        before: Option<&str>,
+    ) -> Value {
         let mut args = Map::new();
         args.insert("pond".into(), pond.into());
         if let Some(l) = limit {
             args.insert("limit".into(), l.into());
         }
+        if let Some(b) = before {
+            args.insert("before".into(), b.into());
+        }
         let out = c.call_tool("get_lineage", args).await.unwrap();
         assert!(!out.is_error, "get_lineage {pond}: {:?}", out.value);
         out.value
+    }
+
+    /// A run's identity: the pair `(runId, eventType)` is unique per event, so
+    /// a paging walk can prove it saw each one exactly once.
+    fn event_key(event: &Value) -> String {
+        format!(
+            "{}/{}",
+            event["run"]["runId"].as_str().unwrap_or("?"),
+            event["eventType"].as_str().unwrap_or("?")
+        )
+    }
+
+    fn event_time(event: &Value) -> &str {
+        event["eventTime"]
+            .as_str()
+            .expect("every event carries eventTime")
     }
 
     /// The redacted SQL the run's job carries — how a test tells one query's
@@ -803,10 +832,18 @@ mod lineage {
             events.iter().map(sql_of).collect::<Vec<_>>()
         );
 
-        // The limit binds, and takes from the NEW end.
+        // The limit binds, and takes from the NEW end. The count is a range,
+        // not an equality: a page is cut back to a timestamp boundary rather
+        // than ending mid-`eventTime` (that is what makes `before` an exact
+        // cursor), so a page of 2 may legitimately come back holding 1.
         let page = get_lineage(&c, "ordered", Some(2)).await;
         let limited = page["events"].as_array().unwrap();
-        assert_eq!(limited.len(), 2, "limit=2 must return two events");
+        assert!(
+            !limited.is_empty() && limited.len() <= 2,
+            "limit=2 must return one or two events, got {}",
+            limited.len()
+        );
+        assert!(limited.len() < events.len(), "the limit must actually bind");
         for event in limited {
             assert!(
                 sql_of(event).contains("gamma"),
@@ -823,11 +860,84 @@ mod lineage {
     }
 
     #[tokio::test]
-    async fn lineage_tool_on_a_node_that_does_not_hold_the_pond_says_where_it_lives() {
-        // The events are files on the node that RAN the query, and reads are not
-        // forwarded — so an agent that lands on a peer (every gatewayed cluster
-        // load-balances) must be told that, not handed an empty page it would
-        // read as "this table came from nowhere".
+    async fn lineage_tool_pages_backwards_through_the_whole_history() {
+        // THE paging contract, walked the way the tool description tells an
+        // agent to walk it: `before` = the oldest eventTime received, exclusive,
+        // until `truncated` is false. It must terminate, cover every event, and
+        // repeat none — the three ways paging silently breaks.
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
+            .await
+            .unwrap();
+
+        allocate(&c, "paged", Some(true)).await;
+        for i in 0..6 {
+            c.write("paged", &format!("CREATE TABLE t{i}(id INTEGER)"))
+                .await
+                .unwrap();
+        }
+        // The whole trail in one call is the oracle the walk is compared to.
+        let whole = get_lineage(&c, "paged", Some(500)).await;
+        let expected: Vec<String> = whole["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(event_key)
+            .collect();
+        assert!(
+            expected.len() >= 12,
+            "six writes record six event pairs, got {}",
+            expected.len()
+        );
+        assert_eq!(whole["truncated"], json!(false), "the oracle is complete");
+
+        let mut walked: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        // A bound generous enough for one event per page, tight enough that a
+        // non-terminating walk fails instead of hanging.
+        let max_pages = expected.len() + 2;
+        let mut pages = 0usize;
+        loop {
+            let page = get_lineage_page(&c, "paged", Some(3), cursor.as_deref()).await;
+            let events = page["events"].as_array().unwrap();
+            assert!(
+                !events.is_empty(),
+                "a truncated page promised more events, then returned none"
+            );
+            // Newest-first WITHIN a page, and every page older than the last.
+            if let Some(prev) = cursor.as_deref() {
+                assert!(
+                    event_time(&events[0]) < prev,
+                    "a page must start strictly older than the previous cursor"
+                );
+            }
+            cursor = Some(event_time(events.last().unwrap()).to_string());
+            walked.extend(events.iter().map(event_key));
+            pages += 1;
+            assert!(pages <= max_pages, "the walk did not terminate: {walked:?}");
+            if page["truncated"] == json!(false) {
+                break;
+            }
+        }
+        assert!(pages >= 2, "a 12-event history at 3 per page must page");
+
+        let mut sorted_walk = walked.clone();
+        sorted_walk.sort();
+        let mut sorted_expected = expected.clone();
+        sorted_expected.sort();
+        assert_eq!(
+            sorted_walk, sorted_expected,
+            "paging must visit every event exactly once — no skips, no repeats"
+        );
+        c.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lineage_tool_on_a_non_owner_node_forwards_to_the_pond_owner() {
+        // The events are FILES on the node that ran the query, and behind the
+        // gateway we ship an agent lands on a non-owner roughly (1 - 1/n) of
+        // the time. Reading locally there would answer an honest question with
+        // an empty page, so the peer forwards — like every other pond-scoped op.
         let (control, _admin) = crate::common::start_control_plane_only().await;
         // Owner first and alone, so it certainly owns the pond (placement is
         // random once there are two nodes).
@@ -839,33 +949,39 @@ mod lineage {
         oc.write("elsewhere", "CREATE TABLE t(id INTEGER)")
             .await
             .unwrap();
-        // The owner itself answers — otherwise the peer's refusal below would
-        // prove nothing about WHERE the events are.
+        let from_owner = get_lineage(&oc, "elsewhere", None).await;
+        let owned: Vec<String> = from_owner["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(event_key)
+            .collect();
         assert!(
-            !get_lineage(&oc, "elsewhere", None).await["events"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "the owning node holds the events"
+            !owned.is_empty(),
+            "the owning node holds the events, or the peer below proves nothing"
         );
 
         let peer = crate::common::add_node("peer", &control, None).await;
         let pc = LatiqClient::connect(&peer.mcp_endpoint, Some("agent-x".into()))
             .await
             .unwrap();
-        let mut args = Map::new();
-        args.insert("pond".into(), "elsewhere".into());
-        let out = pc.call_tool("get_lineage", args).await.unwrap();
-        assert!(
-            out.is_error,
-            "a node holding none of the pond must not answer with an empty page: {:?}",
-            out.value
+        let from_peer = get_lineage(&pc, "elsewhere", None).await;
+        let forwarded: Vec<String> = from_peer["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(event_key)
+            .collect();
+        assert_eq!(
+            forwarded, owned,
+            "a peer must return the owner's events, not its own empty directory"
         );
-        assert_eq!(out.value["kind"], "storage");
-        let message = out.value["message"].as_str().unwrap();
-        assert!(
-            message.contains(&owner.internal_endpoint),
-            "the error must name the node that has them: {message}"
+        // The proof it really crossed the hop rather than being read locally:
+        // the directory named is the OWNER's storage, which the peer does not
+        // have — its own pond directory does not exist.
+        assert_eq!(
+            from_peer["lineage_dir"], from_owner["lineage_dir"],
+            "the page must be the owner's, directory included"
         );
         oc.close().await.unwrap();
         pc.close().await.unwrap();

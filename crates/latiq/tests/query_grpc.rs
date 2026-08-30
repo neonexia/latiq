@@ -795,12 +795,18 @@ mod lineage {
     }
 
     /// A DESIGN pin, not a behaviour test. Lineage is fixed for the pond's
-    /// lifetime because the sidecar is seeded and its view created at pond
-    /// creation: turning lineage on later would leave a gap at the start of the
+    /// lifetime: turning it on later would leave a gap at the start of the
     /// pond's history that reads as "nothing happened" rather than "we were not
     /// recording" — worse than having no lineage at all. So there is
     /// deliberately NO enable/disable RPC on any surface, and this fails the
     /// build if one appears. Reversing it needs a deliberate backfill story.
+    ///
+    /// It pins the SETTER, not the word: `Data.GetLineage` reads the trail (and
+    /// is what lets a node forward an agent's `get_lineage` to the pond's
+    /// owner), which takes nothing away from the invariant. The guard was
+    /// widened from "no rpc name contains lineage" to "no rpc name MUTATES
+    /// lineage" for exactly that reason — more precise about the real property,
+    /// not merely quieter.
     #[test]
     fn lineage_setting_is_fixed_for_the_pond_lifetime() {
         const DATA: &str = include_str!("../../latiq-proto/proto/latiq/v1/data.proto");
@@ -819,8 +825,12 @@ mod lineage {
                 };
                 rpcs += 1;
                 let method = rest.split('(').next().unwrap_or_default().trim();
+                let lower = method.to_ascii_lowercase();
+                let mutates = ["set", "enable", "disable", "update", "toggle", "configure"]
+                    .iter()
+                    .any(|verb| lower.starts_with(verb));
                 assert!(
-                    !method.to_ascii_lowercase().contains("lineage"),
+                    !(lower.contains("lineage") && mutates),
                     "{file} declares `rpc {method}`: lineage is chosen at pond creation \
                      and fixed for the pond's lifetime — enabling it later would leave a \
                      hole at the start of the provenance record"
@@ -832,7 +842,20 @@ mod lineage {
         // renamed files, a changed `rpc` spelling — would pass while guarding
         // nothing. Pin that every declared RPC was seen, and that the flag it is
         // guarding really is on the wire at creation time.
-        assert_eq!(rpcs, 33, "every declared RPC must have been scanned");
+        assert_eq!(rpcs, 34, "every declared RPC must have been scanned");
+        // The widened guard must still bite: a setter spelled any of the ways
+        // above is refused. Without this the loosening could have been a
+        // silent removal.
+        for forbidden in ["SetLineage", "EnableLineage", "UpdateLineage"] {
+            let lower = forbidden.to_ascii_lowercase();
+            assert!(
+                ["set", "enable", "disable", "update", "toggle", "configure"]
+                    .iter()
+                    .any(|verb| lower.starts_with(verb))
+                    && lower.contains("lineage"),
+                "the guard would not have caught `rpc {forbidden}`"
+            );
+        }
         assert!(
             DATA.contains("bool lineage"),
             "the Data surface must carry the lineage flag at allocate + describe"

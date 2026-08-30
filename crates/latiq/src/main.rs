@@ -311,10 +311,11 @@ enum PondCmd {
         /// discover it (shown in `pond list`/`describe`).
         #[arg(short, long)]
         description: Option<String>,
-        /// Record OpenLineage provenance for every query on this pond, queryable
-        /// as `lineage.events`. Off by default (it costs disk and a little
-        /// per-query time). Chosen here and FIXED for the pond's lifetime —
-        /// there is no way to turn it on afterwards.
+        /// Record OpenLineage provenance for every query on this pond, into
+        /// its own `lineage/` directory (agents read it with the `get_lineage`
+        /// MCP tool). Off by default (it costs disk and a little per-query
+        /// time). Chosen here and FIXED for the pond's lifetime — there is no
+        /// way to turn it on afterwards.
         #[arg(long)]
         lineage: bool,
     },

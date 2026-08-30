@@ -22,5 +22,5 @@ pub mod reader;
 pub mod writer;
 
 pub use event::{Dataset, EventType, Job, ParentClaim, Run, RunEvent};
-pub use reader::{read_newest, EventPage, ReadError};
+pub use reader::{read_newest, EventPage, PageRequest, ReadError};
 pub use writer::LineageWriter;

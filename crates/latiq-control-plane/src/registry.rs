@@ -36,10 +36,10 @@ pub struct PondRow {
     pub extensions: Vec<String>,
     /// Optional agent-discovery text: what this pond is for. Empty = none.
     pub description: String,
-    /// Whether this pond records OpenLineage events into its queryable sidecar.
-    /// Opt-in at creation and **fixed for the pond's lifetime** (there is no
-    /// setter: the sidecar is seeded at creation, so enabling it later would
-    /// leave a hole at the start of the record). Off by default.
+    /// Whether this pond records OpenLineage events into its own `lineage/`
+    /// directory. Opt-in at creation and **fixed for the pond's lifetime**
+    /// (there is no setter: enabling it later would leave a hole at the start
+    /// of the record that reads as "nothing happened"). Off by default.
     pub lineage: bool,
 }
 
