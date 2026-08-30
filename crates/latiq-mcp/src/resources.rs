@@ -23,6 +23,7 @@ const RESOURCES: &[Res] = &[
 - **SQL dialect:** Latiq speaks ANSI SQL on DuckDB. DuckDB-specific functions work but reduce portability — prefer ANSI when other agents will read your code.\n\
 - **Self-describing schemas:** when you CREATE TABLE, add column and table COMMENTs. Other agents discovering your pond rely on them. See latiq://recipes/schema-design.\n\
 - **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')`. `author` is the identity; `commit_extra_info` carries the evidence for it (issuer/subject when the caller was verified) — read BOTH, because an unverified caller can claim any author.\n\
+- **Latiq owns the transaction:** send plain statements — multi-statement SQL is fine, but never `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`. Latiq commits your write itself and records the author just before committing; your own `COMMIT` ends that transaction first, so the change lands in history with NO author.\n\
 - **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
 - **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
 - **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first). See latiq://recipes/lineage.\n\
@@ -38,6 +39,7 @@ const RESOURCES: &[Res] = &[
 Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 - **read_query** accepts SELECT and read-only metadata (SHOW/DESCRIBE). Writes are rejected — use write_query.\n\
 - **write_query** accepts INSERT/UPDATE/DELETE and DDL (CREATE/DROP/ALTER, CREATE TABLE AS SELECT).\n\
+- **Transaction control is Latiq's.** Don't send `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`: read_query rejects them, and in write_query they cut short the transaction Latiq attributes your write in (nothing rejects them there — it silently costs you the author). Several plain statements in one call are fine; they commit together as one snapshot.\n\
 - Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
 - Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` (`commit_extra_info` is where verified-vs-claimed shows up). List tables/columns with `SHOW TABLES` / `information_schema`.\n\
 - Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.",
@@ -96,6 +98,7 @@ Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB download
         body: "# Recipe — attribution lookup\n\n\
 Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
 Use this to coordinate: see who created a table before extending it.\n\
+**How a write loses its author:** Latiq brackets your statement in its own transaction and records the author immediately before committing. SQL that does its own `COMMIT` (or `BEGIN`/`ROLLBACK`/`START TRANSACTION`) ends that bracket first, so the snapshot appears here with no author and nobody can tell who made the change. Nothing stops you — just send plain statements.\n\
 **Always read `commit_extra_info` alongside `author`.** `author` alone cannot tell a VERIFIED writer from one merely claiming that name — the evidence (issuer/subject, and whether the identity was verified) lives in `commit_extra_info`.",
     },
     Res {
@@ -234,7 +237,7 @@ pub fn get_prompt(name: &str, args: &Map<String, Value>) -> Option<GetPromptResu
             "Set up a pond named '{pond}' for {domain} where several agents will collaborate:\n\
 1. allocate_pond with name='{pond}'.\n\
 2. Design a self-describing schema (COMMENT every table and column) — see latiq://recipes/schema-design.\n\
-3. Establish an attribution-lookup habit: agents read `ducklake_snapshots('<pond>')` to see who wrote what.\n\
+3. Establish an attribution-lookup habit: agents read `ducklake_snapshots('<pond>')` to see who wrote what — and none of them wrap SQL in BEGIN/COMMIT/ROLLBACK, which ends Latiq's own transaction early and leaves the write with no author.\n\
 4. Coordinate writes; conflicts auto-retry (latiq://troubleshooting/conflicts).",
             pond = arg(args, "pond_name", "shared"),
             domain = arg(args, "domain", "the task")
@@ -260,7 +263,7 @@ See latiq://recipes/schema-design.",
             "Recover from a write conflict in pond '{pond}':\n\
 1. Re-read the current state: `SELECT max(snapshot_id) FROM ducklake_snapshots('<pond>')`.\n\
 2. Identify the conflicting writer via `ducklake_snapshots('<pond>')`.\n\
-3. Re-plan your write against the latest snapshot and retry (writes auto-retry, but re-check assumptions).\n\
+3. Re-plan your write against the latest snapshot and retry (writes auto-retry, but re-check assumptions) — retry as plain statements; a hand-rolled BEGIN/COMMIT does not help and costs you the author on the write.\n\
 See latiq://troubleshooting/conflicts.",
             pond = arg(args, "pond_id", "the pond")
         ),

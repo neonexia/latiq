@@ -204,6 +204,8 @@ pool). Readers past that wait briefly for a connection.
 
 `query` runs any statement: DDL/DML are attributed to your identity; a plain `SELECT` runs as a read (no snapshot). The pond's storage materializes on first touch.
 
+Latiq manages the transaction on the write path — send plain statements (several in one call is fine) and leave out `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`. The author is recorded just before Latiq's own commit, so your `COMMIT` ends the transaction first and the write lands in history with no author. Reads reject transaction control outright; writes don't police it.
+
 ```bash
 latiq query --pond demo --agent-id alice "CREATE TABLE events(id INTEGER, sev VARCHAR)"
 latiq query --pond demo --agent-id alice "INSERT INTO events VALUES (1,'high'),(2,'critical')"
