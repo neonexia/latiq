@@ -14,7 +14,7 @@ fn embedded_handle_lifecycle_and_arrow_query() {
 
     // create_pond returns a handle carrying metadata (incl. description).
     let work = db
-        .create_pond(Some("work"), "medium", "round-trip test")
+        .create_pond(Some("work"), "medium", "round-trip test", false)
         .unwrap();
     assert_eq!(work.name(), "work");
     assert!(!work.id().is_empty());

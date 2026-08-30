@@ -104,7 +104,7 @@ impl PyDatabase {
         let info = py
             .allow_threads(|| {
                 inner
-                    .create_pond_with_lineage(name, tier, description, lineage)
+                    .create_pond(name, tier, description, lineage)
                     .map(|p| p.info)
             })
             .map_err(err)?;

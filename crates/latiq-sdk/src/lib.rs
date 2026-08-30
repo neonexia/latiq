@@ -243,23 +243,13 @@ impl Latiq {
     }
 
     /// Allocate a pond and return a handle. `description` is agent-discovery text.
-    /// Lineage is off; `create_pond_with_lineage` opts in.
+    ///
+    /// `lineage` records OpenLineage provenance for every query (written as JSONL
+    /// into the pond's own `lineage/` directory on its node; agents read it with
+    /// the `get_lineage` MCP tool). The choice is made here and is **fixed for the
+    /// pond's lifetime and cannot be enabled later** — turning it on later would
+    /// leave a hole at the start of the record. Off (`false`) costs nothing.
     pub fn create_pond(
-        &self,
-        name: Option<&str>,
-        tier: &str,
-        description: &str,
-    ) -> Result<Pond<'_>> {
-        self.create_pond_with_lineage(name, tier, description, false)
-    }
-
-    /// Allocate a pond, choosing whether it records OpenLineage provenance for
-    /// every query (written as JSONL into the pond's own `lineage/` directory
-    /// on its node; agents read it with the `get_lineage` MCP tool). The choice is
-    /// made here and is **fixed for the pond's lifetime** — there is no call to
-    /// change it, because turning it on later would leave a hole at the start of
-    /// the record. Off costs nothing.
-    pub fn create_pond_with_lineage(
         &self,
         name: Option<&str>,
         tier: &str,
