@@ -7,7 +7,7 @@
 //! already abstracts "the registry".
 use crate::arrow::ArrowReadStream;
 use crate::error::AgentError;
-use crate::types::{DescribeResult, PullResult};
+use crate::types::{DescribeResult, LineagePage, PullResult};
 use latiq_common::Identity;
 use latiq_engine::{ExplainResult, QueryResult};
 use std::collections::BTreeMap;
@@ -54,6 +54,20 @@ pub trait Forwarder: Send + Sync {
         identity: &Identity,
         pond: &str,
     ) -> Result<DescribeResult, AgentError>;
+
+    /// Read a page of the pond's lineage from the owning node. Forwarded like
+    /// every other pond-scoped op, and for a sharper reason than most: the
+    /// events are FILES on the node that ran the queries, so a peer has nothing
+    /// of its own to answer with. `since` is inclusive, `before` exclusive.
+    async fn get_lineage(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+        limit: usize,
+        since: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<LineagePage, AgentError>;
 
     async fn drop_pond(
         &self,

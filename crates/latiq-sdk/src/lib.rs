@@ -67,7 +67,8 @@ pub struct PondInfo {
     pub node_id: String,
     pub tier: String,
     pub description: String,
-    /// Whether this pond records lineage (`lineage.events`). Fixed at creation.
+    /// Whether this pond records OpenLineage events (into the pond's own
+    /// `lineage/` directory on its node). Fixed at creation.
     pub lineage: bool,
 }
 
@@ -253,7 +254,8 @@ impl Latiq {
     }
 
     /// Allocate a pond, choosing whether it records OpenLineage provenance for
-    /// every query (queryable in the pond as `lineage.events`). The choice is
+    /// every query (written as JSONL into the pond's own `lineage/` directory
+    /// on its node; agents read it with the `get_lineage` MCP tool). The choice is
     /// made here and is **fixed for the pond's lifetime** — there is no call to
     /// change it, because turning it on later would leave a hole at the start of
     /// the record. Off costs nothing.

@@ -1291,29 +1291,70 @@ impl AgentOps {
     /// — the MCP `get_lineage` tool is an adapter over this, and a second
     /// surface would be another adapter and not a change in here.
     ///
-    /// Three things it does NOT do, each on purpose:
+    /// **The paging contract.** `since` is an INCLUSIVE lower bound ("what has
+    /// happened since I last looked") and `before` an EXCLUSIVE upper one (the
+    /// backward cursor: pass the oldest `eventTime` you received to get the
+    /// next older page). A page is never cut in the middle of one `eventTime`,
+    /// so walking `before` backwards visits every event exactly once — see
+    /// `latiq_lineage::read_newest` for the one degenerate exception.
     ///
-    /// - **No DuckDB.** The events are JSONL on this node's disk and are
+    /// Two things it does NOT do, on purpose:
+    ///
+    /// - **No DuckDB.** The events are JSONL on the owning node's disk and are
     ///   returned verbatim; nothing is attached, and no Latiq object is created
     ///   in the pond's catalog (invariant 6).
-    /// - **No filtering or aggregation** beyond `since` + the caps. A caller
+    /// - **No filtering or aggregation** beyond the bounds + caps. A caller
     ///   that wants either can run `read_json_auto` over `lineage_dir`, which
     ///   is why the page carries it.
-    /// - **No forwarding.** The events are written by the node that ran the
-    ///   query, so a node that does not hold the pond has nothing to page —
-    ///   and says so rather than returning an empty list.
     pub async fn get_lineage(
         &self,
         identity: &Identity,
         pond_ref: &str,
         limit: usize,
         since: Option<&str>,
+        before: Option<&str>,
     ) -> Result<LineagePage, AgentError> {
         let info = self
             .pond_info_audited(identity, "get_lineage", pond_ref)
             .await?;
+        // Validated before the forward decision: the owner would refuse it
+        // identically, and a peer hop to earn the same error is pure latency.
+        if limit == 0 {
+            return Err(self
+                .audit_err(
+                    identity,
+                    "get_lineage",
+                    Some(&info.pond_id),
+                    None,
+                    0,
+                    AgentError::new(
+                        ErrorKind::InvalidValue,
+                        "`limit` must be at least 1.".to_string(),
+                        "Omit `limit` for the default page, or pass a positive count \
+                         (capped at 500).",
+                        LINEAGE_RECIPE,
+                    ),
+                )
+                .await);
+        }
+        // The events are FILES on the node that ran the queries, so the owner
+        // is the only node that can answer — forwarded exactly like every other
+        // pond-scoped op, token replay included.
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "get_lineage",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            record_forward("lineage");
+            return fwd
+                .get_lineage(owner, identity, pond_ref, limit, since, before)
+                .await;
+        }
+        info!(op = "get_lineage", pond = pond_ref, "processing locally");
         let started = Instant::now();
-        let res = self.get_lineage_local(&info, limit, since).await;
+        let res = self.get_lineage_local(&info, limit, since, before).await;
         self.audit(
             identity,
             "get_lineage",
@@ -1331,6 +1372,7 @@ impl AgentOps {
         info: &PondInfo,
         limit: usize,
         since: Option<&str>,
+        before: Option<&str>,
     ) -> Result<LineagePage, AgentError> {
         // "We were never recording" is a different answer from "nothing
         // happened", and a caller that cannot tell them apart will read an
@@ -1351,19 +1393,19 @@ impl AgentOps {
             ));
         }
         let pid = Self::parse_id(&info.pond_id)?;
-        // The pond's files are on the node that ran its queries. `pond_location`
-        // failing here means this node holds none of them.
+        // Reached only when the pond has no live owner to forward to (the
+        // forward decision above handles every other remote case), so this node
+        // is standing in for a node that is gone — and the files went with it.
         let loc = self.storage.pond_location(pid).map_err(|_| {
-            let owner = info.node_endpoint.as_deref().unwrap_or("another node");
             AgentError::new(
                 ErrorKind::Storage,
                 format!(
-                    "Pond '{}' is not held by this node, so its lineage cannot be read here — the \
-                     events live on the node that ran the queries ({owner}).",
+                    "Pond '{}' has no lineage on this node, and the node that recorded it is not \
+                     currently registered — its events are wherever that node's storage is.",
                     info.name
                 ),
-                "Ask the node that owns the pond (describe_pond reports it), or read the pond's \
-                 lineage directory there directly.",
+                "Retry once the pond's node is back; if it is gone for good, so is the trail. \
+                 describe_pond reports the pond's current owner.",
                 LINEAGE_RECIPE,
             )
         })?;
@@ -1378,16 +1420,23 @@ impl AgentOps {
         self.flush_pond_lineage(&info.pond_id).await;
 
         let dir = loc.lineage_dir.clone();
-        let since = since.map(str::to_string);
+        let (since, before) = (since.map(str::to_string), before.map(str::to_string));
         let page = tokio::task::spawn_blocking(move || {
-            latiq_lineage::read_newest(std::path::Path::new(&dir), limit, since.as_deref())
+            latiq_lineage::read_newest(
+                std::path::Path::new(&dir),
+                latiq_lineage::PageRequest {
+                    limit,
+                    since: since.as_deref(),
+                    before: before.as_deref(),
+                },
+            )
         })
         .await
         .map_err(|e| AgentError::internal(format!("join: {e}")))?
         .map_err(|e| match e {
-            latiq_lineage::ReadError::BadSince(s) => AgentError::new(
+            latiq_lineage::ReadError::BadTimestamp { field, value } => AgentError::new(
                 ErrorKind::InvalidValue,
-                format!("`since` is not an RFC-3339 timestamp: '{s}'."),
+                format!("`{field}` is not an RFC-3339 timestamp: '{value}'."),
                 "Pass an RFC-3339 instant, e.g. since='2026-08-14T10:00:00Z', or omit it.",
                 LINEAGE_RECIPE,
             ),
@@ -1404,6 +1453,7 @@ impl AgentOps {
             events: page.events,
             truncated: page.truncated,
             malformed_lines: page.malformed_lines,
+            unreadable_files: page.unreadable_files,
         })
     }
 

@@ -133,13 +133,17 @@ pub struct LineageArgs {
     #[schemars(description = "Pond id or name")]
     pub pond: String,
     #[schemars(
-        description = "How many events to return, newest first (default 50, max 500). Two events are recorded per operation."
+        description = "How many events to return, newest first (default 50, max 500). Two events are recorded per operation. Must be at least 1 — `0` is rejected, not read as 'no limit'."
     )]
     pub limit: Option<u32>,
     #[schemars(
-        description = "Only events at or after this RFC-3339 instant, e.g. `2026-08-14T10:00:00Z`. Use the newest `eventTime` you already have to page backwards through a busy pond."
+        description = "Only events at or after this RFC-3339 instant, INCLUSIVE, e.g. `2026-08-14T10:00:00Z`. For catching up: pass the newest `eventTime` you already have to see what happened since (that one event comes back again, because the bound includes its own instant)."
     )]
     pub since: Option<String>,
+    #[schemars(
+        description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE. This is the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it to get the next older page. Pages are cut on a timestamp boundary, so this never repeats or skips an event."
+    )]
+    pub before: Option<String>,
 }
 
 /// The HTTP header carrying the CLAIMED leaf id. Same name as the gRPC metadata
@@ -752,8 +756,10 @@ Use it to answer 'where did this table come from?', 'who wrote it, and was that 
 Only ponds allocated with `lineage: true` record anything; asking a pond that does not returns an error saying so — that is deliberately \
 distinct from an empty list, so you can tell 'we were not recording' from 'nothing happened'. \
 Each operation contributes a START and a terminal (COMPLETE/FAIL/ABORT) event sharing one `run.runId`; the identity, SQL shape, datasets read/written and the DuckLake snapshot ride the facets. \
-Bounded on purpose: `limit` defaults to 50 (max 500) and the page also stops at ~256 KB, so a busy pond cannot flood your context — \
-page backwards with `since` (pass the oldest `eventTime` you got), and read `truncated` to know there is more. \
+Bounded on purpose — `limit` defaults to 50 (max 500) and a page also stops at ~256 KB — so a busy pond cannot flood your context. \
+PAGING: when `truncated` is true there are OLDER events; call again with `before` set to the oldest `eventTime` you just received (exclusive) and repeat until `truncated` is false. \
+`since` is the opposite bound and is INCLUSIVE — use it to catch up on what is new, not to page backwards. \
+Read `malformed_lines` / `unreadable_files`: non-zero means this page is missing events that were recorded. \
 Events are returned verbatim: valid OpenLineage 2-0-2, replayable into any OpenLineage consumer unchanged. \
 To FILTER or AGGREGATE the whole trail instead of paging it, read_query over the returned `lineage_dir`: \
 `SELECT * FROM read_json_auto('<lineage_dir>/*.jsonl')`. See latiq://recipes/lineage.",
@@ -770,13 +776,14 @@ To FILTER or AGGREGATE the whole trail instead of paging it, read_query over the
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        // The core clamps this; the default lives here because "how much of an
-        // agent's context may one answer cost" is an adapter question.
+        // The core clamps the upper end and refuses 0; the DEFAULT lives here,
+        // because "how much of an agent's context may one answer cost" is a
+        // question about this surface's audience.
         let limit = a.limit.unwrap_or(DEFAULT_LINEAGE_LIMIT) as usize;
         Ok(with_bearer(tok, async {
             match self
                 .ops
-                .get_lineage(&id, &a.pond, limit, a.since.as_deref())
+                .get_lineage(&id, &a.pond, limit, a.since.as_deref(), a.before.as_deref())
                 .await
             {
                 Ok(page) => ok_value(serde_json::to_value(page).unwrap_or_default()),

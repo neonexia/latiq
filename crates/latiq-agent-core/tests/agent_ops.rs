@@ -522,6 +522,7 @@ mod forwarding {
         writes: AtomicUsize,
         pulls: AtomicUsize,
         describes: AtomicUsize,
+        lineages: AtomicUsize,
         last_endpoint: Mutex<String>,
         last_pond: Mutex<String>,
         last_sql: Mutex<String>,
@@ -646,6 +647,31 @@ mod forwarding {
             Ok(latiq_agent_core::PullResult {
                 catalog: catalog.to_string(),
                 query: q.to_string(),
+            })
+        }
+        async fn get_lineage(
+            &self,
+            e: &str,
+            _: &Identity,
+            p: &str,
+            limit: usize,
+            since: Option<&str>,
+            before: Option<&str>,
+        ) -> Result<latiq_agent_core::LineagePage, AgentError> {
+            self.lineages.fetch_add(1, Ordering::SeqCst);
+            // The bounds are recorded in `last_sql` (the fake's free-text slot)
+            // so a test can prove they crossed the hop rather than being
+            // silently dropped — a forward that lost `before` would page for
+            // ever without it.
+            self.note(e, p, &format!("{limit}|{since:?}|{before:?}"));
+            Ok(latiq_agent_core::LineagePage {
+                pond_id: PID.to_string(),
+                pond_name: p.to_string(),
+                lineage_dir: "/owner/ponds/x/lineage".to_string(),
+                events: vec![serde_json::json!({"eventTime": "2026-08-14T10:00:00.000Z"})],
+                truncated: false,
+                malformed_lines: 0,
+                unreadable_files: 0,
             })
         }
         async fn catalog_describe(
@@ -851,6 +877,65 @@ mod forwarding {
         assert_eq!(
             tables,
             vec![("main".to_string(), "forwarded_table".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_get_lineage_delegates_to_owner_with_its_bounds_intact() {
+        // A pond's events are FILES on the node that ran its queries, so a peer
+        // has nothing of its own to answer with — behind a load-balancing
+        // gateway an agent lands on a peer most of the time, and a local read
+        // there would answer an honest question with an empty page.
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(
+            Some("http://owner:9092"),
+            "http://greeter:9092",
+            fwd.clone(),
+        );
+        let page = ops
+            .get_lineage(
+                &Identity::claimed(Some("a")),
+                "pond-x",
+                7,
+                Some("2026-08-14T09:00:00Z"),
+                Some("2026-08-14T11:00:00Z"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fwd.lineages.load(Ordering::SeqCst), 1);
+        assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
+        assert_eq!(*fwd.last_pond.lock().unwrap(), "pond-x");
+        assert_eq!(
+            *fwd.last_sql.lock().unwrap(),
+            "7|Some(\"2026-08-14T09:00:00Z\")|Some(\"2026-08-14T11:00:00Z\")",
+            "limit and BOTH bounds must cross the hop, or paging loops on the owner"
+        );
+        assert_eq!(
+            page.lineage_dir, "/owner/ponds/x/lineage",
+            "the owner's answer is returned as-is, directory included"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_get_lineage_rejects_a_zero_limit_before_the_hop() {
+        // `limit: 0` is a caller mistake with one right answer everywhere; the
+        // owner would refuse it identically, so a peer hop to earn the same
+        // error is pure latency.
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(
+            Some("http://owner:9092"),
+            "http://greeter:9092",
+            fwd.clone(),
+        );
+        let err = ops
+            .get_lineage(&Identity::claimed(Some("a")), "pond-x", 0, None, None)
+            .await
+            .expect_err("zero is refused");
+        assert_eq!(err.envelope().kind, latiq_common::ErrorKind::InvalidValue);
+        assert_eq!(
+            fwd.lineages.load(Ordering::SeqCst),
+            0,
+            "and it never reached the owner"
         );
     }
 

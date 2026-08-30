@@ -103,12 +103,18 @@ pub struct LineagePage {
     /// its own context.
     pub lineage_dir: String,
     pub events: Vec<serde_json::Value>,
-    /// More events matched than fit in this page. Narrow with `since` or ask
-    /// for a larger `limit`.
+    /// Older events matched than this page could carry. Read the next page by
+    /// passing the oldest `eventTime` in `events` as the next call's `before`
+    /// (exclusive) — the page is cut on a timestamp boundary, so that walks the
+    /// history backwards without skipping or repeating an event.
     pub truncated: bool,
     /// Lines skipped because they were not valid JSON. Reported rather than
     /// swallowed: a short answer must not look like a complete one.
     pub malformed_lines: usize,
+    /// Whole batch files (up to 64 events each) that could not be read. Same
+    /// reason as `malformed_lines`, one level up.
+    #[serde(default)]
+    pub unreadable_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

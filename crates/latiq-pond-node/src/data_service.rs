@@ -373,6 +373,33 @@ impl Data for DataService {
         .await
     }
 
+    /// Read a page of the pond's lineage. Empty `since`/`before` mean
+    /// unbounded — proto3 has no optional string, and an empty timestamp is not
+    /// a timestamp anyone could have meant.
+    async fn get_lineage(
+        &self,
+        req: Request<GetLineageRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let (id, tok) = self.identity(&req, "get_lineage").await?;
+        let tid = trace_id_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("get_lineage", tid, tok, async move {
+            let page = ops
+                .get_lineage(
+                    &id,
+                    &r.pond,
+                    r.limit as usize,
+                    non_empty(&r.since),
+                    non_empty(&r.before),
+                )
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(page).unwrap_or_default()))
+        })
+        .await
+    }
+
     async fn catalog_describe(
         &self,
         req: Request<CatalogDescribeRequest>,
@@ -396,4 +423,9 @@ impl Data for DataService {
         })
         .await
     }
+}
+
+/// `""` on the wire means "absent", never an empty timestamp.
+fn non_empty(s: &str) -> Option<&str> {
+    (!s.is_empty()).then_some(s)
 }

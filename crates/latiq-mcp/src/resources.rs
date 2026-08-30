@@ -108,7 +108,12 @@ Use this to coordinate: see who created a table before extending it.\n\
 ```\nallocate_pond {name:'audited', lineage:true}\n```\n\
 `describe_pond` reports `lineage`. Calling get_lineage on a pond without it returns an error, not an empty list — 'we were not recording' and 'nothing happened' are different answers, and only one of them means the data appeared from nowhere.\n\n\
 **Read it, newest first:**\n\
-```\nget_lineage {pond:'audited'}                                  # newest 50 events\nget_lineage {pond:'audited', limit:200, since:'2026-08-14T10:00:00Z'}\n```\n\
+```\nget_lineage {pond:'audited'}                 # the newest 50 events\n```\n\
+**Page backwards** while `truncated` is true, using the OLDEST `eventTime` you received as the next `before` (exclusive — it never repeats or skips an event, because a page is cut on a timestamp boundary):\n\
+```\nget_lineage {pond:'audited', limit:50}\nget_lineage {pond:'audited', limit:50, before:'<oldest eventTime from the last page>'}\n... until truncated is false\n```\n\
+**Catch up** instead with `since`, which is the opposite bound and is INCLUSIVE — pass the newest `eventTime` you already have and that one event comes back with anything newer:\n\
+```\nget_lineage {pond:'audited', since:'2026-08-14T10:00:00Z'}\n```\n\
+`malformed_lines` and `unreadable_files` are non-zero when the page is missing events that were recorded — a short answer never pretends to be a complete one.\n\
 Each operation records a START and a terminal (COMPLETE / FAIL / ABORT) event sharing one `run.runId`. \
 Standard facets carry the SQL shape (`job.facets.sql`, literals redacted), the engine, the error message on a failure, and each dataset's DuckLake snapshot (`inputs[].facets.version`). \
 Latiq's own facets carry the caller (`run.facets.latiq_identity` — read `verified` before you trust `subject`), the pond (`job.facets.latiq_pond`), and the outcome + duration (`run.facets.latiq_query`).\n\
