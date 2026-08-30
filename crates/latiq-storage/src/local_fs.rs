@@ -1,4 +1,6 @@
-//! Local-filesystem pond storage: <root>/<pond-id>/{catalog.duckdb, data/}.
+//! Local-filesystem pond storage: <root>/<pond-id>/{catalog.duckdb, data/},
+//! plus `lineage/` for ponds that opted into lineage — that one directory is
+//! conditional, so the opt-in is visible on disk and not only in the registry.
 use crate::location::PondLocation;
 use crate::storage::{PondStorage, StorageError};
 use latiq_common::PondId;
@@ -17,6 +19,11 @@ impl LocalFs {
     fn pond_dir(&self, pond_id: PondId) -> PathBuf {
         self.root.join(pond_id.to_string())
     }
+    /// The single definition of the lineage path, so the string handed out in
+    /// `PondLocation` and the directory actually created cannot diverge.
+    fn lineage_dir(&self, pond_id: PondId) -> PathBuf {
+        self.pond_dir(pond_id).join("lineage")
+    }
     fn location_for(&self, pond_id: PondId) -> PondLocation {
         let dir = self.pond_dir(pond_id);
         PondLocation {
@@ -29,15 +36,20 @@ impl LocalFs {
             // AgentOps sets these from the pond's registry record.
             extensions: Vec::new(),
             lineage: false,
-            lineage_dir: dir.join("lineage").display().to_string(),
+            lineage_dir: self.lineage_dir(pond_id).display().to_string(),
         }
     }
-    /// Materialize `<root>/<pond-id>/lineage/`. Idempotent — `create_dir_all`
-    /// is a no-op when the directory is already there, which is what the
-    /// `ensure_pond` path needs for a pond whose storage already exists.
+    /// Materialize `<root>/<pond-id>/lineage`. Idempotent, and cheap in the
+    /// steady state: `ensure_pond` runs on every query, so an already-created
+    /// directory costs one `stat` and — more importantly — cannot fail. Without
+    /// the fast path a transient mkdir error would turn an ordinary read, which
+    /// touches nothing under `lineage/`, into a storage error.
     fn create_lineage_dir(&self, pond_id: PondId) -> Result<(), StorageError> {
-        std::fs::create_dir_all(self.pond_dir(pond_id).join("lineage"))
-            .map_err(|e| StorageError::Io(e.to_string()))
+        let dir = self.lineage_dir(pond_id);
+        if dir.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir).map_err(|e| StorageError::Io(e.to_string()))
     }
 }
 
@@ -169,6 +181,34 @@ mod tests {
         );
         // Idempotent: a second ensure with the dir already there is not an error.
         fs.ensure_pond(off, true).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ensure_pond_on_a_materialised_lineage_pond_leaves_it_intact() {
+        // ensure_pond runs on every query, so re-ensuring must be a no-op:
+        // it must succeed and must not disturb events already written there.
+        let tmp = std::env::temp_dir().join(format!("latiq-localfs-test-{}", PondId::new()));
+        let fs = LocalFs::new(&tmp);
+        let id = PondId::new();
+        let loc = fs.create_pond(id, true).unwrap();
+
+        let event = PathBuf::from(&loc.lineage_dir).join("events.jsonl");
+        std::fs::write(&event, "{\"eventType\":\"START\"}\n").unwrap();
+
+        for _ in 0..3 {
+            let again = fs.ensure_pond(id, true).unwrap();
+            assert_eq!(again.lineage_dir, loc.lineage_dir);
+        }
+
+        // Non-vacuous: the exact bytes are still there, so the directory was
+        // neither recreated nor cleared by the re-ensures above.
+        assert_eq!(
+            std::fs::read_to_string(&event).unwrap(),
+            "{\"eventType\":\"START\"}\n"
+        );
+        assert!(PathBuf::from(&loc.lineage_dir).is_dir());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
