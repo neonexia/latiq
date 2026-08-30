@@ -10,6 +10,14 @@ use std::collections::BTreeMap;
 /// The SQL to mount an external catalog, and to tear it back down.
 pub struct AttachPlan {
     pub alias: String,
+    /// How the SOURCE identifies itself, for lineage: the catalog's own locator,
+    /// scheme included and otherwise unmodified (`ducklake:<metadata>`, the
+    /// iceberg REST endpoint + warehouse). `alias` is a pond-local name nobody
+    /// else can join on, so a dataset pulled from here is filed under this
+    /// instead — the same rule `latiq_common::DatasetRef::external` follows for
+    /// a file or an object. Two warehouses behind one endpoint are two
+    /// catalogs, so the warehouse is part of it.
+    pub namespace: String,
     /// `INSTALL …; LOAD …;` for the type's extensions.
     pub load: Vec<String>,
     /// `(secret_name, CREATE SECRET …)` — dropped on detach.
@@ -89,6 +97,7 @@ fn ducklake(
     );
     Ok(AttachPlan {
         alias: alias.to_string(),
+        namespace: format!("ducklake:{metadata}"),
         load,
         secrets,
         attach,
@@ -204,6 +213,7 @@ fn iceberg(
     );
     Ok(AttachPlan {
         alias: alias.to_string(),
+        namespace: format!("{}/{warehouse}", endpoint.trim_end_matches('/')),
         load,
         secrets,
         attach,

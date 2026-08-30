@@ -66,6 +66,22 @@ fn apply_datasets(meta: &mut QueryMeta, datasets: PlanDatasets) {
     }
 }
 
+/// Re-file a dataset that a transient `ATTACH` put under the catalog's local
+/// `alias` in the SOURCE's own namespace.
+///
+/// The alias is a pond-local name — the operator's registry entry, mounted for
+/// the duration of one pull — so `ext.main.widgets` says nothing another tool's
+/// lineage can join on, and leaving `namespace` empty would hand the table the
+/// *pond's* namespace and claim the lakehouse's data as ours. Anything not
+/// under the alias (the pond table the pull creates) is left exactly as it is.
+fn externalize(mut ds: DatasetRef, alias: &str, namespace: &str) -> DatasetRef {
+    if let Some(rest) = ds.name.strip_prefix(&format!("{alias}.")) {
+        ds.name = rest.to_string();
+        ds.namespace = Some(namespace.to_string());
+    }
+    ds
+}
+
 /// One pond's engine resources. Still **one DuckDB database per pond**
 /// (invariant 7) — tier `memory_limit`/`threads` caps stay instance-global and
 /// one process owns the catalog file — but reached through two handles:
@@ -490,7 +506,7 @@ impl QueryEngine for DuckEngine {
         alias: &str,
         params: &std::collections::BTreeMap<String, String>,
         query: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<QueryMeta, EngineError> {
         // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
         // write into the pond — must run on the writer connection, not a pooled
         // read one whose session state other readers would then observe.
@@ -498,6 +514,12 @@ impl QueryEngine for DuckEngine {
         let guard = lock_recover(&pond.writer);
         let plan = crate::attachers::plan(catalog_type, alias, params)?;
         attach_catalog(&guard.conn, &plan)?;
+        // Extracted while the catalog is still ATTACHED and before the pull
+        // runs — the only window where both sides bind: afterwards the external
+        // tables are detached and the pull's own target already exists. Gated
+        // on the pond's lineage flag like every other path, so a pond that did
+        // not opt in pays nothing for the second bind.
+        let datasets = plan_datasets(loc, &guard, query);
         // Run the pull query (a CREATE TABLE … in the pond's default catalog),
         // then tear the attachment down regardless of the outcome.
         let ran = guard
@@ -505,7 +527,20 @@ impl QueryEngine for DuckEngine {
             .execute_batch(query)
             .map_err(|e| EngineError::Engine(format!("pull query: {e}")));
         teardown_catalog(&guard.conn, &plan);
-        ran
+        ran?;
+        let mut meta = QueryMeta::default();
+        apply_datasets(
+            &mut meta,
+            datasets.map(|(inputs, outputs)| {
+                let f = |ds: Vec<DatasetRef>| {
+                    ds.into_iter()
+                        .map(|d| externalize(d, &plan.alias, &plan.namespace))
+                        .collect()
+                };
+                (f(inputs), f(outputs))
+            }),
+        );
+        Ok(meta)
     }
 
     fn describe_catalog(
@@ -604,6 +639,7 @@ mod tests {
         let inst = PondInstance::open(&loc).unwrap();
         let plan = crate::attachers::AttachPlan {
             alias: "leaktest".into(),
+            namespace: "ducklake:/nonexistent_dir_xyz/meta.duckdb".into(),
             load: vec![],
             secrets: vec![(
                 "leak_sec".into(),

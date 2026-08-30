@@ -710,37 +710,61 @@ impl AgentOps {
         }
         let started = Instant::now();
         let res = self.catalog_pull_local(&info, catalog, query, params).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
             "catalog_pull",
             Some(pond_ref),
             Some(query.to_string()),
-            started.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
-        res
+        // The one op whose INPUT is not in the pond, and the edge with the most
+        // provenance value: the catalog is detached before this returns, so
+        // nothing in the pond afterwards remembers where its rows came from.
+        // A failure carries no datasets — the plan bound against a catalog that
+        // is gone by now, and re-binding it would attach it again.
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op: "catalog_pull",
+            sql: query,
+            duration_ms,
+            meaning: DurationMeaning::Completion,
+            error: res.as_ref().err(),
+            meta: res.as_ref().ok().map(|(_, meta)| meta),
+            engine_version: &self.engine_version,
+        });
+        res.map(|(pull, _)| pull)
     }
 
     /// The local half of `catalog_pull` (see `describe_pond_local` for why it is
-    /// split out).
+    /// split out). Returns the engine's meta alongside the result: the pull's
+    /// two sides can only be named while the catalog is attached, so the
+    /// emitter cannot go looking for them afterwards.
     async fn catalog_pull_local(
         &self,
         info: &PondInfo,
         catalog: &str,
         query: &str,
         params: std::collections::BTreeMap<String, String>,
-    ) -> Result<PullResult, AgentError> {
+    ) -> Result<(PullResult, QueryMeta), AgentError> {
         let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
         let engine = self.engine.clone();
         let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
-        tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
-            .await
-            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
-        Ok(PullResult {
-            catalog: cat.name,
-            query: query.to_string(),
+        let meta = tokio::task::spawn_blocking(move || {
+            engine.pull_catalog(&loc, &ty, &alias, &merged, &q)
         })
+        .await
+        .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        Ok((
+            PullResult {
+                catalog: cat.name,
+                query: query.to_string(),
+            },
+            meta,
+        ))
     }
 
     /// Transiently attach a catalog on the pond and list its tables.
