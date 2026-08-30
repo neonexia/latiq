@@ -14,7 +14,9 @@
 //! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
 //! watcher thread interrupts the running statement when the `AbortToken` is
 //! cancelled, and exits when the operation completes.
-use crate::exec::{referenced_tables, run_explain, run_read, run_read_arrow, run_write};
+use crate::exec::{
+    in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow, run_write,
+};
 use crate::instance::PondInstance;
 use latiq_common::{DatasetRef, Identity, QueryMeta};
 use latiq_engine::{
@@ -53,36 +55,6 @@ type PlanDatasets = Option<(Vec<DatasetRef>, Vec<DatasetRef>)>;
 fn plan_datasets(loc: &PondLocation, inst: &PondInstance, sql: &str) -> PlanDatasets {
     loc.lineage
         .then(|| referenced_tables(inst, sql, &loc.catalog_name))
-}
-
-/// Run a read (and its provenance extraction) inside one read-only transaction,
-/// so the plan, the rows and the snapshot accessor all see a single pinned
-/// catalog snapshot.
-///
-/// **Every** read is bracketed, not only a lineage pond's: it is measurably
-/// *faster* than the unbracketed read it replaces (one transaction amortises
-/// the catalog-snapshot resolution auto-commit repeats per statement — see
-/// `exec::in_read_txn`), and it makes a multi-scan read and a streamed batch
-/// sequence snapshot-consistent for every caller. Only the snapshot accessor is
-/// gated on `loc.lineage`, because only lineage records the value.
-fn read_txn<T>(
-    loc: &PondLocation,
-    inst: &PondInstance,
-    f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
-) -> Result<(T, Option<i64>), EngineError> {
-    crate::exec::in_read_txn(inst, loc.lineage.then_some(loc.catalog_name.as_str()), f)
-}
-
-/// Stamp the snapshot the read actually observed onto this pond's inputs.
-fn observed_datasets(
-    loc: &PondLocation,
-    datasets: PlanDatasets,
-    observed: Option<i64>,
-) -> PlanDatasets {
-    datasets.map(|(mut inputs, outputs)| {
-        crate::exec::stamp_observed_version(&mut inputs, &loc.catalog_name, observed);
-        (inputs, outputs)
-    })
 }
 
 /// Attach what the plan found to the statement's meta. A no-op for a pond
@@ -270,7 +242,15 @@ impl DuckEngine {
     }
 
     /// Run a read on a pooled connection. The connection is dropped rather than
-    /// reused if the read failed.
+    /// reused unless the read succeeded.
+    ///
+    /// Not reusable *until proven otherwise*: `f` can panic (a cell conversion,
+    /// a sink, an encoder), and an assignment after the call is skipped entirely
+    /// when it does. `ReadGuard::drop` still runs during the unwind, so a
+    /// connection left mid-transaction — with a `ROLLBACK` that the pending
+    /// interrupt may have refused — would otherwise be pooled and wedge every
+    /// later reader of this pond. The `Err` path and the panic path must reach
+    /// the same conclusion.
     fn with_read<T>(
         &self,
         loc: &PondLocation,
@@ -278,6 +258,7 @@ impl DuckEngine {
     ) -> Result<T, EngineError> {
         let pond = self.pond(loc)?;
         let mut g = pond.checkout_read()?;
+        g.reusable = false;
         let out = f(&g);
         g.reusable = out.is_ok();
         out
@@ -359,18 +340,20 @@ impl QueryEngine for DuckEngine {
             // Both under ONE abort watcher: the extra bind is real work (a
             // remote glob can dominate the query) and must be interruptible.
             Self::run_with_abort(i, &abort, |i| {
-                let ((mut res, datasets), observed) = read_txn(loc, i, |i| {
+                // One read-only transaction over both, so the version the plan
+                // records for an input is the snapshot the rows actually came
+                // from (`exec::in_read_txn`).
+                in_read_txn(i, |i| {
                     // Before the run, not after: extraction binds the
                     // statement, and a statement that has already run may no
                     // longer bind (a dropped table, a table the same batch
                     // created). Same order on every path, so provenance does
                     // not depend on the statement.
                     let datasets = plan_datasets(loc, i, sql);
-                    let res = run_read(i, sql)?;
-                    Ok((res, datasets))
-                })?;
-                apply_datasets(&mut res.meta, observed_datasets(loc, datasets, observed));
-                Ok(res)
+                    let mut res = run_read(i, sql)?;
+                    apply_datasets(&mut res.meta, datasets);
+                    Ok(res)
+                })
             })
         })
     }
@@ -391,16 +374,21 @@ impl QueryEngine for DuckEngine {
             // stays open across the whole batch stream — a correctness gain, in
             // that the stream is now snapshot-consistent rather than resolving
             // the catalog per statement — and a cancellation mid-stream unwinds
-            // through `read_txn`, which rolls back before the connection is
+            // through `in_read_txn`, which rolls back before the connection is
             // discarded.
+            //
+            // That makes the sink's backpressure part of this transaction's
+            // lifetime: a consumer that stops reading holds a DuckLake snapshot
+            // pinned, not just a pool connection. `ArrowSink::batch` must
+            // therefore stay cancellation-responsive — see `ChannelSink` in
+            // `latiq-agent-core`, whose send wakes on the abort token.
             Self::run_with_abort(i, &abort, |i| {
-                let ((mut meta, datasets), observed) = read_txn(loc, i, |i| {
+                in_read_txn(i, |i| {
                     let datasets = plan_datasets(loc, i, sql);
-                    let meta = run_read_arrow(i, sql, &abort, sink)?;
-                    Ok((meta, datasets))
-                })?;
-                apply_datasets(&mut meta, observed_datasets(loc, datasets, observed));
-                Ok(meta)
+                    let mut meta = run_read_arrow(i, sql, &abort, sink)?;
+                    apply_datasets(&mut meta, datasets);
+                    Ok(meta)
+                })
             })
         })
     }
@@ -856,6 +844,40 @@ mod tests {
             .collect();
         assert_eq!(lock_recover(&pond.reads.state).created, pond.reads.max);
         drop(held);
+    }
+
+    #[test]
+    fn a_panicking_read_does_not_return_its_connection_to_the_pool() {
+        // `g.reusable = out.is_ok()` after the call is SKIPPED when `f` panics,
+        // so a panic (a cell conversion, a sink, an encoder) used to pool a
+        // connection that may still be mid-transaction with a stale interrupt —
+        // wedging every later reader of the pond. The `Err` path and the panic
+        // path must reach the same conclusion, which is why the guard is now
+        // cleared before `f` runs rather than set after it.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap();
+        let pond = eng.pond(&loc).unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eng.with_read(&loc, |_| -> Result<(), EngineError> {
+                panic!("a sink blew up mid-read")
+            })
+        }));
+        assert!(
+            panicked.is_err(),
+            "the panic must propagate, not be absorbed"
+        );
+        let st = lock_recover(&pond.reads.state);
+        assert!(
+            st.idle.is_empty(),
+            "a connection whose read panicked must not be handed to the next reader"
+        );
+        assert_eq!(
+            st.created, 0,
+            "and it must be accounted as discarded, or the pool leaks its bound"
+        );
     }
 
     #[test]

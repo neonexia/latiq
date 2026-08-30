@@ -423,7 +423,7 @@ mod lineage {
         let latest = |i: &PondInstance| scalar(i, "SELECT max(snapshot_id) FROM pond.snapshots()");
         let pinned = latest(&writer);
 
-        let ((rows, inputs), observed) = in_read_txn(&reader, Some("pond"), |i| {
+        let (rows, inputs) = in_read_txn(&reader, |i| {
             let (inputs, _) = refs(i, "SELECT * FROM a");
             // Between the extraction and the read — the exact interleaving.
             writer
@@ -443,18 +443,57 @@ mod lineage {
             "the interleaved commit must have advanced the catalog"
         );
         // The rows the read returned are the state at `pinned` (one row), and
-        // both recorded versions name that same snapshot.
+        // the version recorded for the input names that same snapshot. Those
+        // two agreeing is the whole claim: unbracketed, the extraction would
+        // still report `pinned` while the read returned the newer snapshot's
+        // two rows.
         assert_eq!(rows, 1, "the read must see the snapshot it was pinned at");
-        assert_eq!(
-            observed,
-            Some(pinned),
-            "the accessor must report the transaction's pinned snapshot, not the catalog's newest"
-        );
         assert_eq!(
             inputs[0].version,
             Some(pinned),
             "the input's version must be the snapshot the rows came from"
         );
+    }
+
+    #[test]
+    fn lineage_a_read_cannot_close_the_transaction_that_pins_its_version() {
+        // The bracket is only worth something if user SQL cannot open it from
+        // the inside. `SELECT … ; COMMIT; BEGIN TRANSACTION` ends OUR pinned
+        // transaction after the rows are read and leaves a fresh one for our
+        // COMMIT to close successfully — so the read would report a version it
+        // never observed, which is the exact defect the transaction exists to
+        // remove. Verified reachable before the guard: `run_read` ran it, and
+        // our COMMIT then succeeded against a transaction the statement had
+        // opened.
+        let (_fs, _id, inst) = pond_with_a_view();
+        for sql in [
+            "SELECT * FROM a; COMMIT; BEGIN TRANSACTION",
+            "SELECT * FROM a;COMMIT;BEGIN TRANSACTION",
+            "SELECT * FROM a; ROLLBACK",
+        ] {
+            assert!(
+                matches!(
+                    run_read(&inst, sql),
+                    Err(latiq_engine::EngineError::ReadOnlyViolation)
+                ),
+                "transaction control must be refused as a read-only violation, \
+                 not left to corrupt the bracket: {sql:?}"
+            );
+        }
+        // The same statement inside the bracket leaves it intact: the read is
+        // refused, and the transaction the caller opened is still ours to
+        // commit. (Without the guard this COMMIT would have closed a
+        // transaction the STATEMENT opened.)
+        let outcome = in_read_txn(&inst, |i| {
+            let refused = run_read(i, "SELECT * FROM a; COMMIT; BEGIN TRANSACTION");
+            assert!(matches!(
+                refused,
+                Err(latiq_engine::EngineError::ReadOnlyViolation)
+            ));
+            // Still pinned, so a normal read still works in here.
+            Ok(run_read(i, "SELECT * FROM a")?.rows.len())
+        });
+        assert_eq!(outcome.unwrap(), 1);
     }
 
     #[test]
@@ -464,17 +503,15 @@ mod lineage {
         // Both exits are covered — the closure returning `Err`, and the caller's
         // `?` unwinding out of it.
         let (_fs, _id, inst) = pond_with_a_view();
-        let failed: Result<((), Option<i64>), _> = in_read_txn(&inst, Some("pond"), |i| {
+        let failed: Result<(), _> = in_read_txn(&inst, |i| {
             let _ = run_read(i, "SELECT * FROM a")?;
             Err(latiq_engine::EngineError::Cancelled)
         });
         assert!(matches!(failed, Err(latiq_engine::EngineError::Cancelled)));
         // A second transaction can only begin if the first one closed — DuckDB
         // rejects a nested BEGIN, so this is the whole assertion.
-        let (n, _) = in_read_txn(&inst, None, |i| {
-            Ok(run_read(i, "SELECT * FROM a")?.rows.len())
-        })
-        .expect("a rolled-back transaction must leave the connection usable");
+        let n = in_read_txn(&inst, |i| Ok(run_read(i, "SELECT * FROM a")?.rows.len()))
+            .expect("a rolled-back transaction must leave the connection usable");
         assert_eq!(n, 1);
     }
 
