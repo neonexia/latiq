@@ -141,7 +141,7 @@ pub struct LineageArgs {
     )]
     pub since: Option<String>,
     #[schemars(
-        description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE. This is the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it to get the next older page. Pages are cut on a timestamp boundary, so this never repeats or skips an event."
+        description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE. This is the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it to get the next older page. Pages are cut on a timestamp boundary, so this never repeats or skips an event — except for a FULL page whose events ALL share one `eventTime`, which is returned uncut, so a cursor from it skips the rest of that millisecond; raise `limit` if that happens."
     )]
     pub before: Option<String>,
 }

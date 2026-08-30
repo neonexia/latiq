@@ -559,6 +559,9 @@ mod tests {
 
     #[test]
     fn reader_cuts_a_page_on_a_timestamp_boundary_so_before_cannot_skip() {
+        // Regression pin (d119792): pages ended wherever the cap bound, so a
+        // page cut mid-`eventTime` handed back a cursor that skipped every
+        // event sharing that timestamp.
         // Paging exactness: events 1 and 2 share 10:00:01. A page of 2 would
         // otherwise end between them, and the next call's `before` (exclusive)
         // would skip the older one. So the page cuts back to the boundary.
@@ -672,6 +675,9 @@ mod tests {
 
     #[test]
     fn reader_holds_only_what_could_make_the_page() {
+        // Regression pin (d119792): the reader collected whole batch files, so
+        // a 10 000-event batch (the writer's buffer cap) was materialised in
+        // full to answer `limit=1`.
         // The memory bound: a batch far larger than the page must not be
         // materialised. `read_tail` is the thing under test, because the page
         // it feeds looks identical either way.

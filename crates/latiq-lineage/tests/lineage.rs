@@ -459,6 +459,10 @@ fn lineage_writer_buffering_alone_never_touches_the_filesystem() {
 
 #[test]
 fn lineage_writer_retries_a_batch_that_failed_to_write() {
+    // Regression pin (c9b5c4d): a failed batch was DISCARDED, so a transient
+    // write error cost events outright — and with batch 64 < cap 10 000 the
+    // buffer could never fill, making the documented drop-oldest policy
+    // unreachable.
     // A failed batch goes back in the buffer instead of being discarded, so a
     // transient failure (a brief ENOSPC, an EIO) costs latency rather than
     // events — and so the capacity bound is guarding something real rather

@@ -861,6 +861,10 @@ mod lineage {
 
     #[tokio::test]
     async fn lineage_tool_pages_backwards_through_the_whole_history() {
+        // Regression pin (d119792): the tool told agents to page backwards with
+        // `since`, an INCLUSIVE LOWER bound — which returns the same newest page
+        // for ever. Not redundant with the reader's unit tests: this walks the
+        // surface an agent actually drives, where the wrong bound lived.
         // THE paging contract, walked the way the tool description tells an
         // agent to walk it: `before` = the oldest eventTime received, exclusive,
         // until `truncated` is false. It must terminate, cover every event, and

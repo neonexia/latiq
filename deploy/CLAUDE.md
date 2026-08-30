@@ -78,6 +78,20 @@ rejection. Verified token: `iss=http://keycloak:8080/realms/latiq`,
 `latiq-compose.yml` is **deliberately untouched** by all of this: the external-user
 deployment stays pure images + ports, no profiles, no mounts.
 
+## Lineage backend (`LATIQ_LINEAGE_BACKEND_URL` — optional, pond node only)
+`--lineage-backend-url` / **`LATIQ_LINEAGE_BACKEND_URL`** on `latiq node add` is the
+**full** OpenLineage endpoint to POST to (`http://marquez:5000/api/v1/lineage`), not a
+base URL. Unset in every compose today; add it per pond-node service when lineage must
+outlive its pond — dropping a pond destroys its local trail, and the backend is the
+durability answer. Validated **once at startup**, so a typo stops the node instead of
+warning on every query forever. Additive: ponds allocated with `--lineage` always write
+their own files, and a backend that is down, hung or 500-ing can never affect a query.
+**No credentials are sent** — a plaintext `http://` URL to a non-loopback host warns
+once at startup (bodies carry pond and table names, redacted SQL, and the caller's
+subject/issuer) and is allowed anyway: a Marquez on a private network is legitimate.
+Watch `latiq_lineage_sink_events_dropped` on the node's `/metrics` — nothing awaits a
+POST, so it is the only signal a backend has stopped keeping up.
+
 ## Deployment tiers
 1. **Dev** → `./dev.sh` (control plane + N nodes; nginx front door when `--nodes>1`).
 2. **External** → the published compose + GHCR image. Agents → the MCP endpoint

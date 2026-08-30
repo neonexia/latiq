@@ -39,7 +39,9 @@ message PondInfoMsg {
   repeated string extensions = 8;
   // Agent-discovery text: what this pond is for (empty = none).
   string description = 9;
-  // Whether this pond records OpenLineage events into its queryable sidecar.
+  // Whether this pond records OpenLineage events as JSONL files in its own
+  // `lineage/` directory, read back via the `get_lineage` MCP tool (no SQL
+  // sidecar — docs/lineage.md, "Cut: the SQL catalog over the events").
   // Opt-in at creation, fixed for the pond's lifetime; false by default so the
   // default deployment pays nothing.
   bool lineage = 10;

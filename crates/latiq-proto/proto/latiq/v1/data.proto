@@ -50,7 +50,10 @@ message CatalogDescribeRequest {
 // deliberately no enable/disable RPC (turning it on later would leave a hole at
 // the start of the provenance record). Proto3 defaults it to false, so an older
 // client simply gets a pond with lineage off. `describe_pond`'s JSON reports it
-// under `pond.lineage`, so a caller can tell whether `lineage.events` exists.
+// under `pond.lineage`, so a caller can tell whether the pond has a trail to
+// read. Events are OpenLineage JSONL files in the pond's own `lineage/`
+// directory, read back through the `get_lineage` MCP tool — there is no SQL
+// view over them (docs/lineage.md, "Cut: the SQL catalog over the events").
 message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; bool lineage = 4; }
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }
 message DropPondRequest { string pond = 1; bool confirm = 2; }
