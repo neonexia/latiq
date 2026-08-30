@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/neonexia/latiq/v0.1.0/crates/latiq-lineage/spec/facets/1-0-0/LatiqIdentityFacet.json",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqIdentityFacet.json",
   "$defs": {
     "LatiqIdentityFacet": {
       "description": "The identity Latiq attributed this run to. `verified` distinguishes a principal proven by a validated token from a relaxed-mode claim; `agentIdVerified` is always false because the agent id is a claimed leaf that rides an HTTP header and never carries authority.",

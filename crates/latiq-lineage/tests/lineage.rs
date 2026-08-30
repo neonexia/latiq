@@ -425,6 +425,40 @@ fn lineage_writer_batches_and_renames_into_place() {
 }
 
 #[test]
+fn lineage_writer_retries_a_batch_that_failed_to_write() {
+    // A failed batch goes back in the buffer instead of being discarded, so a
+    // transient failure (a brief ENOSPC, an EIO) costs latency rather than
+    // events — and so the capacity bound is guarding something real rather
+    // than a buffer that can never fill.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("not-created-yet");
+    let writer = LineageWriter::with_limits(path.to_str().unwrap(), 1000, 64);
+
+    writer.record(&write_event());
+    writer.record(&read_event());
+    writer.flush(); // fails: the directory does not exist
+    assert!(!path.exists(), "nothing can have been written yet");
+
+    fs::create_dir(&path).expect("lineage dir appears");
+    writer.flush();
+
+    let events = events_in(&path);
+    assert_eq!(
+        events.len(),
+        2,
+        "both buffered events must survive the failed attempt and land on the retry"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["eventType"].as_str().expect("eventType"))
+            .collect::<Vec<_>>(),
+        vec!["COMPLETE", "START"],
+        "a requeued batch must keep its order, not reverse or interleave"
+    );
+}
+
+#[test]
 fn lineage_writer_flushes_on_drop() {
     // Events recorded before a shutdown are exactly the ones an incident
     // investigation wants; a batch-size-only flush would lose them.

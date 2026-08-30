@@ -38,10 +38,21 @@ rather than dereferencing it, so validation stays offline.
 
 `latiq_identity`, `latiq_pond`, `latiq_query` and `latiq_parent_claim` are Latiq
 facets (OpenLineage requires a prefix; ours is `latiq`). They exist as files so
-that each facet's mandatory `_schemaURL` points at a real, immutable document:
-the `$id` of each is its own path in this repo at the release tag, which is what
-`src/event.rs` stamps into the events. That URL must never change for a given
-facet version — a consumer treats `_schemaURL` as an opaque identity for the
-facet's shape (Marquez and DataHub do not dereference it), so changing it renames
-the facet as far as every downstream store is concerned. A breaking change to a
-facet's fields gets a new `1-0-1/` directory, not an edit in place.
+each facet's mandatory `_schemaURL` names a real document rather than being
+invented: the `$id` of each is its own path in this repo under a
+`lineage-facets-<version>` git ref, and that is exactly what `src/event.rs`
+stamps into the events.
+
+Two things to keep straight:
+
+- **The version is the facet's, not the release's.** It is bumped only when that
+  facet's fields change, and never at release time. A consumer treats
+  `_schemaURL` as an opaque identity for the facet's *shape* (Marquez and DataHub
+  do not dereference it), so floating it with the crate version would make every
+  Latiq release look like a new facet type downstream. The four facets version
+  independently. A field change gets a new `1-0-1/` directory and a matching git
+  ref, not an edit in place.
+- **It is an identifier, not currently a fetchable document.** The repo is
+  private and no `lineage-facets-1-0-0` ref has been cut, so following the URL
+  today gets a 404. That is acceptable precisely because consumers do not
+  dereference it — but do not write anywhere that it resolves.
