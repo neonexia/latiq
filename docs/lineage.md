@@ -100,30 +100,73 @@ stops the node instead of warning on every query forever. When set, every event
 goes to both. **No credentials are sent**; a backend that needs auth is a later,
 explicit decision rather than a scheme invented here.
 
-Three properties of the sink, in the order they matter:
+Four properties of the sink, in the order they matter:
 
-1. **It can never fail, slow or block a query.** Submitting is one `try_send`
-   onto a bounded queue; every POST happens on a background task nobody awaits,
-   modelled on the node's heartbeat loop (tolerates a dead endpoint, recovers
-   without supervision). A dead, hung, TLS-failing, DNS-failing or 500-ing
-   backend is invisible to the query path. A full queue **drops** with a
-   warning; it never grows and it never waits.
+1. **It can never fail, slow or block a query.** Submitting is a `push_back`
+   under a mutex that is never held across an `await`; every POST happens on a
+   background task nobody awaits, modelled on the node's heartbeat loop
+   (tolerates a dead endpoint, recovers without supervision), with a 10-second
+   ceiling per request so a backend that accepts a connection and never answers
+   cannot stall the poster forever. Dead, hung, TLS-failing, DNS-failing and
+   500-ing backends are all invisible to the query path. The tests pin the
+   dead-endpoint, hung-endpoint and 500 cases directly; TLS and DNS failures
+   are the same `reqwest` error branch as a refused connection.
 2. **The posted bytes are the stored bytes.** An event is serialized exactly
    once and that same string goes to the file buffer and to the sink, so what a
    backend receives is byte-identical to what the pond's files hold and to what
    `get_lineage` returns. If the wire form and the stored form could drift,
    "OpenLineage compliant" would mean nothing.
-3. **Failure logging is rate-limited to the transitions.** A node whose backend
-   is down posts on every query; without this it would drown the log it shares
-   with the access trail.
+3. **Delivery is best-effort, and "goes to both" is not a delivery guarantee.**
+   A failed POST — a refused connection, a timeout, a 500 — is **dropped and
+   never retried**: retrying means holding an event while more arrive behind
+   it, which is how a bounded queue becomes a queue that is always full. And
+   when the queue (1024 events) does fill, it evicts the **oldest**, matching
+   `LineageWriter`'s own capacity policy and for the same reason — the queue
+   only fills when the backend is failing, and the events nearest the failure
+   are the ones an investigation wants. The pond's own files keep every event
+   either way; the sink is a mirror, not a second source of truth.
+4. **Failure logging is rate-limited to the transitions**, and plaintext is
+   flagged. A node whose backend is down posts on every query; without the
+   rate limit it would drown the log it shares with the access trail. A
+   plaintext `http://` URL to a non-loopback host warns once at startup: every
+   body carries pond and table names, redacted SQL and the caller's subject and
+   issuer, and since no credentials are supported there is nothing else that
+   would make an operator notice the traffic is in the clear. It is a warning,
+   not a refusal — a Marquez on a private network is a legitimate deployment.
 
-**A flush on shutdown.** The writer flushes on `Drop`, so a graceful teardown
-loses nothing — but SIGTERM ends the process rather than dropping anything, and
-up to one batch per pond would go with it. That batch is the last few queries
-before the node went down, which is exactly the window an incident asks about,
-so the node catches SIGTERM/Ctrl-C and flushes. This is the node's *only*
-shutdown work today; the full sequence (stop accepting → abort in-flight →
-checkpoint → deregister) is still a target, and this is where it goes.
+An operator watching it has three gauges on the node's `/metrics`:
+`latiq_lineage_sink_events_submitted`, `..._posted` and `..._dropped`. They are
+the only visibility there is, because nothing awaits a POST — `..._dropped`
+climbing is the sole signal that a backend has stopped keeping up.
+
+**A bounded flush on shutdown — not a graceful drain.** The writer flushes on
+`Drop`, so a teardown that drops the last `AgentOps` loses nothing — but SIGTERM
+ends the process rather than dropping anything, and up to one batch per pond
+(plus the sink's whole backlog) would go with it. That is the last few queries
+before the node went down, which is exactly the window an incident asks about.
+So the `latiq` binary catches SIGTERM/Ctrl-C and the node flushes each pond's
+files and then drains the sink.
+
+Three things this deliberately is not:
+
+- **Not graceful.** The Data/Stream gRPC server is a separate task that keeps
+  accepting, and in-flight MCP requests are cancelled with the server future
+  rather than allowed to finish. The promise is only that what is *already
+  buffered at signal time* lands; a query completing after the flush records
+  events that are lost, exactly as they were before this existed. The full
+  sequence (stop accepting → abort in-flight → checkpoint → deregister) is still
+  a target, and this is where it goes.
+- **Not unbounded.** The whole sequence has a five-second budget, after which
+  the node exits anyway and says in a `warn!` what it could not flush. The file
+  flush fsyncs on a blocking pool it shares with batch writes and `getaddrinfo`;
+  installing a signal handler also takes away the operator's second-Ctrl-C
+  escape. Losing some events is strictly better than a node that will not die.
+- **Not installed by the library.** The signal handler lives in the `latiq`
+  binary, never in `latiq-pond-node`. `run_pond_node` is also what the SDK's
+  embedded `LocalCluster` and the Python wheel run *inside a host process*, and
+  a library that replaces its host's `SIGTERM` disposition can stop `kill` from
+  terminating that host. The library exposes `run_pond_node_until(cfg,
+  shutdown)`; whoever owns the process owns its signals.
 
 ---
 

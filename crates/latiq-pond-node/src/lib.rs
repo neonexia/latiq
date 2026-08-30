@@ -76,7 +76,12 @@ pub fn warm_extensions() -> Result<(), Box<dyn std::error::Error>> {
 /// Periodically refresh this node's resource + load gauges. The per-pond
 /// in-flight gauge is maintained inline in AgentOps; this samples the node-level
 /// gauges + process CPU/memory.
-pub fn spawn_node_collector(ops: Arc<AgentOps>) {
+/// `sink` is the node's optional lineage backend, if one is configured: its
+/// POSTs happen on a task nobody awaits, so these three gauges are the only way
+/// an operator can answer "is anything actually leaving this node?" -- and, more
+/// to the point, "is the backend keeping up?", which `..._dropped` climbing is
+/// the only signal of.
+pub fn spawn_node_collector(ops: Arc<AgentOps>, sink: Option<Arc<latiq_lineage::HttpSink>>) {
     tokio::spawn(async move {
         let mut sampler = latiq_metrics::ProcessSampler::new();
         loop {
@@ -84,6 +89,11 @@ pub fn spawn_node_collector(ops: Arc<AgentOps>) {
             latiq_metrics::record_process_gauges(&mut sampler);
             metrics::gauge!("latiq_inflight_queries").set(ops.inflight().len() as f64);
             metrics::gauge!("latiq_node_open_ponds").set(ops.open_pond_count() as f64);
+            if let Some(sink) = sink.as_deref() {
+                metrics::gauge!("latiq_lineage_sink_events_submitted").set(sink.submitted() as f64);
+                metrics::gauge!("latiq_lineage_sink_events_posted").set(sink.posted() as f64);
+                metrics::gauge!("latiq_lineage_sink_events_dropped").set(sink.dropped() as f64);
+            }
         }
     });
 }
@@ -159,7 +169,33 @@ pub async fn serve_data(
 
 /// Run a pond node: register with the control plane, start a heartbeat loop, and
 /// serve the agent MCP surface + the Data/Query gRPC surface (blocks).
+///
+/// **Serves until the process ends.** This is the entry point for EMBEDDED
+/// callers -- `latiq-sdk`'s `LocalCluster` and, through it, the Python wheel --
+/// so it must not install a signal handler: a library that replaces a host
+/// process's `SIGTERM` disposition can stop `kill` from terminating that
+/// process, and would let a signal aimed at the host silently tear down the
+/// embedded node while the host runs on. The binary drives shutdown explicitly
+/// through [`run_pond_node_until`].
 pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
+    // `pending()` never resolves, so the `select!` inside can only be decided
+    // by the server future -- exactly the behaviour this has always had.
+    run_pond_node_until(cfg, std::future::pending::<()>()).await
+}
+
+/// [`run_pond_node`], stopping when `shutdown` resolves.
+///
+/// The seam the `latiq` binary uses to hand in SIGTERM/Ctrl-C. It lives here
+/// rather than in this crate's own signal handling on purpose: **whoever owns
+/// the process owns its signals**, and that is the binary, never a library a
+/// host embedded.
+///
+/// On shutdown it flushes buffered lineage under a bound -- see
+/// [`shutdown_lineage`], which is explicit that this is not a graceful drain.
+pub async fn run_pond_node_until(
+    cfg: PondNodeConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> anyhow::Result<()> {
     // Latiq is built on the ducklake + httpfs extensions — ensure they load BEFORE
     // we register or serve, so a node that can't function never joins the cluster.
     // Fail fast with a clear error rather than degrading per pond.
@@ -196,12 +232,14 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     // public URL: a malformed backend URL must stop the node loudly, not become
     // a warning on every query for the life of the process. `None` = no backend
     // configured, the default.
-    let lineage_sink: Option<Arc<dyn latiq_lineage::EventSink>> =
+    //
+    // Kept as the concrete type as well as the neutral one: the collector
+    // publishes its counters, while `AgentOps` must only ever see `EventSink`.
+    let lineage_sink: Option<Arc<latiq_lineage::HttpSink>> =
         match cfg.lineage_backend_url.as_deref() {
-            Some(url) => {
-                let sink = latiq_lineage::HttpSink::new(url).map_err(|e| anyhow::anyhow!("{e}"))?;
-                Some(Arc::new(sink))
-            }
+            Some(url) => Some(Arc::new(
+                latiq_lineage::HttpSink::new(url).map_err(|e| anyhow::anyhow!("{e}"))?,
+            )),
             None => None,
         };
 
@@ -212,7 +250,9 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         &cfg.internal_endpoint,
         &cfg.control_endpoint,
         &cfg.data_dir,
-        lineage_sink,
+        lineage_sink
+            .clone()
+            .map(|s| s as Arc<dyn latiq_lineage::EventSink>),
     )
     .await?;
 
@@ -228,7 +268,7 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     if let Some(metrics_addr) = cfg.metrics_addr {
         let handle = latiq_metrics::init_recorder();
         metrics::gauge!("latiq_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
-        spawn_node_collector(ops.clone());
+        spawn_node_collector(ops.clone(), lineage_sink.clone());
         tokio::spawn(async move {
             if let Err(e) = latiq_metrics::serve_metrics(metrics_addr, handle).await {
                 eprintln!("metrics server error: {e}");
@@ -298,55 +338,112 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         r = serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url)) => {
             r.map_err(|e| anyhow::anyhow!("mcp server error: {e}"))
         }
-        _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received; flushing buffered lineage");
+        _ = shutdown => {
+            tracing::info!("shutdown requested; flushing buffered lineage");
             Ok(())
         }
     };
 
-    // The node's ONLY shutdown work, and the reason `shutdown_signal` exists at
-    // all. `LineageWriter` flushes on `Drop`, so a teardown that drops the last
-    // `AgentOps` already loses nothing -- but a SIGTERM does not drop anything,
-    // it ends the process, and up to one batch per pond (64 events) would go
-    // with it. That batch is the last few queries before the node went down,
-    // which is precisely the window an incident asks about.
-    //
-    // It does BLOCKING, fsyncing io (see `AgentOps::flush_lineage`), so it runs
-    // on the blocking pool and not on the worker that was serving.
-    let _ = tokio::task::spawn_blocking(move || served.flush_lineage()).await;
+    shutdown_lineage(served).await;
     result
 }
 
-/// Resolves when the process is asked to stop: SIGTERM (how a container runtime
-/// stops a node) or Ctrl-C.
+/// The most the node will spend on its shutdown work before exiting anyway.
 ///
-/// There is **no other shutdown hook on this node today** -- the serve futures
-/// run until the process ends, and `latiq-pond-node/CLAUDE.md` still lists
-/// graceful shutdown (stop accepting -> abort in-flight -> checkpoint ->
-/// deregister) as a target. This is deliberately not that. It is the smallest
-/// thing that lets the buffered lineage land, and the place the rest of that
-/// sequence goes when it is built.
-async fn shutdown_signal() {
-    #[cfg(unix)]
+/// Bounded because everything in it can stall: the file flush fsyncs (an NFS
+/// mount or an EIO makes that unbounded) and shares a blocking pool with batch
+/// writes, extension warming and `getaddrinfo`, while the sink drain is waiting
+/// on a network. An operator's escape from a node that will not die used to be
+/// a second Ctrl-C -- which is gone the moment anything installs a signal
+/// handler -- so the bound has to come from us. **Losing some events is
+/// strictly better than a node that will not die.**
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Land what lineage is buffered, then go. **This is not a graceful drain**, and
+/// the difference matters: the Data/Stream gRPC server is a separate spawned
+/// task that keeps accepting, and in-flight MCP requests are cancelled with the
+/// server future rather than allowed to finish. What this promises is narrower
+/// and worth exactly its cost -- everything already buffered at signal time
+/// lands. A query that completes after the flush records events that are lost,
+/// as it would have been before this existed.
+///
+/// Two halves, in this order and for a reason:
+///
+/// 1. `flush_lineage` writes each pond's buffered batch to its own files. It
+///    does BLOCKING, fsyncing io, so it runs on the blocking pool. `Drop`
+///    already covers a teardown that drops the last `AgentOps` -- but SIGTERM
+///    drops nothing, it ends the process, and up to one batch per pond (64
+///    events) would go with it. That batch is the last few queries before the
+///    node went down, which is precisely the window an incident asks about.
+/// 2. `drain_lineage_sink` posts what the optional HTTP backend still has
+///    queued -- up to 1024 events, i.e. everything that piled up while the
+///    backend was down. Without it the shutdown flush would save the local
+///    copy of exactly the events the sink exists to get OFF the node.
+async fn shutdown_lineage(ops: Arc<AgentOps>) {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
+    let flushing = ops.clone();
+    if tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || flushing.flush_lineage()),
+    )
+    .await
+    .is_err()
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        // If the handler cannot be installed there is nothing useful to do but
-        // fall back to Ctrl-C: refusing to serve over it would be worse.
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = term.recv() => {}
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            }
-            Err(e) => {
-                tracing::warn!(%e, "could not listen for SIGTERM; only Ctrl-C will flush lineage");
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
+        tracing::warn!(
+            budget_ms = SHUTDOWN_BUDGET.as_millis() as u64,
+            "lineage files did not finish flushing before the shutdown budget ran out; exiting \
+             anyway with some events unwritten"
+        );
+        return;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    // Whatever is left of the budget. The sink bounds itself with it and warns
+    // about anything it could not post, so there is nothing to log here.
+    ops.drain_lineage_sink(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .await;
+}
+
+#[cfg(test)]
+mod tests {
+    /// The embedded path must install NO signal handler.
+    ///
+    /// `run_pond_node` is not only the binary's node path -- `latiq-sdk`'s
+    /// `LocalCluster::start`, and therefore the Python wheel, calls it. A
+    /// library that installs a process-wide handler replaces its host's
+    /// `SIG_DFL` disposition without emulating it, so `kill <pid>` on a Python
+    /// process that merely embedded a pond can stop terminating it, and a
+    /// signal aimed at the host silently tears down the embedded node while the
+    /// host runs on. The handler therefore lives in `crates/latiq/src/main.rs`.
+    ///
+    /// A source guard and not a runtime one, stated plainly: proving it at
+    /// runtime means reading the process's `sigaction` disposition before and
+    /// after starting an embedded node, which needs a live control plane, a
+    /// bound port and `libc` -- for a property whose only failure mode is
+    /// someone reintroducing these three tokens into this crate. The
+    /// counter-assertions below are what stop it passing vacuously.
+    #[test]
+    fn the_embedded_node_path_installs_no_signal_handler() {
+        // Only the NON-test half: this module names the forbidden tokens as
+        // string literals, and a guard that searches itself always matches.
+        let src = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("this file has a #[cfg(test)] module, and this test is in it")
+            .0;
+        for token in ["tokio::signal", "SignalKind", "ctrl_c"] {
+            assert!(
+                !src.contains(token),
+                "`{token}` is back in latiq-pond-node: signal handling belongs to the binary                  (crates/latiq/src/main.rs), because this crate is also what the embedded SDK                  and the Python wheel run in a host process"
+            );
+        }
+        // Anti-vacuity, both directions. The seam must exist (or the guard is
+        // trivially satisfied by a crate that never shuts down at all), and the
+        // haystack must be the real file.
+        assert!(
+            src.contains("pub async fn run_pond_node_until("),
+            "the shutdown seam the binary drives is gone; without it the handler has nowhere              to live but here"
+        );
+        assert!(
+            src.contains("async fn shutdown_lineage("),
+            "the shutdown work itself is gone, so this guard is protecting nothing"
+        );
     }
 }

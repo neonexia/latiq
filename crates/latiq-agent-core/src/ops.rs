@@ -166,6 +166,23 @@ impl AgentOps {
         }
     }
 
+    /// Deliver whatever the optional lineage sink still has queued, giving up
+    /// after `budget`.
+    ///
+    /// The companion to `flush_lineage` on the shutdown path, and it must run
+    /// **after** it: the file flush can hand the sink nothing (the sink is fed
+    /// at buffer time, not at write time), but ordering them this way means the
+    /// cheap, always-correct half happens first and the bounded, best-effort
+    /// half gets whatever budget is left.
+    ///
+    /// Awaits rather than blocks, and is bounded by the sink itself. A node
+    /// with no backend configured returns immediately.
+    pub async fn drain_lineage_sink(&self, budget: std::time::Duration) {
+        if let Some(sink) = self.lineage_sink.as_deref() {
+            sink.drain(budget).await;
+        }
+    }
+
     /// Emit this operation's lineage. Called from the PUBLIC op methods beside
     /// `self.audit(...)`, and only on the local path — see `crate::lineage`.
     ///
