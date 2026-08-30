@@ -14,9 +14,9 @@
 //! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
 //! watcher thread interrupts the running statement when the `AbortToken` is
 //! cancelled, and exits when the operation completes.
-use crate::exec::{run_explain, run_read, run_read_arrow, run_write};
+use crate::exec::{referenced_tables, run_explain, run_read, run_read_arrow, run_write};
 use crate::instance::PondInstance;
-use latiq_common::Identity;
+use latiq_common::{DatasetRef, Identity, QueryMeta};
 use latiq_engine::{
     AbortToken, ArrowSink, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary,
     TableInfo,
@@ -31,6 +31,30 @@ use std::time::Duration;
 pub struct DuckEngine {
     /// Per-pond engine resources, keyed by catalog URI.
     ponds: Mutex<HashMap<String, Arc<Pond>>>,
+    /// The linked DuckDB's version, asked once (see `version`).
+    version: std::sync::OnceLock<String>,
+}
+
+/// What the bound plan said a statement reads and writes, or `None` when the
+/// pond did not opt into lineage.
+///
+/// The `Option` is the opt-in, made unmissable: extraction costs a second bind
+/// (~380 µs against a 2.16 ms query, ~18%), and not paying it for a pond that
+/// records no lineage is the entire justification for the per-pond flag. Every
+/// call site therefore goes through here rather than deciding for itself.
+type PlanDatasets = Option<(Vec<DatasetRef>, Vec<DatasetRef>)>;
+
+fn plan_datasets(loc: &PondLocation, inst: &PondInstance, sql: &str) -> PlanDatasets {
+    loc.lineage.then(|| referenced_tables(inst, sql))
+}
+
+/// Attach what the plan found to the statement's meta. A no-op for a pond
+/// without lineage, so `tables_touched` stays empty exactly where nothing asked
+/// for it.
+fn apply_datasets(meta: &mut QueryMeta, datasets: PlanDatasets) {
+    if let Some((inputs, outputs)) = datasets {
+        meta.set_datasets(inputs, outputs);
+    }
 }
 
 /// One pond's engine resources. Still **one DuckDB database per pond**
@@ -258,6 +282,22 @@ impl DuckEngine {
 }
 
 impl QueryEngine for DuckEngine {
+    fn version(&self) -> String {
+        // Asked of the linked library itself (an in-memory connection needs no
+        // pond and no extensions), then cached: a hard-coded string would be
+        // wrong the first time the bundled DuckDB is bumped, and the lineage
+        // trail would claim a version that never ran anything.
+        self.version
+            .get_or_init(|| {
+                duckdb::Connection::open_in_memory()
+                    .and_then(|c| c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)))
+                    // An engine that cannot say its version must not break a
+                    // query over it: the facet is simply less specific.
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError> {
         // Opening the instance attaches the pond's DuckLake catalog (creating the
         // catalog file on first open) and validates it's usable. No Latiq objects
@@ -273,7 +313,14 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
         self.with_read(loc, |i| {
-            Self::run_with_abort(i, &abort, |i| run_read(i, sql))
+            // Before the run, not after: extraction binds the statement, and a
+            // statement that has already run may no longer bind (a dropped
+            // table, a table the same batch created). Same order on every path,
+            // so provenance does not depend on what the statement happened to be.
+            let datasets = plan_datasets(loc, i, sql);
+            let mut res = Self::run_with_abort(i, &abort, |i| run_read(i, sql))?;
+            apply_datasets(&mut res.meta, datasets);
+            Ok(res)
         })
     }
 
@@ -283,9 +330,13 @@ impl QueryEngine for DuckEngine {
         sql: &str,
         abort: AbortToken,
         sink: &mut dyn ArrowSink,
-    ) -> Result<(), EngineError> {
+    ) -> Result<QueryMeta, EngineError> {
         self.with_read(loc, |i| {
-            Self::run_with_abort(i, &abort, |i| run_read_arrow(i, sql, &abort, sink))
+            let datasets = plan_datasets(loc, i, sql);
+            let mut meta =
+                Self::run_with_abort(i, &abort, |i| run_read_arrow(i, sql, &abort, sink))?;
+            apply_datasets(&mut meta, datasets);
+            Ok(meta)
         })
     }
 
@@ -298,9 +349,15 @@ impl QueryEngine for DuckEngine {
     ) -> Result<QueryResult, EngineError> {
         let pond = self.pond(loc)?;
         let guard = lock_recover(&pond.writer);
-        Self::run_with_abort(&guard, &abort, |i| {
+        // Before the write, necessarily: a `DROP TABLE t` no longer binds once
+        // it has run, so extraction afterwards would report no output for
+        // exactly the statements whose output matters most.
+        let datasets = plan_datasets(loc, &guard, sql);
+        let mut res = Self::run_with_abort(&guard, &abort, |i| {
             run_write(i, sql, identity, &loc.catalog_name)
-        })
+        })?;
+        apply_datasets(&mut res.meta, datasets);
+        Ok(res)
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {

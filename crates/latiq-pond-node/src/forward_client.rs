@@ -266,10 +266,12 @@ impl Forwarder for GrpcForwarder {
             .schema_rx
             .await
             .map_err(|_| AgentError::internal("forward arrow: stream closed before schema"))??;
-        Ok(ArrowReadStream {
+        // No meta: the peer that RAN this query is the one that records its
+        // lineage, and inventing one here would put datasets on the wrong node.
+        Ok(ArrowReadStream::new(
             schema,
-            batches: Box::pin(ReceiverStream::new(parts.batch_rx)),
-        })
+            Box::pin(ReceiverStream::new(parts.batch_rx)),
+        ))
     }
 
     async fn write(

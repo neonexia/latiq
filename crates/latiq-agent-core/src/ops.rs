@@ -73,6 +73,10 @@ pub struct AgentOps {
     /// rather than once per query (the same discipline `LineageWriter` uses for
     /// its own buffer lock).
     lineage_poison_warned: Arc<AtomicBool>,
+    /// The engine's version, asked once here rather than per query: it goes on
+    /// every lineage event, and a pond WITHOUT lineage must not pay so much as
+    /// an allocation for a field it will never emit.
+    engine_version: String,
 }
 
 impl AgentOps {
@@ -83,6 +87,7 @@ impl AgentOps {
         config: AgentConfig,
     ) -> Self {
         Self {
+            engine_version: engine.version(),
             control,
             storage,
             engine,
@@ -857,6 +862,7 @@ impl AgentOps {
             meaning: DurationMeaning::Establishment,
             error: res.as_ref().err(),
             meta: None,
+            engine_version: &self.engine_version,
         });
         res
     }
@@ -885,6 +891,10 @@ impl AgentOps {
 
         let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
+        // The engine's meta is only complete when the last batch has been
+        // produced, so it rides its own channel rather than the schema oneshot:
+        // a collecting caller drains the stream first and reads it after.
+        let (meta_tx, meta_rx) = oneshot::channel::<QueryMeta>();
 
         let engine = self.engine.clone();
         let inflight = self.inflight.clone();
@@ -897,14 +907,23 @@ impl AgentOps {
                 batch_tx,
             };
             let res = engine.read_arrow(&loc, &sql2, token, &mut sink);
-            if let Err(e) = res {
-                let ae = AgentError::from(e);
-                // Deliver the error on whichever channel is still open: the schema
-                // oneshot (no batches produced yet) or the batch stream.
-                if let Some(stx) = sink.schema_tx.take() {
-                    let _ = stx.send(Err(ae));
-                } else {
-                    let _ = sink.batch_tx.blocking_send(Err(ae));
+            match res {
+                Ok(meta) => {
+                    // Sent before the sink (and so `batch_tx`) is dropped, so a
+                    // caller that waits for the end of the stream never waits
+                    // for the meta.
+                    let _ = meta_tx.send(meta);
+                }
+                Err(e) => {
+                    let ae = AgentError::from(e);
+                    // Deliver the error on whichever channel is still open: the
+                    // schema oneshot (no batches produced yet) or the batch
+                    // stream.
+                    if let Some(stx) = sink.schema_tx.take() {
+                        let _ = stx.send(Err(ae));
+                    } else {
+                        let _ = sink.batch_tx.blocking_send(Err(ae));
+                    }
                 }
             }
             inflight.complete(&op_id);
@@ -922,6 +941,7 @@ impl AgentOps {
         Ok(ArrowReadStream {
             schema,
             batches: Box::pin(ReceiverStream::new(batch_rx)),
+            meta: Some(meta_rx),
         })
     }
 
@@ -989,6 +1009,7 @@ impl AgentOps {
             meaning: DurationMeaning::Completion,
             error: res.as_ref().err(),
             meta: res.as_ref().ok().map(|r| &r.meta),
+            engine_version: &self.engine_version,
         });
         res
     }
@@ -1004,6 +1025,7 @@ impl AgentOps {
             .collect();
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut batches = stream.batches;
+        let meta = stream.meta;
         while let Some(b) = batches.next().await {
             append_batch_rows(&b?, &columns, &mut rows)?;
             if rows.len() > self.config.inline_row_cap {
@@ -1014,19 +1036,24 @@ impl AgentOps {
             }
         }
         let n = rows.len() as u64;
-        // TASK 4 NOTE: this synthesises the meta rather than carrying the
-        // engine's, because the Arrow hop returns batches and not a QueryMeta.
-        // So `tables_touched` (and the snapshot) stay empty on this path even
-        // once the bound-plan extraction populates them, and `read_collected`'s
-        // lineage events would carry no datasets. Plumbing the engine's meta
-        // through the Arrow stream belongs with the task that fills it in.
+        // The ENGINE's meta, not a fabricated one: this is the CLI/SDK read
+        // path, so a synthesised meta here would strip every dataset the engine
+        // extracted and `read_collected` would emit dataset-less lineage even
+        // once the plan extraction works. `rows` is still ours — it counts what
+        // was actually collected, which is what the caller is being handed.
+        //
+        // A meta only fails to arrive when the producer could not speak for the
+        // engine (a stream decoded from a peer's chunks), and then an empty one
+        // is the honest answer: this node did not run the query.
+        let mut meta = match meta {
+            Some(rx) => rx.await.unwrap_or_default(),
+            None => QueryMeta::default(),
+        };
+        meta.rows = n;
         Ok(QueryResult {
             columns,
             rows,
-            meta: QueryMeta {
-                rows: n,
-                ..Default::default()
-            },
+            meta,
         })
     }
 
@@ -1080,6 +1107,7 @@ impl AgentOps {
             meaning: DurationMeaning::Completion,
             error: res.as_ref().err(),
             meta: res.as_ref().ok().map(|r| &r.meta),
+            engine_version: &self.engine_version,
         });
         res
     }

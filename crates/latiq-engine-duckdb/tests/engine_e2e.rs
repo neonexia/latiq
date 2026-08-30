@@ -246,3 +246,428 @@ fn attribution_unverified_caller_has_empty_verified_fields() {
 
     fs.drop_pond(pond).unwrap();
 }
+
+/// Provenance extraction: what a statement reads and writes, taken from
+/// DuckDB's **bound** plan (`exec::referenced_tables`). Everything here is our
+/// integration with the serialiser, never DuckDB's SQL semantics: the shapes we
+/// read out of the plan, the three properties that make the extraction safe
+/// (never fails, never executes, never concatenates), and the gate that keeps a
+/// lineage-disabled pond from paying for any of it.
+mod lineage {
+    use super::*;
+    use latiq_common::DatasetRef;
+    use latiq_engine_duckdb::exec::referenced_tables;
+    use latiq_engine_duckdb::instance::PondInstance;
+
+    /// A pond with `a`, `b` and a view `vw` that joins them.
+    fn pond_with_a_view() -> (TempFs, PondId, PondInstance) {
+        let fs = TempFs::new();
+        let pond = PondId::new();
+        let loc = fs.create_pond(pond, true).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+        for sql in [
+            "CREATE TABLE a(id INTEGER, v VARCHAR)",
+            "INSERT INTO a VALUES (1,'x')",
+            "CREATE TABLE b(id INTEGER, w VARCHAR)",
+            "INSERT INTO b VALUES (1,'y')",
+            "CREATE VIEW vw AS SELECT a.id, a.v, b.w FROM a JOIN b USING (id)",
+        ] {
+            inst.conn.execute_batch(sql).unwrap();
+        }
+        (fs, pond, inst)
+    }
+
+    fn names(datasets: &[DatasetRef]) -> Vec<&str> {
+        let mut out: Vec<&str> = datasets.iter().map(|d| d.name.as_str()).collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn scalar(inst: &PondInstance, sql: &str) -> i64 {
+        inst.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn lineage_extracts_base_tables_through_a_view() {
+        // THE deciding case for using the bound plan over the parse tree: the
+        // parse tree of `SELECT * FROM vw` says only `vw`, and the base tables
+        // are unrecoverable from it. A consumer told a query read `vw` learns
+        // nothing about which data it actually depended on.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let (inputs, outputs) = referenced_tables(&inst, "SELECT * FROM vw");
+        assert_eq!(
+            names(&inputs),
+            vec!["pond.main.a", "pond.main.b"],
+            "a view must resolve to the base tables it reads"
+        );
+        assert!(
+            !names(&inputs).contains(&"pond.main.vw"),
+            "the view itself is not a dataset anything read"
+        );
+        assert!(outputs.is_empty(), "a SELECT writes nothing");
+
+        // A CTE resolves the same way — same mechanism, and the pin costs a line.
+        let (cte_inputs, _) =
+            referenced_tables(&inst, "WITH c AS (SELECT * FROM a) SELECT * FROM c");
+        assert_eq!(names(&cte_inputs), vec!["pond.main.a"]);
+    }
+
+    #[test]
+    fn lineage_distinguishes_same_named_tables_in_different_catalogs() {
+        // Two catalogs can both hold `main.events`. A bare table name would
+        // conflate them into one dataset in every consumer — which is worse
+        // than reporting nothing, because it invents a dependency.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let side = tempfile::tempdir().unwrap();
+        let side_db = side.path().join("side.duckdb");
+        inst.conn
+            .execute_batch(&format!(
+                "ATTACH '{}' AS side; CREATE TABLE side.main.a(id INTEGER);",
+                side_db.display()
+            ))
+            .unwrap();
+
+        let (inputs, _) = referenced_tables(
+            &inst,
+            "SELECT a.id FROM a JOIN side.main.a AS s ON a.id = s.id",
+        );
+        assert_eq!(
+            names(&inputs),
+            vec!["pond.main.a", "side.main.a"],
+            "the catalog must be part of a dataset's identity"
+        );
+    }
+
+    #[test]
+    fn lineage_separates_write_targets_from_read_inputs() {
+        // `INSERT INTO a SELECT * FROM b` is one dataset read and a different
+        // one written. Reporting a flat "tables touched" list would make `b`
+        // look like it was written, reversing the direction of the edge every
+        // lineage graph is built from.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let (inputs, outputs) = referenced_tables(&inst, "INSERT INTO a SELECT * FROM b");
+        assert_eq!(names(&inputs), vec!["pond.main.b"]);
+        assert_eq!(names(&outputs), vec!["pond.main.a"]);
+
+        // A DELETE both reads and writes its target: it must appear on BOTH
+        // sides, not be silently classified as one of them.
+        let (del_in, del_out) = referenced_tables(&inst, "DELETE FROM a WHERE id = 1");
+        assert_eq!(names(&del_in), vec!["pond.main.a"]);
+        assert_eq!(names(&del_out), vec!["pond.main.a"]);
+
+        // DDL targets are outputs too, or a pond's tables would appear in the
+        // graph only once something inserted into them.
+        let (_, created) = referenced_tables(&inst, "CREATE TABLE c AS SELECT * FROM a");
+        assert_eq!(names(&created), vec!["pond.main.c"]);
+        let (_, dropped) = referenced_tables(&inst, "DROP TABLE b");
+        assert_eq!(names(&dropped), vec!["pond.main.b"]);
+    }
+
+    #[test]
+    fn lineage_records_the_snapshot_each_input_was_read_at() {
+        // "Which version did this run consume" is the question a dataset
+        // version facet exists to answer; a missing or stale one makes two
+        // different reads of a changing table indistinguishable.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let latest =
+            |inst: &PondInstance| scalar(inst, "SELECT max(snapshot_id) FROM pond.snapshots()");
+
+        let before = latest(&inst);
+        let (inputs, _) = referenced_tables(&inst, "SELECT * FROM a");
+        assert_eq!(
+            inputs[0].version,
+            Some(before),
+            "an input must carry the snapshot it would be read at"
+        );
+
+        // After a write, the same query reads a NEWER snapshot — so the version
+        // tracks the data and is not a constant that happened to match.
+        inst.conn
+            .execute_batch("INSERT INTO a VALUES (2,'z')")
+            .unwrap();
+        let after = latest(&inst);
+        assert!(after > before, "the write must advance the snapshot");
+        let (inputs, _) = referenced_tables(&inst, "SELECT * FROM a");
+        assert_eq!(inputs[0].version, Some(after));
+
+        // Nothing outside DuckLake gets a version invented for it.
+        inst.conn
+            .execute_batch("CREATE TEMP TABLE t(id INTEGER)")
+            .unwrap();
+        let (temp_inputs, _) = referenced_tables(&inst, "SELECT * FROM t");
+        assert_eq!(names(&temp_inputs), vec!["temp.main.t"]);
+        assert_eq!(
+            temp_inputs[0].version, None,
+            "a table with no snapshot must not be given one"
+        );
+    }
+
+    #[test]
+    fn lineage_unparseable_sql_yields_no_tables_rather_than_failing() {
+        // Extraction is best-effort provenance riding on a real query: it may
+        // never turn a working query into a failure, and `json_serialize_plan`
+        // reports these IN BAND (`{"error":true,…}`) rather than raising, so a
+        // caller that only handled a raised error would hand the caller a plan
+        // document that is really an error object.
+        let (_fs, _id, inst) = pond_with_a_view();
+        for sql in [
+            "SELEC bogus",                     // syntax error
+            "SELECT * FROM nonexistent_table", // binder error
+            "",                                // nothing at all
+        ] {
+            let (inputs, outputs) = referenced_tables(&inst, sql);
+            assert!(
+                inputs.is_empty() && outputs.is_empty(),
+                "{sql:?} must yield no datasets, got {inputs:?} / {outputs:?}"
+            );
+        }
+        // A batch whose LATER statement cannot bind against the catalog AS IT
+        // STANDS (the table its first statement would create does not exist
+        // yet) yields nothing rather than failing. A known, accepted limit of
+        // planning without executing: no lineage beats fabricated lineage.
+        let (batch_in, batch_out) = referenced_tables(
+            &inst,
+            "CREATE TABLE later(i INTEGER); INSERT INTO later VALUES (1)",
+        );
+        assert!(
+            batch_in.is_empty() && batch_out.is_empty(),
+            "an unbindable batch must yield nothing, got {batch_in:?} / {batch_out:?}"
+        );
+
+        // Anti-vacuity: the same pond, a statement that does resolve.
+        let (inputs, _) = referenced_tables(&inst, "SELECT * FROM a");
+        assert_eq!(names(&inputs), vec!["pond.main.a"]);
+
+        // And a multi-statement batch that DOES bind reports every statement's
+        // datasets — a batch is one operation, not only its first statement.
+        let (multi_in, _) = referenced_tables(&inst, "SELECT * FROM a; SELECT * FROM b");
+        assert_eq!(names(&multi_in), vec!["pond.main.a", "pond.main.b"]);
+    }
+
+    #[test]
+    fn lineage_extraction_does_not_execute_the_statement() {
+        // The property that disqualified every alternative (`EXPLAIN ANALYZE`,
+        // profiling): planning a statement must not RUN it. This is the test
+        // that stops a future refactor reaching for one of them — if it does,
+        // rows appear, snapshots advance and a file gets written.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("copied.parquet");
+
+        let rows_before = scalar(&inst, "SELECT count(*) FROM a");
+        let snapshot_before = scalar(&inst, "SELECT max(snapshot_id) FROM pond.snapshots()");
+
+        referenced_tables(&inst, "INSERT INTO a VALUES (99,'inserted')");
+        referenced_tables(&inst, "DELETE FROM a");
+        referenced_tables(&inst, "DROP TABLE b");
+        referenced_tables(
+            &inst,
+            &format!(
+                "COPY (SELECT * FROM a) TO '{}' (FORMAT PARQUET)",
+                target.display()
+            ),
+        );
+
+        assert_eq!(
+            scalar(&inst, "SELECT count(*) FROM a"),
+            rows_before,
+            "no row may be inserted or deleted by planning a statement"
+        );
+        assert_eq!(
+            scalar(&inst, "SELECT max(snapshot_id) FROM pond.snapshots()"),
+            snapshot_before,
+            "planning must not commit anything"
+        );
+        assert!(
+            !target.exists(),
+            "planning a COPY … TO must not write its target"
+        );
+        // And `b`, whose DROP was planned, is still queryable.
+        assert_eq!(scalar(&inst, "SELECT count(*) FROM b"), 1);
+    }
+
+    #[test]
+    fn lineage_a_plan_over_the_size_cap_is_skipped_not_parsed() {
+        // Plan JSON scales with the number of LITERALS, not tables: a 1000-
+        // element `IN` list serialises to hundreds of KB. Over the cap we
+        // record nothing rather than spend a multi-megabyte JSON parse on
+        // provenance — the query itself is unaffected either way.
+        let (_fs, _id, inst) = pond_with_a_view();
+        let list = (0..40_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let big = format!("SELECT * FROM a WHERE id IN ({list})");
+        let (inputs, outputs) = referenced_tables(&inst, &big);
+        assert!(
+            inputs.is_empty() && outputs.is_empty(),
+            "an oversized plan must be skipped, got {inputs:?}"
+        );
+        // Anti-vacuity: a small IN list over the same shape IS extracted, so
+        // the emptiness above is the cap and not a query the walker cannot read.
+        let (small_inputs, _) = referenced_tables(&inst, "SELECT * FROM a WHERE id IN (1,2,3)");
+        assert_eq!(names(&small_inputs), vec!["pond.main.a"]);
+    }
+
+    #[test]
+    fn lineage_plan_key_names_still_match_this_duckdb_version() {
+        // The plan's key names are serialisation internals with NO stability
+        // guarantee, and they differ per table function. A DuckDB upgrade that
+        // renames one would make extraction silently return nothing for that
+        // scan kind — under-reporting, which is the worst failure mode for
+        // provenance and the exact reason the purpose-built C API was rejected.
+        // So: exercise one query per scan kind and assert the datasets, so an
+        // upgrade fails HERE with a name, rather than quietly downstream.
+        let (fs, id, inst) = pond_with_a_view();
+        let parquet = fs.pond_location(id).unwrap().data_path.to_string() + "/probe.parquet";
+        inst.conn
+            .execute_batch(&format!(
+                "COPY (SELECT 1 AS id) TO '{parquet}' (FORMAT PARQUET); \
+                 CREATE TEMP TABLE t(id INTEGER);"
+            ))
+            .unwrap();
+
+        // ducklake_scan: catalog_name / schema_name / table_name + snapshot.
+        let (ducklake, _) = referenced_tables(&inst, "SELECT * FROM a");
+        assert_eq!(
+            names(&ducklake),
+            vec!["pond.main.a"],
+            "a DuckLake scan no longer resolves: its plan keys \
+             (function_data.catalog_name/schema_name/table_name) have moved"
+        );
+        assert!(
+            ducklake[0].version.is_some(),
+            "the DuckLake scan's function_data.snapshot.snapshot_id has moved"
+        );
+
+        // seq_scan: catalog / schema / table — different key names entirely.
+        let (seq, _) = referenced_tables(&inst, "SELECT * FROM t");
+        assert_eq!(
+            names(&seq),
+            vec!["temp.main.t"],
+            "a core table scan no longer resolves: its plan keys \
+             (function_data.catalog/schema/table) have moved"
+        );
+
+        // read_parquet: `files`, and the standard `file` namespace kept intact.
+        let (files, _) =
+            referenced_tables(&inst, &format!("SELECT * FROM read_parquet('{parquet}')"));
+        assert_eq!(
+            names(&files),
+            vec![parquet.as_str()],
+            "a file scan no longer resolves: function_data.files has moved"
+        );
+        assert_eq!(
+            files[0].namespace.as_deref(),
+            Some("file"),
+            "an external source must keep its standard scheme"
+        );
+    }
+
+    #[test]
+    fn lineage_disabled_pond_pays_for_no_extraction() {
+        // The per-pond opt-in exists because extraction costs a second bind of
+        // every statement. A pond that records no lineage must therefore not
+        // just emit nothing — it must not extract, which is observable as an
+        // empty meta on exactly the same queries.
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let id = Identity::claimed(Some("agent-a"));
+        let mut off = fs.create_pond(PondId::new(), false).unwrap();
+        off.lineage = false;
+        let mut on = fs.create_pond(PondId::new(), true).unwrap();
+        on.lineage = true;
+
+        for loc in [&off, &on] {
+            eng.write_query(loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
+                .unwrap();
+        }
+        let quiet = eng
+            .read_query(&off, "SELECT * FROM t", AbortToken::new())
+            .unwrap();
+        assert!(
+            quiet.meta.tables_touched.is_empty() && quiet.meta.inputs.is_empty(),
+            "a lineage-disabled pond must not extract, got {:?}",
+            quiet.meta
+        );
+        let loud = eng
+            .read_query(&on, "SELECT * FROM t", AbortToken::new())
+            .unwrap();
+        assert_eq!(
+            loud.meta.tables_touched,
+            vec!["pond.main.t"],
+            "the opted-in pond gets its inputs — so the silence above is the flag"
+        );
+    }
+
+    #[test]
+    fn lineage_every_query_path_reports_its_datasets() {
+        // Three engine entry points produce a meta, and each is the read path
+        // for a different surface: `read_arrow` is what the CLI and SDK use, so
+        // a meta missing there means the primary read path has no provenance at
+        // all. Pinned per path, because they are three different code paths.
+        use arrow::datatypes::SchemaRef;
+        use arrow::record_batch::RecordBatch;
+        use latiq_engine::ArrowSink;
+        use std::ops::ControlFlow;
+
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let id = Identity::claimed(Some("agent-a"));
+        let mut loc = fs.create_pond(PondId::new(), true).unwrap();
+        loc.lineage = true;
+        eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
+            .unwrap();
+
+        let write = eng
+            .write_query(&loc, "INSERT INTO t VALUES (1)", &id, AbortToken::new())
+            .unwrap();
+        assert_eq!(write.meta.outputs.len(), 1, "a write reports its target");
+        assert_eq!(write.meta.outputs[0].name, "pond.main.t");
+        assert!(write.meta.inputs.is_empty(), "VALUES reads no dataset");
+
+        let read = eng
+            .read_query(&loc, "SELECT i FROM t", AbortToken::new())
+            .unwrap();
+        assert_eq!(read.meta.tables_touched, vec!["pond.main.t"]);
+
+        struct Silent;
+        impl ArrowSink for Silent {
+            fn schema(&mut self, _: SchemaRef) -> ControlFlow<()> {
+                ControlFlow::Continue(())
+            }
+            fn batch(&mut self, _: RecordBatch) -> ControlFlow<()> {
+                ControlFlow::Continue(())
+            }
+        }
+        let streamed = eng
+            .read_arrow(&loc, "SELECT i FROM t", AbortToken::new(), &mut Silent)
+            .unwrap();
+        assert_eq!(
+            streamed.tables_touched,
+            vec!["pond.main.t"],
+            "the streaming read path must report its inputs too"
+        );
+        assert_eq!(streamed.rows, 1, "and the rows it streamed");
+    }
+
+    #[test]
+    fn lineage_engine_reports_its_real_version() {
+        // The processing-engine facet claims what ran the query. A hard-coded
+        // string would be wrong the first time the bundled DuckDB is bumped,
+        // and nothing would notice.
+        let eng = DuckEngine::new();
+        let reported = eng.version();
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let actual = eng
+            .read_query(&loc, "SELECT version() AS v", AbortToken::new())
+            .unwrap();
+        assert_eq!(
+            serde_json::json!(reported),
+            actual.rows[0][0],
+            "the reported version must be what the engine itself says"
+        );
+        assert!(reported.starts_with('v'), "got {reported:?}");
+    }
+}
