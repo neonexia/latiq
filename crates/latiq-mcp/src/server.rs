@@ -492,7 +492,7 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
     /// For writes/DDL use write_query. Results are bounded by the inline cap.
     #[tool(
         description = "Run a read-only SQL query (SELECT, or read-only metadata like SHOW/DESCRIBE) against a pond. \
-For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here. \
+For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here, as is transaction control (BEGIN/COMMIT/ROLLBACK): Latiq manages the transaction. \
 Latiq prefers ANSI SQL; DuckDB extensions are tolerated. Discover tables with `SHOW TABLES` (or `information_schema.tables`/`information_schema.columns`) first. \
 Do: add WHERE/LIMIT on selective columns and call explain_query if unsure of cost. Don't: unbounded `SELECT *` on large tables — results are capped (~10k rows); narrow, aggregate, or materialize with CREATE TABLE AS SELECT. \
 Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correct. See latiq://recipes/large-results.",
@@ -520,10 +520,13 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     }
 
     /// Run a write/DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/CTAS) against a
-    /// pond. Writes are attributed to your agent identity.
+    /// pond. Writes are attributed to your agent identity, which Latiq records
+    /// inside the transaction it owns — caller SQL must not do its own
+    /// BEGIN/COMMIT/ROLLBACK.
     #[tool(
         description = "Run a write or DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE TABLE AS SELECT) against a pond. \
 Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` — `commit_extra_info` carries the verified-vs-claimed evidence). \
+Latiq runs your statement inside its OWN transaction and records the author just before committing, so send plain statements — several are fine, but do NOT include BEGIN/COMMIT/ROLLBACK/START TRANSACTION. Your own COMMIT ends Latiq's transaction before the author is written, and the change lands in the pond's history with NO author. \
 Marked destructive because it CAN delete data; clients may require approval. \
 Load external public files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'` (public/anonymous only). \
 Do: add column COMMENTs so other agents understand your tables. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",
@@ -810,7 +813,7 @@ impl ServerHandler for LatiqServer {
         )
         .with_instructions(
             "Latiq — the agent-native data pond. Allocate a pond (a private DuckLake workspace), \
-write/read SQL with native attribution. \
+write/read SQL with native attribution. Latiq owns the transaction around every write — send plain statements, never BEGIN/COMMIT/ROLLBACK. \
 FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new one; then write_query/read_query. \
 TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
 pull_catalog for an external database/lakehouse (iceberg) — you pull a subset into the pond, then work there \
