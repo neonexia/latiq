@@ -1754,10 +1754,53 @@ impl ArrowSink for ChannelSink {
     }
 }
 
+/// DuckDB type names whose parentheses hold a **type modifier** — a width, a
+/// precision, a scale — rather than a value. Digits inside the parens that
+/// directly follow one of these are part of the *type*, so redacting them turns
+/// `DECIMAL(10,2)` into DDL that no longer says what the column is.
+///
+/// Verified against DuckDB (every entry here is accepted as `CREATE TABLE
+/// x(c <name>(n))`; the ones it rejects — `TIME`, `BLOB`, `DOUBLE`, `TIMESTAMPTZ`,
+/// `TIMESTAMP_S/_MS/_NS` — are deliberately absent, since a paren after them is
+/// not a type modifier at all).
+///
+/// **`INTERVAL` is deliberately excluded.** DuckDB parses `INTERVAL (5) DAY` as a
+/// value expression (`to_days(5)`), so preserving digits there would be a
+/// redaction hole. Losing an interval's precision is the cheaper mistake.
+const PARAMETERISED_TYPES: &[&str] = &[
+    "DECIMAL",
+    "DEC",
+    "NUMERIC",
+    "VARCHAR",
+    "NVARCHAR",
+    "CHAR",
+    "CHARACTER",
+    "VARYING", // the second word of `CHARACTER VARYING(n)`
+    "BPCHAR",
+    "TEXT",
+    "STRING",
+    "TIMESTAMP",
+    "DATETIME",
+    "BIT",
+    "BITSTRING",
+    "FLOAT",
+];
+
+fn is_parameterised_type(word: &str) -> bool {
+    PARAMETERISED_TYPES
+        .iter()
+        .any(|t| word.eq_ignore_ascii_case(t))
+}
+
 /// Minimal SQL-shape redaction for the audit log and the lineage `SQLJobFacet`
 /// (one redactor, so provenance can never carry a literal the trail hid): drop comments (so literals
 /// hidden in them can't leak), then collapse quoted-string and numeric *literals*
-/// to `?`. Identifiers that merely contain digits (`t1`, `events2`) are preserved.
+/// to `?`. Identifiers that merely contain digits (`t1`, `events2`) are preserved,
+/// and so are the numbers inside a **type specification** (`DECIMAL(10,2)`,
+/// `VARCHAR(64)`) — those describe a schema, not a value, and a DDL statement
+/// whose types were collapsed is neither readable nor re-runnable. Values inside
+/// a DDL statement (a CTAS predicate) are still collapsed: the exemption is
+/// scoped to one paren directly after a type keyword, never to a statement kind.
 /// (A full parser-based redactor is future work.)
 pub(crate) fn redact_sql(sql: &str) -> String {
     let decommented = strip_sql_comments(sql);
@@ -1767,6 +1810,13 @@ pub(crate) fn redact_sql(sql: &str) -> String {
     // right after one (e.g. the `1` in `t1`) is part of that identifier, not a
     // numeric literal, so it must not be collapsed.
     let mut prev_ident = false;
+    // The identifier run currently being emitted, and whether the one that just
+    // ended names a parameterised type (so the next `(` opens type modifiers).
+    let mut word = String::new();
+    let mut type_word_pending = false;
+    // Inside `…(` of a type specification, where digits are the type, not a
+    // value. Type modifiers do not nest, so one flag and the next `)` suffice.
+    let mut in_type_params = false;
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
@@ -1783,17 +1833,44 @@ pub(crate) fn redact_sql(sql: &str) -> String {
                 }
                 out.push('?');
                 prev_ident = false;
+                word.clear();
+                type_word_pending = false;
             }
-            d if d.is_ascii_digit() && !prev_ident => {
+            d if d.is_ascii_digit() && !prev_ident && !in_type_params => {
                 // Numeric literal: collapse the digit/decimal run.
                 while matches!(chars.peek(), Some(n) if n.is_ascii_digit() || *n == '.') {
                     chars.next();
                 }
                 out.push('?');
                 prev_ident = false;
+                word.clear();
+                type_word_pending = false;
             }
             other => {
-                prev_ident = other.is_ascii_alphanumeric() || other == '_';
+                let ident_char = other.is_ascii_alphanumeric() || other == '_';
+                prev_ident = ident_char;
+                if ident_char {
+                    word.push(other);
+                } else {
+                    if !word.is_empty() {
+                        type_word_pending = is_parameterised_type(&word);
+                        word.clear();
+                    }
+                    match other {
+                        '(' => {
+                            in_type_params = type_word_pending;
+                            type_word_pending = false;
+                        }
+                        ')' => {
+                            in_type_params = false;
+                            type_word_pending = false;
+                        }
+                        // Whitespace between the keyword and its `(` is allowed;
+                        // anything else ends the type specification.
+                        c if !c.is_whitespace() => type_word_pending = false,
+                        _ => {}
+                    }
+                }
                 out.push(other);
             }
         }
@@ -1889,6 +1966,63 @@ mod tests {
         assert_eq!(
             r.split_whitespace().collect::<Vec<_>>(),
             ["SELECT", "id", "FROM", "t"]
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_the_width_of_a_type_specification() {
+        // Regression pin: `DECIMAL(10,2)` used to record as `DECIMAL(?,?)`, so
+        // the DDL in the trail was neither readable as a schema nor re-runnable
+        // and the column's type could not be recovered by a reader.
+        assert_eq!(
+            redact_sql("CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))"),
+            "CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))"
+        );
+        // Same for a cast, and for a width written with a space before the paren.
+        assert_eq!(
+            redact_sql("SELECT CAST(x AS DECIMAL (18, 4)), CAST(y AS VARCHAR(64)) FROM t"),
+            "SELECT CAST(x AS DECIMAL (18, 4)), CAST(y AS VARCHAR(64)) FROM t"
+        );
+    }
+
+    #[test]
+    fn redaction_collapses_values_in_a_ddl_with_a_predicate() {
+        // The case that makes "skip redaction for DDL" wrong: a CTAS is DDL, but
+        // its predicate carries user values that must still be redacted.
+        assert_eq!(
+            redact_sql(
+                "CREATE TABLE big AS SELECT * FROM orders \
+                 WHERE amount > 9999 AND customer = 'acme'"
+            ),
+            "CREATE TABLE big AS SELECT * FROM orders WHERE amount > ? AND customer = ?"
+        );
+    }
+
+    #[test]
+    fn redaction_collapses_inserted_values() {
+        assert_eq!(
+            redact_sql("INSERT INTO t VALUES (1, 'acme', 100.50)"),
+            "INSERT INTO t VALUES (?, ?, ?)"
+        );
+    }
+
+    #[test]
+    fn redaction_collapses_an_interval_parenthesised_value() {
+        // `INTERVAL (5) DAY` is a *value* expression in DuckDB, not a type
+        // modifier, so INTERVAL is deliberately not on the type-keyword list.
+        assert_eq!(
+            redact_sql("SELECT * FROM t WHERE d > now() - INTERVAL (9999) DAY"),
+            "SELECT * FROM t WHERE d > now() - INTERVAL (?) DAY"
+        );
+    }
+
+    #[test]
+    fn redaction_does_not_treat_a_call_as_a_type_specification() {
+        // Only the type keywords open a preserved paren; a function call whose
+        // argument happens to be numeric is still a value.
+        assert_eq!(
+            redact_sql("SELECT count(1), round(amount, 2) FROM t WHERE id = 7"),
+            "SELECT count(?), round(amount, ?) FROM t WHERE id = ?"
         );
     }
 
