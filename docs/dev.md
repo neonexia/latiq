@@ -148,6 +148,7 @@ cargo run -p latiq -- node add --port 51401 --root ~/.latiq
 | `--advertise-addr` | `127.0.0.1:<port>` | The node's **internal** `host:port`, advertised to the control plane so peer nodes can forward pond requests. Agents never dial it |
 | `--public-mcp-url` | derived from `--advertise-addr` | The URL **agents** dial, e.g. `https://latiq.example.com/mcp` (`$LATIQ_PUBLIC_MCP_URL`). Published as the RFC 9728 `resource` and in the 401 challenge — behind a gateway this must be the *gateway's* URL, or conforming clients reject the metadata document |
 | `--auth-issuer` / `--auth-audience` / `--auth-jwks-uri` | — | As `latiq serve` above; turns verification on for MCP and Data/Stream |
+| `--lineage-backend-url` | — | Also POST every lineage event to an OpenLineage receiver (`$LATIQ_LINEAGE_BACKEND_URL`) — the **full** endpoint, e.g. `http://marquez:5000/api/v1/lineage`. Validated at startup; additive, never in the query path, no credentials sent |
 
 `--root` defaults to `~/.latiq` (pass `--root /data` to override); the node registers with the control plane at `$LATIQ_SERVER` (default `http://127.0.0.1:51400`). So `LATIQ_SERVER=… latiq serve --root /data` needs nothing more.
 
@@ -170,6 +171,7 @@ export LATIQ_SERVER=http://127.0.0.1:51400      # only if you changed --server-p
 latiq pond create --name demo                 # control plane picks a node; --name optional (auto-named)
 latiq pond create --name big --tier large     # resource tier (default medium); caps the pond's memory + CPU
 latiq pond create --name geo --extensions spatial,fts  # load DuckDB extensions on the pond
+latiq pond create --name audited --lineage    # record OpenLineage provenance (fixed at creation; see below)
 latiq pond list                               # discover ponds (control-plane registry)
 latiq pond describe demo                       # metadata (incl. tier) + table summary
 latiq pond drop demo --confirm                 # DESTRUCTIVE — requires --confirm
@@ -225,6 +227,23 @@ error [pond_not_found]: Pond 'ghost' does not exist.
   suggest: Call list_ponds to see available ponds, or allocate_pond to create one.
   see: latiq://troubleshooting/pond-not-found
 ```
+
+### Lineage (OpenLineage, opt-in per pond)
+
+A pond allocated with `--lineage` records an OpenLineage event pair (a `START` plus a `COMPLETE`/`FAIL`/`ABORT`) for **every** query — reads included — as batched JSONL in its own `lineage/` directory. The flag is chosen at creation and **fixed for the pond's lifetime**; ponds without it pay nothing.
+
+```bash
+latiq pond create --name audited --lineage
+latiq query --pond audited --agent-id alice "CREATE TABLE t(id INTEGER)"
+latiq query --pond audited --agent-id alice "INSERT INTO t VALUES (1),(2)"
+latiq query --pond audited "SELECT count(*) FROM t"
+latiq pond list -f json                       # each pond's `lineage` flag (describe reports it too)
+ls ~/.latiq/ponds/<pond-id>/lineage/          # the event files: {unix-millis}-{uuid}.jsonl
+```
+
+**Reading it back is `get_lineage`, an agent tool** — "where did this data come from?" is an agent question, so it lives on MCP and there is deliberately no CLI command for it (invariant 1: the CLI is not an agent). The Data gRPC `GetLineage` RPC exists only so a node that doesn't own the pond can forward to the one that does — the events are files on the node that ran the query. Point an MCP client at the node (`http://127.0.0.1:51402/mcp`, see *The agent surface* below) and call `get_lineage {pond:'audited'}` — newest first, events returned verbatim, with the pond's `lineage_dir` in the response; `limit`/`since`/`before` page it (`latiq-client` is the agent-sim client to drive it from a test).
+
+A raw `ls` may show nothing right after a query: events are written a batch at a time (64) and on shutdown. `get_lineage` flushes that pond's buffer before reading, so it always sees the query you just ran. To also POST every event to an OpenLineage backend, start the node with `--lineage-backend-url http://localhost:5000/api/v1/lineage` (`$LATIQ_LINEAGE_BACKEND_URL`) — additive, never in the query path, no credentials sent.
 
 ### Query-by-URI ingestion (public files)
 
@@ -388,13 +407,13 @@ Agents (frontier LLMs), not the CLI, point an MCP client at the node's MCP endpo
 http://127.0.0.1:51402/mcp     (Streamable HTTP transport)
 ```
 
-Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`, `write_query`, `explain_query` — plus `latiq://` resources and prompt SOPs for guidance. Results carry both a text block and `structuredContent`; errors set `isError` with the structured envelope. **Identity arrives in the transport, never in a tool argument** — the claimed leaf is the `latiq-agent-id` HTTP header, and a verified principal is `Authorization: Bearer`. With no issuer configured (the dev default) identity stays claimed, default `anonymous`. To exercise this surface programmatically in tests, use `latiq-client` (the agent-sim MCP client) — never from the CLI.
+Tools: `allocate_pond`, `describe_pond`, `list_ponds`, `drop_pond`, `read_query`, `write_query`, `explain_query`, `get_lineage` (the pond's own provenance) — plus `latiq://` resources and prompt SOPs for guidance. Results carry both a text block and `structuredContent`; errors set `isError` with the structured envelope. **Identity arrives in the transport, never in a tool argument** — the claimed leaf is the `latiq-agent-id` HTTP header, and a verified principal is `Authorization: Bearer`. With no issuer configured (the dev default) identity stays claimed, default `anonymous`. To exercise this surface programmatically in tests, use `latiq-client` (the agent-sim MCP client) — never from the CLI.
 
 ---
 
 ## What works now vs. later
 
-**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, structured access traces (`latiq::access` log target, with `outcome`), **OAuth 2.1 authentication across all three surfaces** (opt-in via `--auth-issuer`; the caller's token is replayed on the node hop and re-verified by the owner), **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), and **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads).
+**Now (Slice 0+ / M1–M11 + forwarding + Arrow streaming + tiers):** pond lifecycle, SQL read/write with native attribution, `explain`, native DuckLake metadata (`pond.snapshots()` for history/attribution; `SHOW TABLES` / `information_schema` for catalog introspection — nothing layered on top), query-by-URI ingestion of public files, query cancellation + prompt resource release, the completed MCP agent surface (tools + resources + prompts), the Data and Admin gRPC surfaces, structured access traces (`latiq::access` log target, with `outcome`), **OAuth 2.1 authentication across all three surfaces** (opt-in via `--auth-issuer`; the caller's token is replayed on the node hop and re-verified by the owner), **multi-node forwarding behind a front door** (any node greets, resolves the owner, forwards), **Arrow streaming reads** (`Stream/ReadArrow`, Arrow IPC over our own gRPC — uncapped for the SDK; MCP/CLI collect to JSON at the edge), **per-pond resource tiers** (`--tier`; caps the pond's DuckDB memory + threads), and **opt-in per-pond OpenLineage lineage** (`--lineage`; JSONL in the pond's own `lineage/`, read over MCP with `get_lineage`, optional HTTP backend).
 
 **Later slices:** authorization (pond ownership + grants bound to the verified subject), rate limiting, OpenTelemetry, node-liveness reaping (a crashed node currently stays `active`), disk quotas, a packaged SDK (and, if generic Flight/ADBC interop is ever needed, the Flight protocol on top of the existing Arrow stream).
 

@@ -8,7 +8,7 @@ The shared rules for writing any test (which layer earns it, assert *why*, no va
 
 ## Three drivers (one per audience)
 - **`sdk/`** — Python (`latiq` wheel + `pyarrow`/`pandas`). All SDK surfaces, **Arrow→pandas analysis asserted == SQL**, uncapped Arrow streaming past the 10k cap, multi-node placement + greeter forwarding.
-- **`agent/`** — TypeScript, **Vercel AI SDK MCP client** (the same client an `ai` agent uses), driven by a *scripted* sequence (no live LLM → deterministic, no API key). Every MCP tool + read-only guard + structured-error contract; resources + prompt SOPs via the raw MCP SDK client (the AI SDK client doesn't surface those).
+- **`agent/`** — TypeScript, **Vercel AI SDK MCP client** (the same client an `ai` agent uses), driven by a *scripted* sequence (no live LLM → deterministic, no API key). Every MCP tool **except `get_lineage`** + read-only guard + structured-error contract; resources + prompt SOPs via the raw MCP SDK client (the AI SDK client doesn't surface those). **Lineage is a known e2e gap:** nothing here allocates a pond with `lineage: true` or calls `get_lineage`, so the tool is covered only by the in-process Rust tests (`crates/latiq/tests/mcp.rs`, `latiq-agent-core`'s `tests/agent_ops.rs`) and never against the dockerized cluster — where forwarding to the pond's *owner* (the only node holding the event files) is the part e2e would actually prove.
 - **`perf/`** — Python SDK. `run_perf.py` is the nightly smoke gate (mid-size write/read/pandas
   throughput + aggregate p50/p95 + cross-node fan, recorded + floored). `read_bench.py` +
   `report.py` are a **characterization** benchmark, not a gate: read concurrency on a shared

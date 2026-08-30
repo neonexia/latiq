@@ -48,7 +48,12 @@ store — different reader, different question.
 It is fixed for the pond's lifetime: an existing pond cannot be switched on, and
 `describe_pond` reports the flag so a caller can tell whether `get_lineage` will
 have anything to say. A pond that did not opt in pays nothing — no event, no
-formatting, no directory lookup, no writer.
+formatting, no directory lookup, no writer — with one structural exception it
+does see: both read paths now run inside `exec::in_read_txn` on every pond
+regardless of the flag, so a lineage input reports the version the read
+observed. It is ungated because it measured *faster* than the unbracketed read
+(`crates/latiq-engine-duckdb/CLAUDE.md`), but it is a change to a lineage-off
+pond's query path all the same.
 
 **One event pair per query.** A `START` and a terminal `COMPLETE` / `FAIL` /
 `ABORT` (a cancelled or timed-out query aborts; a consumer that cannot tell that
@@ -67,6 +72,15 @@ under two pond-local snapshot ids, only one of them real.
 written. Table-level, not column-level. A statement whose plan did not resolve
 carries **no** datasets rather than guessed ones — an invented input is worse
 than a missing one.
+
+**A `catalog_pull` is one of those queries**, and the most valuable of them: the
+external catalog is detached before the call returns, so after a pull nothing in
+the pond — not the catalog, not the snapshots — remembers where its rows came
+from. Both sides are named while the catalog is still attached; the pond table
+it created is the output, and the source table is an input under the
+**catalog's own locator** (`ducklake:<metadata>`, the iceberg endpoint +
+warehouse) rather than the pond-local alias it was mounted as, so our events
+join with the source's own lineage exactly as an `s3://` or `file` dataset does.
 
 **Versions are native DuckLake snapshots**, on the standard
 `datasetVersion` facet. A read reports the exact snapshot it observed; a write
@@ -89,9 +103,30 @@ the pond's owning node. Newest first, events returned **verbatim** — not
 round-tripped through our own struct, so an event written by a different build
 of Latiq keeps every field it was recorded with. `since` is an inclusive lower
 bound, `before` an exclusive upper one, and a page is never cut in the middle of
-one `eventTime`, so walking `before` backwards visits every event exactly once.
+one `eventTime`, so walking `before` backwards visits every event exactly once —
+with one degenerate exception: a *full* page whose events all share a single
+`eventTime` (more events in one millisecond than `limit`) is returned uncut, and
+a cursor taken from it skips the rest of that millisecond. Raise `limit` if a
+pond can really do that.
 Malformed lines and unreadable batch files are **counted and reported**: a short
 answer must never look like a complete one.
+
+**Four caps, and one of them is not about page size.** `limit` defaults to 50
+(the MCP surface's choice — it is the agent's context being spent) and is
+clamped to `MAX_LIMIT` 500; a page also stops at `MAX_BYTES` 256 KB, because
+events differ in size by more than an order of magnitude and a count alone does
+not bound a response. The non-obvious one is `MAX_FILES` 500: only the 500
+newest batch files are examined, so a pond with a longer history comes back
+`truncated` even when the page is not full — otherwise a `since`/`before` filter
+matching nothing recent would walk the whole history for a page it will never
+fill.
+
+**The pond's own writer is flushed on the read path**, for just that pond,
+before the directory is listed. A batch is 64 events and one operation
+contributes 2, so without it a quiet pond would show nothing and the agent's own
+just-finished query — the first thing anyone looks for — would be missing.
+Flushing every pond on the node to answer a question about one would put
+unrelated `fsync`s on the call, so it does not.
 
 **An optional OpenLineage HTTP backend.** `--lineage-backend-url` /
 `LATIQ_LINEAGE_BACKEND_URL` on `latiq node add` — the full endpoint to POST to,
@@ -141,8 +176,10 @@ climbing is the sole signal that a backend has stopped keeping up.
 
 **A bounded flush on shutdown — not a graceful drain.** The writer flushes on
 `Drop`, so a teardown that drops the last `AgentOps` loses nothing — but SIGTERM
-ends the process rather than dropping anything, and up to one batch per pond
-(plus the sink's whole backlog) would go with it. That is the last few queries
+ends the process rather than dropping anything, and every pond's buffer (plus
+the sink's whole backlog) would go with it — normally a partial batch, but a
+pond whose writes have been failing holds its requeued batches too, up to the
+10 000-event cap. That is the last few queries
 before the node went down, which is exactly the window an incident asks about.
 So the `latiq` binary catches SIGTERM/Ctrl-C and the node flushes each pond's
 files and then drains the sink.
@@ -156,11 +193,19 @@ Three things this deliberately is not:
   events that are lost, exactly as they were before this existed. The full
   sequence (stop accepting → abort in-flight → checkpoint → deregister) is still
   a target, and this is where it goes.
-- **Not unbounded.** The whole sequence has a five-second budget, after which
+- **Not unbounded.** The whole sequence has a fifteen-second budget, after which
   the node exits anyway and says in a `warn!` what it could not flush. The file
   flush fsyncs on a blocking pool it shares with batch writes and `getaddrinfo`;
   installing a signal handler also takes away the operator's second-Ctrl-C
   escape. Losing some events is strictly better than a node that will not die.
+  The number is a ceiling and not a cost — a node with no backend configured
+  drains instantly — and it is **deliberately larger than the sink's 10-second
+  POST ceiling**: the drain cannot outrun a request already in flight, so a
+  budget below that ceiling would let one hung backend discard the whole backlog
+  in exactly the case the drain exists for. The two constants live in different
+  crates and a `const` assertion in `latiq-pond-node` keeps them composed. The
+  upper bound is the orchestrator's grace period (30s by default on k8s), which
+  SIGKILLs the node regardless.
 - **Not installed by the library.** The signal handler lives in the `latiq`
   binary, never in `latiq-pond-node`. `run_pond_node` is also what the SDK's
   embedded `LocalCluster` and the Python wheel run *inside a host process*, and
@@ -184,7 +229,7 @@ facet:
 | OpenLineage concept | Latiq mapping | Trust |
 |---|---|---|
 | **Job** | the pond + the op + the target dataset — the stable, recurring thing | derived |
-| **Run** | **one query execution**, id minted by Latiq | **ours, unforgeable** |
+| **Run** | **one query execution**, id minted by Latiq | **ours — never a caller argument** (but see *What lineage does not promise*) |
 | **Parent run** | the caller's workflow / step, opaque | **claimed, never verified** |
 
 Same discipline as identity: verify what's verifiable, record the rest as
@@ -280,7 +325,9 @@ than getting columns perfectly right later.
 `latiq-lineage` is protocol-neutral like `latiq-agent-core` that depends on it
 (invariant 5). The HTTP sink is the one deliberate exception — it is HTTP by
 definition — and it sits behind the `http-sink` Cargo feature that only
-`latiq-pond-node` enables. With the feature off the crate does not even depend
+`latiq-pond-node` enables (outside dev-dependencies: `latiq-agent-core` turns it
+on for the two tests that pin the sink's promises, which resolver 2 keeps out of
+the shipped binary). With the feature off the crate does not even depend
 on `reqwest`, so the neutrality of the rest is enforced by Cargo rather than by
 a reviewer noticing. What the writer and the core see is `EventSink`, a trait
 over `&str` with no transport in it.

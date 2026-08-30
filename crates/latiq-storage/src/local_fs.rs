@@ -187,6 +187,10 @@ mod tests {
 
     #[test]
     fn ensure_pond_on_a_materialised_lineage_pond_leaves_it_intact() {
+        // Regression pin (7f0e518): `create_lineage_dir` ran an unconditional
+        // `create_dir_all` on every query, so a transient mkdir error turned an
+        // ordinary read — which touches nothing under `lineage/` — into a
+        // storage error. The existence fast path is what this holds in place.
         // ensure_pond runs on every query, so re-ensuring must be a no-op:
         // it must succeed and must not disturb events already written there.
         let tmp = std::env::temp_dir().join(format!("latiq-localfs-test-{}", PondId::new()));
