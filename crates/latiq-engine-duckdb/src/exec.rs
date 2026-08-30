@@ -144,26 +144,6 @@ fn max_snapshot(inst: &PondInstance, cat_quoted: &str) -> Option<i64> {
         .flatten()
 }
 
-/// The snapshot this connection is **currently reading at**, or `None` if the
-/// catalog has none. `current_snapshot()` is a direct accessor, and inside an
-/// explicit transaction it returns the transaction's *pinned* snapshot — which
-/// is what makes it the version the read genuinely observed, rather than
-/// whatever the catalog had advanced to by the time we asked.
-///
-/// Not a replacement for [`max_snapshot`]: the write path compares before/after
-/// across a commit boundary, where "the global maximum" is the right question
-/// and a pinned per-transaction value would be the wrong one.
-fn current_snapshot(inst: &PondInstance, cat_quoted: &str) -> Option<i64> {
-    inst.conn
-        .query_row(
-            &format!("SELECT id FROM {cat_quoted}.current_snapshot()"),
-            [],
-            |r| r.get::<_, Option<i64>>(0),
-        )
-        .ok()
-        .flatten()
-}
-
 /// An open `BEGIN TRANSACTION READ ONLY`, rolled back on drop unless committed.
 ///
 /// Drop-based, not `ROLLBACK` at each error site, because these connections are
@@ -189,8 +169,11 @@ impl<'a> ReadTxn<'a> {
             .conn
             .execute_batch("COMMIT")
             .map_err(|e| EngineError::Engine(e.to_string()))?;
-        // Only now is there nothing to roll back — a failed COMMIT leaves the
-        // transaction open, and Drop must still clean it up.
+        // Cleared only on success. A failed COMMIT most likely aborted the
+        // transaction itself, in which case Drop's ROLLBACK is a no-op — this
+        // is defensive, not a claim about what DuckDB does with a failed
+        // commit, and it costs one refused statement on a connection the
+        // caller is about to discard anyway.
         self.open = false;
         Ok(())
     }
@@ -208,58 +191,51 @@ impl Drop for ReadTxn<'_> {
     }
 }
 
-/// Run `f` inside a read-only transaction on `inst`, returning its value plus
-/// the snapshot the transaction observed (when `catalog` is given — i.e. when
-/// the caller records lineage; a pond that records none does not pay for the
-/// accessor).
+/// Run `f` inside a read-only transaction on `inst`.
 ///
-/// The transaction is the point: everything `f` does — provenance extraction,
-/// the read itself — and the accessor below all resolve against **one** pinned
-/// catalog snapshot. Unbracketed they are separate implicit transactions, so a
-/// commit landing between them makes the recorded version describe a state the
-/// query never read, which is precisely the claim the version is there to make.
+/// The transaction is the whole point: everything `f` does — provenance
+/// extraction and the read itself — resolves against **one** pinned catalog
+/// snapshot. Unbracketed they are separate implicit transactions, so a commit
+/// landing between them makes the version recorded for an input describe a
+/// state the query never read, which is precisely the claim that version is
+/// there to make.
+///
+/// There is no separate snapshot accessor: each DuckLake scan already carries
+/// its own `snapshot.snapshot_id` in the bound plan (see [`scan_datasets`]),
+/// and *because* the extraction now runs inside this transaction, that value
+/// **is** the one the read observed. Measured across 17 read shapes, every
+/// input from this pond's catalog arrives versioned that way, so asking
+/// `current_snapshot()` as well would have been a second question with the
+/// same answer, charged to every lineage read.
 ///
 /// Measured (200 iterations, 200k-row aggregate, release): plain read
-/// 1.94–1.99 ms, bracketed 1.68–1.72 ms, bracketed + accessor 1.72–1.76 ms.
-/// One transaction amortises the per-statement catalog-snapshot resolution that
-/// auto-commit repeats, so the bracket is a saving, not a cost.
+/// 1.94–1.99 ms, bracketed 1.68–1.72 ms. One transaction amortises the
+/// per-statement catalog-snapshot resolution that auto-commit repeats, so the
+/// bracket is a saving, not a cost — which is why `read_query`/`read_arrow`
+/// take one for every pond, not only a lineage pond's.
+///
+/// Scope: the two `QueryEngine` read paths. `describe_schema`,
+/// `describe_catalog` and `explain_query` deliberately stay unbracketed —
+/// single-statement introspection with no version to record and nothing to keep
+/// consistent across statements.
+///
+/// The bracket's integrity depends on the read guard refusing transaction
+/// control: a `COMMIT` inside the user's SQL ends *this* transaction, and a
+/// following `BEGIN` leaves a fresh one for [`ReadTxn::commit`] to close
+/// without complaint. `latiq_engine::is_read_only` rejects those keywords for
+/// that reason (verified reachable before it did).
 ///
 /// Pinning is **lazy** — taken at the first catalog-touching statement, not at
-/// `BEGIN` — so whichever of `f`'s statements runs first establishes it, and
-/// the accessor then reports that same pin.
+/// `BEGIN` — so whichever of `f`'s statements runs first establishes it.
 pub fn in_read_txn<T>(
     inst: &PondInstance,
-    catalog: Option<&str>,
     f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
-) -> Result<(T, Option<i64>), EngineError> {
+) -> Result<T, EngineError> {
     let txn = ReadTxn::begin(inst)?;
     // Any error here — including a cancellation — drops `txn` and rolls back.
     let out = f(inst)?;
-    let observed = catalog.and_then(|c| current_snapshot(inst, &crate::instance::quote_ident(c)));
     txn.commit()?;
-    Ok((out, observed))
-}
-
-/// Record the snapshot the read actually observed on this pond's own inputs.
-///
-/// Fills a **missing** version only. An input the plan already versioned keeps
-/// it: a time-travel read (`FROM a AT (VERSION => 1)`) names a snapshot that is
-/// deliberately not the one the transaction is pinned at, and overwriting it
-/// would report a state that query did not read. Everything else is left alone
-/// too — a temp table, a Parquet file and another catalog's table have no
-/// DuckLake snapshot, and inventing this pond's for them would be a lie.
-pub fn stamp_observed_version(inputs: &mut [DatasetRef], catalog: &str, observed: Option<i64>) {
-    let Some(observed) = observed else {
-        return;
-    };
-    let prefix = format!("{catalog}.");
-    for ds in inputs {
-        // `namespace: None` is what marks one of the node's own catalogs; the
-        // catalog is the first segment of the `{catalog}.{schema}.{table}` name.
-        if ds.version.is_none() && ds.namespace.is_none() && ds.name.starts_with(&prefix) {
-            ds.version = Some(observed);
-        }
-    }
+    Ok(out)
 }
 
 /// Execute a statement and materialize its result rows aligned to column names.
@@ -884,75 +860,35 @@ mod tests {
     }
 
     #[test]
-    fn stamp_observed_version_fills_only_this_ponds_unversioned_inputs() {
-        // The observed snapshot answers "what state did this read see" for the
-        // pond's own tables. Applying it anywhere else invents a version: a
-        // time-travel read deliberately names a different snapshot, and a temp
-        // table, a Parquet file and another catalog's table have no DuckLake
-        // snapshot at all.
-        let mut travelled = DatasetRef::table("pond", "main", "a");
-        travelled.version = Some(1);
-        let mut inputs = vec![
-            DatasetRef::table("pond", "main", "a"),
-            travelled,
-            DatasetRef::table("temp", "main", "t"),
-            DatasetRef::table("side", "main", "a"),
-            DatasetRef::external("s3://bucket/x.parquet"),
-        ];
-        stamp_observed_version(&mut inputs, "pond", Some(7));
-        assert_eq!(
-            inputs[0].version,
-            Some(7),
-            "this pond's unversioned input gets the snapshot the read observed"
-        );
-        assert_eq!(
-            inputs[1].version,
-            Some(1),
-            "a time-travel version must survive — it names the state that read"
-        );
-        for other in &inputs[2..] {
-            assert_eq!(
-                other.version, None,
-                "nothing outside this pond's catalog gets a version: {other:?}"
-            );
-        }
-        // No observed snapshot (a pond with no snapshots yet) invents nothing.
-        let mut fresh = vec![DatasetRef::table("pond", "main", "a")];
-        stamp_observed_version(&mut fresh, "pond", None);
-        assert_eq!(fresh[0].version, None);
-        // A catalog whose name is a prefix of this one is a different catalog.
-        let mut neighbour = vec![DatasetRef::table("pondx", "main", "a")];
-        stamp_observed_version(&mut neighbour, "pond", Some(7));
-        assert_eq!(neighbour[0].version, None, "prefix match is not a match");
-    }
-
-    #[test]
-    fn read_transaction_reports_the_snapshot_and_leaves_none_open() {
+    fn read_transaction_pins_the_plan_to_what_the_read_returns_and_leaves_none_open() {
+        // The version recorded for an input comes from the bound plan, and is
+        // the observed one only because the extraction runs inside the same
+        // transaction as the read. Both must therefore name the snapshot the
+        // rows came from, and the transaction must not outlive the call.
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("a"));
         run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1)", &id, "pond").unwrap();
         let latest: i64 = inst
             .conn
             .query_row("SELECT max(snapshot_id) FROM pond.snapshots()", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        let (rows, observed) = in_read_txn(&inst, Some("pond"), |i| {
-            Ok(run_read(i, "SELECT * FROM t")?.rows.len())
+        let (rows, inputs) = in_read_txn(&inst, |i| {
+            let (inputs, _) = referenced_tables(i, "SELECT * FROM t", "pond");
+            Ok((run_read(i, "SELECT * FROM t")?.rows.len(), inputs))
         })
         .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(rows, 1);
         assert_eq!(
-            observed,
+            inputs[0].version,
             Some(latest),
-            "the accessor must name the snapshot the transaction read at"
+            "the input must carry the snapshot the transaction read at"
         );
-        // A pond that records no lineage does not pay for the accessor.
-        let (_, none) = in_read_txn(&inst, None, |i| run_read(i, "SELECT * FROM t")).unwrap();
-        assert_eq!(none, None, "no catalog asked for, no snapshot resolved");
-        // The connection is not left mid-transaction: a write would fail inside
-        // one, both because it is read-only and because COMMIT never ran.
-        run_write(&inst, "INSERT INTO t VALUES (1)", &id, "pond").unwrap();
+        // The connection is not left mid-transaction: this write would fail
+        // inside one, both because it is read-only and because COMMIT never ran.
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond").unwrap();
     }
 
     #[test]

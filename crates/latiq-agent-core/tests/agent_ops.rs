@@ -133,6 +133,63 @@ async fn read_arrow_streams_rows_locally() {
 }
 
 #[tokio::test]
+async fn read_arrow_cancel_reaches_a_producer_parked_on_a_stalled_consumer() {
+    // Regression pin. The engine holds a read-only transaction open across the
+    // whole batch stream, so it also holds a pooled connection and a pinned
+    // DuckLake snapshot. Cancellation works by interrupting DuckDB — but a
+    // producer parked in the bounded sink channel is not in DuckDB, so the
+    // interrupt reaches nothing and a client that stays connected while it
+    // stops reading pins that snapshot for as long as it likes. The send must
+    // therefore watch the abort token itself.
+    use std::time::Duration;
+    let ops = ops();
+    let id = Identity::claimed(Some("a"));
+    let alloc = ops
+        .allocate_pond(&id, Some("stall".into()), "{}", "medium", &[], false)
+        .await
+        .unwrap();
+    ops.write_query(
+        &id,
+        "stall",
+        // Comfortably more batches than the channel's capacity, so the producer
+        // cannot drain into it and finish on its own.
+        "CREATE TABLE t AS SELECT * FROM range(50000) r(i)",
+    )
+    .await
+    .unwrap();
+
+    // Held, NOT drained: dropping it instead would exercise the "receiver gone"
+    // path, which always worked and is not the bug.
+    let _stream = ops
+        .read_arrow(&id, "stall", "SELECT i FROM t")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Anti-vacuity: the operation really is still running (parked in the sink),
+    // so what the cancel below unblocks is that park and not an already
+    // finished read.
+    assert!(
+        !ops.inflight().is_empty(),
+        "the producer should still be in flight, parked on the full channel"
+    );
+
+    ops.inflight().cancel_for_pond(&alloc.pond_id);
+    // The blocking task only reaches `complete` — and so only releases the
+    // transaction and the connection — once the SEND observes the cancel.
+    let unparked = tokio::time::timeout(Duration::from_secs(10), async {
+        while !ops.inflight().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        unparked.is_ok(),
+        "a cancelled read stayed parked in the sink: its transaction, pooled \
+         connection and pinned snapshot are held by a consumer that stopped reading"
+    );
+}
+
+#[tokio::test]
 async fn pond_lifecycle_drop_requires_confirm() {
     let ops = ops();
     let id = Identity::claimed(Some("agent-loop"));

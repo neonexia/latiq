@@ -19,7 +19,7 @@ use latiq_common::Identity;
 use latiq_common::PondId;
 use latiq_common::QueryMeta;
 use latiq_common::{PondTier, ResourceLimits};
-use latiq_engine::{ArrowSink, ExplainResult, QueryEngine, QueryResult};
+use latiq_engine::{AbortToken, ArrowSink, ExplainResult, QueryEngine, QueryResult};
 use latiq_lineage::event::DurationMeaning;
 use latiq_lineage::LineageWriter;
 use latiq_storage::PondStorage;
@@ -900,11 +900,20 @@ impl AgentOps {
         let inflight = self.inflight.clone();
         let sql2 = sql.to_string();
         let pond_name = info.name.clone();
+        // Captured here, in async context: the blocking producer below needs it
+        // to await the consumer without owning a runtime.
+        let rt = tokio::runtime::Handle::current();
+        // The sink's own handle on cancellation. The engine gets `token`; the
+        // sink needs it too, because a producer parked on a full channel is the
+        // one place an interrupt cannot reach (see `ChannelSink::send_batch`).
+        let sink_abort = token.clone();
         tokio::task::spawn_blocking(move || {
             let t0 = Instant::now();
             let mut sink = ChannelSink {
                 schema_tx: Some(schema_tx),
                 batch_tx,
+                rt,
+                abort: sink_abort,
             };
             let res = engine.read_arrow(&loc, &sql2, token, &mut sink);
             match res {
@@ -922,7 +931,11 @@ impl AgentOps {
                     if let Some(stx) = sink.schema_tx.take() {
                         let _ = stx.send(Err(ae));
                     } else {
-                        let _ = sink.batch_tx.blocking_send(Err(ae));
+                        // Same bounded wait as a batch: this must not park
+                        // forever on a stalled consumer either. The `biased`
+                        // select still delivers the error whenever the channel
+                        // has room, cancelled or not.
+                        let _ = sink.send_batch(Err(ae));
                     }
                 }
             }
@@ -1432,6 +1445,47 @@ fn append_batch_rows(
 struct ChannelSink {
     schema_tx: Option<oneshot::Sender<Result<SchemaRef, AgentError>>>,
     batch_tx: mpsc::Sender<Result<RecordBatch, AgentError>>,
+    /// The runtime this blocking producer belongs to, so it can await a send
+    /// without a runtime of its own. Captured before `spawn_blocking`.
+    rt: tokio::runtime::Handle,
+    /// The operation's cancellation token — see [`ChannelSink::send_batch`].
+    abort: AbortToken,
+}
+
+impl ChannelSink {
+    /// Hand one item to the consumer, waking either when it makes room **or**
+    /// when the operation is cancelled.
+    ///
+    /// A plain `blocking_send` on this bounded channel is unrecoverable: the
+    /// engine holds a read-only transaction — and therefore a pinned DuckLake
+    /// snapshot and a pool connection — open across the whole batch stream, and
+    /// `run_with_abort`'s watcher cancels by interrupting DuckDB. A producer
+    /// parked in the channel is not in DuckDB, so the interrupt does nothing
+    /// and a client that stays connected but stops reading pins that snapshot
+    /// against expiry/cleanup for as long as it likes. Selecting on the abort
+    /// token is what makes cancellation actually reach a stalled stream, so the
+    /// transaction rolls back and the connection is released.
+    ///
+    /// **Still open, and pre-existing:** nothing imposes an *absolute* deadline
+    /// on a slow-but-live consumer. Until one does, a reader that keeps the
+    /// stream alive can hold a pool slot for as long as it likes, and with
+    /// `(cores*2).clamp(4,32)` such readers per pond later reads wait on the
+    /// pool's untimed condvar. What the deadline should be, and whether it is
+    /// configurable, is a policy question that has not been decided.
+    fn send_batch(&self, item: Result<RecordBatch, AgentError>) -> ControlFlow<()> {
+        self.rt.block_on(async {
+            tokio::select! {
+                // Biased: with capacity free and a cancel racing, delivering the
+                // batch we already produced is the better of two valid answers.
+                biased;
+                sent = self.batch_tx.send(item) => match sent {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(_) => ControlFlow::Break(()), // receiver gone
+                },
+                _ = self.abort.cancelled() => ControlFlow::Break(()),
+            }
+        })
+    }
 }
 
 impl ArrowSink for ChannelSink {
@@ -1444,10 +1498,7 @@ impl ArrowSink for ChannelSink {
         ControlFlow::Continue(())
     }
     fn batch(&mut self, batch: RecordBatch) -> ControlFlow<()> {
-        match self.batch_tx.blocking_send(Ok(batch)) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
+        self.send_batch(Ok(batch))
     }
 }
 
