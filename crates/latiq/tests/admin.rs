@@ -1052,7 +1052,8 @@ mod sdk_auth {
         let (c, g) = (control.clone(), gateway.clone());
         let err = blocking(move || {
             let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
-            db.create_pond(Some("sdkauth"), "medium", "").unwrap();
+            db.create_pond(Some("sdkauth"), "medium", "", false)
+                .unwrap();
             db.query("sdkauth", "SELECT 1 AS n")
                 .unwrap_err()
                 .to_string()
@@ -1134,7 +1135,8 @@ mod sdk_auth {
         let (c, g, t) = (server.clone(), gateway.clone(), token);
         let listed = blocking(move || {
             let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
-            db.create_pond(Some("sdkadmin"), "medium", "").unwrap();
+            db.create_pond(Some("sdkadmin"), "medium", "", false)
+                .unwrap();
             db.list_ponds().unwrap()
         })
         .await;
