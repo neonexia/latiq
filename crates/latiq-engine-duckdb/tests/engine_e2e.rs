@@ -11,7 +11,7 @@ fn pond_lifecycle_end_to_end() {
     let fs = TempFs::new();
     let eng = DuckEngine::new();
     let id = PondId::new();
-    let loc = fs.create_pond(id).unwrap();
+    let loc = fs.create_pond(id, false).unwrap();
     eng.init_pond(&loc).unwrap();
 
     let agent = Identity::claimed(Some("agent-e2e"));
@@ -77,7 +77,7 @@ fn attribution_records_the_verified_subject_not_only_the_claimed_leaf() {
     let fs = TempFs::new();
     let eng = DuckEngine::new();
     let pond = PondId::new();
-    let loc = fs.create_pond(pond).unwrap();
+    let loc = fs.create_pond(pond, false).unwrap();
     eng.init_pond(&loc).unwrap();
 
     let id = Identity::verified(
@@ -173,7 +173,7 @@ fn attribution_escapes_hostile_identity_values() {
     let fs = TempFs::new();
     let eng = DuckEngine::new();
     let pond = PondId::new();
-    let loc = fs.create_pond(pond).unwrap();
+    let loc = fs.create_pond(pond, false).unwrap();
     eng.init_pond(&loc).unwrap();
 
     let write = |sql: &str, id: &Identity| {
@@ -231,7 +231,7 @@ fn attribution_unverified_caller_has_empty_verified_fields() {
     let fs = TempFs::new();
     let eng = DuckEngine::new();
     let pond = PondId::new();
-    let loc = fs.create_pond(pond).unwrap();
+    let loc = fs.create_pond(pond, false).unwrap();
     eng.init_pond(&loc).unwrap();
 
     let id = Identity::claimed(Some("agent-plain"));

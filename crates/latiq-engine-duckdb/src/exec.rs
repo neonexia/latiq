@@ -413,7 +413,7 @@ mod tests {
 
     fn pond() -> (TempFs, PondInstance) {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         (fs, inst)
     }

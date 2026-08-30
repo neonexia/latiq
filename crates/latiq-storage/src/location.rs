@@ -29,4 +29,10 @@ pub struct PondLocation {
     /// reads it on open to decide whether the pond has a lineage sidecar.
     #[serde(default)]
     pub lineage: bool,
+    /// Where this pond's OpenLineage `.jsonl` event files live,
+    /// `<root>/<pond-id>/lineage/`. Computed unconditionally — only its
+    /// *existence on disk* reflects the `lineage` opt-in, and because it sits
+    /// inside the pond directory, `drop_pond` reaps it with everything else.
+    #[serde(default)]
+    pub lineage_dir: String,
 }
