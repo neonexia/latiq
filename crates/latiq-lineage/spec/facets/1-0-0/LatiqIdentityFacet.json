@@ -16,8 +16,11 @@
               "type": "boolean"
             },
             "subject": {
-              "description": "The principal. `anonymous` when no issuer is configured.",
-              "type": "string"
+              "description": "The verified principal, and null whenever `verified` is false — a relaxed-mode caller has no principal, and an empty string would render as a blank owner rather than as its absence. `agentId` carries the claimed leaf in that case.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "issuer": {
               "description": "The token issuer, absent in relaxed mode.",

@@ -89,7 +89,9 @@ the version is the engine's, not something we maintain.
 
 **Identity, verified or claimed.** The `latiq_identity` facet carries `subject`,
 `issuer`, `verified`, and the claimed leaf `agentId` stamped
-`agentIdVerified: false`. A reader can always tell provenance from assertion.
+`agentIdVerified: false`. A reader can always tell provenance from assertion:
+when `verified` is false there is no principal, so `subject` and `issuer` are
+both **`null`** — never `""` — and only `agentId` carries the claim.
 
 **Files in the pond's own `lineage/` directory.** Batched JSONL, written to a
 temp file, `fsync`ed, and renamed into place, so a reader globbing `*.jsonl`
