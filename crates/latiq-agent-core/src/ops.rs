@@ -25,7 +25,8 @@ use latiq_lineage::LineageWriter;
 use latiq_storage::PondStorage;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -63,7 +64,15 @@ pub struct AgentOps {
     /// directory (the pond's own `lineage/`) and a batch buffer; keyed by pond
     /// id and shared across `AgentOps` clones, so the batching is per pond and
     /// not per request. A pond that never opts in never gets an entry.
-    lineage_writers: Arc<Mutex<HashMap<String, Arc<LineageWriter>>>>,
+    ///
+    /// An `RwLock` because every query of every lineage-enabled pond reads it
+    /// and only a pond's FIRST emit writes it — a `Mutex` here would serialize
+    /// lineage emission for the whole node behind one pond's map lookup.
+    lineage_writers: Arc<RwLock<HashMap<String, Arc<LineageWriter>>>>,
+    /// Poisoning is permanent, so the warning about it fires once per node
+    /// rather than once per query (the same discipline `LineageWriter` uses for
+    /// its own buffer lock).
+    lineage_poison_warned: Arc<AtomicBool>,
 }
 
 impl AgentOps {
@@ -81,7 +90,8 @@ impl AgentOps {
             config,
             self_endpoint: None,
             forwarder: None,
-            lineage_writers: Arc::new(Mutex::new(HashMap::new())),
+            lineage_writers: Arc::new(RwLock::new(HashMap::new())),
+            lineage_poison_warned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -107,18 +117,20 @@ impl AgentOps {
     /// where nobody opted in. A companion to `open_pond_count` (same shape, same
     /// purpose: an observable count of a per-pond resource this node holds).
     pub fn lineage_writer_count(&self) -> usize {
-        self.lineage_writers.lock().map(|m| m.len()).unwrap_or(0)
+        self.lineage_writers_read().map(|m| m.len()).unwrap_or(0)
     }
 
     /// Write out every pond's buffered lineage events now.
     ///
     /// **This blocks** (the writer fsyncs), so it belongs on a shutdown path or
-    /// a blocking task, never in a request handler — the whole point of
-    /// batching is that a query never waits behind an fsync.
+    /// a blocking task, never in a request handler. That is a property of THIS
+    /// call, not of the query path: a query only ever buffers, and hands the
+    /// occasional due batch to `spawn_blocking` without awaiting it (see
+    /// `emit_lineage`), so no query ever waits behind an fsync.
     pub fn flush_lineage(&self) {
-        let writers: Vec<Arc<LineageWriter>> = match self.lineage_writers.lock() {
-            Ok(map) => map.values().cloned().collect(),
-            Err(_) => return,
+        let writers: Vec<Arc<LineageWriter>> = match self.lineage_writers_read() {
+            Some(map) => map.values().cloned().collect(),
+            None => return,
         };
         // Flushing outside the lock: an IO stall must not block the next emit.
         for writer in writers {
@@ -132,6 +144,13 @@ impl AgentOps {
     /// The `lineage` check comes first and costs one bool: a pond that did not
     /// opt in must not reach the writer registry, the storage lookup, or any
     /// string formatting.
+    ///
+    /// Building the events is pure memory. The batch write is not — it fsyncs —
+    /// so when one comes due it goes to the blocking pool, and is deliberately
+    /// **not awaited**: the query has already produced its answer and must not
+    /// wait on lineage IO, nor may that IO occupy the async worker it ran on.
+    /// The events are in the buffer before this returns, so nothing is lost if
+    /// that task is slow; the buffer is bounded, and `Drop` flushes what is left.
     fn emit_lineage(&self, rec: QueryRecord<'_>) {
         if !rec.info.lineage {
             return;
@@ -140,19 +159,29 @@ impl AgentOps {
             return; // nothing to do, and never anything to fail
         };
         let node_id = self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE);
-        crate::lineage::record(&writer, node_id, rec);
+        if crate::lineage::record(&writer, node_id, rec) {
+            tokio::task::spawn_blocking(move || writer.flush());
+        }
     }
 
     /// This pond's writer, built on first use. The pond's `lineage_dir` is
     /// resolved once per pond here rather than once per query: by the time an op
     /// emits, its local path has already ensured the pond exists.
     ///
+    /// The location is resolved with **no lock held** — for `LocalFs` it stats
+    /// the pond directory, and one slow stat must not serialize emission for
+    /// every other pond on the node. The cost is that two first emits for one
+    /// pond can both build a writer; the insert keeps whichever landed first, so
+    /// a pond never ends up with two writers batching into one directory.
+    ///
     /// `None` on any failure — a pond whose location will not resolve loses its
     /// lineage, and never its query.
     fn lineage_writer(&self, info: &PondInfo) -> Option<Arc<LineageWriter>> {
-        let mut map = self.lineage_writers.lock().ok()?;
-        if let Some(writer) = map.get(&info.pond_id) {
-            return Some(writer.clone());
+        {
+            let map = self.lineage_writers_read()?;
+            if let Some(writer) = map.get(&info.pond_id) {
+                return Some(writer.clone());
+            }
         }
         let pid = Self::parse_id(&info.pond_id).ok()?;
         let loc = self
@@ -163,28 +192,68 @@ impl AgentOps {
             })
             .ok()?;
         let writer = Arc::new(LineageWriter::new(&loc.lineage_dir));
-        map.insert(info.pond_id.clone(), writer.clone());
-        Some(writer)
+        let mut map = self.lineage_writers_write()?;
+        Some(
+            map.entry(info.pond_id.clone())
+                .or_insert(writer) // a concurrent first emit wins; ours is dropped
+                .clone(),
+        )
     }
 
-    /// Evict a dropped pond's writer. Two reasons it cannot be skipped: the map
-    /// would otherwise leak an entry per dropped pond for the life of the
-    /// process, and a writer that outlived its pond would later flush into a
-    /// deleted directory.
+    /// Evict a dropped pond's writer, flushing it on the blocking pool (the
+    /// flush fsyncs). Two reasons it cannot be skipped: the map would otherwise
+    /// leak an entry per dropped pond for the life of the process, and a writer
+    /// that outlived its pond would keep failing and requeueing batches into a
+    /// deleted directory until it hit its capacity bound.
     ///
-    /// The final flush happens in `LineageWriter::drop`, which does synchronous
-    /// fsync-ing IO — hence `spawn_blocking`, awaited, so the drop is off the
-    /// async worker AND has finished before the caller deletes the files. Any
-    /// events still buffered land in a directory that is about to be removed;
-    /// that is accepted (dropping a pond destroys its provenance — the HTTP
-    /// sink is the durability answer).
+    /// What this does NOT promise: that the writer is gone by the time the
+    /// caller deletes the files. `lineage_writer` hands out `Arc` clones, and one
+    /// can be alive on an in-flight request's stack; that straggler's `Drop`
+    /// flushes later, possibly into a directory that no longer exists, which the
+    /// writer answers with a `warn!` and a dropped batch. Harmless, and cheaper
+    /// than the refcount gymnastics that forcing last-drop would need — dropping
+    /// a pond destroys its provenance either way (the HTTP sink is the
+    /// durability answer).
     async fn evict_lineage_writer(&self, pond_id: &str) {
-        let writer = match self.lineage_writers.lock() {
-            Ok(mut map) => map.remove(pond_id),
-            Err(_) => None,
-        };
+        let writer = self
+            .lineage_writers_write()
+            .and_then(|mut map| map.remove(pond_id));
         if let Some(writer) = writer {
-            let _ = tokio::task::spawn_blocking(move || drop(writer)).await;
+            let _ = tokio::task::spawn_blocking(move || writer.flush()).await;
+        }
+    }
+
+    fn lineage_writers_read(
+        &self,
+    ) -> Option<RwLockReadGuard<'_, HashMap<String, Arc<LineageWriter>>>> {
+        match self.lineage_writers.read() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                self.warn_lineage_poisoned();
+                None
+            }
+        }
+    }
+
+    fn lineage_writers_write(
+        &self,
+    ) -> Option<RwLockWriteGuard<'_, HashMap<String, Arc<LineageWriter>>>> {
+        match self.lineage_writers.write() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                self.warn_lineage_poisoned();
+                None
+            }
+        }
+    }
+
+    /// A panic elsewhere poisoned the registry, which disables lineage for the
+    /// rest of the process. Said once, and said out loud: silence here is
+    /// indistinguishable from a deployment where nobody opted in, and
+    /// `lineage_writer_count` would report 0 for both.
+    fn warn_lineage_poisoned(&self) {
+        if !self.lineage_poison_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!("lineage writer registry is poisoned; lineage is disabled on this node");
         }
     }
 
@@ -448,6 +517,12 @@ impl AgentOps {
         // BEFORE the files it writes into are deleted.
         self.evict_lineage_writer(&pond_id).await;
         let _ = self.storage.drop_pond(pid);
+        // Again, because a query that slipped past `begin_drop` can re-insert a
+        // writer in the window between the two. This narrows that window rather
+        // than closing it — a re-insert after this line still leaves an entry
+        // pointing at a deleted directory — but it costs a map lookup and turns
+        // "leaks for the life of the process" into a race you have to win.
+        self.evict_lineage_writer(&pond_id).await;
         self.inflight.end_drop(&pond_id);
         self.audit(
             identity,
@@ -939,6 +1014,12 @@ impl AgentOps {
             }
         }
         let n = rows.len() as u64;
+        // TASK 4 NOTE: this synthesises the meta rather than carrying the
+        // engine's, because the Arrow hop returns batches and not a QueryMeta.
+        // So `tables_touched` (and the snapshot) stay empty on this path even
+        // once the bound-plan extraction populates them, and `read_collected`'s
+        // lineage events would carry no datasets. Plumbing the engine's meta
+        // through the Arrow stream belongs with the task that fills it in.
         Ok(QueryResult {
             columns,
             rows,

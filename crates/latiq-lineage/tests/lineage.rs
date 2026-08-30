@@ -425,6 +425,39 @@ fn lineage_writer_batches_and_renames_into_place() {
 }
 
 #[test]
+fn lineage_writer_buffering_alone_never_touches_the_filesystem() {
+    // `buffer_all` exists so an async caller can keep the fsync off its worker
+    // thread: it must therefore do NO io itself, and it must report when a
+    // batch is due so the caller knows to flush somewhere it is allowed to
+    // block. Both halves matter -- a `buffer_all` that never said "due" would
+    // be silently correct here and lose every event in production.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let writer = LineageWriter::with_limits(path.to_str().unwrap(), 2, 64);
+
+    assert!(
+        !writer.buffer_all(&[write_event()]),
+        "one event is below the batch size"
+    );
+    assert!(
+        writer.buffer_all(&[read_event()]),
+        "the second event brings a batch due"
+    );
+    assert!(
+        jsonl_files(&path).is_empty(),
+        "buffering must write nothing at all, due batch or not: {:?}",
+        jsonl_files(&path)
+    );
+
+    writer.flush();
+    assert_eq!(
+        events_in(&path).len(),
+        2,
+        "everything buffered lands once the caller flushes"
+    );
+}
+
+#[test]
 fn lineage_writer_retries_a_batch_that_failed_to_write() {
     // A failed batch goes back in the buffer instead of being discarded, so a
     // transient failure (a brief ENOSPC, an EIO) costs latency rather than

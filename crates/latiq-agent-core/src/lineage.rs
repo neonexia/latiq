@@ -40,7 +40,8 @@
 //! missing one.
 use latiq_common::{Identity, QueryMeta};
 use latiq_lineage::event::{
-    dataset_namespace, facets, job_name, DurationMeaning, EventType, Outcome, JOB_NAMESPACE,
+    dataset_namespace, facets, job_name, rfc3339_millis_ago, DurationMeaning, EventType, Outcome,
+    JOB_NAMESPACE,
 };
 use latiq_lineage::{Dataset, Job, LineageWriter, Run, RunEvent};
 
@@ -76,9 +77,14 @@ pub(crate) struct QueryRecord<'a> {
     pub meta: Option<&'a QueryMeta>,
 }
 
-/// Buffer this operation's `START` and terminal event. Both go in one
-/// `record_all` so a reader never finds one without the other in the directory.
-pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>) {
+/// Buffer this operation's `START` and terminal event. Both go in one call so a
+/// reader never finds one without the other in the directory.
+///
+/// Buffering only — **no filesystem access happens here**. Returns whether a
+/// batch has come due, which the caller answers by flushing on a blocking pool:
+/// the fsync belongs anywhere except the async worker the query ran on.
+#[must_use = "a due batch must be flushed, or events sit in memory until shutdown"]
+pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>) -> bool {
     let info = rec.info;
     let is_write = rec.op == "write_query";
 
@@ -99,15 +105,16 @@ pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>
         })
         .collect();
 
-    let job = || {
-        Job::new(
-            JOB_NAMESPACE,
-            job_name(&info.name, rec.op, tables.first().map(String::as_str)),
-        )
-        .with(facets::sql(&crate::ops::redact_sql(rec.sql)))
-        .with(facets::job_type("QUERY"))
-        .with(facets::pond(&info.pond_id, &info.name, node_id))
-    };
+    // Built ONCE and cloned: the job is identical on both events of a run, and
+    // rebuilding it would re-run `redact_sql` (a full char-by-char rescan) and
+    // re-serialize three facet bodies for one query.
+    let job = Job::new(
+        JOB_NAMESPACE,
+        job_name(&info.name, rec.op, tables.first().map(String::as_str)),
+    )
+    .with(facets::sql(&crate::ops::redact_sql(rec.sql)))
+    .with(facets::job_type("QUERY"))
+    .with(facets::pond(&info.pond_id, &info.name, node_id));
 
     // The run id is minted once and shared: a START and its terminal event are
     // one run, and a consumer joins them on nothing else.
@@ -122,7 +129,19 @@ pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>
     // START carries inputs only: the outputs do not exist yet, and their
     // version facet would be the snapshot BEFORE the write rather than the one
     // the write produced.
-    let mut start = RunEvent::new(EventType::Start, base.clone(), job());
+    //
+    // And it is stamped with when the operation BEGAN, not with now. Both
+    // events are built here, after the op finished, so a `now` on the START
+    // would put the beginning of the run at its end — every consumer that
+    // derives a duration from START -> terminal (which is why the spec wants
+    // the pair at all) would report ~0 ms, and contradict `latiq_query`'s
+    // `durationMs` on the very same events.
+    let mut start = RunEvent::at(
+        rfc3339_millis_ago(rec.duration_ms),
+        EventType::Start,
+        base.clone(),
+        job.clone(),
+    );
     if !is_write {
         start = start.with_inputs(datasets.clone());
     }
@@ -138,14 +157,14 @@ pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>
     if let Some(e) = rec.error {
         run = run.with(facets::error_message(&e.envelope().message));
     }
-    let mut terminal_event = RunEvent::new(event_type, run, job());
+    let mut terminal_event = RunEvent::new(event_type, run, job);
     terminal_event = if is_write {
         terminal_event.with_outputs(datasets)
     } else {
         terminal_event.with_inputs(datasets)
     };
 
-    writer.record_all(&[start, terminal_event]);
+    writer.buffer_all(&[start, terminal_event])
 }
 
 /// The terminal state. A cancelled query `ABORT`s: it neither completed nor

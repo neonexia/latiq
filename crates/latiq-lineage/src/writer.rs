@@ -134,9 +134,28 @@ impl LineageWriter {
     /// Buffer several events together — how a caller emits a run's `START` and
     /// its terminal event, which belong in the same batch so a reader never
     /// finds one without the other in the directory.
+    ///
+    /// Writes the batch INLINE when one comes due. An async caller must use
+    /// [`LineageWriter::buffer_all`] instead and hand the resulting
+    /// [`LineageWriter::flush`] to a blocking pool — the write fsyncs, and a
+    /// Tokio worker is the wrong thread to do that on.
     pub fn record_all(&self, events: &[RunEvent]) {
+        if self.buffer_all(events) {
+            self.flush();
+        }
+    }
+
+    /// Buffer events **without touching the filesystem**, returning whether a
+    /// batch has come due.
+    ///
+    /// This is the split that keeps lineage off the query's critical path: the
+    /// common call serializes and pushes under a short-lived lock and is over,
+    /// and the caller that sees `true` can move the (fsyncing) write elsewhere
+    /// rather than paying for it inline. Nothing here can block on IO, so
+    /// "recorded" is observable to a later `flush()` the moment this returns.
+    pub fn buffer_all(&self, events: &[RunEvent]) -> bool {
         if self.dir.is_none() || events.is_empty() {
-            return;
+            return false;
         }
         let lines: Vec<String> = events
             .iter()
@@ -152,18 +171,12 @@ impl LineageWriter {
             })
             .collect();
 
-        let drained = {
-            let Some(mut buffer) = self.lock() else {
-                return;
-            };
-            buffer.events.extend(lines);
-            self.enforce_capacity(&mut buffer);
-            (buffer.events.len() >= self.batch_size).then(|| self.take_batch(&mut buffer))
+        let Some(mut buffer) = self.lock() else {
+            return false;
         };
-        // Outside the lock: an IO stall must not block the next query's record().
-        if let Some((batch, millis)) = drained {
-            self.write_or_requeue(batch, millis);
-        }
+        buffer.events.extend(lines);
+        self.enforce_capacity(&mut buffer);
+        buffer.events.len() >= self.batch_size
     }
 
     /// Write whatever is buffered, regardless of batch size.

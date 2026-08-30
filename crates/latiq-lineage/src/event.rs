@@ -92,8 +92,20 @@ impl RunEvent {
     /// therefore two calls, which is what the spec wants — they differ in time,
     /// type and facets, and share only the run id.
     pub fn new(event_type: EventType, run: Run, job: Job) -> Self {
+        Self::at(now_rfc3339(), event_type, run, job)
+    }
+
+    /// As [`RunEvent::new`], with `event_time` supplied by the caller.
+    ///
+    /// A producer that only learns an operation happened once it has FINISHED
+    /// needs this: stamping both events with *now* would place the START at the
+    /// end of the run, so every consumer computing a duration from START →
+    /// COMPLETE would report ~0 ms — and disagree with `latiq_query.durationMs`
+    /// on the same event pair. Backdate the START instead; see
+    /// [`rfc3339_millis_ago`].
+    pub fn at(event_time: impl Into<String>, event_type: EventType, run: Run, job: Job) -> Self {
         Self {
-            event_time: now_rfc3339(),
+            event_time: event_time.into(),
             producer: PRODUCER,
             schema_url: SCHEMA_URL,
             event_type,
@@ -470,6 +482,20 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// An `eventTime` `millis` milliseconds in the past, in the same format as
+/// *now*. This is how a caller that measured an operation's duration recovers
+/// the moment it STARTED — the wall clock is sampled once, here, so the two
+/// events of a run cannot be stamped from two different reads of it.
+pub fn rfc3339_millis_ago(millis: u64) -> String {
+    let now = chrono::Utc::now();
+    let started = now
+        .checked_sub_signed(chrono::TimeDelta::milliseconds(millis as i64))
+        // Only reachable for an absurd duration; `now` is a truthful fallback
+        // and still a valid timestamp, which is what compliance requires.
+        .unwrap_or(now);
+    started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +510,26 @@ mod tests {
             "expected an explicit UTC offset, got {now}"
         );
         chrono::DateTime::parse_from_rfc3339(&now).expect("parses as RFC-3339");
+    }
+
+    #[test]
+    fn a_backdated_event_time_is_still_rfc3339_and_really_earlier() {
+        // The START of a run is stamped by subtracting the measured duration:
+        // if that produced a naive or a same-instant timestamp, every consumer
+        // would report a zero-length run for a query that took a minute.
+        let started = rfc3339_millis_ago(5_000);
+        assert!(
+            started.ends_with('Z'),
+            "expected an explicit UTC offset, got {started}"
+        );
+        let parsed = chrono::DateTime::parse_from_rfc3339(&started).expect("parses as RFC-3339");
+        let delta = chrono::Utc::now()
+            .signed_duration_since(parsed)
+            .num_milliseconds();
+        assert!(
+            (4_900..=6_000).contains(&delta),
+            "expected ~5s in the past, got {delta}ms"
+        );
     }
 
     #[test]
