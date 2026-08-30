@@ -1900,10 +1900,12 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "jsonschema",
  "latiq-common",
  "latiq-control-plane",
  "latiq-engine",
  "latiq-engine-duckdb",
+ "latiq-lineage",
  "latiq-storage",
  "metrics",
  "serde",
