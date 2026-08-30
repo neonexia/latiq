@@ -7,6 +7,7 @@ use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
+use crate::lineage::{QueryRecord, IN_PROCESS_NODE};
 use crate::types::{
     AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult, PondInfo,
     PullResult,
@@ -19,9 +20,12 @@ use latiq_common::PondId;
 use latiq_common::QueryMeta;
 use latiq_common::{PondTier, ResourceLimits};
 use latiq_engine::{ArrowSink, ExplainResult, QueryEngine, QueryResult};
+use latiq_lineage::event::DurationMeaning;
+use latiq_lineage::LineageWriter;
 use latiq_storage::PondStorage;
+use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -54,6 +58,12 @@ pub struct AgentOps {
     /// Delegate for ponds owned by a different node. `None` = single-node: every
     /// pond is local, so the behavior is exactly as before forwarding existed.
     forwarder: Option<Arc<dyn Forwarder>>,
+    /// One lineage writer per opted-in pond, built lazily on that pond's first
+    /// emit and evicted by `drop_pond`. Per pond because a writer owns a
+    /// directory (the pond's own `lineage/`) and a batch buffer; keyed by pond
+    /// id and shared across `AgentOps` clones, so the batching is per pond and
+    /// not per request. A pond that never opts in never gets an entry.
+    lineage_writers: Arc<Mutex<HashMap<String, Arc<LineageWriter>>>>,
 }
 
 impl AgentOps {
@@ -71,6 +81,7 @@ impl AgentOps {
             config,
             self_endpoint: None,
             forwarder: None,
+            lineage_writers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -90,6 +101,91 @@ impl AgentOps {
     /// Pond instances open on this node (for the `latiq_node_open_ponds` gauge).
     pub fn open_pond_count(&self) -> usize {
         self.engine.open_pond_count()
+    }
+
+    /// Ponds with a live lineage writer on this node — always 0 in a deployment
+    /// where nobody opted in. A companion to `open_pond_count` (same shape, same
+    /// purpose: an observable count of a per-pond resource this node holds).
+    pub fn lineage_writer_count(&self) -> usize {
+        self.lineage_writers.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Write out every pond's buffered lineage events now.
+    ///
+    /// **This blocks** (the writer fsyncs), so it belongs on a shutdown path or
+    /// a blocking task, never in a request handler — the whole point of
+    /// batching is that a query never waits behind an fsync.
+    pub fn flush_lineage(&self) {
+        let writers: Vec<Arc<LineageWriter>> = match self.lineage_writers.lock() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => return,
+        };
+        // Flushing outside the lock: an IO stall must not block the next emit.
+        for writer in writers {
+            writer.flush();
+        }
+    }
+
+    /// Emit this operation's lineage. Called from the PUBLIC op methods beside
+    /// `self.audit(...)`, and only on the local path — see `crate::lineage`.
+    ///
+    /// The `lineage` check comes first and costs one bool: a pond that did not
+    /// opt in must not reach the writer registry, the storage lookup, or any
+    /// string formatting.
+    fn emit_lineage(&self, rec: QueryRecord<'_>) {
+        if !rec.info.lineage {
+            return;
+        }
+        let Some(writer) = self.lineage_writer(rec.info) else {
+            return; // nothing to do, and never anything to fail
+        };
+        let node_id = self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE);
+        crate::lineage::record(&writer, node_id, rec);
+    }
+
+    /// This pond's writer, built on first use. The pond's `lineage_dir` is
+    /// resolved once per pond here rather than once per query: by the time an op
+    /// emits, its local path has already ensured the pond exists.
+    ///
+    /// `None` on any failure — a pond whose location will not resolve loses its
+    /// lineage, and never its query.
+    fn lineage_writer(&self, info: &PondInfo) -> Option<Arc<LineageWriter>> {
+        let mut map = self.lineage_writers.lock().ok()?;
+        if let Some(writer) = map.get(&info.pond_id) {
+            return Some(writer.clone());
+        }
+        let pid = Self::parse_id(&info.pond_id).ok()?;
+        let loc = self
+            .storage
+            .pond_location(pid)
+            .inspect_err(|e| {
+                tracing::warn!(pond = %info.pond_id, %e, "no lineage for this pond: unresolved location");
+            })
+            .ok()?;
+        let writer = Arc::new(LineageWriter::new(&loc.lineage_dir));
+        map.insert(info.pond_id.clone(), writer.clone());
+        Some(writer)
+    }
+
+    /// Evict a dropped pond's writer. Two reasons it cannot be skipped: the map
+    /// would otherwise leak an entry per dropped pond for the life of the
+    /// process, and a writer that outlived its pond would later flush into a
+    /// deleted directory.
+    ///
+    /// The final flush happens in `LineageWriter::drop`, which does synchronous
+    /// fsync-ing IO — hence `spawn_blocking`, awaited, so the drop is off the
+    /// async worker AND has finished before the caller deletes the files. Any
+    /// events still buffered land in a directory that is about to be removed;
+    /// that is accepted (dropping a pond destroys its provenance — the HTTP
+    /// sink is the durability answer).
+    async fn evict_lineage_writer(&self, pond_id: &str) {
+        let writer = match self.lineage_writers.lock() {
+            Ok(mut map) => map.remove(pond_id),
+            Err(_) => None,
+        };
+        if let Some(writer) = writer {
+            let _ = tokio::task::spawn_blocking(move || drop(writer)).await;
+        }
     }
 
     /// If this node isn't the pond's owner (and forwarding is configured), return
@@ -232,6 +328,11 @@ impl AgentOps {
         })
     }
 
+    /// NO LINEAGE EVENT: describe reads no data. It reports the pond's tables
+    /// and columns from the catalog, so there is no run to attribute and no
+    /// dataset was consumed or produced — an event here would add a run to
+    /// every consumer's graph that touched nothing.
+    ///
     /// The local half of `describe_pond` — split out so its failures are audited
     /// alongside its successes without the forwarded path double-recording (the
     /// owner audits what it actually ran).
@@ -343,6 +444,9 @@ impl AgentOps {
         if let Ok(loc) = self.storage.pond_location(pid) {
             self.engine.forget_pond(&loc);
         }
+        // Same order, same reason, for the pond's lineage writer: let it go
+        // BEFORE the files it writes into are deleted.
+        self.evict_lineage_writer(&pond_id).await;
         let _ = self.storage.drop_pond(pid);
         self.inflight.end_drop(&pond_id);
         self.audit(
@@ -656,15 +760,29 @@ impl AgentOps {
         info!(op = "read_arrow", pond = pond_ref, "processing locally");
         let started = Instant::now();
         let res = self.read_arrow_local(&info, sql).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
             "read_arrow",
             Some(&info.pond_id),
             Some(redact_sql(sql)),
-            started.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
+        // Lineage records establishment for the same reason the audit does, and
+        // labels the duration as such: there is no row count and no completion
+        // time to claim here, and a `completion` label would be a lie.
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op: "read_arrow",
+            sql,
+            duration_ms,
+            meaning: DurationMeaning::Establishment,
+            error: res.as_ref().err(),
+            meta: None,
+        });
         res
     }
 
@@ -774,15 +892,29 @@ impl AgentOps {
             Ok(stream) => self.collect_stream(stream).await,
             Err(e) => Err(e),
         };
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
             "read_query",
             Some(&info.pond_id),
             Some(redact_sql(sql)),
-            started.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
+        // Emitted here, in the public method, and NOT in `read_arrow_local` —
+        // which this shares with `read_arrow`, so an emitter down there would
+        // record one read twice, under two different ops.
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op: "read_query",
+            sql,
+            duration_ms,
+            meaning: DurationMeaning::Completion,
+            error: res.as_ref().err(),
+            meta: res.as_ref().ok().map(|r| &r.meta),
+        });
         res
     }
 
@@ -848,15 +980,26 @@ impl AgentOps {
         info!(op = "query", pond = pond_ref, "processing locally");
         let t0 = Instant::now();
         let res = self.run_query_local(&info, sql, identity, write).await;
+        let duration_ms = t0.elapsed().as_millis() as u64;
         self.audit(
             identity,
             op,
             Some(&info.pond_id),
             Some(redact_sql(sql)),
-            t0.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op,
+            sql,
+            duration_ms,
+            meaning: DurationMeaning::Completion,
+            error: res.as_ref().err(),
+            meta: res.as_ref().ok().map(|r| &r.meta),
+        });
         res
     }
 
@@ -959,6 +1102,10 @@ impl AgentOps {
         res
     }
 
+    /// NO LINEAGE EVENT: explain executes nothing. The statement is planned and
+    /// discarded, so no data moved and no snapshot exists to version — the
+    /// access trail records the attempt, which is the right place for it.
+    ///
     /// The local half of `explain_query` (see `describe_pond_local`).
     async fn explain_query_local(
         &self,
@@ -1170,11 +1317,12 @@ impl ArrowSink for ChannelSink {
     }
 }
 
-/// Minimal SQL-shape redaction for the audit log: drop comments (so literals
+/// Minimal SQL-shape redaction for the audit log and the lineage `SQLJobFacet`
+/// (one redactor, so provenance can never carry a literal the trail hid): drop comments (so literals
 /// hidden in them can't leak), then collapse quoted-string and numeric *literals*
 /// to `?`. Identifiers that merely contain digits (`t1`, `events2`) are preserved.
 /// (A full parser-based redactor is future work.)
-fn redact_sql(sql: &str) -> String {
+pub(crate) fn redact_sql(sql: &str) -> String {
     let decommented = strip_sql_comments(sql);
     let mut out = String::with_capacity(decommented.len());
     let mut chars = decommented.chars().peekable();

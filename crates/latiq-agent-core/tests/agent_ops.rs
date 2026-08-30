@@ -399,6 +399,8 @@ mod forwarding {
     /// Every pond resolves to a fixed owner endpoint (or none).
     struct FixedOwner {
         endpoint: Option<String>,
+        /// The pond's lineage opt-in, as the registry would report it.
+        lineage: bool,
     }
 
     #[async_trait::async_trait]
@@ -430,7 +432,7 @@ mod forwarding {
                 node_endpoint: self.endpoint.clone(),
                 tier: "medium".to_string(),
                 extensions: vec![],
-                lineage: false,
+                lineage: self.lineage,
                 description: String::new(),
             })
         }
@@ -604,16 +606,89 @@ mod forwarding {
     }
 
     fn ops_with(owner: Option<&str>, self_ep: &str, fwd: Arc<RecordingForwarder>) -> AgentOps {
+        ops_with_lineage(owner, self_ep, fwd, false).0
+    }
+
+    /// As `ops_with`, with the pond's lineage opt-in chosen and the storage kept
+    /// so a test can look for the events on disk.
+    fn ops_with_lineage(
+        owner: Option<&str>,
+        self_ep: &str,
+        fwd: Arc<RecordingForwarder>,
+        lineage: bool,
+    ) -> (AgentOps, Arc<TempFs>) {
         let control = Arc::new(FixedOwner {
             endpoint: owner.map(|s| s.to_string()),
+            lineage,
         });
-        AgentOps::new(
+        let storage = Arc::new(TempFs::new());
+        let ops = AgentOps::new(
             control,
-            Arc::new(TempFs::new()),
+            storage.clone(),
             Arc::new(DuckEngine::new()),
             AgentConfig::default(),
         )
-        .with_forwarding(self_ep.to_string(), fwd)
+        .with_forwarding(self_ep.to_string(), fwd);
+        (ops, storage)
+    }
+
+    #[tokio::test]
+    async fn lineage_forwarded_op_is_recorded_once_by_the_owner() {
+        // The owner runs the query, so the owner emits: a greeter that also
+        // emitted would double the run in every consumer, with two different
+        // pond-local snapshot ids and only one of them real.
+        let fwd = Arc::new(RecordingForwarder::default());
+        let (greeter, greeter_storage) = ops_with_lineage(
+            Some("http://owner:9092"),
+            "http://greeter:9092",
+            fwd.clone(),
+            true,
+        );
+        // Give the greeter this pond's storage, lineage directory and all: a
+        // greeter that emitted would then leave real files here, so the
+        // emptiness below is a decision and not a missing directory.
+        latiq_storage::PondStorage::ensure_pond(
+            greeter_storage.as_ref(),
+            latiq_common::PondId::parse(PID).unwrap(),
+            true,
+        )
+        .unwrap();
+        greeter
+            .write_query(
+                &Identity::claimed(Some("a")),
+                "pond-x",
+                "CREATE TABLE t(i INT)",
+            )
+            .await
+            .unwrap();
+        greeter.flush_lineage();
+        assert_eq!(fwd.writes.load(Ordering::SeqCst), 1, "it did forward");
+        assert_eq!(
+            greeter.lineage_writer_count(),
+            0,
+            "the node that only relayed the write must record nothing"
+        );
+        assert!(super::lineage::events_in(&greeter_storage, PID).is_empty());
+
+        // Anti-vacuity: the same pond, same SQL, owned by this node — the
+        // events appear, so the silence above is the forward and not a pond
+        // that never emits.
+        let (owner, owner_storage) =
+            ops_with_lineage(Some("http://me:9092"), "http://me:9092", fwd.clone(), true);
+        owner
+            .write_query(
+                &Identity::claimed(Some("a")),
+                "pond-x",
+                "CREATE TABLE t(i INT)",
+            )
+            .await
+            .unwrap();
+        owner.flush_lineage();
+        assert_eq!(
+            super::lineage::events_in(&owner_storage, PID).len(),
+            2,
+            "the owner records the write it actually ran, once"
+        );
     }
 
     #[tokio::test]
@@ -734,5 +809,579 @@ mod forwarding {
             .unwrap();
         assert_eq!(fwd.reads.load(Ordering::SeqCst), 0);
         assert_eq!(r.rows[0][0], serde_json::json!(1));
+    }
+}
+
+/// Lineage emission from the query path: a pond that opted in leaves a
+/// spec-compliant OpenLineage trail in its own directory, and a pond that did
+/// not pays nothing for it.
+///
+/// The events are read back off disk rather than through a fake sink, because
+/// the file in the pond's `lineage/` directory is the artefact task 6's MCP
+/// tool and task 7's HTTP sink both read — a test against an in-memory
+/// interception would not prove the thing that ships.
+mod lineage {
+    use latiq_agent_core::{AgentConfig, AgentOps, RegistryControlPlane};
+    use latiq_common::{Identity, PondId};
+    use latiq_control_plane::Registry;
+    use latiq_engine_duckdb::DuckEngine;
+    use latiq_storage::{PondStorage, TempFs};
+    use serde_json::{json, Value};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    /// As the file-level `ops()`, but keeping the storage handle: the events
+    /// live in the pond's own directory, so a test has to be able to find it.
+    pub(super) fn ops_with_storage() -> (AgentOps, Arc<TempFs>) {
+        let registry = Registry::open(None).unwrap();
+        registry
+            .register_node(
+                "node-a",
+                "http://127.0.0.1:8080/mcp",
+                "http://127.0.0.1:9092",
+                100,
+            )
+            .unwrap();
+        let control = Arc::new(RegistryControlPlane::new(registry));
+        let storage = Arc::new(TempFs::new());
+        let engine = Arc::new(DuckEngine::new());
+        let ops = AgentOps::new(control, storage.clone(), engine, AgentConfig::default());
+        (ops, storage)
+    }
+
+    /// The pond's lineage directory, or `None` once (or before) the pond has
+    /// no storage on this node at all.
+    pub(super) fn lineage_dir(storage: &TempFs, pond_id: &str) -> Option<std::path::PathBuf> {
+        let pid = PondId::parse(pond_id).expect("pond id parses");
+        let loc = storage.pond_location(pid).ok()?;
+        Some(std::path::PathBuf::from(loc.lineage_dir))
+    }
+
+    /// Every event the pond has on disk, in file order (which is chronological,
+    /// per the writer's name format) and then line order within a file.
+    pub(super) fn events_in(storage: &TempFs, pond_id: &str) -> Vec<Value> {
+        let Some(dir) = lineage_dir(storage, pond_id) else {
+            return Vec::new(); // no storage for this pond on this node
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new(); // no lineage directory at all
+        };
+        let mut names: Vec<String> = entries
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let body = std::fs::read_to_string(dir.join(&name)).expect("event file readable");
+            for line in body.lines() {
+                out.push(
+                    serde_json::from_str(line)
+                        .unwrap_or_else(|e| panic!("torn record in {name}: {e}")),
+                );
+            }
+        }
+        out
+    }
+
+    /// One facet body, e.g. `facet(e, "run", "latiq_identity")`.
+    pub(super) fn facet<'a>(event: &'a Value, owner: &str, key: &str) -> &'a Value {
+        &event[owner]["facets"][key]
+    }
+
+    fn job_name(event: &Value) -> &str {
+        event["job"]["name"].as_str().expect("job name is a string")
+    }
+
+    fn event_type(event: &Value) -> &str {
+        event["eventType"].as_str().expect("eventType is a string")
+    }
+
+    /// The events of one operation: a job name uniquely identifies the op here
+    /// (`{pond}.{op}[.{target}]`), and the START/terminal pair share a run id.
+    fn events_for_op<'a>(events: &'a [Value], job_prefix: &str) -> Vec<&'a Value> {
+        events
+            .iter()
+            .filter(|e| job_name(e).starts_with(job_prefix))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lineage_disabled_pond_emits_nothing_and_does_no_work() {
+        // The point of the opt-in. "Emits nothing" and "costs nothing" are
+        // different claims and only the second justifies the flag: a pond
+        // without lineage must never even resolve a writer, which is what the
+        // per-pond directory lookup and every event allocation hang off.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let off = ops
+            .allocate_pond(&id, Some("quiet".into()), "{}", "medium", &[], false)
+            .await
+            .unwrap();
+        ops.write_query(&id, "quiet", "CREATE TABLE t(i INTEGER)")
+            .await
+            .unwrap();
+        ops.read_query(&id, "quiet", "SELECT * FROM t")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        assert_eq!(
+            ops.lineage_writer_count(),
+            0,
+            "a pond without lineage must not cause a writer to be built"
+        );
+        assert!(
+            !lineage_dir(&storage, &off.pond_id)
+                .expect("the pond has storage")
+                .exists(),
+            "a pond without lineage must have no lineage directory"
+        );
+        assert!(events_in(&storage, &off.pond_id).is_empty());
+
+        // Anti-vacuity: the same ops, the same queries, with the flag on — so
+        // the emptiness above is the flag and not an emitter that never runs.
+        let on = ops
+            .allocate_pond(&id, Some("loud".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "loud", "CREATE TABLE t(i INTEGER)")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+        assert_eq!(ops.lineage_writer_count(), 1, "exactly the opted-in pond");
+        assert_eq!(
+            events_in(&storage, &on.pond_id).len(),
+            2,
+            "the opted-in pond records a START and a terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_write_records_start_and_complete_with_the_verified_subject() {
+        // A lone START leaves a permanently-RUNNING run in every consumer, so
+        // both events are required. And the identity facet has to keep the
+        // verified subject distinguishable from the claimed leaf: authority
+        // only ever comes from the verified field.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::verified(
+            "svc-orchestrator",
+            "https://idp.example/realms/latiq",
+            Some("planner-7"),
+        );
+        let pond = ops
+            .allocate_pond(&id, Some("ledger".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "ledger", "CREATE TABLE t(i INTEGER, sev VARCHAR)")
+            .await
+            .unwrap();
+        ops.write_query(&id, "ledger", "INSERT INTO t VALUES (1,'high')")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        let writes = events_for_op(&events, "ledger.write_query");
+        assert_eq!(
+            writes.len(),
+            4,
+            "two writes, each a START and a terminal event: {events:#?}"
+        );
+        let types: Vec<&str> = writes.iter().map(|e| event_type(e)).collect();
+        assert_eq!(types, vec!["START", "COMPLETE", "START", "COMPLETE"]);
+
+        // The pair of one operation shares a run id, and two operations do not.
+        let run_ids: Vec<&Value> = writes.iter().map(|e| &e["run"]["runId"]).collect();
+        assert_eq!(
+            run_ids[0], run_ids[1],
+            "a START and its terminal event are one run"
+        );
+        assert_ne!(run_ids[1], run_ids[2], "two writes are two runs");
+
+        let insert = writes[3];
+        let ident = facet(insert, "run", "latiq_identity");
+        assert_eq!(ident["subject"], json!("svc-orchestrator"));
+        assert_eq!(ident["issuer"], json!("https://idp.example/realms/latiq"));
+        assert_eq!(ident["verified"], json!(true));
+        assert_eq!(
+            ident["agentId"],
+            json!("planner-7"),
+            "the claimed leaf is recorded, and is not the subject"
+        );
+        assert_eq!(
+            ident["agentIdVerified"],
+            json!(false),
+            "the leaf is claimed on every path"
+        );
+
+        let pond_facet = facet(insert, "job", "latiq_pond");
+        assert_eq!(pond_facet["pondId"], json!(pond.pond_id));
+        assert_eq!(pond_facet["pondName"], json!("ledger"));
+        assert_eq!(insert["job"]["namespace"], json!("latiq"));
+
+        let query = facet(insert, "run", "latiq_query");
+        assert_eq!(query["op"], json!("write_query"));
+        assert_eq!(query["outcome"], json!("ok"));
+        assert_eq!(query["durationMeaning"], json!("completion"));
+
+        // The SQL rides the standard SQLJobFacet, redacted exactly as the
+        // access trail redacts it — provenance must not become a literal leak.
+        let sql = facet(insert, "job", "sql")["query"]
+            .as_str()
+            .expect("sql facet carries the query");
+        assert_eq!(sql, "INSERT INTO t VALUES (?,?)");
+    }
+
+    #[tokio::test]
+    async fn lineage_failed_query_emits_a_fail_event_with_an_error_facet() {
+        // A store that records only successes tells you what worked, never what
+        // was attempted — the same reason the access trail records `outcome`.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("broken".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.read_query(&id, "broken", "SELECT * FROM nope")
+            .await
+            .expect_err("the table does not exist");
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        assert_eq!(
+            events.len(),
+            2,
+            "a failed query is still a run: START and a terminal event"
+        );
+        assert_eq!(event_type(&events[0]), "START");
+        assert_eq!(
+            event_type(&events[1]),
+            "FAIL",
+            "the terminal event must say the run failed, not COMPLETE"
+        );
+        assert_eq!(
+            facet(&events[1], "run", "latiq_query")["outcome"],
+            json!("error")
+        );
+        let err = facet(&events[1], "run", "errorMessage");
+        assert_eq!(err["programmingLanguage"], json!("RUST"));
+        let message = err["message"].as_str().expect("an error message");
+        assert!(
+            message.to_lowercase().contains("nope"),
+            "the facet must carry the real failure, got {message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_read_is_recorded_once_as_the_op_the_caller_invoked() {
+        // `read_collected` runs `read_arrow_local`, so an emitter placed in the
+        // local halves rather than the public methods would record this read
+        // twice, under two different ops. Pins that.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("once".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "once", "CREATE TABLE t AS SELECT 1 AS i")
+            .await
+            .unwrap();
+        // `read_collected` — the path that rides `read_arrow_local`, and so the
+        // one where a misplaced emitter would double-record. (`read_query`
+        // takes the non-Arrow `run_query` path and is covered above.)
+        ops.read_collected(&id, "once", "SELECT i FROM t")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        assert_eq!(
+            events_for_op(&events, "once.read_query").len(),
+            2,
+            "exactly one START/terminal pair for the read: {events:#?}"
+        );
+        assert!(
+            events_for_op(&events, "once.read_arrow").is_empty(),
+            "the internal Arrow hop must not appear as an operation of its own"
+        );
+        assert_eq!(
+            events.len(),
+            4,
+            "one write and one read, two events each — nothing else emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_read_arrow_records_at_establishment() {
+        // The stream's completion is unobservable on both paths (see
+        // `read_arrow`'s audit-timing doc), so its events fire when the stream
+        // is established and say so — a `completion` label here would be a lie
+        // about what the duration measured.
+        use tokio_stream::StreamExt;
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("streamy".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "streamy", "CREATE TABLE t AS SELECT 1 AS i")
+            .await
+            .unwrap();
+        let stream = ops
+            .read_arrow(&id, "streamy", "SELECT i FROM t")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        let reads = events_for_op(&events, "streamy.read_arrow");
+        assert_eq!(
+            reads.len(),
+            2,
+            "both events fire at establishment, before a single batch is drained"
+        );
+        let query = facet(reads[1], "run", "latiq_query");
+        assert_eq!(query["op"], json!("read_arrow"));
+        assert_eq!(
+            query["durationMeaning"],
+            json!("establishment"),
+            "the duration measured establishment, not the life of the stream"
+        );
+
+        // Draining afterwards must not add a third event.
+        let mut batches = stream.batches;
+        while let Some(b) = batches.next().await {
+            b.unwrap();
+        }
+        ops.flush_lineage();
+        assert_eq!(
+            events_in(&storage, &pond.pond_id).len(),
+            events.len(),
+            "consuming the stream must not emit again"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_dropping_the_pond_evicts_its_writer() {
+        // The writer is keyed by pond and lives for the process; without
+        // eviction the map leaks an entry per dropped pond, and a writer that
+        // outlived its pond would later flush into a deleted directory.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("ephemeral".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "ephemeral", "CREATE TABLE t(i INTEGER)")
+            .await
+            .unwrap();
+        // Captured before the drop: afterwards the pond has no location to
+        // resolve the path from.
+        let dir = lineage_dir(&storage, &pond.pond_id).expect("the pond has storage");
+        assert_eq!(
+            ops.lineage_writer_count(),
+            1,
+            "the query must have built a writer, or the eviction below proves nothing"
+        );
+
+        ops.drop_pond(&id, "ephemeral", true).await.unwrap();
+        assert_eq!(
+            ops.lineage_writer_count(),
+            0,
+            "dropping the pond must evict its writer"
+        );
+        assert!(
+            !dir.exists(),
+            "the pond's files, lineage included, are reaped with it"
+        );
+    }
+
+    // ------------------------------------------------------- compliance
+
+    const CORE_URI: &str = "https://openlineage.io/spec/2-0-2/OpenLineage.json";
+    // The vendored schemas live in `latiq-lineage/spec/` and stay a single
+    // copy: this reaches across to them rather than duplicating the files,
+    // because two copies of a spec drift and only one of them would be wrong.
+    const CORE: &str = include_str!("../../latiq-lineage/spec/OpenLineage-2-0-2.json");
+
+    /// The schema for every facet the PRODUCTION emitter can attach. A facet
+    /// that appears on a real event without an entry here fails the test —
+    /// which is the point: `latiq-lineage`'s own compliance test walks a
+    /// fixture it builds itself and so cannot see what `ops.rs` actually emits.
+    fn facet_schemas() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "sql",
+                include_str!("../../latiq-lineage/spec/facets/SQLJobFacet-1-0-1.json"),
+            ),
+            (
+                "jobType",
+                include_str!("../../latiq-lineage/spec/facets/JobTypeJobFacet-2-0-3.json"),
+            ),
+            (
+                "errorMessage",
+                include_str!("../../latiq-lineage/spec/facets/ErrorMessageRunFacet-1-0-1.json"),
+            ),
+            (
+                "version",
+                include_str!(
+                    "../../latiq-lineage/spec/facets/DatasetVersionDatasetFacet-1-0-1.json"
+                ),
+            ),
+            (
+                "latiq_identity",
+                include_str!("../../latiq-lineage/spec/facets/1-0-0/LatiqIdentityFacet.json"),
+            ),
+            (
+                "latiq_pond",
+                include_str!("../../latiq-lineage/spec/facets/1-0-0/LatiqPondFacet.json"),
+            ),
+            (
+                "latiq_query",
+                include_str!("../../latiq-lineage/spec/facets/1-0-0/LatiqQueryFacet.json"),
+            ),
+        ]
+    }
+
+    fn core_registry() -> jsonschema::Registry<'static> {
+        let core: Value = serde_json::from_str(CORE).expect("vendored core schema parses");
+        jsonschema::Registry::new()
+            .add(CORE_URI, jsonschema::Resource::from_contents(core))
+            .expect("core schema URI is valid")
+            .prepare()
+            .expect("registry builds")
+    }
+
+    fn validator(registry: &jsonschema::Registry<'_>, schema: Value) -> jsonschema::Validator {
+        jsonschema::options()
+            .should_validate_formats(true)
+            .with_registry(registry)
+            .build(&schema)
+            .expect("schema compiles")
+    }
+
+    fn assert_valid(v: &jsonschema::Validator, instance: &Value, what: &str) {
+        let errors: Vec<String> = v.iter_errors(instance).map(|e| format!("{e}")).collect();
+        assert!(
+            errors.is_empty(),
+            "{what} is not valid OpenLineage: {errors:?}\ninstance: {instance:#}"
+        );
+    }
+
+    fn all_facets(event: &Value) -> Vec<(String, String, Value)> {
+        let mut out = Vec::new();
+        let mut collect = |owner: &str, holder: &Value| {
+            if let Some(map) = holder.get("facets").and_then(Value::as_object) {
+                for (k, v) in map {
+                    out.push((owner.to_string(), k.clone(), v.clone()));
+                }
+            }
+        };
+        collect("run", &event["run"]);
+        collect("job", &event["job"]);
+        for (side, key) in [("input", "inputs"), ("output", "outputs")] {
+            for ds in event[key].as_array().unwrap_or(&Vec::new()) {
+                collect(side, ds);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn lineage_events_from_the_query_path_are_valid_and_fully_stamped() {
+        // Missing `_producer`/`_schemaURL` is one of only two hard OpenLineage
+        // rejection causes, and a fixture-based test cannot catch a facet the
+        // PRODUCTION emitter forgets to stamp. So: take events off the disk of
+        // a pond that ran real queries, and hold them to the real spec.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::verified("svc-orchestrator", "https://idp.example", Some("planner-7"));
+        let pond = ops
+            .allocate_pond(&id, Some("compliant".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(&id, "compliant", "INSERT INTO absent VALUES (1)")
+            .await
+            .expect_err("no such table — so the error facet is exercised too");
+        ops.write_query(&id, "compliant", "CREATE TABLE t AS SELECT 1 AS i")
+            .await
+            .unwrap();
+        ops.read_query(&id, "compliant", "SELECT i FROM t")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+
+        let registry = core_registry();
+        let envelope = validator(
+            &registry,
+            json!({ "$ref": format!("{CORE_URI}#/$defs/RunEvent") }),
+        );
+
+        let events = events_in(&storage, &pond.pond_id);
+        assert!(
+            events.len() >= 6,
+            "three operations must have produced three event pairs, got {}",
+            events.len()
+        );
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for event in &events {
+            assert_valid(&envelope, event, "an event from the query path");
+            let facets = all_facets(event);
+            assert!(
+                facets.len() >= 4,
+                "an emitted event carried almost no facets: {event:#}"
+            );
+            for (owner, key, payload) in facets {
+                for field in ["_producer", "_schemaURL"] {
+                    let uri = payload
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!("{owner} facet `{key}` is missing {field}: {payload:#}")
+                        });
+                    assert!(
+                        uri.starts_with("https://"),
+                        "{owner} facet `{key}` {field} must be an absolute URI, got {uri:?}"
+                    );
+                }
+                let (_, schema) = facet_schemas()
+                    .into_iter()
+                    .find(|(k, _)| *k == key)
+                    .unwrap_or_else(|| {
+                        panic!("emitted facet `{key}` on {owner} has no vendored schema")
+                    });
+                let v = validator(
+                    &registry,
+                    serde_json::from_str(schema).expect("facet schema parses"),
+                );
+                assert_valid(
+                    &v,
+                    &json!({ key.clone(): payload }),
+                    &format!("{owner} facet `{key}`"),
+                );
+                seen.insert(key);
+            }
+        }
+        // Anti-vacuity, and a completeness pin: these are the facets the
+        // emitter is supposed to stamp on every run, plus the error facet the
+        // failed write above exists to produce.
+        for required in [
+            "latiq_identity",
+            "latiq_pond",
+            "latiq_query",
+            "sql",
+            "jobType",
+            "errorMessage",
+        ] {
+            assert!(
+                seen.contains(required),
+                "the query path never emitted the `{required}` facet; saw {seen:?}"
+            );
+        }
     }
 }

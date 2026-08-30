@@ -8,6 +8,7 @@ latiq-common = { path = "../latiq-common" }
 latiq-storage = { path = "../latiq-storage" }
 latiq-engine = { path = "../latiq-engine" }
 latiq-control-plane = { path = "../latiq-control-plane" }
+latiq-lineage = { path = "../latiq-lineage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -20,5 +21,9 @@ arrow = { workspace = true }
 
 [dev-dependencies]
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
+# Compliance proof for the events the query path actually emits, validated
+# against the schemas vendored once in `latiq-lineage/spec/`. Dev-only: it must
+# never ship in the binary.
+jsonschema = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

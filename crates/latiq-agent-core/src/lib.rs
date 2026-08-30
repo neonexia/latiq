@@ -6,6 +6,10 @@ pub mod control;
 pub mod error;
 pub mod forward;
 pub mod inflight;
+/// The lineage emitter. Private: unlike `access`, which every surface calls, it
+/// is reached only from the public ops methods — one emit per operation, on the
+/// node that ran it (see the module doc).
+pub(crate) mod lineage;
 pub mod ops;
 pub mod registry_control;
 pub mod trace;
