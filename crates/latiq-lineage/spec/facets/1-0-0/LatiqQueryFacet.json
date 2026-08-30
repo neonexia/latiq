@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/neonexia/latiq/v0.1.0/crates/latiq-lineage/spec/facets/1-0-0/LatiqQueryFacet.json",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqQueryFacet.json",
   "$defs": {
     "LatiqQueryFacet": {
       "description": "What Latiq operation this run was, how it ended, and how long it took. `durationMeaning` states what the duration measures, because a streaming read's duration is establishment time, not completion time.",

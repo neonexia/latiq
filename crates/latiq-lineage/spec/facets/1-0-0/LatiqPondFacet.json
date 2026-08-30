@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/neonexia/latiq/v0.1.0/crates/latiq-lineage/spec/facets/1-0-0/LatiqPondFacet.json",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqPondFacet.json",
   "$defs": {
     "LatiqPondFacet": {
       "description": "The pond this job ran against and the node that executed it. On the job (not the run) because a pond is the stable, recurring thing a job is named after.",

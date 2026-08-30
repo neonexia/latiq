@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/neonexia/latiq/v0.1.0/crates/latiq-lineage/spec/facets/1-0-0/LatiqParentClaimFacet.json",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqParentClaimFacet.json",
   "$defs": {
     "LatiqParentClaimFacet": {
       "description": "The caller's raw, opaque workflow/step labels, verbatim. `parent.run.runId` must be a UUID, so Latiq derives one from `workflowId`; this facet preserves what the caller actually said. Always `verified: false` \u2014 a parent is claimed and never load-bearing.",

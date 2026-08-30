@@ -15,10 +15,11 @@ use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-/// URI identifying us as the producer of this metadata. Consumers treat it as
-/// an opaque identity, so it stays stable across a version bump of anything
-/// else in the workspace.
-pub const PRODUCER: &str = "https://github.com/neonexia/latiq/tree/v0.1.0";
+/// URI identifying us as the producer of this metadata. Deliberately carries
+/// **no version**: consumers key on `_producer` as an opaque producer identity,
+/// so bumping it every release would make each Latiq release look like a
+/// different producer. Do not "update" it at release time.
+pub const PRODUCER: &str = "https://github.com/neonexia/latiq";
 
 /// The core spec version every event here conforms to. `spec/README.md` records
 /// the upstream tag the vendored copy came from.
@@ -36,8 +37,21 @@ pub const JOB_NAMESPACE: &str = "latiq";
 const LATIQ_PARENT_NAMESPACE: Uuid = Uuid::from_u128(0xe2adba64_917e_49e4_9882_278323268fed);
 
 const SPEC_FACETS: &str = "https://openlineage.io/spec/facets";
-const LATIQ_FACETS: &str =
-    "https://raw.githubusercontent.com/neonexia/latiq/v0.1.0/crates/latiq-lineage/spec/facets/1-0-0";
+
+/// Where our custom facet schemas are identified from. `{version}` is a
+/// **facet-schema** version, not a release: it appears in the git ref and in
+/// the path, and it changes **only when that facet's fields change**. It must
+/// not be bumped at release time — `_schemaURL` identifies a facet's *shape* to
+/// a consumer, so floating it with the crate version would make every Latiq
+/// release look like a new facet type downstream.
+const LATIQ_FACETS: &str = "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-{version}/crates/latiq-lineage/spec/facets/{version}";
+
+// Each facet versions independently — a change to `latiq_query`'s fields must
+// not renumber, and so invalidate, the other three.
+const IDENTITY_FACET_VERSION: &str = "1-0-0";
+const POND_FACET_VERSION: &str = "1-0-0";
+const QUERY_FACET_VERSION: &str = "1-0-0";
+const PARENT_CLAIM_FACET_VERSION: &str = "1-0-0";
 
 // ---------------------------------------------------------------- envelope
 
@@ -276,8 +290,11 @@ pub mod facets {
         format!("{SPEC_FACETS}/{version}/{name}.json#/$defs/{name}")
     }
 
-    fn latiq_url(name: &str) -> String {
-        format!("{LATIQ_FACETS}/{name}.json#/$defs/{name}")
+    fn latiq_url(name: &str, version: &str) -> String {
+        format!(
+            "{}/{name}.json#/$defs/{name}",
+            LATIQ_FACETS.replace("{version}", version)
+        )
     }
 
     /// `ParentRunFacet` — the claimed workflow, as a derived UUID plus a job
@@ -299,7 +316,7 @@ pub mod facets {
     pub fn parent_claim(claim: &ParentClaim) -> Facet {
         Facet::stamp(
             "latiq_parent_claim",
-            latiq_url("LatiqParentClaimFacet"),
+            latiq_url("LatiqParentClaimFacet", PARENT_CLAIM_FACET_VERSION),
             &serde_json::json!({
                 "workflowId": claim.workflow_id,
                 "stepId": claim.step_id,
@@ -379,7 +396,7 @@ pub mod facets {
     ) -> Facet {
         Facet::stamp(
             "latiq_identity",
-            latiq_url("LatiqIdentityFacet"),
+            latiq_url("LatiqIdentityFacet", IDENTITY_FACET_VERSION),
             &serde_json::json!({
                 "verified": verified,
                 "subject": subject,
@@ -395,7 +412,7 @@ pub mod facets {
     pub fn pond(pond_id: &str, pond_name: &str, node_id: &str) -> Facet {
         Facet::stamp(
             "latiq_pond",
-            latiq_url("LatiqPondFacet"),
+            latiq_url("LatiqPondFacet", POND_FACET_VERSION),
             &serde_json::json!({ "pondId": pond_id, "pondName": pond_name, "nodeId": node_id }),
         )
     }
@@ -410,7 +427,7 @@ pub mod facets {
     ) -> Facet {
         Facet::stamp(
             "latiq_query",
-            latiq_url("LatiqQueryFacet"),
+            latiq_url("LatiqQueryFacet", QUERY_FACET_VERSION),
             &serde_json::json!({
                 "op": op,
                 "outcome": outcome,
