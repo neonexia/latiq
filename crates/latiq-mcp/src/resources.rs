@@ -26,7 +26,8 @@ const RESOURCES: &[Res] = &[
 - **Latiq owns the transaction:** send plain statements — multi-statement SQL is fine, but never `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`. Latiq commits your write itself and records the author just before committing; your own `COMMIT` ends that transaction first, so the change lands in history with NO author.\n\
 - **Discover:** `SHOW TABLES` lists tables (and `information_schema.columns` for columns); list_ponds + describe_pond find existing work to join.\n\
 - **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
-- **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first). See latiq://recipes/lineage.\n\
+- **Identity:** who you are arrives in the TRANSPORT, never in a tool argument — no tool takes an agent id, so don't try to set one. The `Authorization: Bearer` token is the verified principal (`subject` + `issuer`); the `latiq-agent-id` header is a CLAIM and carries no authority. On a deployment with no issuer configured nothing is verified: you get `verified: false` and a null `subject` wherever identity is reported. Read that as \"nobody proved it\", not \"nobody did it\".\n\
+- **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first), and check the `lineage` flag in describe_pond to know whether a pond has it. It is chosen at allocation and CANNOT be turned on later, so ask for it when you allocate. It is a working record, not tamper-proof evidence — the events are files in the pond, and dropping the pond destroys them. See latiq://recipes/lineage.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
 - **Plan first:** call explain_query before an expensive query to estimate cost, then refine.\n\
 - **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.",
@@ -99,7 +100,8 @@ Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB download
 Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
 Use this to coordinate: see who created a table before extending it.\n\
 **How a write loses its author:** Latiq brackets your statement in its own transaction and records the author immediately before committing. SQL that does its own `COMMIT` (or `BEGIN`/`ROLLBACK`/`START TRANSACTION`) ends that bracket first, so the snapshot appears here with no author and nobody can tell who made the change. Nothing stops you — just send plain statements.\n\
-**Always read `commit_extra_info` alongside `author`.** `author` alone cannot tell a VERIFIED writer from one merely claiming that name — the evidence (issuer/subject, and whether the identity was verified) lives in `commit_extra_info`.",
+**Always read `commit_extra_info` alongside `author`.** `author` alone cannot tell a VERIFIED writer from one merely claiming that name — the evidence (issuer/subject, and whether the identity was verified) lives in `commit_extra_info`. Where the deployment configures no issuer there is nothing to verify, so every author is a claim and no subject is recorded; that is the default, not a fault.\n\
+**You cannot choose the identity you write under.** It comes from the transport — the bearer token (verified `subject`/`issuer`) and the `latiq-agent-id` header (a claimed leaf) — and no tool takes it as an argument.",
     },
     Res {
         uri: "latiq://recipes/lineage",
@@ -119,12 +121,20 @@ Use this to coordinate: see who created a table before extending it.\n\
 `malformed_lines` and `unreadable_files` are non-zero when the page is missing events that were recorded — a short answer never pretends to be a complete one.\n\
 Each operation records a START and a terminal (COMPLETE / FAIL / ABORT) event sharing one `run.runId`. \
 Standard facets carry the SQL shape (`job.facets.sql`, literals redacted), the engine, the error message on a failure, and each dataset's DuckLake snapshot (`inputs[].facets.version`). \
-Latiq's own facets carry the caller (`run.facets.latiq_identity` — read `verified` before you trust `subject`), the pond (`job.facets.latiq_pond`), and the outcome + duration (`run.facets.latiq_query`).\n\
+Latiq's own facets carry the caller (`run.facets.latiq_identity`), the pond (`job.facets.latiq_pond`), and the outcome + duration (`run.facets.latiq_query`, on the terminal event only).\n\
 The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consumer unchanged.\n\n\
+**Reading the identity facet.** Verified caller:\n\
+```json\n{ \"agentId\": \"analytics-agent-7\", \"agentIdVerified\": false,\n  \"issuer\": \"https://idp.example/realms/latiq\",\n  \"subject\": \"d6d75715-…\", \"verified\": true }\n```\n\
+`subject`/`issuer` come from the caller's bearer token; `agentId` is the claimed leaf header and `agentIdVerified` says whether that leaf itself was backed by the token. Where no issuer is configured there is nothing to verify, so `verified` is false and `subject` and `issuer` are **null** while `agentId` still names the caller — a null subject means the deployment proved nothing, not that nobody ran the query. Check `verified` before you attribute anything to `subject`.\n\n\
 **Complements attribution, not a replacement.** `ducklake_snapshots('<pond>')` says who committed a snapshot; lineage says which run produced it and what that run read. See latiq://recipes/attribution-lookup.\n\n\
 **To filter or aggregate the WHOLE trail** rather than page it, query the files directly — get_lineage returns their directory as `lineage_dir`:\n\
 ```sql\nSELECT job.name, run.facets.latiq_query.outcome, count(*)\nFROM read_json_auto('<lineage_dir>/*.jsonl')\nGROUP BY 1, 2;\n```\n\
-**Watch for:** the facets present differ per event, so DuckDB's inferred struct type can shift between queries — SELECT the fields you need, and don't rely on a stable schema across runs. Only `*.jsonl` files are complete; a `.tmp-` file is a batch still being written.",
+**Watch for:** the facets present differ per event, so DuckDB's inferred struct type can shift between queries — SELECT the fields you need, and don't rely on a stable schema across runs. Only `*.jsonl` files are complete; a `.tmp-` file is a batch still being written.\n\n\
+**What lineage does NOT promise.**\n\
+- It is a record, not proof. The events are ordinary files under `lineage_dir` in the pond, and write_query runs arbitrary SQL — so anything that can write in the pond can also add, overwrite or remove events. Use it to understand what happened; do not present it as evidence nobody could have altered.\n\
+- It starts at allocation. Nothing is recorded for a pond that was allocated without `lineage`, and it cannot be switched on afterwards — you would have to redo the work in a new pond.\n\
+- It dies with the pond. drop_pond removes the lineage directory along with the data; read what you need first.\n\
+- It covers queries, not intent. The SQL shape is recorded with literals redacted, so the trail shows what ran, not the values it ran on.",
     },
     Res {
         uri: "latiq://troubleshooting",
