@@ -172,7 +172,7 @@ impl AgentOps {
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
             .storage
-            .create_pond(pid)
+            .create_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
@@ -244,7 +244,7 @@ impl AgentOps {
         // pond's registry name so introspection is scoped to this catalog.
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
@@ -594,7 +594,7 @@ impl AgentOps {
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
@@ -682,7 +682,7 @@ impl AgentOps {
         let pid = Self::parse_id(&pond_id)?;
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
@@ -878,7 +878,7 @@ impl AgentOps {
         // under the pond's registry name so callers query `<pond>.snapshots()`.
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
@@ -970,7 +970,7 @@ impl AgentOps {
         // pond's registry name so the plan resolves names in this catalog.
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);

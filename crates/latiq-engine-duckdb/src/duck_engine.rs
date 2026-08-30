@@ -465,7 +465,7 @@ mod tests {
         // If ATTACH fails, the secret must NOT linger on the reused pond connection
         // (Latiq stores zero credentials — invariant 6).
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         let plan = crate::attachers::AttachPlan {
             alias: "leaktest".into(),
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn cancels_long_running_query_and_recovers() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
 
@@ -538,7 +538,7 @@ mod tests {
     fn recovers_from_poisoned_mutex() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
 
@@ -578,7 +578,7 @@ mod tests {
         use std::ops::ControlFlow;
 
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
         eng.write_query(
@@ -637,7 +637,7 @@ mod tests {
         // different connection must observe committed writes. Checked on a fresh
         // pooled connection AND on a reused one.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let id = Identity::claimed(Some("writer"));
         eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
@@ -667,7 +667,7 @@ mod tests {
         // The Scenario B fix: a checked-out reader must not block a write. If
         // reads still took the writer mutex this would deadlock.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let id = Identity::claimed(Some("w"));
         eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn pool_hands_out_distinct_connections_and_respects_its_bound() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
         let pond = eng.pond(&loc).unwrap();
@@ -716,7 +716,7 @@ mod tests {
         // Session state is not inherited by a clone; if we failed to re-apply it,
         // pooled reads would render timestamps in the host timezone.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let tz = eng
             .read_query(
@@ -733,7 +733,7 @@ mod tests {
         // Many readers on a shared pond — the product's "agents share a pond" case.
         use std::sync::Arc as StdArc;
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = StdArc::new(DuckEngine::new());
         eng.write_query(
             &loc,
@@ -763,7 +763,7 @@ mod tests {
         // resolved limits change — otherwise the new tier silently does nothing.
         use latiq_common::ResourceLimits;
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.limits = Some(ResourceLimits {
             memory_bytes: 1024 * 1024 * 1024,
             cores: 2,
@@ -807,12 +807,12 @@ mod tests {
         // The read pool must follow, or uncapping raises the thread budget while
         // leaving concurrent readers queued behind a mid-tier-sized pool.
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.limits = None; // the `none` tier
         let eng = DuckEngine::new();
         let uncapped = eng.pond(&loc).unwrap().reads.max;
 
-        let mut medium = fs.create_pond(PondId::new()).unwrap();
+        let mut medium = fs.create_pond(PondId::new(), false).unwrap();
         medium.limits = Some(latiq_common::ResourceLimits {
             memory_bytes: 4 * 1024 * 1024 * 1024,
             cores: 4,
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn forget_pond_evicts_cached_instance() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap(); // opens + caches the instance
         assert_eq!(
