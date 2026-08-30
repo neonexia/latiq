@@ -34,14 +34,18 @@ class Database:
         name: str | None = ...,
         tier: str = ...,
         description: str = ...,
+        lineage: bool = ...,
     ) -> Pond:
-        """Allocate a pond and return a handle. `description` is agent-discovery text."""
+        """Allocate a pond and return a handle. `description` is agent-discovery
+        text. `lineage=True` opts the pond into OpenLineage provenance for every
+        query (off by default, fixed for the pond's lifetime)."""
 
     def get_pond(self, pond: str) -> Pond:
         """Fetch an existing pond's metadata and return a handle (one round-trip)."""
 
     def list_ponds(self) -> dict[str, dict[str, Any]]:
-        """Ponds keyed by name: `{name: {pond_id, tier, node_id, description}}`."""
+        """Ponds keyed by name:
+        `{name: {pond_id, tier, node_id, description, lineage}}`."""
 
     def list_datasets(self, query: str | None = ...) -> dict[str, dict[str, Any]]:
         """Curated datasets keyed by name. `query`: None/`""` = all, `"#tag"`,
@@ -64,6 +68,10 @@ class Pond:
     def tier(self) -> str: ...
     @property
     def description(self) -> str: ...
+    @property
+    def lineage(self) -> bool:
+        """Whether this pond records OpenLineage events into its own `lineage/`
+        directory on its node. Fixed at creation."""
     @overload
     def query(self, sql: str, stream: Literal[False] = ...) -> pyarrow.Table:
         """Run SQL. Reads stream back as a `pyarrow.Table` (uncapped); writes
