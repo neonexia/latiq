@@ -4,6 +4,11 @@ How Latiq is packaged and run. The whole system is the **one `latiq` binary**; t
 role is the command (`serve` = control plane, `node add` = pond node, else the CLI).
 `ENTRYPOINT ["latiq"]`; compose/k8s pick the role.
 
+**`deploy/` is the single home for deployment artifacts** — the user compose, the
+cluster compose, the fixtures, both Dockerfiles, the CLI installer. `README.md`
+here is the human front door (which file is which); this file is the invariants.
+Nothing deployment-shaped should live outside this directory or in another repo.
+
 ## The cluster compose (`deploy/cluster/`)
 Control plane + pond nodes behind an **nginx gateway** — the single front door:
 - **Data + Stream gRPC → `:51500`** — round-robin across nodes (stateless; the
@@ -19,11 +24,18 @@ Control plane + pond nodes behind an **nginx gateway** — the single front door
 - `cluster/docker-compose.yml` — the **repo/CI/dev** stack: mounts `./nginx.conf`,
   and carries the `test`/`scale`/`tools` **profiles** (Prometheus + MinIO +
   Iceberg-REST for internal testing; a 3rd node for scale-out; an in-network `cli`).
-- `latiq-compose.yml` — the **minimal external-user** deployment: control plane +
-  2 pond nodes + gateway, **no profiles**, **pure images + ports** (no inline
-  configs, no mounts) so it runs clone-free and **identically under Docker AND
-  Podman**. Mirrored to the public `neonexia/latiq-deploy` repo:
-  `curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml && docker compose up -d` (or `podman compose up -d`).
+- `docker-compose.yml` (repo root of `deploy/`) — the **minimal external-user**
+  deployment: control plane + 2 pond nodes + gateway, **no profiles**, **pure
+  images + ports** (no inline configs, no mounts) so it runs clone-free and
+  **identically under Docker AND Podman**. It is fetched directly from this repo:
+  `curl -O https://raw.githubusercontent.com/neonexia/latiq/main/deploy/docker-compose.yml && docker compose up -d` (or `podman compose up -d`).
+  **Keep it mount-free** — a single bind mount both breaks the clone-free path and
+  is the most likely thing to break Podman.
+
+`install.sh` installs the client-only CLI. Its download URL still points at the
+`cli-latest` release of `neonexia/latiq-deploy` because that is where the nightly
+`publish-cli` job uploads the assets; if those move to this repo's releases,
+change **both** `install.sh` and `nightly.yml` together.
 
 **The gateway image.** So the user compose stays pure-images, the gateway is a
 published image — `latiq-gateway` (`deploy/gateway.Dockerfile` = `nginx` + baked
@@ -75,7 +87,7 @@ default, and without the mapper every token fails the audience check as an opaqu
 rejection. Verified token: `iss=http://keycloak:8080/realms/latiq`,
 `aud=["latiq","account"]`.
 
-`latiq-compose.yml` is **deliberately untouched** by all of this: the external-user
+`docker-compose.yml` is **deliberately untouched** by all of this: the external-user
 deployment stays pure images + ports, no profiles, no mounts.
 
 ## Lineage backend (`LATIQ_LINEAGE_BACKEND_URL` — optional, pond node only)

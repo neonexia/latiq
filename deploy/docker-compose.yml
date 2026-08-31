@@ -2,7 +2,7 @@
 # only PUBLISHED images (GHCR + Docker Hub) — no inline configs, no file mounts —
 # so it runs with NO repo clone and identically under Docker AND Podman:
 #
-#   curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
+#   curl -O https://raw.githubusercontent.com/neonexia/latiq/main/deploy/docker-compose.yml
 #   docker compose up -d      # (or: podman compose up -d)
 #
 # Then:

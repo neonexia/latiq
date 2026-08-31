@@ -1,6 +1,6 @@
 # The Latiq query gateway image: nginx with the front-door config baked in, so the
-# user-facing compose (deploy/latiq-compose.yml, mirrored to neonexia/latiq-deploy)
-# is pure images + ports — no inline `configs:` and no file mounts. That makes it
+# user-facing compose (deploy/docker-compose.yml) is pure images + ports — no
+# inline `configs:` and no file mounts. That makes it
 # runtime-agnostic: identical under `docker compose` and `podman compose`.
 #
 # The baked config IS deploy/cluster/nginx.conf (the same file the internal test
