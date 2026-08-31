@@ -7,12 +7,12 @@
 # release source with LATIQ_RELEASE_REPO / LATIQ_RELEASE_TAG.
 set -eu
 
-# Where the prebuilt CLI binaries are published. The nightly's `publish-cli` job
-# uploads them to the `cli-latest` release of neonexia/latiq-deploy (that repo
-# predates this one being public and still owns the release assets). Repointing
-# the assets at this repo's own releases is a one-line change here plus the
-# matching change in .github/workflows/nightly.yml.
-repo="${LATIQ_RELEASE_REPO:-neonexia/latiq-deploy}"
+# Where the prebuilt CLI binaries are published. `cli-latest` is a ROLLING release
+# in this repo, refreshed by the nightly's `publish-cli` job and by every tagged
+# release (.github/workflows/nightly.yml + release.yml) — change those and this
+# together, or the installer and the publisher disagree.
+# Pin a specific version instead with  LATIQ_RELEASE_TAG=v0.2.0.
+repo="${LATIQ_RELEASE_REPO:-neonexia/latiq}"
 tag="${LATIQ_RELEASE_TAG:-cli-latest}"
 
 os=$(uname -s)
