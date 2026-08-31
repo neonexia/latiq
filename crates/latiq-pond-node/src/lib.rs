@@ -13,6 +13,7 @@ pub use grpc_control::GrpcControlPlane;
 pub use stream_service::StreamService;
 
 use latiq_agent_core::{AgentConfig, AgentOps};
+use latiq_auth::Verifier;
 use latiq_engine_duckdb::DuckEngine;
 use latiq_mcp::serve_mcp;
 use latiq_proto::v1::control_client::ControlClient;
@@ -34,12 +35,24 @@ pub struct PondNodeConfig {
     pub data_addr: SocketAddr,
     /// Internal endpoint advertised to the control plane (single-node routing).
     pub internal_endpoint: String,
+    /// The public URL agents use to reach this node's MCP endpoint, e.g.
+    /// `https://latiq.example.com/mcp`. Published as the RFC 9728 `resource`
+    /// identifier and in the 401 challenge, so it MUST be the address clients
+    /// actually dial -- behind a gateway that is the gateway's URL, not this
+    /// node's. Distinct from `internal_endpoint` (`--advertise-addr`), which is
+    /// the internal address peer nodes use to forward pond requests. `None`
+    /// derives it from `internal_endpoint`, which is correct only when clients
+    /// reach nodes directly.
+    pub public_mcp_url: Option<String>,
     /// Control-plane Control gRPC endpoint, e.g. `http://127.0.0.1:9090`.
     pub control_endpoint: String,
     /// Local-FS root for pond storage.
     pub data_dir: PathBuf,
     /// Address to serve Prometheus `/metrics` on (None = metrics off).
     pub metrics_addr: Option<SocketAddr>,
+    /// When set, every surface on this node requires a verified bearer token.
+    /// `None` keeps the relaxed identity of the embedded and dev paths.
+    pub auth: Option<latiq_auth::AuthConfig>,
 }
 
 /// Install the standard + optional DuckDB extensions into the local cache so a
@@ -98,16 +111,33 @@ pub async fn build_ops(
     Ok(Arc::new(ops))
 }
 
-/// Serve the Data/Query gRPC surface on `addr`.
+/// Serve the Data/Query gRPC surface on `addr`. `verifier` is built once at
+/// startup and shared — never per request.
+///
+/// `metadata_url` is the RFC 9728 protected-resource document advertised in the
+/// `WWW-Authenticate` challenge on a rejection. On a pond node that document is
+/// served by the MCP surface, so the URL points there (see `run_pond_node`);
+/// `None` means no challenge is attached.
 pub async fn serve_data(
     addr: SocketAddr,
     ops: Arc<AgentOps>,
+    verifier: Option<Arc<Verifier>>,
+    metadata_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Data (unary JSON, CLI/SDK) + Stream (server-streaming Arrow, SDK + the
-    // node-to-node read forward) share one port — both plain tonic.
+    // node-to-node read forward) share one port — both plain tonic. Both get the
+    // same verifier: a surface left unauthenticated is the whole node's auth.
     Server::builder()
-        .add_service(DataServer::new(DataService::new(ops.clone())))
-        .add_service(StreamServer::new(StreamService::new(ops)))
+        .add_service(DataServer::new(
+            DataService::new(ops.clone())
+                .with_verifier(verifier.clone())
+                .with_metadata_url(metadata_url.as_deref()),
+        ))
+        .add_service(StreamServer::new(
+            StreamService::new(ops)
+                .with_verifier(verifier)
+                .with_metadata_url(metadata_url.as_deref()),
+        ))
         .serve(addr)
         .await?;
     Ok(())
@@ -128,6 +158,25 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
                  not load them (bake them into the deployment image): {e}"
             )
         })?;
+
+    // Built ONCE, before anything serves: a bad auth config must stop the node
+    // loudly rather than let it come up accepting unauthenticated callers.
+    let verifier = match cfg.auth.clone() {
+        Some(auth) => Some(Arc::new(Verifier::new(auth).map_err(|e| {
+            anyhow::anyhow!("auth is configured but the verifier could not be built: {e}")
+        })?)),
+        None => None,
+    };
+
+    // Resolved BEFORE the node registers or serves, like the verifier: a bad
+    // public URL means every client's discovery fails with an error that points
+    // nowhere near this setting, so it must stop the node loudly instead.
+    let mcp_public_url = latiq_mcp::resolve_public_mcp_url(
+        cfg.public_mcp_url.as_deref(),
+        &cfg.internal_endpoint,
+        cfg.mcp_addr,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     let mcp_endpoint = format!("http://{}/mcp", cfg.mcp_addr);
     let ops = build_ops(
@@ -187,8 +236,20 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     // Serve both surfaces concurrently.
     let data_ops = ops.clone();
     let data_addr = cfg.data_addr;
+    let data_verifier = verifier.clone();
+    // ASSUMPTION: the RFC 9728 document lives on this node's MCP surface, so the
+    // Data/Stream challenge points there. Both surfaces derive it from ONE
+    // string — `mcp_public_url`, the URL clients actually dial (see
+    // `resolve_public_mcp_url`) — never the socket we bound: every compose file
+    // we ship binds 0.0.0.0, and two challenges naming different documents would
+    // be worse than one wrong one.
+    // `None` when no verifier is configured: a node that never opted into auth
+    // must not advertise an authorization server.
+    let data_metadata_url = verifier
+        .as_ref()
+        .map(|_| latiq_mcp::protected_resource_metadata_url(&mcp_public_url));
     tokio::spawn(async move {
-        if let Err(e) = serve_data(data_addr, data_ops).await {
+        if let Err(e) = serve_data(data_addr, data_ops, data_verifier, data_metadata_url).await {
             eprintln!("data gRPC server error: {e}");
         }
     });
@@ -198,7 +259,10 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         cfg.node_id, cfg.data_addr
     );
     println!("  pond storage: {}", cfg.data_dir.display());
-    serve_mcp(cfg.mcp_addr, ops)
+    // The MCP surface gets the SAME verifier as Data/Stream (a surface left
+    // unauthenticated is the whole node's auth) and the SAME advertised URL, so
+    // the two challenges can never point at different documents.
+    serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url))
         .await
         .map_err(|e| anyhow::anyhow!("mcp server error: {e}"))?;
     Ok(())

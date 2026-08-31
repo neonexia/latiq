@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 latiq-common = { path = "../latiq-common" }
 latiq-agent-core = { path = "../latiq-agent-core" }
+latiq-auth = { path = "../latiq-auth" }
 latiq-proto = { path = "../latiq-proto" }
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-storage = { path = "../latiq-storage" }
@@ -21,3 +22,9 @@ tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 arrow = { workspace = true }
+
+[dev-dependencies]
+# The in-process fake IdP behind the auth tests.
+latiq-auth = { path = "../latiq-auth", features = ["test-support"] }
+latiq-control-plane = { path = "../latiq-control-plane" }
+reqwest = { workspace = true }

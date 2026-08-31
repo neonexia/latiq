@@ -12,7 +12,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
 use latiq_agent_core::{AgentError, ArrowReadStream, DescribeResult, Forwarder, PullResult};
-use latiq_common::{ErrorEnvelope, Identity};
+use latiq_common::{ErrorEnvelope, ErrorKind, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::stream_client::StreamClient;
@@ -66,10 +66,23 @@ impl GrpcForwarder {
 /// Tag the forwarded request with the caller's identity (so the owner attributes
 /// the op to the original agent) and the ambient trace id (so the request's spans
 /// correlate across the node hop).
+///
+/// When the caller presented a bearer token, the ORIGINAL token is replayed so
+/// the owner verifies it itself and reaches the same verified identity. Without
+/// that, only `latiq-agent-id` would cross the hop and a verified caller would
+/// arrive downgraded to claimed — fail-safe for authority, but it silently drops
+/// subject/issuer and makes the owner's attribution wrong. We deliberately do
+/// NOT send an internal header asserting "already verified": a claim the owner
+/// trusts without checking is trust laundering.
 fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
     let mut req = Request::new(msg);
     if let Ok(v) = MetadataValue::try_from(id.agent_id.as_str()) {
         req.metadata_mut().insert("latiq-agent-id", v);
+    }
+    if let Some(token) = latiq_agent_core::current_bearer() {
+        if let Ok(v) = MetadataValue::try_from(format!("Bearer {token}").as_str()) {
+            req.metadata_mut().insert("authorization", v);
+        }
     }
     if let Some(tid) = latiq_agent_core::current_trace_id() {
         if let Ok(v) = MetadataValue::try_from(tid.as_str()) {
@@ -91,6 +104,14 @@ fn status_to_error(s: Status) -> AgentError {
     match s.code() {
         Code::NotFound => AgentError::pond_not_found(s.message()),
         Code::AlreadyExists => AgentError::name_conflict(s.message()),
+        // The owner re-verifies the replayed token on its own authority and can
+        // legitimately refuse a token the greeter accepted (asymmetric issuer
+        // trust). The catch-all would report that as `Internal` — a crash, from
+        // the client's point of view — and hide the one failure the client can
+        // actually act on by re-minting its token and retrying.
+        Code::Unauthenticated => {
+            AgentError::of_kind(ErrorKind::Unauthenticated, s.message().to_string())
+        }
         _ => AgentError::internal(s.message().to_string()),
     }
 }

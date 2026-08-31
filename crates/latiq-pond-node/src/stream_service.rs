@@ -6,9 +6,10 @@
 //! It encodes `AgentOps::read_arrow`'s `RecordBatch` stream into ONE Arrow IPC
 //! stream (schema message first, then batches), chunked into `ArrowChunk`s —
 //! nothing is buffered: each batch becomes a chunk as it arrives.
-use crate::data_service::{identity_of, to_status};
+use crate::data_service::{challenge_of, identity_of, to_status};
 use arrow::ipc::writer::StreamWriter;
 use latiq_agent_core::{AgentOps, ArrowReadStream};
+use latiq_auth::Verifier;
 use latiq_proto::v1::stream_server::Stream as StreamSvc;
 use latiq_proto::v1::{ArrowChunk, QueryRequest};
 use std::pin::Pin;
@@ -20,11 +21,32 @@ use tonic::{Request, Response, Status};
 
 pub struct StreamService {
     ops: Arc<AgentOps>,
+    verifier: Option<Arc<Verifier>>,
+    /// The `WWW-Authenticate` value handed back on a rejection, built once.
+    challenge: Option<String>,
 }
 
 impl StreamService {
     pub fn new(ops: Arc<AgentOps>) -> Self {
-        Self { ops }
+        Self {
+            ops,
+            verifier: None,
+            challenge: None,
+        }
+    }
+
+    /// Require verified bearer tokens on this surface — the Stream surface is
+    /// the easy one to forget, and it reads the same data the Data surface does.
+    pub fn with_verifier(mut self, verifier: Option<Arc<Verifier>>) -> Self {
+        self.verifier = verifier;
+        self
+    }
+
+    /// The RFC 9728 protected-resource metadata URL to advertise on a rejection —
+    /// the same one the Data surface advertises; they share a port and an issuer.
+    pub fn with_metadata_url(mut self, metadata_url: Option<&str>) -> Self {
+        self.challenge = challenge_of(metadata_url);
+        self
     }
 }
 
@@ -38,14 +60,20 @@ impl StreamSvc for StreamService {
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<Self::ReadArrowStream>, Status> {
-        let id = identity_of(&req);
+        let (id, tok) = identity_of(
+            self.verifier.as_ref(),
+            self.challenge.as_deref(),
+            &req,
+            "read_arrow",
+        )
+        .await?;
         let tid = crate::data_service::trace_id_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         // Resolving the read (incl. pond-not-found / parse errors and the schema)
         // happens before we return — and so does any forward — so the trace id
         // must be ambient here; the batch encoding runs after, untraced.
-        let read = crate::data_service::traced("read_arrow", tid, async move {
+        let read = crate::data_service::traced("read_arrow", tid, tok, async move {
             ops.read_arrow(&id, &r.pond, &r.sql)
                 .await
                 .map_err(to_status)

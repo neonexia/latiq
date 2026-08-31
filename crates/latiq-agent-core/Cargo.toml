@@ -21,3 +21,4 @@ arrow = { workspace = true }
 [dev-dependencies]
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }

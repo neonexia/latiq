@@ -73,9 +73,26 @@ async fn wait_connectable(endpoint: &str) {
 
 /// Start the control plane (Control + Admin gRPC) and return its endpoints.
 async fn start_control_plane() -> (String, String) {
+    start_control_plane_with_auth(None).await
+}
+
+/// Start the control plane, optionally requiring verified bearer tokens on its
+/// Admin surface. `start_control_plane` stays auth-free so every pre-existing
+/// test keeps exercising the relaxed path.
+pub async fn start_control_plane_with_auth(
+    auth: Option<latiq_auth::AuthConfig>,
+) -> (String, String) {
+    let verifier = auth.map(|cfg| {
+        std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
+    });
     let registry = Registry::open(None).unwrap();
     let (control_l, control_port) = bind().await;
     let (admin_l, admin_port) = bind().await;
+    // Same derivation `serve_control_plane` uses: the well-known path on the
+    // address the Admin surface answers at.
+    let metadata_url = verifier
+        .as_ref()
+        .map(|_| format!("http://127.0.0.1:{admin_port}/.well-known/oauth-protected-resource"));
 
     let r1 = registry.clone();
     tokio::spawn(async move {
@@ -87,7 +104,11 @@ async fn start_control_plane() -> (String, String) {
     });
     tokio::spawn(async move {
         Server::builder()
-            .add_service(AdminServer::new(AdminService::new(registry)))
+            .add_service(AdminServer::new(
+                AdminService::new(registry)
+                    .with_verifier(verifier)
+                    .with_metadata_url(metadata_url.as_deref()),
+            ))
             .serve_with_incoming(TcpListenerStream::new(admin_l))
             .await
             .unwrap();
@@ -98,8 +119,75 @@ async fn start_control_plane() -> (String, String) {
     (control_endpoint, admin_endpoint)
 }
 
+/// A control plane serving Control + Admin on ONE port, the shape
+/// `serve_control_plane` (and therefore `latiq serve`) really has. The two-port
+/// variant above exists so a test can drive them independently; the CLI cannot,
+/// because it has a single `$LATIQ_SERVER`. Returns that one endpoint.
+pub async fn start_control_plane_one_port(auth: Option<latiq_auth::AuthConfig>) -> String {
+    let verifier = auth.map(|cfg| {
+        std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
+    });
+    let registry = Registry::open(None).unwrap();
+    let (listener, port) = bind().await;
+    let metadata_url = verifier
+        .as_ref()
+        .map(|_| format!("http://127.0.0.1:{port}/.well-known/oauth-protected-resource"));
+
+    let r1 = registry.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(ControlServer::new(ControlService::new(r1)))
+            .add_service(AdminServer::new(
+                AdminService::new(registry)
+                    .with_verifier(verifier)
+                    .with_metadata_url(metadata_url.as_deref()),
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let endpoint = format!("http://127.0.0.1:{port}");
+    wait_connectable(&endpoint).await;
+    endpoint
+}
+
 /// Start one pond node (real GrpcControlPlane + forwarding) against `control`.
 async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
+    start_node_with_auth(node_id, control_endpoint, None).await
+}
+
+/// The control plane on its own, with NO pond nodes. Returns the (control,
+/// admin) endpoints.
+///
+/// Paired with `add_node`, this is what lets a test build a cluster node by
+/// node: placement is `ORDER BY random()`, so the only reliable way to pin which
+/// node owns a pond is to allocate while just one node exists and then add the
+/// peer that will forward. That in turn is what makes ASYMMETRIC clusters
+/// testable — a greeter and an owner that trust different issuers, or only one
+/// of which requires a token at all.
+pub async fn start_control_plane_only() -> (String, String) {
+    start_control_plane().await
+}
+
+/// Add a pond node to an already-running control plane, with its own auth config.
+pub async fn add_node(
+    node_id: &str,
+    control_endpoint: &str,
+    auth: Option<latiq_auth::AuthConfig>,
+) -> NodeStack {
+    start_node_with_auth(node_id, control_endpoint, auth).await
+}
+
+/// Start one pond node, optionally requiring verified bearer tokens on its Data,
+/// Stream and MCP surfaces.
+async fn start_node_with_auth(
+    node_id: &str,
+    control_endpoint: &str,
+    auth: Option<latiq_auth::AuthConfig>,
+) -> NodeStack {
+    let verifier = auth.map(|cfg| {
+        std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
+    });
     let tmp = tempfile::tempdir().unwrap();
     let (mcp_l, mcp_port) = bind().await;
     let (data_l, data_port) = bind().await;
@@ -107,6 +195,12 @@ async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     let data_endpoint = format!("http://127.0.0.1:{data_port}");
     let internal_endpoint = data_endpoint.clone();
 
+    let mcp_verifier = verifier.clone();
+    // Same derivation `run_pond_node` uses: the RFC 9728 document is served by
+    // this node's MCP surface, so the Data/Stream challenge points there.
+    let metadata_url = verifier
+        .as_ref()
+        .map(|_| format!("http://127.0.0.1:{mcp_port}/.well-known/oauth-protected-resource"));
     let ops = build_ops(
         node_id,
         &mcp_endpoint,
@@ -120,14 +214,24 @@ async fn start_node(node_id: &str, control_endpoint: &str) -> NodeStack {
     let data_ops = ops.clone();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(DataServer::new(DataService::new(data_ops.clone())))
-            .add_service(StreamServer::new(StreamService::new(data_ops)))
+            .add_service(DataServer::new(
+                DataService::new(data_ops.clone())
+                    .with_verifier(verifier.clone())
+                    .with_metadata_url(metadata_url.as_deref()),
+            ))
+            .add_service(StreamServer::new(
+                StreamService::new(data_ops)
+                    .with_verifier(verifier)
+                    .with_metadata_url(metadata_url.as_deref()),
+            ))
             .serve_with_incoming(TcpListenerStream::new(data_l))
             .await
             .unwrap();
     });
     tokio::spawn(async move {
-        serve_mcp_with_listener(mcp_l, ops).await.unwrap();
+        serve_mcp_with_listener(mcp_l, ops, mcp_verifier, None)
+            .await
+            .unwrap();
     });
 
     wait_connectable(&data_endpoint).await;
@@ -150,6 +254,58 @@ pub async fn start_stack() -> TestStack {
         control_endpoint,
         mcp_endpoint: node.mcp_endpoint.clone(),
         _tmp: node._tmp,
+    }
+}
+
+/// Start the full stack with a single pond node whose Data + Stream surfaces
+/// require a verified bearer token. `start_stack` stays auth-free so every
+/// pre-existing test keeps exercising the relaxed path.
+pub async fn start_stack_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
+    let (control_endpoint, admin_endpoint) = start_control_plane().await;
+    let node = start_node_with_auth("node-test", &control_endpoint, Some(auth)).await;
+    TestStack {
+        data_endpoint: node.data_endpoint.clone(),
+        admin_endpoint,
+        control_endpoint,
+        mcp_endpoint: node.mcp_endpoint.clone(),
+        _tmp: node._tmp,
+    }
+}
+
+/// The whole stack authenticated the way a deployment really is: Control +
+/// Admin on ONE port behind one verifier, plus a pond node behind the same one.
+/// `control_endpoint == admin_endpoint` here, which is what an SDK or CLI client
+/// sees — it has a single server address and cannot aim Admin somewhere else.
+/// The two-port `start_stack_with_auth` leaves the control plane relaxed, so an
+/// Admin call from a client would land on the Control port and fail as
+/// `Unimplemented` rather than `Unauthenticated`: it cannot see a client that
+/// forgets its token on the Admin channel.
+pub async fn start_stack_one_port_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
+    let endpoint = start_control_plane_one_port(Some(auth.clone())).await;
+    let node = start_node_with_auth("node-test", &endpoint, Some(auth)).await;
+    TestStack {
+        data_endpoint: node.data_endpoint.clone(),
+        admin_endpoint: endpoint.clone(),
+        control_endpoint: endpoint,
+        mcp_endpoint: node.mcp_endpoint.clone(),
+        _tmp: node._tmp,
+    }
+}
+
+/// `n` pond nodes, all requiring the same verified bearer token — the shape a
+/// real cluster has, and what makes the forward hop's own auth testable.
+pub async fn start_stack_n_with_auth(n: usize, auth: latiq_auth::AuthConfig) -> MultiStack {
+    let (control_endpoint, admin_endpoint) = start_control_plane().await;
+    let mut nodes = Vec::with_capacity(n);
+    for i in 0..n {
+        nodes.push(
+            start_node_with_auth(&format!("node-{i}"), &control_endpoint, Some(auth.clone())).await,
+        );
+    }
+    MultiStack {
+        control_endpoint,
+        admin_endpoint,
+        nodes,
     }
 }
 

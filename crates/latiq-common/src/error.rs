@@ -25,6 +25,11 @@ pub enum ErrorKind {
     UriNotAllowed,
     QueryTimeout,
     QueryCancelled,
+    /// The caller's credential was absent, expired, or refused. The one failure
+    /// a client can actually ACT on (re-mint the token and retry), so it must be
+    /// distinguishable from a crash all the way to the edge — including across a
+    /// node-to-node forward, where the owner re-verifies on its own authority.
+    Unauthenticated,
     Storage,
     Internal,
 }
@@ -60,6 +65,7 @@ impl ErrorKind {
             ErrorKind::UriNotAllowed => "uri_not_allowed",
             ErrorKind::QueryTimeout => "query_timeout",
             ErrorKind::QueryCancelled => "query_cancelled",
+            ErrorKind::Unauthenticated => "unauthenticated",
             ErrorKind::Storage => "storage",
             ErrorKind::Internal => "internal",
         }
@@ -95,6 +101,9 @@ impl ErrorKind {
                 "Narrow the query (WHERE/LIMIT) or aggregate server-side, then retry."
             }
             ErrorKind::QueryCancelled => "Re-issue the query if you still need the result.",
+            ErrorKind::Unauthenticated => {
+                "Obtain a fresh access token for this deployment and retry with it."
+            }
             ErrorKind::Storage | ErrorKind::Internal => {
                 "Retry; if it persists, report to your operator."
             }
@@ -115,9 +124,13 @@ impl ErrorKind {
             | ErrorKind::InvalidValue
             | ErrorKind::MissingArgument
             | ErrorKind::UriNotAllowed => "latiq://guidance",
-            ErrorKind::QueryCancelled | ErrorKind::Storage | ErrorKind::Internal => {
-                "latiq://troubleshooting"
-            }
+            // No dedicated resource: `latiq://troubleshooting` is a real served
+            // resource, and inventing a URI here would send a caller after one
+            // that does not exist.
+            ErrorKind::Unauthenticated
+            | ErrorKind::QueryCancelled
+            | ErrorKind::Storage
+            | ErrorKind::Internal => "latiq://troubleshooting",
         }
     }
 }
@@ -193,6 +206,7 @@ mod tests {
             ErrorKind::UriNotAllowed,
             ErrorKind::QueryTimeout,
             ErrorKind::QueryCancelled,
+            ErrorKind::Unauthenticated,
             ErrorKind::Storage,
             ErrorKind::Internal,
         ] {
@@ -216,6 +230,7 @@ mod tests {
             ErrorKind::UriNotAllowed,
             ErrorKind::QueryTimeout,
             ErrorKind::QueryCancelled,
+            ErrorKind::Unauthenticated,
             ErrorKind::Storage,
             ErrorKind::Internal,
         ] {
