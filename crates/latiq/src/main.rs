@@ -34,7 +34,9 @@ const DEFAULT_CONTROL: &str = "http://127.0.0.1:51400";
 const SERVER_HELP: &str = "\
 ENVIRONMENT:
   LATIQ_SERVER  Control-plane address the CLI connects to. Set this first, e.g.
-                `export LATIQ_SERVER=http://host:51400` (default http://127.0.0.1:51400).";
+                `export LATIQ_SERVER=http://host:51400` (default http://127.0.0.1:51400).
+  LATIQ_TOKEN   OAuth bearer token, sent on every request (same as --token). Needed
+                only against a deployment started with --auth-issuer.";
 
 /// As `SERVER_HELP`, plus the optional query front door — used by `query` and
 /// `pond describe`, which run against a pond node.
@@ -46,12 +48,20 @@ ENVIRONMENT:
   LATIQ_QUERY_GATEWAY  Optional data front door (e.g. an nginx LB over several
                        nodes). If set, the query is sent there and the greeter node
                        forwards to the pond's owner; otherwise the CLI connects to
-                       the owning node directly.";
+                       the owning node directly.
+  LATIQ_TOKEN          OAuth bearer token, sent on every request (same as --token).
+                       Needed only against a deployment started with --auth-issuer.";
 
 #[derive(Parser)]
 #[command(name = "latiq", version, about = "Agent-native data pond")]
 #[command(after_help = QUERY_HELP)]
 struct Cli {
+    /// OAuth bearer token presented on EVERY request this CLI makes — Admin and
+    /// Control as well as data ops. Only needed where the deployment configures
+    /// an issuer; unset means the relaxed (claimed-identity) path. Global, so it
+    /// works on every subcommand.
+    #[arg(long, global = true, env = "LATIQ_TOKEN")]
+    token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -191,6 +201,25 @@ struct ServeArgs {
     /// Prometheus /metrics port (default: control port + 1000).
     #[arg(long)]
     metrics_port: Option<u16>,
+    /// Trusted OIDC issuer URL. Repeatable: pass it more than once, or set
+    /// LATIQ_AUTH_ISSUER to a comma-separated list, to trust several IdPs (the
+    /// usual case being a workforce IdP for operators plus a workload IdP for
+    /// agents). Any issuer here turns on verification for every surface on this
+    /// process. None = relaxed claimed identity (dev / embedded).
+    #[arg(long, env = "LATIQ_AUTH_ISSUER", value_delimiter = ',')]
+    auth_issuer: Vec<String>,
+    /// The audience this deployment expects in a token (`aud`). Required
+    /// whenever an issuer is set: without it, a token minted for any other
+    /// service that trusts the same IdP would be accepted here. One value for
+    /// all issuers -- the audience names US, not who vouched for the caller.
+    #[arg(long, env = "LATIQ_AUTH_AUDIENCE")]
+    auth_audience: Option<String>,
+    /// Explicit JWKS URL, overriding the default derived from the issuer. Only
+    /// valid with exactly ONE --auth-issuer, since it cannot be matched to a
+    /// particular issuer otherwise. Needed for split-horizon deployments where
+    /// the issuer identifier is not a reachable address.
+    #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
+    auth_jwks_uri: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -223,12 +252,40 @@ struct NodeAddArgs {
     /// deployments, or forwarding lands on the wrong host.
     #[arg(long)]
     advertise_addr: Option<String>,
+    /// The public URL agents use to reach this node's MCP endpoint, e.g.
+    /// https://latiq.example.com/mcp. Published as the RFC 9728 `resource`
+    /// identifier and in the 401 challenge, so it MUST be the address clients
+    /// actually dial -- behind a gateway that is the gateway's URL, not this
+    /// node's. Distinct from --advertise-addr, which is the internal address
+    /// peer nodes use to forward pond requests. Defaults to deriving from
+    /// --advertise-addr, which is correct only when clients reach nodes directly.
+    #[arg(long, env = "LATIQ_PUBLIC_MCP_URL")]
+    public_mcp_url: Option<String>,
     /// Data root; pond storage lives under <root>/ponds (default ~/.latiq).
     #[arg(short, long)]
     root: Option<PathBuf>,
     /// Prometheus /metrics port (default: data port + 1000).
     #[arg(long)]
     metrics_port: Option<u16>,
+    /// Trusted OIDC issuer URL. Repeatable: pass it more than once, or set
+    /// LATIQ_AUTH_ISSUER to a comma-separated list, to trust several IdPs (the
+    /// usual case being a workforce IdP for operators plus a workload IdP for
+    /// agents). Any issuer here turns on verification for every surface on this
+    /// process. None = relaxed claimed identity (dev / embedded).
+    #[arg(long, env = "LATIQ_AUTH_ISSUER", value_delimiter = ',')]
+    auth_issuer: Vec<String>,
+    /// The audience this deployment expects in a token (`aud`). Required
+    /// whenever an issuer is set: without it, a token minted for any other
+    /// service that trusts the same IdP would be accepted here. One value for
+    /// all issuers -- the audience names US, not who vouched for the caller.
+    #[arg(long, env = "LATIQ_AUTH_AUDIENCE")]
+    auth_audience: Option<String>,
+    /// Explicit JWKS URL, overriding the default derived from the issuer. Only
+    /// valid with exactly ONE --auth-issuer, since it cannot be matched to a
+    /// particular issuer otherwise. Needed for split-horizon deployments where
+    /// the issuer identifier is not a reachable address.
+    #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
+    auth_jwks_uri: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -318,6 +375,12 @@ struct QueryArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Recorded ONCE, before any client exists, so `auth_interceptor` is the only
+    // thing that ever has to know about it. A blank value is no value (see
+    // `non_blank`): `LATIQ_TOKEN=` from a compose file or a `.env` must not
+    // become an `Authorization: Bearer ` header, which is rejected as malformed
+    // rather than as absent.
+    let _ = TOKEN.set(bearer_of(&cli.token));
     match cli.command {
         #[cfg(feature = "server")]
         Command::Serve(a) => run_serve(a).await,
@@ -732,9 +795,68 @@ fn start_metrics(bind: &str, main_port: u16, metrics_port: Option<u16>) -> Resul
     Ok(addr)
 }
 
+/// A blank value means "not set". Compose always passes the variable through
+/// (possibly empty), so an empty string must mean auth off, not a broken issuer.
+fn non_blank(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Build the auth config the server surfaces verify against, from the three
+/// `--auth-*` flags. `None` = the relaxed (claimed-identity) path this binary
+/// has always taken; there is no partial state in between.
+///
+/// Both errors here are refusals to guess: an issuer without an audience would
+/// accept any token minted for any service that trusts the same IdP, and a JWKS
+/// uri that cannot be matched to one issuer would silently be applied to the
+/// wrong one. Either is a security hole, so neither gets a default.
+#[cfg(feature = "server")]
+fn auth_config(
+    issuers: Vec<String>,
+    audience: Option<String>,
+    jwks_uri: Option<String>,
+) -> Result<Option<latiq_auth::AuthConfig>> {
+    let issuers: Vec<String> = issuers
+        .into_iter()
+        .filter_map(|i| non_blank(Some(i)))
+        .collect();
+    if issuers.is_empty() {
+        return Ok(None);
+    }
+    let Some(audience) = non_blank(audience) else {
+        return Err(anyhow!(
+            "--auth-issuer is set but --auth-audience is not. Without an audience a token minted \
+             for any other service that trusts the same issuer would be accepted here. Set \
+             --auth-audience (or $LATIQ_AUTH_AUDIENCE) to the audience this deployment expects."
+        ));
+    };
+    let jwks_uri = non_blank(jwks_uri);
+    if jwks_uri.is_some() && issuers.len() > 1 {
+        return Err(anyhow!(
+            "--auth-jwks-uri cannot be used with {} issuers: it names ONE issuer's key set and \
+             there is no way to tell which. Configure a single issuer, or drop the flag and let \
+             each issuer's JWKS be discovered from its own URL.",
+            issuers.len()
+        ));
+    }
+    Ok(Some(latiq_auth::AuthConfig {
+        audience,
+        issuers: issuers
+            .into_iter()
+            .map(|issuer| latiq_auth::IssuerConfig {
+                issuer,
+                // Only ever `Some` in the single-issuer case, guarded above.
+                jwks_uri: jwks_uri.clone(),
+            })
+            .collect(),
+    }))
+}
+
 #[cfg(feature = "server")]
 async fn run_serve(a: ServeArgs) -> Result<()> {
     init_tracing();
+    // Resolved BEFORE anything binds: an incoherent auth config must stop the
+    // process, never quietly downgrade it to unauthenticated.
+    let auth = auth_config(a.auth_issuer, a.auth_audience, a.auth_jwks_uri)?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -746,7 +868,21 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     println!("control plane: Control + Admin gRPC on {addr}");
     println!("  registry: {}", db.display());
     println!("  metrics:  http://{metrics_addr}/metrics");
-    serve_control_plane(addr, registry)
+    match &auth {
+        Some(cfg) => println!(
+            "  auth:     verifying tokens for audience '{}' from {}",
+            cfg.audience,
+            cfg.issuers
+                .iter()
+                .map(|i| i.issuer.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // No issuer configured: identity stays relaxed (claimed, anonymous by
+        // default) exactly as it was before the flags existed.
+        None => println!("  auth:     off (relaxed claimed identity)"),
+    }
+    serve_control_plane(addr, registry, auth)
         .await
         .map_err(|e| anyhow!("server error: {e}"))?;
     Ok(())
@@ -755,6 +891,10 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
 #[cfg(feature = "server")]
 async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     init_tracing();
+    // Resolved BEFORE the node registers or serves, for the same reason as
+    // `run_serve`: a node that comes up with a half-configured verifier is a
+    // node accepting unauthenticated callers.
+    let auth = auth_config(a.auth_issuer, a.auth_audience, a.auth_jwks_uri)?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -776,32 +916,93 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         data_addr: data_addr.parse()?,
         internal_endpoint: advertise,
         control_endpoint: control_addr(),
+        // Blank means absent (compose interpolation passes empty strings); the
+        // node then derives the published URL from --advertise-addr as before.
+        public_mcp_url: non_blank(a.public_mcp_url),
         data_dir: root.join("ponds"),
         metrics_addr: Some(metrics_addr),
+        // `None` unless --auth-issuer was given: no flags means the relaxed
+        // (claimed) identity path this node has always run.
+        auth,
     })
     .await
 }
 
 // ---- gRPC clients (friendly connection errors) --------------------------
 
-async fn control_client() -> Result<ControlClient<Channel>> {
-    let addr = control_addr();
-    ControlClient::connect(addr.clone()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
-    })
+/// The operator's bearer token, resolved once in `main` from `--token` /
+/// `$LATIQ_TOKEN`. A process-wide value because it is a property of the
+/// INVOCATION, not of any one command: threading it through every call site is
+/// what let the Admin commands quietly ship without it.
+static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Attach `authorization: Bearer <token>` to every outbound request.
+///
+/// This is a tonic interceptor rather than a per-call-site header for one
+/// reason: it is the ONLY place a request can be built from, so a command added
+/// later authenticates without its author remembering to. Data ops are not
+/// special — Admin gRPC is the operator surface, and an operator CLI that cannot
+/// reach an authenticated control plane is the slice failing its primary
+/// audience. Still per-request metadata, never channel state.
+// The signature is tonic's `Interceptor`, so the `Err` type is not ours to box.
+#[allow(clippy::result_large_err)]
+fn auth_interceptor(mut req: Request<()>) -> Result<Request<()>, Status> {
+    if let Some(token) = TOKEN.get().and_then(Option::as_deref) {
+        if let Ok(value) = format!("Bearer {token}").parse() {
+            req.metadata_mut().insert("authorization", value);
+        }
+    }
+    Ok(req)
 }
 
-async fn admin_client() -> Result<AdminClient<Channel>> {
-    let addr = control_addr();
-    AdminClient::connect(addr.clone()).await.map_err(|_| {
-        anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
-    })
+/// A fn pointer so every client shares one concrete interceptor type.
+type AuthInterceptor = fn(Request<()>) -> Result<Request<()>, Status>;
+/// What every CLI gRPC client actually rides: a channel plus the token.
+type Authed = tonic::service::interceptor::InterceptedService<Channel, AuthInterceptor>;
+
+/// The one place the CLI dials. `None` = unreachable; callers phrase the advice.
+async fn dial(endpoint: &str) -> Option<Channel> {
+    Channel::from_shared(endpoint.to_string())
+        .ok()?
+        .connect()
+        .await
+        .ok()
 }
 
-async fn data_client(endpoint: &str) -> Result<DataClient<Channel>> {
-    DataClient::connect(endpoint.to_string()).await.map_err(|_| {
+fn unreachable_control(addr: &str) -> anyhow::Error {
+    anyhow!("could not reach the control plane at {addr}. Is it running, and is $LATIQ_SERVER set to its address? Start one with `latiq serve`.")
+}
+
+async fn control_client() -> Result<ControlClient<Authed>> {
+    let addr = control_addr();
+    let ch = dial(&addr)
+        .await
+        .ok_or_else(|| unreachable_control(&addr))?;
+    Ok(ControlClient::with_interceptor(
+        ch,
+        auth_interceptor as AuthInterceptor,
+    ))
+}
+
+async fn admin_client() -> Result<AdminClient<Authed>> {
+    let addr = control_addr();
+    let ch = dial(&addr)
+        .await
+        .ok_or_else(|| unreachable_control(&addr))?;
+    Ok(AdminClient::with_interceptor(
+        ch,
+        auth_interceptor as AuthInterceptor,
+    ))
+}
+
+async fn data_client(endpoint: &str) -> Result<DataClient<Authed>> {
+    let ch = dial(endpoint).await.ok_or_else(|| {
         anyhow!("could not reach the pond node at {endpoint}. Is it up? Start one with `latiq node add`.")
-    })
+    })?;
+    Ok(DataClient::with_interceptor(
+        ch,
+        auth_interceptor as AuthInterceptor,
+    ))
 }
 
 /// Where the CLI sends data ops for `pond_ref`. Default: resolve the owning node
@@ -829,6 +1030,16 @@ async fn resolve_node(pond_ref: &str) -> Result<String> {
     Ok(loc.node_endpoint)
 }
 
+/// The bearer credential to present, if any. Blank is absent for the same reason
+/// as the server flags: `LATIQ_TOKEN=` in a compose file or a `.env` must not
+/// become an `Authorization: Bearer ` header that is rejected as malformed.
+fn bearer_of(token: &Option<String>) -> Option<String> {
+    non_blank(token.clone())
+}
+
+/// The CLAIMED agent id a data op is attributed to. The bearer token is NOT set
+/// here — `auth_interceptor` attaches it to every request on every surface, so
+/// there is exactly one place that can forget.
 fn with_id<T>(msg: T, agent_id: &Option<String>) -> Request<T> {
     let mut r = Request::new(msg);
     if let Some(id) = agent_id {
@@ -1383,6 +1594,151 @@ mod tests {
         assert_eq!(
             advertise_endpoint(Some("http://node-a:51401"), 51401),
             "http://node-a:51401"
+        );
+    }
+
+    #[test]
+    fn non_blank_treats_empty_and_whitespace_as_absent() {
+        // Compose interpolation (`${LATIQ_AUTH_ISSUER:-}`) always SETS the
+        // variable, so clap hands us `Some("")`. That must mean "auth off", not
+        // "an issuer named empty string" — otherwise a plain `docker compose up`
+        // comes up rejecting every request.
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some(String::new())), None);
+        assert_eq!(non_blank(Some("   ".into())), None);
+        assert_eq!(non_blank(Some("\t\n".into())), None);
+        // Surrounding whitespace is stripped, not rejected.
+        assert_eq!(
+            non_blank(Some(" https://idp ".into())),
+            Some("https://idp".to_string())
+        );
+        assert_eq!(
+            non_blank(Some("https://idp".into())),
+            Some("https://idp".to_string())
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_is_absent_when_no_issuer_is_set() {
+        // The default path: no flags, no env → no verifier anywhere.
+        assert!(auth_config(vec![], None, None).unwrap().is_none());
+        // An EMPTY issuer env var is the same as an unset one.
+        assert!(auth_config(vec![String::new()], None, None)
+            .unwrap()
+            .is_none());
+        assert!(auth_config(vec!["  ".into()], Some("latiq".into()), None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_requires_an_audience_with_an_issuer() {
+        let e = auth_config(vec!["https://idp".into()], None, None)
+            .expect_err("an issuer without an audience must fail fast");
+        assert!(e.to_string().contains("--auth-audience"), "got {e}");
+        // A blank audience is an absent one.
+        assert!(auth_config(vec!["https://idp".into()], Some("  ".into()), None).is_err());
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_refuses_a_jwks_uri_with_several_issuers() {
+        let e = auth_config(
+            vec!["https://a".into(), "https://b".into()],
+            Some("latiq".into()),
+            Some("https://a/jwks".into()),
+        )
+        .expect_err("an ambiguous jwks uri must fail fast");
+        assert!(e.to_string().contains("--auth-jwks-uri"), "got {e}");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_builds_issuers_in_order() {
+        let cfg = auth_config(
+            vec!["https://a".into(), " https://b ".into(), String::new()],
+            Some(" latiq ".into()),
+            None,
+        )
+        .unwrap()
+        .expect("issuers configured");
+        assert_eq!(cfg.audience, "latiq");
+        let names: Vec<_> = cfg.issuers.iter().map(|i| i.issuer.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["https://a".to_string(), "https://b".to_string()]
+        );
+        assert!(cfg.issuers.iter().all(|i| i.jwks_uri.is_none()));
+
+        // One issuer + an explicit JWKS uri: unambiguous, so it is attached.
+        let cfg = auth_config(
+            vec!["https://a".into()],
+            Some("latiq".into()),
+            Some("https://a/keys".into()),
+        )
+        .unwrap()
+        .expect("issuers configured");
+        assert_eq!(cfg.issuers[0].jwks_uri.as_deref(), Some("https://a/keys"));
+    }
+
+    #[test]
+    fn token_flag_reads_the_env_var() {
+        // Declarative check that `--token` is wired to LATIQ_TOKEN and that a
+        // blank value is not turned into an empty bearer credential.
+        assert_eq!(bearer_of(&None), None);
+        assert_eq!(bearer_of(&Some("  ".into())), None);
+        assert_eq!(bearer_of(&Some(" abc ".into())), Some("abc".to_string()));
+    }
+
+    /// A structural guard the CLI's behavioural auth tests cannot give: the gRPC
+    /// client constructors appear exactly once each, inside the helpers that
+    /// attach the token. A command that dialed its own `AdminClient` would send
+    /// no credential no matter what those tests say, and would trip this.
+    ///
+    /// Pinned to EXACTLY one, not "at most one": `<= 1` is satisfied by zero, so
+    /// the guard passed vacuously the moment a helper was renamed or a client
+    /// stopped being built — silently guarding nothing. Same anti-vacuity
+    /// counter-assertion the SDK's `client_construction` module makes.
+    ///
+    /// A unit test rather than an integration one: it is an `include_str!` grep
+    /// needing no subprocess and no fake IdP, and an integration binary would
+    /// statically link a bundled DuckDB to run it.
+    #[test]
+    fn auth_cli_clients_are_only_built_in_the_shared_helpers() {
+        // Only the NON-test half of the file: this module names every one of the
+        // constructors below as a string literal, and counting those would both
+        // inflate the totals and let a stray literal here mask a real violation.
+        let src = include_str!("main.rs")
+            .split_once("#[cfg(test)]")
+            .expect("this file has a #[cfg(test)] module, and this test is in it")
+            .0;
+
+        // The three clients the CLI actually dials, each from exactly one helper.
+        for ctor in ["AdminClient::", "ControlClient::", "DataClient::"] {
+            let uses = src.matches(ctor).count();
+            assert_eq!(
+                uses, 1,
+                "{ctor} is constructed {uses} times; it must be built exactly once, in \
+                 the shared helper that attaches the bearer token"
+            );
+            let authed = src.matches(&format!("{ctor}with_interceptor")).count();
+            assert_eq!(
+                authed, 1,
+                "the one {ctor} construction is not `with_interceptor`, so it would send \
+                 neither `latiq-agent-id` nor the bearer token"
+            );
+        }
+
+        // `StreamClient` has no CLI command today (the SDK owns the streaming path),
+        // so it is asserted differently: not "exactly one", which would fire on an
+        // honest new command, but "every construction, if any, is authenticated".
+        assert_eq!(
+            src.matches("StreamClient::").count(),
+            src.matches("StreamClient::with_interceptor").count(),
+            "a StreamClient is being built outside the shared builder, so it would \
+             carry no bearer token"
         );
     }
 }

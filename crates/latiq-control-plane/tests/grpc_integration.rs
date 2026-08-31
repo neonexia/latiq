@@ -171,3 +171,50 @@ async fn error_contract_allocate_with_no_node_is_precondition_not_notfound() {
         status.code()
     );
 }
+
+/// An `AuthConfig` the verifier must refuse: plaintext http to a non-loopback
+/// host, i.e. signing keys fetched over a channel anyone can rewrite.
+fn unusable_auth_config() -> latiq_auth::AuthConfig {
+    latiq_auth::AuthConfig {
+        audience: "latiq".to_string(),
+        issuers: vec![latiq_auth::IssuerConfig {
+            issuer: "https://idp.example/realms/latiq".to_string(),
+            jwks_uri: Some("http://idp.example/jwks".to_string()),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn auth_bad_config_fails_startup_instead_of_degrading() {
+    // The worst failure mode this design has is a control plane that was ASKED
+    // for verification, could not build a verifier, and served anyway with none.
+    // Both entry points must refuse to serve at all.
+    let registry = Registry::open(None).unwrap();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap()
+    };
+
+    let err =
+        latiq_control_plane::serve_admin(addr, registry.clone(), Some(unusable_auth_config()))
+            .await
+            .expect_err("serve_admin must not start with an unusable auth config");
+    assert!(
+        err.to_string().contains("jwks"),
+        "the startup failure must say what was wrong: {err}"
+    );
+
+    let err = latiq_control_plane::serve_control_plane(
+        addr,
+        registry.clone(),
+        Some(unusable_auth_config()),
+    )
+    .await
+    .expect_err("serve_control_plane must not start with an unusable auth config");
+    assert!(err.to_string().contains("jwks"), "{err}");
+
+    // The port is still free: nothing bound before the config was rejected.
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("a refused startup must not have bound the port");
+}

@@ -19,6 +19,10 @@ services:
     hostname: control-plane
     command: ["serve", "--bind", "0.0.0.0", "--port", "51400", "--root", "/var/lib/latiq"]
     ports: ["51400:51400"]   # Control + Admin gRPC (CLI/operators)
+    environment:
+      # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:52400/metrics"]
       interval: 3s
@@ -33,6 +37,14 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial: MCP is only reachable through the gateway
+      # in this topology, so that is what the node publishes as its RFC 9728
+      # `resource` and points its 401 challenge at. A property of the topology,
+      # not of auth mode -- hence a plain value, set whether or not auth is on.
+      LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
+      # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:
@@ -49,6 +61,14 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial: MCP is only reachable through the gateway
+      # in this topology, so that is what the node publishes as its RFC 9728
+      # `resource` and points its 401 challenge at. A property of the topology,
+      # not of auth mode -- hence a plain value, set whether or not auth is on.
+      LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
+      # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:
@@ -68,6 +88,14 @@ services:
               "--root", "/var/lib/latiq"]
     environment:
       LATIQ_SERVER: http://control-plane:51400
+      # The URL agents actually dial: MCP is only reachable through the gateway
+      # in this topology, so that is what the node publishes as its RFC 9728
+      # `resource` and points its 401 challenge at. A property of the topology,
+      # not of auth mode -- hence a plain value, set whether or not auth is on.
+      LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
+      # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:
@@ -151,3 +179,67 @@ services:
     environment:
       LATIQ_SERVER: http://control-plane:51400
     depends_on: [control-plane, pond-node-1, pond-node-2]
+
+  # ---- Auth mode (nightly + container only). Behind the `auth` profile, and the
+  # servers only turn auth on when LATIQ_AUTH_ISSUER is non-blank. Both are set by
+  # `docker compose --env-file auth.env ...` (which also sets COMPOSE_PROFILES=auth).
+  #
+  # Keycloak is in-network and every party — pond nodes, control plane, and the two
+  # test runners below — uses the SAME issuer URL `http://keycloak:8080/realms/latiq`
+  # via Docker DNS. No host-vs-container address split to reconcile.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    hostname: keycloak
+    profiles: ["auth"]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: "8080"
+      # Pins the `iss` claim. Every party uses this exact URL.
+      KC_HOSTNAME_URL: http://keycloak:8080
+    volumes:
+      - ./keycloak-realm.json:/opt/keycloak/data/import/realm.json:ro
+    # No published ports: nothing outside the network needs to reach it. Add
+    # `ports: ["8080:8080"]` temporarily if you want the admin console.
+
+  # One-shot in-network SDK auth tests: installs the built wheel from /repo/dist
+  # and runs the auth suite against the gateway. Like `cli`, it runs on the compose
+  # network so `gateway`, `control-plane` and `keycloak` all resolve.
+  auth-tests-sdk:
+    image: python:3.11-slim
+    restart: "no"
+    profiles: ["auth"]
+    working_dir: /repo
+    volumes:
+      - ../..:/repo
+    environment:
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_GATEWAY: gateway:51500
+      LATIQ_SERVER: http://control-plane:51400
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        # --no-index is load-bearing: without it a missing/stale wheel in
+        # /repo/dist silently falls back to PyPI, and the auth suite would go
+        # green against the PUBLISHED latiq instead of this branch's code.
+        pip install --no-cache-dir --no-index --find-links /repo/dist latiq &&
+        pip install --no-cache-dir -r /repo/e2e/sdk/requirements.txt &&
+        pytest /repo/e2e/sdk/test_auth.py -v
+    depends_on: [gateway, keycloak]
+
+  # One-shot in-network MCP agent auth tests (the agent harness is Node).
+  auth-tests-agent:
+    image: node:22-slim
+    restart: "no"
+    profiles: ["auth"]
+    working_dir: /repo/e2e/agent
+    volumes:
+      - ../..:/repo
+    environment:
+      LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
+      LATIQ_MCP: http://gateway:51510/mcp
+      LATIQ_SERVER: http://control-plane:51400
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["npm ci && npm test"]
+    depends_on: [gateway, keycloak]

@@ -182,3 +182,382 @@ async fn mcp_error_contract_is_structured() {
     assert!(out.value["see"].as_str().unwrap().starts_with("latiq://"));
     c.close().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// auth_* — the MCP surface as an OAuth 2.1 resource server. Identity arrives in
+// the TRANSPORT (headers), never as a tool argument the model could type.
+// Verification only: nothing here gates on WHO the agent is.
+// ---------------------------------------------------------------------------
+
+/// The `http://host:port` an mcp endpoint (`…/mcp`) is served from.
+fn base_of(mcp_endpoint: &str) -> String {
+    mcp_endpoint.trim_end_matches("/mcp").to_string()
+}
+
+#[tokio::test]
+async fn auth_mcp_tool_schemas_do_not_expose_agent_id() {
+    // The whole point of the breaking change: a verified principal must arrive
+    // out of band. If `agent_id` is still in a tool's input schema, the model can
+    // type its own identity — so assert on the SCHEMAS, not on behaviour.
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, None).await.unwrap();
+    for t in c.list_tools().await.unwrap() {
+        let schema = serde_json::to_string(&t.input_schema).unwrap();
+        assert!(
+            !schema.contains("agent_id"),
+            "tool {} still advertises agent_id: {schema}",
+            t.name
+        );
+    }
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_mcp_serves_protected_resource_metadata() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = common::start_stack_with_auth(idp.auth_config()).await;
+    let url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        base_of(&s.mcp_endpoint)
+    );
+    // Reachable WITHOUT a token: discovery is impossible otherwise.
+    let res = reqwest::get(&url).await.unwrap();
+    assert!(res.status().is_success(), "got {}", res.status());
+    let doc: Value = res.json().await.unwrap();
+    assert_eq!(doc["authorization_servers"][0], Value::String(idp.issuer));
+    assert_eq!(doc["resource"], Value::String(s.mcp_endpoint.clone()));
+}
+
+#[tokio::test]
+async fn auth_mcp_unauthenticated_request_gets_a_401_challenge() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = common::start_stack_with_auth(idp.auth_config()).await;
+    let res = reqwest::Client::new()
+        .post(&s.mcp_endpoint)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 401);
+    let challenge = res
+        .headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        challenge.contains("resource_metadata="),
+        "the 401 must point at the metadata document: {challenge:?}"
+    );
+    assert!(
+        !challenge.to_lowercase().contains("jwks") && !challenge.contains(&idp.issuer),
+        "the challenge must not leak issuers or the JWKS uri: {challenge:?}"
+    );
+}
+
+/// One JSON-RPC request over raw HTTP, so a test can drive the methods an MCP
+/// client would never let it send unauthenticated (and see the HTTP status the
+/// client library reacts to).
+async fn post_rpc(endpoint: &str, token: Option<&str>, method: &str) -> reqwest::Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "probe", "version": "0"},
+            "uri": "latiq://guidance",
+        },
+    });
+    let mut req = reqwest::Client::new()
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(body.to_string());
+    if let Some(t) = token {
+        req = req.header("authorization", format!("Bearer {t}"));
+    }
+    req.send().await.unwrap()
+}
+
+/// The `WWW-Authenticate` value, or "" — a challenge is what makes an MCP client
+/// re-authenticate instead of wedging.
+fn challenge_of(res: &reqwest::Response) -> String {
+    res.headers()
+        .get("www-authenticate")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn auth_mcp_rejects_an_invalid_token_with_a_401_challenge() {
+    // THE security boundary on this surface. A forged, expired or wrong-audience
+    // token must be refused with the same 401 + challenge a missing one gets —
+    // not a JSON-RPC error inside HTTP 200, which no client can act on, and
+    // above all not a silent downgrade to a claimed identity.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = common::start_stack_with_auth(idp.auth_config()).await;
+    let cases = [
+        ("not a jwt at all", "nonsense".to_string()),
+        (
+            "signed by a key the issuer does not publish",
+            idp.mint_with_foreign_key("svc-mcp", "latiq", &idp.issuer),
+        ),
+        ("expired", idp.mint("svc-mcp", "latiq", &idp.issuer, -60)),
+        (
+            "minted for another audience",
+            idp.mint("svc-mcp", "not-latiq", &idp.issuer, 300),
+        ),
+        (
+            "alg:none",
+            idp.mint_alg_none("svc-mcp", "latiq", &idp.issuer),
+        ),
+    ];
+    for (why, token) in cases {
+        let res = post_rpc(&s.mcp_endpoint, Some(&token), "initialize").await;
+        assert_eq!(res.status().as_u16(), 401, "{why} should be refused");
+        let challenge = challenge_of(&res);
+        assert!(
+            challenge.contains("resource_metadata="),
+            "{why}: a 401 must carry the challenge: {challenge:?}"
+        );
+        assert!(
+            !challenge.contains(&idp.issuer) && !challenge.to_lowercase().contains("jwks"),
+            "{why}: the challenge must not leak issuers or the JWKS uri: {challenge:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_mcp_non_tool_methods_require_a_verified_token() {
+    // `initialize`, `tools/list` and `resources/read` never build an Identity,
+    // so a check that lived only in the tool handlers would let an
+    // unauthenticated caller finish the handshake, enumerate the tool
+    // catalogue, read every latiq:// resource — and allocate a session (plus
+    // its worker task) on every attempt.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = common::start_stack_with_auth(idp.auth_config()).await;
+    for method in ["initialize", "tools/list", "resources/read", "prompts/list"] {
+        // A non-empty string after `Bearer ` is not a credential.
+        let res = post_rpc(&s.mcp_endpoint, Some("x"), method).await;
+        assert_eq!(res.status().as_u16(), 401, "{method} accepted a junk token");
+        assert!(challenge_of(&res).contains("resource_metadata="));
+    }
+    // ...and the same method succeeds with a real token, so the assertion above
+    // is about the credential and not about the method being blocked outright.
+    let token = idp.mint("svc-mcp", "latiq", &idp.issuer, 300);
+    let res = post_rpc(&s.mcp_endpoint, Some(&token), "initialize").await;
+    assert!(res.status().is_success(), "got {}", res.status());
+}
+
+#[tokio::test]
+async fn auth_mcp_nested_well_known_path_is_not_exempt() {
+    // Only the exact well-known path is exempt. `/mcp/.well-known/…` is the MCP
+    // service's own route table, so correctness here rests on the layer seeing
+    // the pre-`StripPrefix` path — pinned so a routing change cannot quietly
+    // open a hole.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = common::start_stack_with_auth(idp.auth_config()).await;
+    let nested = format!("{}/.well-known/oauth-protected-resource", s.mcp_endpoint);
+    let res = post_rpc(&nested, None, "initialize").await;
+    assert_eq!(res.status().as_u16(), 401);
+    assert!(challenge_of(&res).contains("resource_metadata="));
+}
+
+#[tokio::test]
+async fn auth_mcp_claimed_agent_id_header_becomes_the_author() {
+    // The relaxed path every existing deployment runs on. A typo in the header
+    // name would silently downgrade every MCP caller to `anonymous` with the
+    // rest of the suite still green, so assert on the recorded author.
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-claimed".into()))
+        .await
+        .unwrap();
+    c.allocate_pond(Some("claimed")).await.unwrap();
+    c.write("claimed", "CREATE TABLE t(i INTEGER)")
+        .await
+        .unwrap();
+    let r = c
+        .query(
+            "claimed",
+            "SELECT DISTINCT author FROM ducklake_snapshots('claimed')",
+        )
+        .await
+        .unwrap();
+    let authors: Vec<&str> = r.value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row[0].as_str())
+        .collect();
+    assert!(
+        authors.contains(&"agent-claimed"),
+        "the latiq-agent-id header should be the claimed author, got {authors:?}"
+    );
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_mcp_unauthenticated_node_does_not_replay_a_client_token() {
+    // Mirrors forwarding_does_not_leak_a_client_authorization_header_without_auth
+    // for the MCP surface. A node with NO verifier must not capture whatever
+    // `authorization` header a client happens to send — one meant for an
+    // upstream gateway, say — and replay it to a peer. The owner here REQUIRES a
+    // token, so if the greeter had forwarded the (perfectly valid) header this
+    // write would succeed. It must not.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let (control, _admin) = common::start_control_plane_only().await;
+    let owner = common::add_node("owner", &control, Some(idp.auth_config())).await;
+    let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+
+    let mut oc = latiq_proto::v1::data_client::DataClient::connect(owner.data_endpoint.clone())
+        .await
+        .unwrap();
+    let mut alloc = tonic::Request::new(latiq_proto::v1::AllocatePondRequest {
+        name: "leakmcp".into(),
+        policy_json: String::new(),
+        tier: String::new(),
+    });
+    alloc
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    oc.allocate_pond(alloc).await.unwrap();
+
+    // The greeter requires nothing, so it must also capture nothing.
+    let greeter = common::add_node("greeter", &control, None).await;
+    let c = LatiqClient::connect_with_token(
+        &greeter.mcp_endpoint,
+        Some("agent-x".into()),
+        Some(token.clone()),
+    )
+    .await
+    .unwrap();
+    let out = c
+        .write("leakmcp", "CREATE TABLE t(i INTEGER)")
+        .await
+        .unwrap();
+    assert!(out.is_error, "the hop must fail closed: {:?}", out.value);
+    assert!(
+        format!("{}", out.value).contains("a bearer token is required"),
+        "the client's header must not cross the hop from an unauthenticated node: {:?}",
+        out.value
+    );
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn auth_mcp_accepts_a_valid_token_and_marks_identity_verified() {
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let s = common::start_stack_with_auth(idp.auth_config()).await;
+    let token = idp.mint("svc-mcp", "latiq", &idp.issuer, 300);
+    // The claimed leaf rides its own header; the token is the verified principal.
+    let c = LatiqClient::connect_with_token(&s.mcp_endpoint, Some("agent-x".into()), Some(token))
+        .await
+        .unwrap();
+
+    let a = c.allocate_pond(Some("authed")).await.unwrap();
+    assert!(!a.is_error, "{:?}", a.value);
+    let w = c
+        .write("authed", "CREATE TABLE t(i INTEGER)")
+        .await
+        .unwrap();
+    assert!(!w.is_error, "{:?}", w.value);
+
+    // Exactly the recipe latiq://recipes/attribution-lookup ships, so the
+    // snippet's column names are proven copy-pasteable here too.
+    let r = c
+        .query(
+            "authed",
+            "SELECT author, commit_extra_info FROM ducklake_snapshots('authed')",
+        )
+        .await
+        .unwrap();
+    assert!(!r.is_error, "{:?}", r.value);
+    let rows = r.value["rows"].as_array().unwrap();
+    let authors: Vec<&str> = rows.iter().filter_map(|row| row[0].as_str()).collect();
+    assert!(
+        rows.iter().any(|row| row[1]
+            .as_str()
+            .is_some_and(|e| e.contains("\"verified\":true"))),
+        "commit_extra_info should carry the verified evidence: {rows:?}"
+    );
+    // The proof it was VERIFIED and not merely accepted: the commit author is
+    // the token's SUBJECT, and the claimed leaf is absent.
+    assert!(
+        authors.contains(&"svc-mcp"),
+        "author should be the verified subject, got {authors:?}"
+    );
+    assert!(
+        !authors.contains(&"agent-x"),
+        "the claimed leaf must not be the author for a verified caller: {authors:?}"
+    );
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_cross_node_write_forwards_the_bearer_on_an_auth_enabled_cluster() {
+    // MCP shares one `AgentOps` + `GrpcForwarder` with the Data surface, so an
+    // MCP call against a node that does NOT own the pond has to replay the
+    // caller's token for the owner to re-verify. This test used to pin the
+    // opposite (the hop failing closed with "a bearer token is required")
+    // because MCP had no verifier and scoped no token; it now pins the fix.
+    let idp = latiq_auth::test_support::TestIdp::start().await;
+    let (control, _admin) = common::start_control_plane_only().await;
+
+    // Owner first, alone, so it certainly owns `mcpfwd` (placement is random).
+    let owner = common::add_node("owner", &control, Some(idp.auth_config())).await;
+    let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+    let mut oc = latiq_proto::v1::data_client::DataClient::connect(owner.data_endpoint.clone())
+        .await
+        .unwrap();
+    let mut alloc = tonic::Request::new(latiq_proto::v1::AllocatePondRequest {
+        name: "mcpfwd".into(),
+        policy_json: String::new(),
+        tier: String::new(),
+    });
+    alloc
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    oc.allocate_pond(alloc).await.unwrap();
+
+    // Now the peer, driven over MCP — every op on `mcpfwd` must forward.
+    let greeter = common::add_node("greeter", &control, Some(idp.auth_config())).await;
+    let c = LatiqClient::connect_with_token(
+        &greeter.mcp_endpoint,
+        Some("agent-x".into()),
+        Some(token.clone()),
+    )
+    .await
+    .unwrap();
+    let out = c
+        .write("mcpfwd", "CREATE TABLE t(i INTEGER)")
+        .await
+        .unwrap();
+    assert!(
+        !out.is_error,
+        "the caller's token must ride the hop so the owner can re-verify it: {:?}",
+        out.value
+    );
+    // And the owner attributed the forwarded write to the VERIFIED subject.
+    let r = c
+        .query(
+            "mcpfwd",
+            "SELECT DISTINCT author FROM ducklake_snapshots('mcpfwd')",
+        )
+        .await
+        .unwrap();
+    let authors: Vec<&str> = r.value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row[0].as_str())
+        .collect();
+    assert!(
+        authors.contains(&"svc-dave"),
+        "the owner should attribute the forwarded write to the token subject: {authors:?}"
+    );
+    c.close().await.unwrap();
+}

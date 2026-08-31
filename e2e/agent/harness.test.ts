@@ -14,8 +14,39 @@ import { after, before, test } from "node:test";
 import { experimental_createMCPClient } from "ai";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth-extensions.js";
 
 const URL_ = process.env.LATIQ_MCP ?? "http://127.0.0.1:51402/mcp";
+
+/** One provider for both clients. undefined when the cluster has no auth. */
+function authProvider() {
+  const issuer = process.env.LATIQ_AUTH_ISSUER;
+  if (!issuer) return undefined;
+  // No `expectedIssuer` on purpose: ClientCredentialsProviderOptions has no such
+  // field (SDK 1.29), so passing one would read as issuer pinning that isn't
+  // actually happening. The issuer is discovered from the RFC 9728 document.
+  return new ClientCredentialsProvider({
+    clientId: "latiq-agent",
+    clientSecret: process.env.LATIQ_CLIENT_SECRET ?? "latiq-agent-secret",
+    scope: "openid",
+  });
+}
+
+/**
+ * The transport BOTH clients use: the AI SDK's MCP client is handed a transport
+ * instance we construct, so the official SDK is the OAuth engine in both cases.
+ * With LATIQ_AUTH_ISSUER set the whole suite runs authenticated; without it the
+ * behaviour is byte-for-byte what it was before.
+ */
+function transport() {
+  const provider = authProvider();
+  // NEVER also set requestInit.headers.Authorization -- _commonHeaders spreads
+  // requestInit.headers AFTER the provider's, silently overriding the token.
+  return new StreamableHTTPClientTransport(
+    new global.URL(URL_),
+    provider ? { authProvider: provider } : undefined,
+  );
+}
 
 const EXPECTED_TOOLS = [
   "allocate_pond", "describe_pond", "list_ponds", "drop_pond",
@@ -34,10 +65,10 @@ const failed = (r: any) => { assert.equal(r.isError, true, `expected an error re
 const name = (p: string) => `${p}-${randomUUID().slice(0, 8)}`;
 
 before(async () => {
-  ai = await experimental_createMCPClient({ transport: new StreamableHTTPClientTransport(new global.URL(URL_)) });
+  ai = await experimental_createMCPClient({ transport: transport() });
   tools = await ai.tools();
   raw = new Client({ name: "latiq-agent-harness", version: "0.0.0" });
-  await raw.connect(new StreamableHTTPClientTransport(new global.URL(URL_)));
+  await raw.connect(transport());
 });
 
 after(async () => {
@@ -111,9 +142,31 @@ test("dataset catalog surface: list + load + query a curated dataset", async () 
 
 test("catalog surface is reachable (list_catalogs)", async () => {
   // describe/pull_catalog need a registered external catalog (the dedicated
-  // iceberg e2e covers that); here we just prove the agent can enumerate them.
-  const r = await tools.list_catalogs.execute({}, opts());
-  ok(r);
+  // iceberg e2e covers that); here we prove the agent can ENUMERATE them — and
+  // asserting only `isError === false` could not fail on any regression in what
+  // enumeration returns, so assert the payload the model actually reads.
+  const r: any = ok(await tools.list_catalogs.execute({}, opts()));
+  assert.ok(Array.isArray(r?.catalogs),
+    `list_catalogs returns {catalogs: [...]}: ${JSON.stringify(r)}`);
+  // A fresh cluster registers none (that is an operator action via the CLI). If
+  // this cluster is meant to have some, update this test rather than loosening it.
+  assert.deepEqual(r.catalogs, [],
+    `no external catalogs are registered on a fresh cluster: ${JSON.stringify(r.catalogs)}`);
+  // Whatever IS listed must be usable by a model: named and typed.
+  for (const c of r.catalogs as any[]) {
+    assert.ok(c?.name, `a catalog entry is named: ${JSON.stringify(c)}`);
+    assert.ok(c?.type, `catalog ${c?.name} must advertise its type: ${JSON.stringify(c)}`);
+  }
+
+  // The negative half: an unknown catalog is a structured tool error, not a
+  // silent empty success the model would read as "nothing there".
+  const pond = name("cat");
+  ok(await tools.allocate_pond.execute({ name: pond }, opts()));
+  const err = failed(await tools.describe_catalog.execute(
+    { pond, catalog: "does-not-exist" }, opts()));
+  assert.match(JSON.stringify(err ?? ""), /does-not-exist/,
+    `the error names the unknown catalog: ${JSON.stringify(err)}`);
+  ok(await tools.drop_pond.execute({ pond, confirm: true }, opts()));
 });
 
 test("resources: guidance + dialect are readable", async () => {

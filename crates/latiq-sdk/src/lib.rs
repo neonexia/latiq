@@ -51,6 +51,10 @@ pub struct Latiq {
     control_channel: Channel,
     data_channel: Channel,
     identity: String,
+    /// The OAuth bearer token presented on every request, when the deployment
+    /// requires one. Held BESIDE the channels, never in them: a `Channel` is
+    /// shared and cached, while tonic metadata is per request.
+    token: Option<String>,
     /// Keeps the embedded control-plane + pond-node alive (None in remote mode).
     _local: Option<LocalCluster>,
 }
@@ -140,6 +144,27 @@ impl Latiq {
         root: Option<PathBuf>,
         query_gateway: Option<&str>,
     ) -> Result<Self> {
+        Self::connect_with_token(server, root, query_gateway, None)
+    }
+
+    /// As `connect_with`, plus the OAuth bearer token this client presents.
+    ///
+    /// `token = None` falls back to `$LATIQ_TOKEN`, so a notebook or a job can be
+    /// handed a credential without threading it through the call. Either way a
+    /// blank value means "no token": an empty `Authorization: Bearer ` header is
+    /// worse than none, since it is rejected as malformed rather than as absent.
+    /// Against a deployment with no issuer configured the token is simply unused.
+    pub fn connect_with_token(
+        server: &str,
+        root: Option<PathBuf>,
+        query_gateway: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Self> {
+        let token = token
+            .map(str::to_string)
+            .or_else(|| std::env::var("LATIQ_TOKEN").ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -148,7 +173,11 @@ impl Latiq {
         );
         if server == "local" {
             let root = root.unwrap_or_else(default_local_root);
-            let local = rt.block_on(LocalCluster::start(&rt, &root))?;
+            let auth = BearerAuth {
+                identity: DEFAULT_IDENTITY.into(),
+                token: token.clone(),
+            };
+            let local = rt.block_on(LocalCluster::start(&rt, &root, auth))?;
             let control_endpoint = local.control_endpoint.clone();
             let data_endpoint = local.data_endpoint.clone();
             // `connect_lazy` registers with the reactor, so it must be built
@@ -163,7 +192,8 @@ impl Latiq {
                 data_endpoint,
                 control_channel,
                 data_channel,
-                identity: "sdk".into(),
+                identity: DEFAULT_IDENTITY.into(),
+                token,
                 _local: Some(local),
             })
         } else {
@@ -185,7 +215,8 @@ impl Latiq {
                 data_endpoint,
                 control_channel,
                 data_channel,
-                identity: "sdk".into(),
+                identity: DEFAULT_IDENTITY.into(),
+                token,
                 _local: None,
             })
         }
@@ -301,9 +332,9 @@ impl Latiq {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .describe_pond(self.with_id(DescribePondRequest {
+                .describe_pond(DescribePondRequest {
                     pond: pond.to_string(),
-                }))
+                })
                 .await?
                 .into_inner();
             parse_json(&resp.json)
@@ -314,10 +345,10 @@ impl Latiq {
     pub fn drop_pond(&self, pond: &str, confirm: bool) -> Result<()> {
         self.rt.block_on(async {
             let mut d = self.data().await?;
-            d.drop_pond(self.with_id(DropPondRequest {
+            d.drop_pond(DropPondRequest {
                 pond: pond.to_string(),
                 confirm,
-            }))
+            })
             .await?;
             Ok(())
         })
@@ -341,20 +372,20 @@ impl Latiq {
         self.rt.block_on(async {
             if !latiq_engine::is_read_only(sql) {
                 let mut d = self.data().await?;
-                d.write_query(self.with_id(QueryRequest {
+                d.write_query(QueryRequest {
                     pond: pond.to_string(),
                     sql: sql.to_string(),
-                }))
+                })
                 .await
                 .map_err(|s| anyhow!("write: {}", s.message()))?;
                 return Ok(Vec::new());
             }
             let mut sc = self.stream().await?;
             let mut streaming = sc
-                .read_arrow(self.with_id(QueryRequest {
+                .read_arrow(QueryRequest {
                     pond: pond.to_string(),
                     sql: sql.to_string(),
-                }))
+                })
                 .await
                 .map_err(|s| anyhow!("read: {}", s.message()))?
                 .into_inner();
@@ -371,10 +402,10 @@ impl Latiq {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .explain_query(self.with_id(QueryRequest {
+                .explain_query(QueryRequest {
                     pond: pond.to_string(),
                     sql: sql.to_string(),
-                }))
+                })
                 .await
                 .map_err(|s| anyhow!("explain: {}", s.message()))?
                 .into_inner();
@@ -461,10 +492,10 @@ impl Latiq {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .load_dataset(self.with_id(LoadDatasetRequest {
+                .load_dataset(LoadDatasetRequest {
                     pond: pond.to_string(),
                     dataset: dataset.to_string(),
-                }))
+                })
                 .await
                 .map_err(|s| anyhow!("load_dataset: {}", s.message()))?
                 .into_inner();
@@ -483,11 +514,11 @@ impl Latiq {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .catalog_describe(self.with_id(CatalogDescribeRequest {
+                .catalog_describe(CatalogDescribeRequest {
                     pond: pond.to_string(),
                     catalog: catalog.to_string(),
                     params: set,
-                }))
+                })
                 .await
                 .map_err(|s| anyhow!("describe_catalog: {}", s.message()))?
                 .into_inner();
@@ -507,12 +538,12 @@ impl Latiq {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .catalog_pull(self.with_id(CatalogPullRequest {
+                .catalog_pull(CatalogPullRequest {
                     pond: pond.to_string(),
                     catalog: catalog.to_string(),
                     query: query.to_string(),
                     params: set,
-                }))
+                })
                 .await
                 .map_err(|s| anyhow!("pull_catalog: {}", s.message()))?
                 .into_inner();
@@ -522,35 +553,86 @@ impl Latiq {
 
     // ── client helpers ──────────────────────────────────────────────
 
-    async fn control(&self) -> RtClient<ControlClient<Channel>> {
-        Ok(ControlClient::new(self.control_channel.clone()))
+    /// This client's identity headers, installed on every client below.
+    fn auth(&self) -> BearerAuth {
+        BearerAuth {
+            identity: self.identity.clone(),
+            token: self.token.clone(),
+        }
     }
 
-    async fn admin(&self) -> RtClient<AdminClient<Channel>> {
-        Ok(AdminClient::new(self.control_channel.clone()))
+    async fn control(&self) -> RtClient<ControlClient<Authed>> {
+        Ok(ControlClient::with_interceptor(
+            self.control_channel.clone(),
+            self.auth(),
+        ))
+    }
+
+    async fn admin(&self) -> RtClient<AdminClient<Authed>> {
+        Ok(AdminClient::with_interceptor(
+            self.control_channel.clone(),
+            self.auth(),
+        ))
     }
 
     /// A Data gRPC client on the front door. The greeter forwards by pond — we do
     /// NOT resolve the owner node directly (its address is unroutable behind a LB).
-    async fn data(&self) -> RtClient<DataClient<Channel>> {
-        Ok(DataClient::new(self.data_channel.clone()))
+    async fn data(&self) -> RtClient<DataClient<Authed>> {
+        Ok(DataClient::with_interceptor(
+            self.data_channel.clone(),
+            self.auth(),
+        ))
     }
 
     /// A Stream gRPC client on the front door (served alongside Data on the same
     /// endpoint). Reads ride `ReadArrow`; the greeter forwards by pond.
-    async fn stream(&self) -> RtClient<StreamClient<Channel>> {
-        Ok(StreamClient::new(self.data_channel.clone()))
-    }
-
-    /// Attach the (relaxed) identity header data ops carry.
-    fn with_id<T>(&self, msg: T) -> Request<T> {
-        let mut r = Request::new(msg);
-        if let Ok(v) = self.identity.parse() {
-            r.metadata_mut().insert("latiq-agent-id", v);
-        }
-        r
+    async fn stream(&self) -> RtClient<StreamClient<Authed>> {
+        Ok(StreamClient::with_interceptor(
+            self.data_channel.clone(),
+            self.auth(),
+        ))
     }
 }
+
+/// The identity this client presents on EVERY request: the CLAIMED leaf, plus
+/// the bearer token that actually proves who we are where one is configured.
+///
+/// An interceptor rather than a per-call-site wrapper, and that is the whole
+/// point. The wrapper it replaces had to be remembered at each of a dozen call
+/// sites, and `list_ponds` — the SDK's one Admin call, on the surface least like
+/// the others — was the one that forgot, so a fully-tokened client was refused
+/// by the control plane. Here there is nothing to remember: a new RPC carries
+/// both headers because it cannot be issued any other way.
+///
+/// Both still ride per-request metadata; the shared, cached `Channel` carries
+/// neither.
+#[derive(Clone)]
+struct BearerAuth {
+    identity: String,
+    token: Option<String>,
+}
+
+impl tonic::service::Interceptor for BearerAuth {
+    // The signature is tonic's, so the `Err` type is not ours to box.
+    #[allow(clippy::result_large_err)]
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, tonic::Status> {
+        if let Ok(v) = self.identity.parse() {
+            req.metadata_mut().insert("latiq-agent-id", v);
+        }
+        if let Some(t) = self.token.as_deref() {
+            if let Ok(v) = format!("Bearer {t}").parse() {
+                req.metadata_mut().insert("authorization", v);
+            }
+        }
+        Ok(req)
+    }
+}
+
+/// The claimed leaf the SDK presents when the caller sets none.
+const DEFAULT_IDENTITY: &str = "sdk";
+
+/// What every SDK gRPC client rides: a cached channel plus the identity headers.
+type Authed = tonic::service::interceptor::InterceptedService<Channel, BearerAuth>;
 
 /// An in-process control-plane + pond-node, alive for the life of a local `Latiq`.
 struct LocalCluster {
@@ -559,7 +641,13 @@ struct LocalCluster {
 }
 
 impl LocalCluster {
-    async fn start(rt: &Arc<tokio::runtime::Runtime>, root: &Path) -> Result<Self> {
+    /// `auth` is only used by the readiness probe below; the embedded control
+    /// plane and node are started with no verifier (relaxed identity).
+    async fn start(
+        rt: &Arc<tokio::runtime::Runtime>,
+        root: &Path,
+        auth: BearerAuth,
+    ) -> Result<Self> {
         std::fs::create_dir_all(root.join("ponds"))?;
         let cp_port = free_port()?;
         let (data_port, mcp_port) = (free_port()?, free_port()?);
@@ -570,7 +658,8 @@ impl LocalCluster {
         let registry = Registry::open(Some(&root.join("registry.duckdb")))
             .map_err(|e| anyhow!("open registry: {e}"))?;
         rt.spawn(async move {
-            let _ = serve_control_plane(cp_addr, registry).await;
+            // Embedded: no issuer, so identity stays relaxed (claimed).
+            let _ = serve_control_plane(cp_addr, registry, None).await;
         });
         wait_connectable(&control_endpoint).await?;
 
@@ -580,14 +669,19 @@ impl LocalCluster {
             mcp_addr: format!("127.0.0.1:{mcp_port}").parse()?,
             data_addr: format!("127.0.0.1:{data_port}").parse()?,
             internal_endpoint: format!("http://127.0.0.1:{data_port}"),
+            // Embedded: the client dials this very process on loopback, so the
+            // derived URL is already the one it reaches.
+            public_mcp_url: None,
             control_endpoint: control_endpoint.clone(),
             data_dir: root.join("ponds"),
             metrics_addr: None,
+            // The embedded stack is in-process and single-user: relaxed identity.
+            auth: None,
         };
         rt.spawn(async move {
             let _ = run_pond_node(cfg).await;
         });
-        wait_for_active_node(&control_endpoint).await?;
+        wait_for_active_node(&control_endpoint, auth).await?;
         // The node registers as `active` (heartbeat) BEFORE its Data/Stream gRPC
         // server is necessarily accepting connections — so also wait for the data
         // port to be dialable, or the first query races and fails "data plane
@@ -669,9 +763,15 @@ async fn wait_connectable(endpoint: &str) -> Result<()> {
     Err(anyhow!("endpoint never became connectable: {endpoint}"))
 }
 
-async fn wait_for_active_node(control_endpoint: &str) -> Result<()> {
+/// Poll the registry until the embedded node reports `active`. `auth` is the
+/// SAME interceptor every other client gets: `list_nodes` is an Admin RPC, and
+/// an Admin RPC without the identity headers is the defect this module's
+/// interceptor exists to make impossible — the embedded control plane happens
+/// not to verify today, which is exactly how such a call survives review.
+async fn wait_for_active_node(control_endpoint: &str, auth: BearerAuth) -> Result<()> {
     for _ in 0..400 {
-        if let Ok(mut c) = AdminClient::connect(control_endpoint.to_string()).await {
+        if let Ok(ch) = Channel::from_shared(control_endpoint.to_string()) {
+            let mut c = AdminClient::with_interceptor(ch.connect_lazy(), auth.clone());
             if let Ok(resp) = c.list_nodes(ListNodesRequest {}).await {
                 if resp.into_inner().nodes.iter().any(|n| n.state == "active") {
                     return Ok(());
@@ -690,4 +790,84 @@ fn lazy_channel(endpoint: &str) -> Result<Channel> {
     Ok(Channel::from_shared(endpoint.to_string())
         .with_context(|| format!("invalid endpoint {endpoint}"))?
         .connect_lazy())
+}
+
+/// Structural guards on how this file builds gRPC clients.
+///
+/// A unit module rather than an integration test: both assertions are
+/// `include_str!` greps over this very file with no runtime dependency at all,
+/// and an integration binary would statically link a bundled DuckDB (~130-160
+/// MB) to run two string searches. See `crates/latiq/tests/CLAUDE.md` rule 1.
+///
+/// The identity headers (`latiq-agent-id` and, where a deployment configures an
+/// issuer, `authorization: Bearer …`) are attached by the `BearerAuth`
+/// interceptor installed in the four client helpers. That makes CONSTRUCTION the
+/// only place a request can lose them: an interceptor cannot be forgotten at a
+/// call site, but a client built straight from a raw `Channel` has no
+/// interceptor at all and would send neither header.
+///
+/// This is the shape of bug that shipped once already — `list_ponds` issued the
+/// SDK's one Admin call without the wrapper that carried the token, so a
+/// fully-tokened client was refused by the control plane. The wrapper is gone;
+/// these tests are what keep its replacement from being routed around. The
+/// behavioural half already exists: `crates/latiq/tests/admin.rs` drives Data,
+/// Stream and Admin against an authenticated stack.
+#[cfg(test)]
+mod client_construction {
+    /// Every way tonic exposes to build a client from a channel.
+    /// `with_interceptor` is the only one that installs `BearerAuth`; the others
+    /// hand back a bare client that would send no identity at all.
+    const UNAUTHENTICATED_CONSTRUCTORS: &[&str] = &["::new(", "::connect(", "::with_origin("];
+
+    const CLIENTS: &[&str] = &["ControlClient", "AdminClient", "DataClient", "StreamClient"];
+
+    #[test]
+    fn every_grpc_client_is_built_with_the_auth_interceptor() {
+        let src = include_str!("lib.rs");
+        for client in CLIENTS {
+            for ctor in UNAUTHENTICATED_CONSTRUCTORS {
+                let pattern = format!("{client}{ctor}");
+                assert!(
+                    !src.contains(&pattern),
+                    "`{pattern}` builds a client with no interceptor, so it would send \
+                     neither `latiq-agent-id` nor the bearer token. Every gRPC client \
+                     must come from the helper that installs `BearerAuth` — see the \
+                     `list_ponds` regression in crates/latiq/tests/admin.rs."
+                );
+            }
+            // …and each client really is built, the authenticated way, at least
+            // once: a guard that passes because nothing matches is no guard.
+            //
+            // Deliberately NOT pinned to exactly one. The invariant is "every
+            // construction is authenticated", not "there is only one construction" —
+            // `AdminClient` legitimately has two (the `admin()` helper and the
+            // embedded readiness probe). Pinning the count would make a future
+            // honest builder look like a violation, and the pressure would be to
+            // relax this test rather than to route the new builder correctly.
+            let authed = src.matches(&format!("{client}::with_interceptor")).count();
+            assert!(
+                authed >= 1,
+                "no authenticated `{client}` builder found — the assertions above \
+                 would then be passing vacuously"
+            );
+        }
+    }
+
+    /// The interceptor is only worth anything if it attaches both headers.
+    #[test]
+    fn the_interceptor_attaches_both_identity_headers() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split_once("impl tonic::service::Interceptor for BearerAuth")
+            .expect("the SDK's interceptor is named BearerAuth")
+            .1;
+        assert!(
+            body.contains("latiq-agent-id"),
+            "the claimed leaf is missing"
+        );
+        assert!(
+            body.contains("authorization"),
+            "the bearer token is missing — this is exactly the list_ponds bug"
+        );
+    }
 }

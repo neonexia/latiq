@@ -48,7 +48,7 @@ Three consequences run through the rest of this spec:
 
 **Scale is measured in working sets, not in agents.** Three hundred agents can share one pond on one node. Node count tracks concurrent ponds and data size, decoupled from fleet size — which is a very different cost curve from per-agent infrastructure.
 
-**Authorization has to be hierarchical.** Nobody is going to pre-register three hundred ephemeral agent identities on an access list. The principal has to be the workflow run, with agents carrying scoped identities beneath it. This is the single most consequential open design question in the system, and it has its own note: [`docs/identity.md`](identity.md).
+**Authority is the run's, not the agent's.** Nobody is going to pre-register three hundred ephemeral agent identities on an access list. So authority comes from one verified principal — the subject in the run's token, issued by the enterprise's own IdP — while each agent's leaf id rides along as claimed attribution and never carries authority. Latiq authenticates that principal today; deciding what it may *reach* is the next slice, and both have their own note: [`docs/identity.md`](identity.md).
 
 ---
 
@@ -86,7 +86,7 @@ An agent connected to Latiq can do the following, using only SQL and a handful o
 
 **Plan before running.** Before an expensive query, the agent can ask Latiq to explain it — what it will scan, what it will cost — refine, and only run when it's satisfied. This makes agents thrifty rather than greedy, and it works because the estimate is a local call, not a network round trip.
 
-**Collaborate with the rest of the graph.** Multiple agents in one pond is the common case, not the edge case. Writes serialize and conflicts auto-retry. Every write is attributed to the identity that made it, riding DuckLake's native commit messages, so history is readable through ordinary SQL against `pond.snapshots()` — no Latiq objects in the pond catalog. Agents coordinate by reading each other's work, not by interrupting each other.
+**Collaborate with the rest of the graph.** Multiple agents in one pond is the common case, not the edge case. Writes serialize and conflicts auto-retry. Every write is attributed to the identity that made it, riding DuckLake's native commit metadata — the author is the verified subject where the caller authenticated, with the claimed agent id and the issuer in `commit_extra_info` — so history is readable through ordinary SQL against `pond.snapshots()`, and a reader can tell a verified writer from one merely claiming a name. No Latiq objects in the pond catalog. Agents coordinate by reading each other's work, not by interrupting each other.
 
 **Discover what's available.** Agents can list ponds, inspect schemas, and decide whether to join an existing collaboration or start fresh. Column and table comments — which the guidance resources push agents to write — make that discovery natural.
 
@@ -106,7 +106,9 @@ An agent connected to Latiq can do the following, using only SQL and a handful o
 
 **Watch it run.** Every process serves a Prometheus `/metrics` endpoint: ponds by tier, per-pond query rate, p95 latency, errors by kind, in-flight load, cross-node forwarding, node liveness. Logs are structured `tracing`, JSON on request, with a `trace_id` propagated across the node hop so one request correlates across the cluster. Latiq ships no dashboards and stores no time series — you point your existing Prometheus, Grafana, and log pipeline at it.
 
-**Read the access trail.** Every operation emits a structured event on the `latiq::access` target carrying the identity, whether it was verified, the operation, the pond, the duration, and a redacted SQL shape with literals replaced. There is no audit table and no audit RPC by design — the trail lives in your log stack, where you already search, retain, and alert.
+**Connect it to your identity provider.** Latiq is an OAuth 2.1 resource server. Point it at the issuers you already run (Okta, Auth0, Entra, Keycloak) with an audience, and every surface — MCP, Data/Stream gRPC, Admin gRPC — requires a valid bearer token. Latiq is never in the token exchange, holds no client secret, and stores no credential: it verifies tokens locally against the IdP's published keys. Agents discover where to authenticate through the standard protected-resource metadata document. Configure no issuer and identity stays claimed-only — which is the embedded case, the dev stack, and a plain compose deployment. Authentication does not yet *gate* anything beyond requiring a valid token; per-pond authorization is the next slice ([`docs/identity.md`](identity.md)).
+
+**Read the access trail.** Every operation that touches a pond or moves data emits a structured event on the `latiq::access` target carrying the claimed agent, the verified subject and issuer, whether it was verified, the operation, the pond, the duration, a redacted SQL shape with literals replaced, and the outcome — successes, failures, and rejected calls alike. (Pure registry browsing — listing datasets and catalogs — is not audited: it touches no pond and carries no identity.) There is no audit table and no audit RPC by design — the trail lives in your log stack, where you already search, retain, and alert.
 
 ---
 
@@ -138,7 +140,7 @@ Stating these is what makes the rest credible.
 
 **Result sets are capped on the agent path.** Inline tool results are bounded so an agent isn't flooded; large results are for the SDK's streaming path, or for `CREATE TABLE AS SELECT` and a follow-up query.
 
-**Identity is claimed, not verified, today.** The agent asserts who it is and Latiq records it. This is adequate for trusted-cluster deployments and inadequate for real multi-tenancy — see [`docs/identity.md`](identity.md).
+**Callers are authenticated, not yet authorized.** Latiq verifies enterprise IdP tokens on every surface, and attribution and the access trail record the verified subject. But it does not yet gate *what* a verified caller may reach: any valid token from a trusted issuer can allocate a pond, read any pond, and use any registered catalog. Pond ownership and grants are the next slice — see [`docs/identity.md`](identity.md).
 
 ---
 

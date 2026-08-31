@@ -21,7 +21,9 @@ GitHub issues; this table is the human-readable summary.*
 | Admin CLI (client-only build) + compose deployment (Docker / Podman) | Now | M1 | ✅ Shipped |
 | Observability — Prometheus `/metrics`, structured JSON logs, `trace_id` propagation, `latiq::access` trail | Now | M1 | ✅ Shipped |
 | Distribution — GHCR images (`latiq` + `latiq-gateway`), PyPI wheel, native CLI binaries; nightly test-gated + change-gated publish | Now | M1 | ✅ Shipped |
-| **Identity + authorization** — verified identity, a principal hierarchy that survives large agent graphs, pond + catalog grants (the keystone; see [`identity.md`](identity.md), #5 / #72) | Next | M2 | 📋 Planned |
+| **Identity v0 — authentication** — MCP-spec OAuth 2.1 resource server (enterprise IdP: Okta / Auth0 / Entra), multi-issuer local JWKS + audience verification, RFC 9728 discovery, one verifier across MCP + Data + Admin, identity out of the MCP tool args and into the transport, token replayed on the node hop (see [`identity.md`](identity.md), #5) | Now | M1 | ✅ Shipped |
+| **Lineage** — OpenLineage events, queryable by agents from an attached read-only sidecar catalog by default, optional HTTP backend (see [`lineage.md`](lineage.md)). Identity is already recorded per write in DuckLake's `commit_extra_info` (subject / issuer / verified), so the event has a verified principal to attach to | Next | M2 | 📋 Planned |
+| **Authorization** — pond ownership + grants bound to the verified subject, catalog grants, filtered discovery, group/role claims (deliberately split out of identity v0; #72) | Next | M2 | 📋 Planned |
 | Pond lifecycle enforcement — reap expired ponds; ownership + release authority move to the run | Next | M2 | 📋 Planned |
 | Placement policy — which node a new pond lands on (binpacking on a busy cluster) | Next | M2 | 📋 Planned |
 | Rate limiting per principal | Next | M2 | 📋 Planned |

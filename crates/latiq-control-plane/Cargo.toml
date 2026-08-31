@@ -7,6 +7,7 @@ edition.workspace = true
 latiq-common = { path = "../latiq-common" }
 latiq-proto = { path = "../latiq-proto" }
 latiq-metrics = { path = "../latiq-metrics" }
+latiq-auth = { path = "../latiq-auth" }
 metrics = { workspace = true }
 duckdb = { workspace = true }
 tonic = { workspace = true }

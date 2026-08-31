@@ -15,10 +15,13 @@ path = "src/main.rs"
 # commands (pond/query/dataset/catalog/stats/node list) — tiny, cross-compiles to
 # any platform in seconds. That's the artifact admins install on their laptops.
 default = ["server"]
-server = ["dep:latiq-control-plane", "dep:latiq-pond-node", "dep:latiq-metrics", "dep:metrics"]
+server = ["dep:latiq-control-plane", "dep:latiq-pond-node", "dep:latiq-metrics", "dep:metrics", "dep:latiq-auth"]
 
 [dependencies]
 latiq-control-plane = { path = "../latiq-control-plane", optional = true }
+# Only the AuthConfig types the `--auth-*` server flags build; the client-only
+# build needs none of it (a bearer token is just a header).
+latiq-auth = { path = "../latiq-auth", optional = true }
 latiq-pond-node = { path = "../latiq-pond-node", optional = true }
 latiq-proto = { path = "../latiq-proto" }
 latiq-common = { path = "../latiq-common" }
@@ -37,6 +40,14 @@ tracing-subscriber = { workspace = true }
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-agent-core = { path = "../latiq-agent-core" }
 latiq-client = { path = "../latiq-client" }
+# The SDK is the other client of the Data/Stream surface; its bearer-token path
+# is exercised against the same harness the gRPC surface tests use.
+latiq-sdk = { path = "../latiq-sdk" }
+# The in-process fake IdP behind the auth_* surface tests.
+latiq-auth = { path = "../latiq-auth", features = ["test-support"] }
+# Drives the MCP surface's plain-HTTP bits (well-known metadata + the 401
+# challenge), which are not reachable through an MCP client.
+reqwest = { workspace = true }
 tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 arrow = { workspace = true }

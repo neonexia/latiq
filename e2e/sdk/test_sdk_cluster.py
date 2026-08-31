@@ -102,11 +102,29 @@ def test_large_read_streams_uncapped_past_the_json_cap(db):
 
 
 def test_explain_returns_a_plan(db):
+    """`explain` must return the STRUCTURED plan contract, not merely a
+    non-empty something. A bare truthiness check passes on an error string or on
+    `{}`, so assert the fields a caller actually reads: the estimates, the scan
+    operations (naming the table the query touched, sourced from the pond), and
+    the raw plan text."""
     p = db.create_pond(name=_name("explain"))
-    p.query(sql="CREATE TABLE t(id INT)")
-    plan = p.explain(sql="SELECT * FROM t WHERE id > 1")
-    assert plan, "explain returned a plan"
-    assert len(str(plan)) > 0
+    p.query(sql="CREATE TABLE explain_probe(id INT)")
+    plan = p.explain(sql="SELECT * FROM explain_probe WHERE id > 1")
+
+    assert isinstance(plan, dict), f"explain returns a plan object, got {plan!r}"
+    for key in ("estimated_rows", "estimated_bytes", "estimated_duration_ms"):
+        assert isinstance(plan.get(key), int), f"{key} missing/not numeric: {plan!r}"
+    assert isinstance(plan.get("raw_plan"), str) and plan["raw_plan"].strip(), (
+        f"raw_plan must carry the engine's plan text: {plan!r}"
+    )
+    for key in ("scan_operations", "warnings", "suggestions"):
+        assert isinstance(plan.get(key), list), f"{key} missing/not a list: {plan!r}"
+    # The plan must be about the query we ASKED about. This is the assertion
+    # that an error string, a `{}`, or a plan for some other statement cannot
+    # satisfy — the table name is unique to this test.
+    assert "explain_probe" in plan["raw_plan"], (
+        f"the plan must describe the query we sent: {plan['raw_plan']!r}"
+    )
     db.drop_pond(pond=p.name, confirm=True)
 
 
@@ -154,12 +172,30 @@ def test_datasets_list_load_and_query(db):
 def test_catalogs_surface_reachable(db):
     """A fresh cluster has no external catalogs registered (that's an operator
     action via the CLI), so list_catalogs is empty and describing an unknown one
-    errors — full pull/describe is covered by the iceberg e2e."""
+    errors — full pull/describe is covered by the iceberg e2e.
+
+    `isinstance(cats, dict)` alone would pass forever on `{}`, so pin the actual
+    contract: an EMPTY registry (not merely a dict-shaped one), and an error that
+    names the missing catalog rather than any old transport failure."""
     cats = db.list_catalogs()
-    assert isinstance(cats, dict)
+    assert isinstance(cats, dict), f"list_catalogs returns a mapping, got {cats!r}"
+    assert cats == {}, (
+        "a fresh cluster registers no external catalogs; if this cluster is "
+        f"meant to have some, this test needs updating: {cats!r}"
+    )
+
     p = db.create_pond(name=_name("cat"))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as e:
         p.describe_catalog(catalog="does-not-exist")
+    msg = str(e.value).lower()
+    assert "does-not-exist" in msg, (
+        f"the error must name the unknown catalog, not just fail: {e.value}"
+    )
+    # A lookup miss, not a transport failure. (The embedded control plane says
+    # "is not registered"; the gRPC one says "not found".)
+    assert "not registered" in msg or "not found" in msg, (
+        f"the error must be a catalog lookup miss, not a transport failure: {e.value}"
+    )
     db.drop_pond(pond=p.name, confirm=True)
 
 
