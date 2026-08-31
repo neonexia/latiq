@@ -33,6 +33,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
+/// The streaming half of the CLI/SDK surface, and the node-to-node read hop.
+/// Serves the same data as [`crate::DataService`] to the same audience, so it
+/// must be configured with the same verifier — forgetting it here leaves an
+/// unauthenticated way to read every pond.
 pub struct StreamService {
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,

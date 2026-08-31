@@ -15,6 +15,8 @@
 //! The `_meta` envelope carried on every query response ("every response carries signal").
 use serde::{Deserialize, Serialize};
 
+/// What a warning is about. Deliberately a closed set, so a client can decide
+/// which classes it cares about without parsing the message text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningKind {
@@ -24,6 +26,8 @@ pub enum WarningKind {
     ResultHygiene,
 }
 
+/// A non-fatal observation about a query that succeeded — advice, never an
+/// error. Rides in `QueryMeta::warnings`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Warning {
     pub kind: WarningKind,
@@ -123,6 +127,10 @@ impl DatasetRef {
     }
 }
 
+/// The `_meta` envelope on every query response: cost, provenance and advice
+/// about the statement that just ran. It is also what the lineage emitter reads
+/// (`inputs`/`outputs`), so a field added here for a client is visible to
+/// provenance too.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueryMeta {
     pub rows: u64,

@@ -23,6 +23,8 @@ use latiq_proto::v1::*;
 use tonic::transport::Channel;
 use tonic::Code;
 
+/// The deployed `ControlPlane`: registry calls over the wire. Cheap to clone —
+/// the channel underneath multiplexes, so cloning does not open a connection.
 #[derive(Clone)]
 pub struct GrpcControlPlane {
     client: ControlClient<Channel>,

@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// A registered pond node, as `list_nodes`/`describe_node` report it. The
+/// liveness fields are derived at read time from the stored heartbeat, so a row
+/// is a snapshot and not a subscription.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRow {
     pub node_id: String,
@@ -38,6 +41,9 @@ pub struct NodeRow {
     pub heartbeat_age_seconds: i64,
 }
 
+/// A pond's row in the registry — its identity, its owning node, and the
+/// settings the node needs to open it. The registry is the only thing that
+/// knows which node holds a pond; the pond's data lives nowhere near here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PondRow {
     pub pond_id: String,
@@ -92,6 +98,9 @@ pub struct CatalogRow {
     pub created_at: String,
 }
 
+/// The control plane's system of record: nodes, ponds, datasets, catalogs and
+/// policy. Cheap to clone (one shared connection), and every method is
+/// self-contained — there is no open transaction to hand around.
 #[derive(Clone)]
 pub struct Registry {
     conn: Arc<Mutex<Connection>>,
@@ -116,6 +125,9 @@ impl Registry {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Upsert a node and mark it `active`. Idempotent by `node_id`, so a node
+    /// that restarts re-registers with its endpoints refreshed rather than
+    /// conflicting — and one the reaper had downed comes straight back.
     pub fn register_node(
         &self,
         node_id: &str,
@@ -211,6 +223,11 @@ impl Registry {
     // a spec struct — would churn every call site for no gain: these are the
     // pond's creation-time properties and they are all required here.
     #[allow(clippy::too_many_arguments)]
+    /// Create a pond and place it on a node. This is the choke point every
+    /// create path funnels through, so it is where placement (a uniformly random
+    /// `active` node), name uniqueness, and the operator-only rule for the
+    /// uncapped tier are all decided. Registry-only: the pond's storage is
+    /// materialized lazily by the owning node on first use.
     pub fn create_pond(
         &self,
         name: Option<String>,
@@ -370,6 +387,8 @@ impl Registry {
         Ok(())
     }
 
+    /// Forget a pond (by id or name). Registry-only — the owning node deletes
+    /// the bytes; this returning `Ok` does not mean storage is gone yet.
     pub fn drop_pond(&self, pond_id: &str) -> Result<(), ControlPlaneError> {
         let c = self.lock();
         let n = c.execute(

@@ -16,6 +16,8 @@
 use latiq_engine::SchemaSummary;
 use serde::{Deserialize, Serialize};
 
+/// A pond's registry record, as every surface sees it. Purely metadata — the
+/// registry's view of a pond, never its contents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PondInfo {
     pub pond_id: String,
@@ -47,6 +49,8 @@ pub struct PondInfo {
     pub lineage: bool,
 }
 
+/// What `allocate_pond` hands back. Both identifiers, because the caller asked
+/// for a name (or none) and every later call may use either.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocateResult {
     pub pond_id: String,
@@ -131,6 +135,9 @@ pub struct LineagePage {
     pub unreadable_files: usize,
 }
 
+/// A pond's orientation for an agent: its registry record plus its live table
+/// schema. The two halves come from different planes — the registry and the
+/// engine — which is why describe runs on the owning node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DescribeResult {
     pub pond: PondInfo,

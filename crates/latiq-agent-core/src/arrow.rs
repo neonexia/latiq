@@ -26,6 +26,10 @@ use tokio_stream::Stream;
 /// A stream of record batches (or the first error encountered mid-stream).
 pub type BatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, AgentError>> + Send>>;
 
+/// A read in progress: the schema now, the rows as they come. Drain `batches`
+/// or drop the stream — the producer holds a read transaction (and a pool
+/// connection) open for the whole stream, so a consumer that simply stops
+/// reading keeps them held.
 pub struct ArrowReadStream {
     pub schema: SchemaRef,
     pub batches: BatchStream,

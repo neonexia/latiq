@@ -16,6 +16,8 @@
 //! Philosophy: 80% of errors recoverable from `suggest` alone; 20% fetch `see`.
 use serde::{Deserialize, Serialize};
 
+/// Where in the caller's SQL the error was found, so a client can point at it
+/// rather than restating the whole statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub line: u32,
@@ -48,6 +50,10 @@ pub enum ErrorKind {
     Internal,
 }
 
+/// The one error shape every surface returns. Four fields, each with a distinct
+/// job: `kind` to branch on, `message` to read, `suggest` to retry from, `see`
+/// to learn from. Prefer [`ErrorEnvelope::for_kind`] so the guidance stays the
+/// same wherever a kind surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
     pub kind: ErrorKind,

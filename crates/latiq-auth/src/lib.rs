@@ -63,6 +63,9 @@ mod bearer_tests {
     }
 }
 
+/// Why a token was not accepted. Every variant is one `Unauthenticated` to the
+/// caller — the distinction is for the operator's log, since telling an
+/// unauthenticated caller *which* check failed is a probing oracle.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("no bearer token presented")]

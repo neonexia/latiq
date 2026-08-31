@@ -52,8 +52,13 @@ use tracing::info;
 /// worse than none at all.
 const LINEAGE_RECIPE: &str = "latiq://recipes/lineage";
 
+/// Node-wide limits on what an op may return inline. The cap is the reason a
+/// read has a bounded worst case at all, so raising it raises every surface's
+/// per-request memory ceiling at once.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Rows a materialized (non-streaming) read may return before it fails with
+    /// `result_cap_exceeded`. Streamed reads (`read_arrow`) are not capped.
     pub inline_row_cap: usize,
 }
 
@@ -65,6 +70,14 @@ impl Default for AgentConfig {
     }
 }
 
+/// Every operation Latiq offers, expressed once and without a protocol. MCP,
+/// Data gRPC and Stream gRPC are all inbound adapters onto this — a new surface
+/// is a new adapter, never a change in here (invariant 5).
+///
+/// The public op methods are also the single place attribution happens: each
+/// one audits (`access::record`) and, for a pond that opted in, emits lineage.
+/// Doing that inside a helper instead would record the same operation twice
+/// under two names. Cheap to `clone` (everything behind it is an `Arc`).
 #[derive(Clone)]
 pub struct AgentOps {
     control: Arc<dyn ControlPlane>,

@@ -21,6 +21,9 @@
 //! to a 401 belongs to each inbound adapter.
 use serde::Serialize;
 
+/// The document served at `/.well-known/oauth-protected-resource`: who we are
+/// and which authorization servers we accept. It must describe what the verifier
+/// actually enforces, or a client is sent to an IdP whose tokens we refuse.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProtectedResourceMetadata {
     pub resource: String,

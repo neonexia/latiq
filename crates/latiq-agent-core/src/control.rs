@@ -18,6 +18,9 @@
 use crate::error::AgentError;
 use crate::types::{CatalogInfo, DatasetInfo, PondInfo};
 
+/// Metadata only — the registry, never data. Nothing here executes SQL or
+/// touches a pond's bytes, which is what keeps the control plane out of the
+/// query path (invariant 3).
 #[async_trait::async_trait]
 pub trait ControlPlane: Send + Sync {
     async fn create_pond(

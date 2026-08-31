@@ -16,6 +16,9 @@
 use latiq_common::{ErrorEnvelope, ErrorKind};
 use tonic::{Code, Status};
 
+/// Registry-level failures. Each variant maps to one `ErrorKind` + gRPC code via
+/// `envelope()`/`to_status`, so the in-process and over-the-wire paths give a
+/// caller identical guidance.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlPlaneError {
     #[error("pond name already exists: {0}")]

@@ -31,6 +31,9 @@ use latiq_proto::v1::*;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 
+/// The operators' surface. It reads and writes the registry directly and holds
+/// no `AgentOps`, so nothing here can run a query — which is what keeps the
+/// control plane out of the data path.
 pub struct AdminService {
     pub registry: Registry,
     verifier: Option<std::sync::Arc<latiq_auth::Verifier>>,

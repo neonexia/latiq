@@ -20,6 +20,9 @@ use crate::storage::{PondStorage, StorageError};
 use latiq_common::PondId;
 use std::path::{Path, PathBuf};
 
+/// Pond storage on the node's own filesystem — the shipped backend. Holds only
+/// a root path: every pond's layout is derived from its id, so there is no
+/// index to keep in step with the registry.
 pub struct LocalFs {
     root: PathBuf,
 }
