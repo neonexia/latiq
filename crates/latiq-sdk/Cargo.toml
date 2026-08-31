@@ -2,6 +2,7 @@
 name = "latiq-sdk"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 # Reusable Rust client for Latiq (CLI/SDK audience — gRPC, never MCP). Two ways to
 # get a cluster: connect to a remote control plane, or start one in-process backed
