@@ -2,7 +2,7 @@
 //! write (txn-wrapped + native DuckLake attribution), and explain.
 use crate::instance::PondInstance;
 use duckdb::types::ValueRef;
-use latiq_common::{DatasetRef, Identity, QueryMeta};
+use latiq_common::{DatasetField, DatasetRef, Identity, QueryMeta};
 use latiq_engine::{is_read_only, AbortToken, ArrowSink, EngineError, ExplainResult, QueryResult};
 use std::time::Instant;
 
@@ -535,6 +535,102 @@ pub fn referenced_tables(
         ),
     }
     (dedup(inputs), dedup(outputs))
+}
+
+/// Fill in the columns of every dataset that lives in **this pond's own
+/// catalog**, in ONE lookup for all of them.
+///
+/// One query, not one per table: the datasets of a statement are all in the
+/// same `information_schema`, so a per-table round trip would charge a join
+/// over five tables five times for information one query already returns.
+/// Everything not in the pond's catalog — an `s3://` object, a Parquet file, a
+/// transiently attached catalog — is skipped rather than guessed: we do not
+/// have its columns cheaply, and a wrong schema is worse than an absent one.
+///
+/// **When to call it matters on each side.** An output's columns only exist
+/// *after* the statement ran (a `CREATE TABLE … AS` has no target to describe
+/// before it); an input's must be read inside the read's own transaction, or
+/// the columns recorded may not be the ones the rows came from.
+///
+/// Best-effort, like [`referenced_tables`]: a failure logs why and leaves the
+/// datasets exactly as they were. It must never fail a query.
+pub fn annotate_schemas(
+    inst: &PondInstance,
+    catalog: &str,
+    inputs: &mut [DatasetRef],
+    outputs: &mut [DatasetRef],
+) {
+    // `{catalog}.{schema}.{table}`, and only for a dataset the pond owns (an
+    // external one carries its own namespace).
+    let qualified = |d: &DatasetRef| -> Option<(String, String)> {
+        if d.namespace.is_some() {
+            return None;
+        }
+        let rest = d.name.strip_prefix(catalog)?.strip_prefix('.')?;
+        let (schema, table) = rest.split_once('.')?;
+        (!table.contains('.')).then(|| (schema.to_string(), table.to_string()))
+    };
+    let wanted: std::collections::BTreeSet<(String, String)> = inputs
+        .iter()
+        .chain(outputs.iter())
+        .filter_map(&qualified)
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    // Escaped as SQL literals, never concatenated raw: these names come from
+    // DuckDB's own plan, but they originate in caller SQL and a quote in an
+    // identifier must not be able to end the literal.
+    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let pairs = wanted
+        .iter()
+        .map(|(s, t)| format!("({}, {})", lit(s), lit(t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT table_schema, table_name, column_name, data_type \
+         FROM information_schema.columns \
+         WHERE table_catalog = {} AND (table_schema, table_name) IN ({pairs}) \
+         ORDER BY table_schema, table_name, ordinal_position",
+        lit(catalog)
+    );
+    let mut by_table: std::collections::HashMap<(String, String), Vec<DatasetField>> =
+        std::collections::HashMap::new();
+    let collected = inst.conn.prepare(&query).and_then(|mut stmt| {
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (schema, table, column, ty) = row?;
+            by_table
+                .entry((schema, table))
+                .or_default()
+                .push(DatasetField {
+                    name: column,
+                    type_name: ty,
+                });
+        }
+        Ok(())
+    });
+    if let Err(e) = collected {
+        // Loud for the same reason `referenced_tables` is: an event whose
+        // datasets lost their columns looks exactly like one whose tables never
+        // had any. The message is DuckDB's own and quotes no user SQL.
+        tracing::warn!(pond = catalog, error = %e, "lineage: no column schema for this statement");
+        return;
+    }
+    for ds in inputs.iter_mut().chain(outputs.iter_mut()) {
+        if let Some(key) = qualified(ds) {
+            if let Some(fields) = by_table.get(&key) {
+                ds.fields = fields.clone();
+            }
+        }
+    }
 }
 
 /// Why an extraction produced nothing.

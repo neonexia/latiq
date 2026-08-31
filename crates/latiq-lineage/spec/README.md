@@ -22,6 +22,7 @@ curl -sSf $B/facets/DatasetVersionDatasetFacet.json  # -> facets/DatasetVersionD
 curl -sSf $B/facets/ErrorMessageRunFacet.json        # -> facets/ErrorMessageRunFacet-1-0-1.json
 curl -sSf $B/facets/JobTypeJobFacet.json             # -> facets/JobTypeJobFacet-2-0-3.json
 curl -sSf $B/facets/ProcessingEngineRunFacet.json    # -> facets/ProcessingEngineRunFacet-1-1-1.json
+curl -sSf $B/facets/SchemaDatasetFacet.json          # -> facets/SchemaDatasetFacet-1-1-1.json
 ```
 
 The version in each filename is the facet's own `$id` version at that tag — the

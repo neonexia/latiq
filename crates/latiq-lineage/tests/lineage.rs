@@ -68,6 +68,7 @@ fn job() -> Job {
 fn dataset(name: &str, snapshot: i64) -> Dataset {
     Dataset::new(latiq_lineage::event::dataset_namespace(POND), name)
         .with(facets::dataset_version(snapshot))
+        .with(facets::schema([("id", "INTEGER"), ("sev", "VARCHAR")]))
 }
 
 /// A write that succeeded: every facet this crate can emit except the error one.
@@ -128,6 +129,10 @@ fn facet_schemas() -> Vec<(&'static str, &'static str)> {
         (
             "version",
             include_str!("../spec/facets/DatasetVersionDatasetFacet-1-0-1.json"),
+        ),
+        (
+            "schema",
+            include_str!("../spec/facets/SchemaDatasetFacet-1-1-1.json"),
         ),
         (
             "errorMessage",

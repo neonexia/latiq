@@ -107,13 +107,24 @@ pub(crate) fn record(writer: &LineageWriter, node_id: &str, rec: QueryRecord<'_>
                     .namespace
                     .clone()
                     .unwrap_or_else(|| dataset_namespace(&info.pond_id));
-                let ds = Dataset::new(namespace, r.name.clone());
+                let mut ds = Dataset::new(namespace, r.name.clone());
                 // The DuckLake snapshot rides the standard dataset-version
                 // facet; there is no top-level snapshot field in the spec.
-                match r.version.or(fallback) {
-                    Some(id) => ds.with(facets::dataset_version(id)),
-                    None => ds,
+                if let Some(id) = r.version.or(fallback) {
+                    ds = ds.with(facets::dataset_version(id));
                 }
+                // The columns, on the standard schema facet, when the engine
+                // had them cheaply — a pond table. An external dataset's are
+                // empty and stay absent: a dataset with no `fields` reads as
+                // "not stated", and a guessed one would read as fact.
+                if !r.fields.is_empty() {
+                    ds = ds.with(facets::schema(
+                        r.fields
+                            .iter()
+                            .map(|f| (f.name.as_str(), f.type_name.as_str())),
+                    ));
+                }
+                ds
             })
             .collect()
     };

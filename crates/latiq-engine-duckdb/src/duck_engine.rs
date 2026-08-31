@@ -15,7 +15,8 @@
 //! watcher thread interrupts the running statement when the `AbortToken` is
 //! cancelled, and exits when the operation completes.
 use crate::exec::{
-    in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow, run_write,
+    annotate_schemas, in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow,
+    run_write,
 };
 use crate::instance::PondInstance;
 use latiq_common::{DatasetRef, Identity, QueryMeta};
@@ -55,6 +56,19 @@ type PlanDatasets = Option<(Vec<DatasetRef>, Vec<DatasetRef>)>;
 fn plan_datasets(loc: &PondLocation, inst: &PondInstance, sql: &str) -> PlanDatasets {
     loc.lineage
         .then(|| referenced_tables(inst, sql, &loc.catalog_name))
+}
+
+/// Fill in the columns of the pond's own datasets, in one lookup.
+///
+/// Gated by the same `Option` as the extraction itself, so a pond without
+/// lineage does not pay for it — and called at a point each path chooses: an
+/// output's columns exist only *after* the statement ran, and an input's must
+/// be read inside the read's own transaction to describe what the rows came
+/// from. Best-effort throughout (`exec::annotate_schemas` warns and returns).
+fn annotate(loc: &PondLocation, inst: &PondInstance, datasets: &mut PlanDatasets) {
+    if let Some((inputs, outputs)) = datasets {
+        annotate_schemas(inst, &loc.catalog_name, inputs, outputs);
+    }
 }
 
 /// Attach what the plan found to the statement's meta. A no-op for a pond
@@ -365,7 +379,10 @@ impl QueryEngine for DuckEngine {
                     // longer bind (a dropped table, a table the same batch
                     // created). Same order on every path, so provenance does
                     // not depend on the statement.
-                    let datasets = plan_datasets(loc, i, sql);
+                    let mut datasets = plan_datasets(loc, i, sql);
+                    // Inside this transaction, so the columns recorded are the
+                    // ones the rows came from.
+                    annotate(loc, i, &mut datasets);
                     let mut res = run_read(i, sql)?;
                     apply_datasets(&mut res.meta, datasets);
                     Ok(res)
@@ -400,7 +417,8 @@ impl QueryEngine for DuckEngine {
             // `latiq-agent-core`, whose send wakes on the abort token.
             Self::run_with_abort(i, &abort, |i| {
                 in_read_txn(i, |i| {
-                    let datasets = plan_datasets(loc, i, sql);
+                    let mut datasets = plan_datasets(loc, i, sql);
+                    annotate(loc, i, &mut datasets);
                     let mut meta = run_read_arrow(i, sql, &abort, sink)?;
                     apply_datasets(&mut meta, datasets);
                     Ok(meta)
@@ -427,8 +445,14 @@ impl QueryEngine for DuckEngine {
         // The cost is that a slow bind delays other writers to this pond; being
         // abortable is what keeps that bounded.
         Self::run_with_abort(&guard, &abort, |i| {
-            let datasets = plan_datasets(loc, i, sql);
+            let mut datasets = plan_datasets(loc, i, sql);
             let mut res = run_write(i, sql, identity, &loc.catalog_name)?;
+            // AFTER the statement: a `CREATE TABLE … AS`'s target has no
+            // columns to describe until it exists, and a dropped table has none
+            // to describe at all — which is why a failed write records none
+            // either: the `QueryEngine::plan_datasets` recovery path below
+            // recovers the datasets and deliberately not their columns.
+            annotate(loc, i, &mut datasets);
             apply_datasets(&mut res.meta, datasets);
             Ok(res)
         })
@@ -519,7 +543,7 @@ impl QueryEngine for DuckEngine {
         // tables are detached and the pull's own target already exists. Gated
         // on the pond's lineage flag like every other path, so a pond that did
         // not opt in pays nothing for the second bind.
-        let datasets = plan_datasets(loc, &guard, query);
+        let mut datasets = plan_datasets(loc, &guard, query);
         // Run the pull query (a CREATE TABLE … in the pond's default catalog),
         // then tear the attachment down regardless of the outcome.
         let ran = guard
@@ -528,6 +552,9 @@ impl QueryEngine for DuckEngine {
             .map_err(|e| EngineError::Engine(format!("pull query: {e}")));
         teardown_catalog(&guard.conn, &plan);
         ran?;
+        // The pull's own target is a pond table, and it exists now. The source
+        // side is external and is skipped, exactly as an `s3://` input is.
+        annotate(loc, &guard, &mut datasets);
         let mut meta = QueryMeta::default();
         apply_datasets(
             &mut meta,
