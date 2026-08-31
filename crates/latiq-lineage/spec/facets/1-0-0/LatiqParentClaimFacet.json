@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqParentClaimFacet.json",
+  "$defs": {
+    "LatiqParentClaimFacet": {
+      "description": "The caller's raw, opaque workflow/step labels, verbatim. `parent.run.runId` must be a UUID, so Latiq derives one from `workflowId`; this facet preserves what the caller actually said. Always `verified: false` \u2014 a parent is claimed and never load-bearing.",
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "workflowId": {
+              "description": "The caller's workflow id, verbatim.",
+              "type": "string"
+            },
+            "stepId": {
+              "description": "The caller's step id, verbatim, if supplied.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "verified": {
+              "description": "Always false: the parent is claimed, never verified.",
+              "type": "boolean",
+              "const": false
+            }
+          },
+          "required": [
+            "workflowId",
+            "verified"
+          ]
+        }
+      ],
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "latiq_parent_claim": {
+      "$ref": "#/$defs/LatiqParentClaimFacet"
+    }
+  }
+}

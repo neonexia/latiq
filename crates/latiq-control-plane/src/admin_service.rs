@@ -282,6 +282,7 @@ impl Admin for AdminService {
                 node_id: row.node_id,
                 tier: row.tier,
                 description: row.description,
+                lineage: row.lineage,
             });
         }
         Ok(Response::new(PondListResponse { ponds }))

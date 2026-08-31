@@ -7,9 +7,10 @@ use crate::control::ControlPlane;
 use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
+use crate::lineage::{QueryRecord, IN_PROCESS_NODE};
 use crate::types::{
-    AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LoadDatasetResult, PondInfo,
-    PullResult,
+    AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LineagePage, LoadDatasetResult,
+    PondInfo, PullResult,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -18,15 +19,24 @@ use latiq_common::Identity;
 use latiq_common::PondId;
 use latiq_common::QueryMeta;
 use latiq_common::{PondTier, ResourceLimits};
-use latiq_engine::{ArrowSink, ExplainResult, QueryEngine, QueryResult};
+use latiq_engine::{AbortToken, ArrowSink, ExplainResult, QueryEngine, QueryResult};
+use latiq_lineage::event::DurationMeaning;
+use latiq_lineage::{EventSink, LineageWriter};
 use latiq_storage::PondStorage;
+use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tracing::info;
+
+/// The `see` target for every lineage-shaped error — a real served resource
+/// (`latiq-mcp`'s `resources.rs`), because a `see` that resolves to nothing is
+/// worse than none at all.
+const LINEAGE_RECIPE: &str = "latiq://recipes/lineage";
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -54,6 +64,29 @@ pub struct AgentOps {
     /// Delegate for ponds owned by a different node. `None` = single-node: every
     /// pond is local, so the behavior is exactly as before forwarding existed.
     forwarder: Option<Arc<dyn Forwarder>>,
+    /// One lineage writer per opted-in pond, built lazily on that pond's first
+    /// emit and evicted by `drop_pond`. Per pond because a writer owns a
+    /// directory (the pond's own `lineage/`) and a batch buffer; keyed by pond
+    /// id and shared across `AgentOps` clones, so the batching is per pond and
+    /// not per request. A pond that never opts in never gets an entry.
+    ///
+    /// An `RwLock` because every query of every lineage-enabled pond reads it
+    /// and only a pond's FIRST emit writes it — a `Mutex` here would serialize
+    /// lineage emission for the whole node behind one pond's map lookup.
+    lineage_writers: Arc<RwLock<HashMap<String, Arc<LineageWriter>>>>,
+    /// Poisoning is permanent, so the warning about it fires once per node
+    /// rather than once per query (the same discipline `LineageWriter` uses for
+    /// its own buffer lock).
+    lineage_poison_warned: Arc<AtomicBool>,
+    /// The node's optional OpenLineage HTTP backend, handed to every writer
+    /// this node builds. A trait object, so this crate stays protocol-neutral
+    /// (invariant 5): the transport is `latiq-lineage`'s feature-gated
+    /// `HttpSink`, and nothing in here knows that HTTP is what it does.
+    lineage_sink: Option<Arc<dyn EventSink>>,
+    /// The engine's version, asked once here rather than per query: it goes on
+    /// every lineage event, and a pond WITHOUT lineage must not pay so much as
+    /// an allocation for a field it will never emit.
+    engine_version: String,
 }
 
 impl AgentOps {
@@ -64,6 +97,7 @@ impl AgentOps {
         config: AgentConfig,
     ) -> Self {
         Self {
+            engine_version: engine.version(),
             control,
             storage,
             engine,
@@ -71,7 +105,22 @@ impl AgentOps {
             config,
             self_endpoint: None,
             forwarder: None,
+            lineage_writers: Arc::new(RwLock::new(HashMap::new())),
+            lineage_poison_warned: Arc::new(AtomicBool::new(false)),
+            lineage_sink: None,
         }
+    }
+
+    /// Also publish every lineage event this node records to `sink` — the
+    /// optional OpenLineage HTTP backend.
+    ///
+    /// Purely additive: the pond's own files are written exactly as before, and
+    /// a sink that is down, slow or dead cannot fail, slow or block a query
+    /// (see `latiq_lineage::sink`). It is the durability answer for a pond that
+    /// gets dropped, whose files go with it.
+    pub fn with_lineage_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.lineage_sink = Some(sink);
+        self
     }
 
     /// Enable node-to-node forwarding: requests for ponds owned by a node other
@@ -90,6 +139,171 @@ impl AgentOps {
     /// Pond instances open on this node (for the `latiq_node_open_ponds` gauge).
     pub fn open_pond_count(&self) -> usize {
         self.engine.open_pond_count()
+    }
+
+    /// Ponds with a live lineage writer on this node — always 0 in a deployment
+    /// where nobody opted in. A companion to `open_pond_count` (same shape, same
+    /// purpose: an observable count of a per-pond resource this node holds).
+    pub fn lineage_writer_count(&self) -> usize {
+        self.lineage_writers_read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Write out every pond's buffered lineage events now.
+    ///
+    /// **This blocks** (the writer fsyncs), so it belongs on a shutdown path or
+    /// a blocking task, never in a request handler. That is a property of THIS
+    /// call, not of the query path: a query only ever buffers, and hands the
+    /// occasional due batch to `spawn_blocking` without awaiting it (see
+    /// `emit_lineage`), so no query ever waits behind an fsync.
+    pub fn flush_lineage(&self) {
+        let writers: Vec<Arc<LineageWriter>> = match self.lineage_writers_read() {
+            Some(map) => map.values().cloned().collect(),
+            None => return,
+        };
+        // Flushing outside the lock: an IO stall must not block the next emit.
+        for writer in writers {
+            writer.flush();
+        }
+    }
+
+    /// Deliver whatever the optional lineage sink still has queued, giving up
+    /// after `budget`.
+    ///
+    /// The companion to `flush_lineage` on the shutdown path, and it must run
+    /// **after** it: the file flush can hand the sink nothing (the sink is fed
+    /// at buffer time, not at write time), but ordering them this way means the
+    /// cheap, always-correct half happens first and the bounded, best-effort
+    /// half gets whatever budget is left.
+    ///
+    /// Awaits rather than blocks, and is bounded by the sink itself. A node
+    /// with no backend configured returns immediately.
+    pub async fn drain_lineage_sink(&self, budget: std::time::Duration) {
+        if let Some(sink) = self.lineage_sink.as_deref() {
+            sink.drain(budget).await;
+        }
+    }
+
+    /// Emit this operation's lineage. Called from the PUBLIC op methods beside
+    /// `self.audit(...)`, and only on the local path — see `crate::lineage`.
+    ///
+    /// The `lineage` check comes first and costs one bool: a pond that did not
+    /// opt in must not reach the writer registry, the storage lookup, or any
+    /// string formatting.
+    ///
+    /// Building the events is pure memory. The batch write is not — it fsyncs —
+    /// so when one comes due it goes to the blocking pool, and is deliberately
+    /// **not awaited**: the query has already produced its answer and must not
+    /// wait on lineage IO, nor may that IO occupy the async worker it ran on.
+    /// The events are in the buffer before this returns, so nothing is lost if
+    /// that task is slow; the buffer is bounded, and `Drop` flushes what is left.
+    fn emit_lineage(&self, rec: QueryRecord<'_>) {
+        if !rec.info.lineage {
+            return;
+        }
+        let Some(writer) = self.lineage_writer(rec.info) else {
+            return; // nothing to do, and never anything to fail
+        };
+        let node_id = self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE);
+        if crate::lineage::record(&writer, node_id, rec) {
+            tokio::task::spawn_blocking(move || writer.flush());
+        }
+    }
+
+    /// This pond's writer, built on first use. The pond's `lineage_dir` is
+    /// resolved once per pond here rather than once per query: by the time an op
+    /// emits, its local path has already ensured the pond exists.
+    ///
+    /// The location is resolved with **no lock held** — for `LocalFs` it stats
+    /// the pond directory, and one slow stat must not serialize emission for
+    /// every other pond on the node. The cost is that two first emits for one
+    /// pond can both build a writer; the insert keeps whichever landed first, so
+    /// a pond never ends up with two writers batching into one directory.
+    ///
+    /// `None` on any failure — a pond whose location will not resolve loses its
+    /// lineage, and never its query.
+    fn lineage_writer(&self, info: &PondInfo) -> Option<Arc<LineageWriter>> {
+        {
+            let map = self.lineage_writers_read()?;
+            if let Some(writer) = map.get(&info.pond_id) {
+                return Some(writer.clone());
+            }
+        }
+        let pid = Self::parse_id(&info.pond_id).ok()?;
+        let loc = self
+            .storage
+            .pond_location(pid)
+            .inspect_err(|e| {
+                tracing::warn!(pond = %info.pond_id, %e, "no lineage for this pond: unresolved location");
+            })
+            .ok()?;
+        let mut writer = LineageWriter::new(&loc.lineage_dir);
+        if let Some(sink) = self.lineage_sink.clone() {
+            writer = writer.with_sink(sink);
+        }
+        let writer = Arc::new(writer);
+        let mut map = self.lineage_writers_write()?;
+        Some(
+            map.entry(info.pond_id.clone())
+                .or_insert(writer) // a concurrent first emit wins; ours is dropped
+                .clone(),
+        )
+    }
+
+    /// Evict a dropped pond's writer, flushing it on the blocking pool (the
+    /// flush fsyncs). Two reasons it cannot be skipped: the map would otherwise
+    /// leak an entry per dropped pond for the life of the process, and a writer
+    /// that outlived its pond would keep failing and requeueing batches into a
+    /// deleted directory until it hit its capacity bound.
+    ///
+    /// What this does NOT promise: that the writer is gone by the time the
+    /// caller deletes the files. `lineage_writer` hands out `Arc` clones, and one
+    /// can be alive on an in-flight request's stack; that straggler's `Drop`
+    /// flushes later, possibly into a directory that no longer exists, which the
+    /// writer answers with a `warn!` and a dropped batch. Harmless, and cheaper
+    /// than the refcount gymnastics that forcing last-drop would need — dropping
+    /// a pond destroys its provenance either way (the HTTP sink is the
+    /// durability answer).
+    async fn evict_lineage_writer(&self, pond_id: &str) {
+        let writer = self
+            .lineage_writers_write()
+            .and_then(|mut map| map.remove(pond_id));
+        if let Some(writer) = writer {
+            let _ = tokio::task::spawn_blocking(move || writer.flush()).await;
+        }
+    }
+
+    fn lineage_writers_read(
+        &self,
+    ) -> Option<RwLockReadGuard<'_, HashMap<String, Arc<LineageWriter>>>> {
+        match self.lineage_writers.read() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                self.warn_lineage_poisoned();
+                None
+            }
+        }
+    }
+
+    fn lineage_writers_write(
+        &self,
+    ) -> Option<RwLockWriteGuard<'_, HashMap<String, Arc<LineageWriter>>>> {
+        match self.lineage_writers.write() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                self.warn_lineage_poisoned();
+                None
+            }
+        }
+    }
+
+    /// A panic elsewhere poisoned the registry, which disables lineage for the
+    /// rest of the process. Said once, and said out loud: silence here is
+    /// indistinguishable from a deployment where nobody opted in, and
+    /// `lineage_writer_count` would report 0 for both.
+    fn warn_lineage_poisoned(&self) {
+        if !self.lineage_poison_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!("lineage writer registry is poisoned; lineage is disabled on this node");
+        }
     }
 
     /// If this node isn't the pond's owner (and forwarding is configured), return
@@ -120,10 +334,11 @@ impl AgentOps {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        lineage: bool,
     ) -> Result<AllocateResult, AgentError> {
         let started = Instant::now();
         let res = self
-            .allocate_pond_inner(identity, name, policy_json, tier, extensions)
+            .allocate_pond_inner(identity, name, policy_json, tier, extensions, lineage)
             .await;
         self.audit(
             identity,
@@ -144,10 +359,18 @@ impl AgentOps {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        lineage: bool,
     ) -> Result<AllocateResult, AgentError> {
         let info = self
             .control
-            .create_pond(name, &identity.agent_id, policy_json, tier, extensions)
+            .create_pond(
+                name,
+                &identity.agent_id,
+                policy_json,
+                tier,
+                extensions,
+                lineage,
+            )
             .await?;
         // The control plane may place the pond on a different node than the one
         // that received this call. In that case, don't eagerly create storage here
@@ -163,11 +386,12 @@ impl AgentOps {
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
             .storage
-            .create_pond(pid)
+            .create_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
 
         let engine = self.engine.clone();
         let loc2 = loc.clone();
@@ -222,6 +446,11 @@ impl AgentOps {
         })
     }
 
+    /// NO LINEAGE EVENT: describe reads no data. It reports the pond's tables
+    /// and columns from the catalog, so there is no run to attribute and no
+    /// dataset was consumed or produced — an event here would add a run to
+    /// every consumer's graph that touched nothing.
+    ///
     /// The local half of `describe_pond` — split out so its failures are audited
     /// alongside its successes without the forwarded path double-recording (the
     /// owner audits what it actually ran).
@@ -234,11 +463,12 @@ impl AgentOps {
         // pond's registry name so introspection is scoped to this catalog.
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         Ok(
@@ -332,7 +562,16 @@ impl AgentOps {
         if let Ok(loc) = self.storage.pond_location(pid) {
             self.engine.forget_pond(&loc);
         }
+        // Same order, same reason, for the pond's lineage writer: let it go
+        // BEFORE the files it writes into are deleted.
+        self.evict_lineage_writer(&pond_id).await;
         let _ = self.storage.drop_pond(pid);
+        // Again, because a query that slipped past `begin_drop` can re-insert a
+        // writer in the window between the two. This narrows that window rather
+        // than closing it — a re-insert after this line still leaves an entry
+        // pointing at a deleted directory — but it costs a map lookup and turns
+        // "leaks for the life of the process" into a race you have to win.
+        self.evict_lineage_writer(&pond_id).await;
         self.inflight.end_drop(&pond_id);
         self.audit(
             identity,
@@ -471,37 +710,61 @@ impl AgentOps {
         }
         let started = Instant::now();
         let res = self.catalog_pull_local(&info, catalog, query, params).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
             "catalog_pull",
             Some(pond_ref),
             Some(query.to_string()),
-            started.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
-        res
+        // The one op whose INPUT is not in the pond, and the edge with the most
+        // provenance value: the catalog is detached before this returns, so
+        // nothing in the pond afterwards remembers where its rows came from.
+        // A failure carries no datasets — the plan bound against a catalog that
+        // is gone by now, and re-binding it would attach it again.
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op: "catalog_pull",
+            sql: query,
+            duration_ms,
+            meaning: DurationMeaning::Completion,
+            error: res.as_ref().err(),
+            meta: res.as_ref().ok().map(|(_, meta)| meta),
+            engine_version: &self.engine_version,
+        });
+        res.map(|(pull, _)| pull)
     }
 
     /// The local half of `catalog_pull` (see `describe_pond_local` for why it is
-    /// split out).
+    /// split out). Returns the engine's meta alongside the result: the pull's
+    /// two sides can only be named while the catalog is attached, so the
+    /// emitter cannot go looking for them afterwards.
     async fn catalog_pull_local(
         &self,
         info: &PondInfo,
         catalog: &str,
         query: &str,
         params: std::collections::BTreeMap<String, String>,
-    ) -> Result<PullResult, AgentError> {
+    ) -> Result<(PullResult, QueryMeta), AgentError> {
         let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
         let engine = self.engine.clone();
         let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
-        tokio::task::spawn_blocking(move || engine.pull_catalog(&loc, &ty, &alias, &merged, &q))
-            .await
-            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
-        Ok(PullResult {
-            catalog: cat.name,
-            query: query.to_string(),
+        let meta = tokio::task::spawn_blocking(move || {
+            engine.pull_catalog(&loc, &ty, &alias, &merged, &q)
         })
+        .await
+        .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        Ok((
+            PullResult {
+                catalog: cat.name,
+                query: query.to_string(),
+            },
+            meta,
+        ))
     }
 
     /// Transiently attach a catalog on the pond and list its tables.
@@ -583,11 +846,12 @@ impl AgentOps {
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         Ok((loc, cat, merged))
     }
 
@@ -644,15 +908,30 @@ impl AgentOps {
         info!(op = "read_arrow", pond = pond_ref, "processing locally");
         let started = Instant::now();
         let res = self.read_arrow_local(&info, sql).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
             "read_arrow",
             Some(&info.pond_id),
             Some(redact_sql(sql)),
-            started.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
+        // Lineage records establishment for the same reason the audit does, and
+        // labels the duration as such: there is no row count and no completion
+        // time to claim here, and a `completion` label would be a lie.
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op: "read_arrow",
+            sql,
+            duration_ms,
+            meaning: DurationMeaning::Establishment,
+            error: res.as_ref().err(),
+            meta: None,
+            engine_version: &self.engine_version,
+        });
         res
     }
 
@@ -670,35 +949,62 @@ impl AgentOps {
         let pid = Self::parse_id(&pond_id)?;
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let (op_id, token) = self.inflight.register(Some(pond_id));
 
         let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
+        // The engine's meta is only complete when the last batch has been
+        // produced, so it rides its own channel rather than the schema oneshot:
+        // a collecting caller drains the stream first and reads it after.
+        let (meta_tx, meta_rx) = oneshot::channel::<QueryMeta>();
 
         let engine = self.engine.clone();
         let inflight = self.inflight.clone();
         let sql2 = sql.to_string();
         let pond_name = info.name.clone();
+        // Captured here, in async context: the blocking producer below needs it
+        // to await the consumer without owning a runtime.
+        let rt = tokio::runtime::Handle::current();
+        // The sink's own handle on cancellation. The engine gets `token`; the
+        // sink needs it too, because a producer parked on a full channel is the
+        // one place an interrupt cannot reach (see `ChannelSink::send_batch`).
+        let sink_abort = token.clone();
         tokio::task::spawn_blocking(move || {
             let t0 = Instant::now();
             let mut sink = ChannelSink {
                 schema_tx: Some(schema_tx),
                 batch_tx,
+                rt,
+                abort: sink_abort,
             };
             let res = engine.read_arrow(&loc, &sql2, token, &mut sink);
-            if let Err(e) = res {
-                let ae = AgentError::from(e);
-                // Deliver the error on whichever channel is still open: the schema
-                // oneshot (no batches produced yet) or the batch stream.
-                if let Some(stx) = sink.schema_tx.take() {
-                    let _ = stx.send(Err(ae));
-                } else {
-                    let _ = sink.batch_tx.blocking_send(Err(ae));
+            match res {
+                Ok(meta) => {
+                    // Sent before the sink (and so `batch_tx`) is dropped, so a
+                    // caller that waits for the end of the stream never waits
+                    // for the meta.
+                    let _ = meta_tx.send(meta);
+                }
+                Err(e) => {
+                    let ae = AgentError::from(e);
+                    // Deliver the error on whichever channel is still open: the
+                    // schema oneshot (no batches produced yet) or the batch
+                    // stream.
+                    if let Some(stx) = sink.schema_tx.take() {
+                        let _ = stx.send(Err(ae));
+                    } else {
+                        // Same bounded wait as a batch: this must not park
+                        // forever on a stalled consumer either. The `biased`
+                        // select still delivers the error whenever the channel
+                        // has room, cancelled or not.
+                        let _ = sink.send_batch(Err(ae));
+                    }
                 }
             }
             inflight.complete(&op_id);
@@ -716,6 +1022,7 @@ impl AgentOps {
         Ok(ArrowReadStream {
             schema,
             batches: Box::pin(ReceiverStream::new(batch_rx)),
+            meta: Some(meta_rx),
         })
     }
 
@@ -761,15 +1068,30 @@ impl AgentOps {
             Ok(stream) => self.collect_stream(stream).await,
             Err(e) => Err(e),
         };
+        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
             "read_query",
             Some(&info.pond_id),
             Some(redact_sql(sql)),
-            started.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
+        // Emitted here, in the public method, and NOT in `read_arrow_local` —
+        // which this shares with `read_arrow`, so an emitter down there would
+        // record one read twice, under two different ops.
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op: "read_query",
+            sql,
+            duration_ms,
+            meaning: DurationMeaning::Completion,
+            error: res.as_ref().err(),
+            meta: res.as_ref().ok().map(|r| &r.meta),
+            engine_version: &self.engine_version,
+        });
         res
     }
 
@@ -784,6 +1106,7 @@ impl AgentOps {
             .collect();
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut batches = stream.batches;
+        let meta = stream.meta;
         while let Some(b) = batches.next().await {
             append_batch_rows(&b?, &columns, &mut rows)?;
             if rows.len() > self.config.inline_row_cap {
@@ -794,13 +1117,24 @@ impl AgentOps {
             }
         }
         let n = rows.len() as u64;
+        // The ENGINE's meta, not a fabricated one: this is the CLI/SDK read
+        // path, so a synthesised meta here would strip every dataset the engine
+        // extracted and `read_collected` would emit dataset-less lineage even
+        // once the plan extraction works. `rows` is still ours — it counts what
+        // was actually collected, which is what the caller is being handed.
+        //
+        // A meta only fails to arrive when the producer could not speak for the
+        // engine (a stream decoded from a peer's chunks), and then an empty one
+        // is the honest answer: this node did not run the query.
+        let mut meta = match meta {
+            Some(rx) => rx.await.unwrap_or_default(),
+            None => QueryMeta::default(),
+        };
+        meta.rows = n;
         Ok(QueryResult {
             columns,
             rows,
-            meta: QueryMeta {
-                rows: n,
-                ..Default::default()
-            },
+            meta,
         })
     }
 
@@ -834,28 +1168,54 @@ impl AgentOps {
         }
         info!(op = "query", pond = pond_ref, "processing locally");
         let t0 = Instant::now();
-        let res = self.run_query_local(&info, sql, identity, write).await;
+        // What the statement's plan said it would touch, filled in only when
+        // the statement failed and so produced no meta of its own.
+        let mut planned = None;
+        let res = self
+            .run_query_local(&info, sql, identity, write, &mut planned)
+            .await;
+        let duration_ms = t0.elapsed().as_millis() as u64;
         self.audit(
             identity,
             op,
             Some(&info.pond_id),
             Some(redact_sql(sql)),
-            t0.elapsed().as_millis() as u64,
+            duration_ms,
             outcome(&res),
         )
         .await;
+        self.emit_lineage(QueryRecord {
+            identity,
+            info: &info,
+            op,
+            sql,
+            duration_ms,
+            meaning: DurationMeaning::Completion,
+            error: res.as_ref().err(),
+            // The result's meta when there is one; the plan's when the
+            // statement failed — a FAIL event that names the table the write
+            // was aiming at is the one a reader actually needs.
+            meta: res.as_ref().ok().map(|r| &r.meta).or(planned.as_ref()),
+            engine_version: &self.engine_version,
+        });
         res
     }
 
     /// The local half of `run_query` (see `describe_pond_local` for why it is
     /// split out): every way this can fail is now on the access trail, where
     /// before only the successes were.
+    ///
+    /// `planned` is an out-parameter rather than part of the return type
+    /// because it is filled in exactly where the return type cannot carry it:
+    /// a write that FAILED still knows what it meant to touch, and that is the
+    /// event where knowing the intended target matters most.
     async fn run_query_local(
         &self,
         info: &PondInfo,
         sql: &str,
         identity: &Identity,
         write: bool,
+        planned: &mut Option<QueryMeta>,
     ) -> Result<QueryResult, AgentError> {
         record_query(&info.name, if write { "write" } else { "read" });
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
@@ -865,11 +1225,12 @@ impl AgentOps {
         // under the pond's registry name so callers query `<pond>.snapshots()`.
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let (op_id, token) = self.inflight.register(Some(pond_id.clone()));
 
         let engine = self.engine.clone();
@@ -878,18 +1239,29 @@ impl AgentOps {
         let identity2 = identity.clone();
         let t0 = Instant::now();
         let out = tokio::task::spawn_blocking(move || {
-            if write {
+            let res = if write {
                 engine.write_query(&loc2, &sql2, &identity2, token)
             } else {
                 engine.read_query(&loc2, &sql2, token)
-            }
+            };
+            // Only for a FAILED write, and only when the pond opted into
+            // lineage (the engine enforces that gate itself): a healthy query
+            // reports its datasets through its own meta and must not pay for a
+            // second bind. On the same blocking thread, because engine calls
+            // block.
+            let planned = match (&res, write) {
+                (Err(_), true) => engine.plan_datasets(&loc2, &sql2),
+                _ => None,
+            };
+            (res, planned)
         })
         .await
         .map_err(|e| AgentError::internal(format!("join: {e}")));
         self.inflight.complete(&op_id);
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).decrement(1.0);
 
-        let result = out?;
+        let (result, from_plan) = out?;
+        *planned = from_plan;
         let qr = match result {
             Ok(qr) => qr,
             Err(e) => {
@@ -945,6 +1317,10 @@ impl AgentOps {
         res
     }
 
+    /// NO LINEAGE EVENT: explain executes nothing. The statement is planned and
+    /// discarded, so no data moved and no snapshot exists to version — the
+    /// access trail records the attempt, which is the right place for it.
+    ///
     /// The local half of `explain_query` (see `describe_pond_local`).
     async fn explain_query_local(
         &self,
@@ -956,11 +1332,12 @@ impl AgentOps {
         // pond's registry name so the plan resolves names in this catalog.
         let mut loc = self
             .storage
-            .ensure_pond(pid)
+            .ensure_pond(pid, info.lineage)
             .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
+        loc.lineage = info.lineage;
         let engine = self.engine.clone();
         let loc2 = loc.clone();
         let sql2 = sql.to_string();
@@ -969,6 +1346,190 @@ impl AgentOps {
                 .await
                 .map_err(|e| AgentError::internal(format!("join: {e}")))??,
         )
+    }
+
+    /// A page of the pond's OpenLineage trail, newest first.
+    ///
+    /// The read half of lineage, and protocol-neutral like everything else here
+    /// — the MCP `get_lineage` tool is an adapter over this, and a second
+    /// surface would be another adapter and not a change in here.
+    ///
+    /// **The paging contract.** `since` is an INCLUSIVE lower bound ("what has
+    /// happened since I last looked") and `before` an EXCLUSIVE upper one (the
+    /// backward cursor: pass the oldest `eventTime` you received to get the
+    /// next older page). A page is never cut in the middle of one `eventTime`,
+    /// so walking `before` backwards visits every event exactly once — see
+    /// `latiq_lineage::read_newest` for the one degenerate exception.
+    ///
+    /// Two things it does NOT do, on purpose:
+    ///
+    /// - **No DuckDB.** The events are JSONL on the owning node's disk and are
+    ///   returned verbatim; nothing is attached, and no Latiq object is created
+    ///   in the pond's catalog (invariant 6).
+    /// - **No filtering or aggregation** beyond the bounds + caps. A caller
+    ///   that wants either can run `read_json_auto` over `lineage_dir`, which
+    ///   is why the page carries it.
+    pub async fn get_lineage(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        limit: usize,
+        since: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<LineagePage, AgentError> {
+        let info = self
+            .pond_info_audited(identity, "get_lineage", pond_ref)
+            .await?;
+        // Validated before the forward decision: the owner would refuse it
+        // identically, and a peer hop to earn the same error is pure latency.
+        if limit == 0 {
+            return Err(self
+                .audit_err(
+                    identity,
+                    "get_lineage",
+                    Some(&info.pond_id),
+                    None,
+                    0,
+                    AgentError::new(
+                        ErrorKind::InvalidValue,
+                        "`limit` must be at least 1.".to_string(),
+                        "Omit `limit` for the default page, or pass a positive count \
+                         (capped at 500).",
+                        LINEAGE_RECIPE,
+                    ),
+                )
+                .await);
+        }
+        // The events are FILES on the node that ran the queries, so the owner
+        // is the only node that can answer — forwarded exactly like every other
+        // pond-scoped op, token replay included.
+        if let Some((fwd, owner)) = self.forward_target(&info) {
+            info!(
+                op = "get_lineage",
+                pond = pond_ref,
+                owner,
+                "forwarding to owner node"
+            );
+            record_forward("lineage");
+            return fwd
+                .get_lineage(owner, identity, pond_ref, limit, since, before)
+                .await;
+        }
+        info!(op = "get_lineage", pond = pond_ref, "processing locally");
+        let started = Instant::now();
+        let res = self.get_lineage_local(&info, limit, since, before).await;
+        self.audit(
+            identity,
+            "get_lineage",
+            Some(info.pond_id.as_str()),
+            None,
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    async fn get_lineage_local(
+        &self,
+        info: &PondInfo,
+        limit: usize,
+        since: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<LineagePage, AgentError> {
+        // "We were never recording" is a different answer from "nothing
+        // happened", and a caller that cannot tell them apart will read an
+        // empty list as proof the data appeared from nowhere. So: an error,
+        // with the one action that fixes it.
+        if !info.lineage {
+            return Err(AgentError::new(
+                ErrorKind::InvalidValue,
+                format!(
+                    "Pond '{}' does not record lineage — it was allocated without it, and that is \
+                     fixed for the pond's lifetime. No events exist for it, which is NOT the same \
+                     as nothing having happened here.",
+                    info.name
+                ),
+                "Allocate a new pond with lineage=true and do the work there; an existing pond \
+                 cannot be switched on.",
+                LINEAGE_RECIPE,
+            ));
+        }
+        let pid = Self::parse_id(&info.pond_id)?;
+        // Reached only when the pond has no live owner to forward to (the
+        // forward decision above handles every other remote case), so this node
+        // is standing in for a node that is gone — and the files went with it.
+        let loc = self.storage.pond_location(pid).map_err(|_| {
+            AgentError::new(
+                ErrorKind::Storage,
+                format!(
+                    "Pond '{}' has no lineage on this node, and the node that recorded it is not \
+                     currently registered — its events are wherever that node's storage is.",
+                    info.name
+                ),
+                "Retry once the pond's node is back; if it is gone for good, so is the trail. \
+                 describe_pond reports the pond's current owner.",
+                LINEAGE_RECIPE,
+            )
+        })?;
+
+        // The caller's own query may still be in the writer's buffer (a batch
+        // is 64 events, and one operation contributes 2), and a get_lineage
+        // that cannot see the query the agent just ran is the first thing it
+        // will try and the first thing that looks broken. Only THIS pond's
+        // writer is flushed: flushing every pond on the node to answer a
+        // question about one would put unrelated fsyncs on this call. It goes
+        // to the blocking pool for the same reason the emit path does.
+        self.flush_pond_lineage(&info.pond_id).await;
+
+        let dir = loc.lineage_dir.clone();
+        let (since, before) = (since.map(str::to_string), before.map(str::to_string));
+        let page = tokio::task::spawn_blocking(move || {
+            latiq_lineage::read_newest(
+                std::path::Path::new(&dir),
+                latiq_lineage::PageRequest {
+                    limit,
+                    since: since.as_deref(),
+                    before: before.as_deref(),
+                },
+            )
+        })
+        .await
+        .map_err(|e| AgentError::internal(format!("join: {e}")))?
+        .map_err(|e| match e {
+            latiq_lineage::ReadError::BadTimestamp { field, value } => AgentError::new(
+                ErrorKind::InvalidValue,
+                format!("`{field}` is not an RFC-3339 timestamp: '{value}'."),
+                "Pass an RFC-3339 instant, e.g. since='2026-08-14T10:00:00Z', or omit it.",
+                LINEAGE_RECIPE,
+            ),
+            latiq_lineage::ReadError::Io(io) => AgentError::of_kind(
+                ErrorKind::Storage,
+                format!("The pond's lineage directory could not be read: {io}"),
+            ),
+        })?;
+
+        Ok(LineagePage {
+            pond_id: info.pond_id.clone(),
+            pond_name: info.name.clone(),
+            lineage_dir: loc.lineage_dir,
+            events: page.events,
+            truncated: page.truncated,
+            malformed_lines: page.malformed_lines,
+            unreadable_files: page.unreadable_files,
+        })
+    }
+
+    /// Write out ONE pond's buffered events, on the blocking pool (the writer
+    /// fsyncs). A pond with no writer on this node has nothing buffered, so
+    /// there is nothing to do and nothing to fail.
+    async fn flush_pond_lineage(&self, pond_id: &str) {
+        let writer = self
+            .lineage_writers_read()
+            .and_then(|map| map.get(pond_id).cloned());
+        if let Some(writer) = writer {
+            let _ = tokio::task::spawn_blocking(move || writer.flush()).await;
+        }
     }
 
     /// Emit one access record on the `latiq::access` target (see the `access`
@@ -1136,6 +1697,47 @@ fn append_batch_rows(
 struct ChannelSink {
     schema_tx: Option<oneshot::Sender<Result<SchemaRef, AgentError>>>,
     batch_tx: mpsc::Sender<Result<RecordBatch, AgentError>>,
+    /// The runtime this blocking producer belongs to, so it can await a send
+    /// without a runtime of its own. Captured before `spawn_blocking`.
+    rt: tokio::runtime::Handle,
+    /// The operation's cancellation token — see [`ChannelSink::send_batch`].
+    abort: AbortToken,
+}
+
+impl ChannelSink {
+    /// Hand one item to the consumer, waking either when it makes room **or**
+    /// when the operation is cancelled.
+    ///
+    /// A plain `blocking_send` on this bounded channel is unrecoverable: the
+    /// engine holds a read-only transaction — and therefore a pinned DuckLake
+    /// snapshot and a pool connection — open across the whole batch stream, and
+    /// `run_with_abort`'s watcher cancels by interrupting DuckDB. A producer
+    /// parked in the channel is not in DuckDB, so the interrupt does nothing
+    /// and a client that stays connected but stops reading pins that snapshot
+    /// against expiry/cleanup for as long as it likes. Selecting on the abort
+    /// token is what makes cancellation actually reach a stalled stream, so the
+    /// transaction rolls back and the connection is released.
+    ///
+    /// **Still open, and pre-existing:** nothing imposes an *absolute* deadline
+    /// on a slow-but-live consumer. Until one does, a reader that keeps the
+    /// stream alive can hold a pool slot for as long as it likes, and with
+    /// `(cores*2).clamp(4,32)` such readers per pond later reads wait on the
+    /// pool's untimed condvar. What the deadline should be, and whether it is
+    /// configurable, is a policy question that has not been decided.
+    fn send_batch(&self, item: Result<RecordBatch, AgentError>) -> ControlFlow<()> {
+        self.rt.block_on(async {
+            tokio::select! {
+                // Biased: with capacity free and a cancel racing, delivering the
+                // batch we already produced is the better of two valid answers.
+                biased;
+                sent = self.batch_tx.send(item) => match sent {
+                    Ok(()) => ControlFlow::Continue(()),
+                    Err(_) => ControlFlow::Break(()), // receiver gone
+                },
+                _ = self.abort.cancelled() => ControlFlow::Break(()),
+            }
+        })
+    }
 }
 
 impl ArrowSink for ChannelSink {
@@ -1148,18 +1750,59 @@ impl ArrowSink for ChannelSink {
         ControlFlow::Continue(())
     }
     fn batch(&mut self, batch: RecordBatch) -> ControlFlow<()> {
-        match self.batch_tx.blocking_send(Ok(batch)) {
-            Ok(()) => ControlFlow::Continue(()),
-            Err(_) => ControlFlow::Break(()),
-        }
+        self.send_batch(Ok(batch))
     }
 }
 
-/// Minimal SQL-shape redaction for the audit log: drop comments (so literals
+/// DuckDB type names whose parentheses hold a **type modifier** — a width, a
+/// precision, a scale — rather than a value. Digits inside the parens that
+/// directly follow one of these are part of the *type*, so redacting them turns
+/// `DECIMAL(10,2)` into DDL that no longer says what the column is.
+///
+/// Verified against DuckDB (every entry here is accepted as `CREATE TABLE
+/// x(c <name>(n))`; the ones it rejects — `TIME`, `BLOB`, `DOUBLE`, `TIMESTAMPTZ`,
+/// `TIMESTAMP_S/_MS/_NS` — are deliberately absent, since a paren after them is
+/// not a type modifier at all).
+///
+/// **`INTERVAL` is deliberately excluded.** DuckDB parses `INTERVAL (5) DAY` as a
+/// value expression (`to_days(5)`), so preserving digits there would be a
+/// redaction hole. Losing an interval's precision is the cheaper mistake.
+const PARAMETERISED_TYPES: &[&str] = &[
+    "DECIMAL",
+    "DEC",
+    "NUMERIC",
+    "VARCHAR",
+    "NVARCHAR",
+    "CHAR",
+    "CHARACTER",
+    "VARYING", // the second word of `CHARACTER VARYING(n)`
+    "BPCHAR",
+    "TEXT",
+    "STRING",
+    "TIMESTAMP",
+    "DATETIME",
+    "BIT",
+    "BITSTRING",
+    "FLOAT",
+];
+
+fn is_parameterised_type(word: &str) -> bool {
+    PARAMETERISED_TYPES
+        .iter()
+        .any(|t| word.eq_ignore_ascii_case(t))
+}
+
+/// Minimal SQL-shape redaction for the audit log and the lineage `SQLJobFacet`
+/// (one redactor, so provenance can never carry a literal the trail hid): drop comments (so literals
 /// hidden in them can't leak), then collapse quoted-string and numeric *literals*
-/// to `?`. Identifiers that merely contain digits (`t1`, `events2`) are preserved.
+/// to `?`. Identifiers that merely contain digits (`t1`, `events2`) are preserved,
+/// and so are the numbers inside a **type specification** (`DECIMAL(10,2)`,
+/// `VARCHAR(64)`) — those describe a schema, not a value, and a DDL statement
+/// whose types were collapsed is neither readable nor re-runnable. Values inside
+/// a DDL statement (a CTAS predicate) are still collapsed: the exemption is
+/// scoped to one paren directly after a type keyword, never to a statement kind.
 /// (A full parser-based redactor is future work.)
-fn redact_sql(sql: &str) -> String {
+pub(crate) fn redact_sql(sql: &str) -> String {
     let decommented = strip_sql_comments(sql);
     let mut out = String::with_capacity(decommented.len());
     let mut chars = decommented.chars().peekable();
@@ -1167,6 +1810,13 @@ fn redact_sql(sql: &str) -> String {
     // right after one (e.g. the `1` in `t1`) is part of that identifier, not a
     // numeric literal, so it must not be collapsed.
     let mut prev_ident = false;
+    // The identifier run currently being emitted, and whether the one that just
+    // ended names a parameterised type (so the next `(` opens type modifiers).
+    let mut word = String::new();
+    let mut type_word_pending = false;
+    // Inside `…(` of a type specification, where digits are the type, not a
+    // value. Type modifiers do not nest, so one flag and the next `)` suffice.
+    let mut in_type_params = false;
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
@@ -1183,17 +1833,44 @@ fn redact_sql(sql: &str) -> String {
                 }
                 out.push('?');
                 prev_ident = false;
+                word.clear();
+                type_word_pending = false;
             }
-            d if d.is_ascii_digit() && !prev_ident => {
+            d if d.is_ascii_digit() && !prev_ident && !in_type_params => {
                 // Numeric literal: collapse the digit/decimal run.
                 while matches!(chars.peek(), Some(n) if n.is_ascii_digit() || *n == '.') {
                     chars.next();
                 }
                 out.push('?');
                 prev_ident = false;
+                word.clear();
+                type_word_pending = false;
             }
             other => {
-                prev_ident = other.is_ascii_alphanumeric() || other == '_';
+                let ident_char = other.is_ascii_alphanumeric() || other == '_';
+                prev_ident = ident_char;
+                if ident_char {
+                    word.push(other);
+                } else {
+                    if !word.is_empty() {
+                        type_word_pending = is_parameterised_type(&word);
+                        word.clear();
+                    }
+                    match other {
+                        '(' => {
+                            in_type_params = type_word_pending;
+                            type_word_pending = false;
+                        }
+                        ')' => {
+                            in_type_params = false;
+                            type_word_pending = false;
+                        }
+                        // Whitespace between the keyword and its `(` is allowed;
+                        // anything else ends the type specification.
+                        c if !c.is_whitespace() => type_word_pending = false,
+                        _ => {}
+                    }
+                }
                 out.push(other);
             }
         }
@@ -1289,6 +1966,63 @@ mod tests {
         assert_eq!(
             r.split_whitespace().collect::<Vec<_>>(),
             ["SELECT", "id", "FROM", "t"]
+        );
+    }
+
+    #[test]
+    fn redaction_keeps_the_width_of_a_type_specification() {
+        // Regression pin: `DECIMAL(10,2)` used to record as `DECIMAL(?,?)`, so
+        // the DDL in the trail was neither readable as a schema nor re-runnable
+        // and the column's type could not be recovered by a reader.
+        assert_eq!(
+            redact_sql("CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))"),
+            "CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))"
+        );
+        // Same for a cast, and for a width written with a space before the paren.
+        assert_eq!(
+            redact_sql("SELECT CAST(x AS DECIMAL (18, 4)), CAST(y AS VARCHAR(64)) FROM t"),
+            "SELECT CAST(x AS DECIMAL (18, 4)), CAST(y AS VARCHAR(64)) FROM t"
+        );
+    }
+
+    #[test]
+    fn redaction_collapses_values_in_a_ddl_with_a_predicate() {
+        // The case that makes "skip redaction for DDL" wrong: a CTAS is DDL, but
+        // its predicate carries user values that must still be redacted.
+        assert_eq!(
+            redact_sql(
+                "CREATE TABLE big AS SELECT * FROM orders \
+                 WHERE amount > 9999 AND customer = 'acme'"
+            ),
+            "CREATE TABLE big AS SELECT * FROM orders WHERE amount > ? AND customer = ?"
+        );
+    }
+
+    #[test]
+    fn redaction_collapses_inserted_values() {
+        assert_eq!(
+            redact_sql("INSERT INTO t VALUES (1, 'acme', 100.50)"),
+            "INSERT INTO t VALUES (?, ?, ?)"
+        );
+    }
+
+    #[test]
+    fn redaction_collapses_an_interval_parenthesised_value() {
+        // `INTERVAL (5) DAY` is a *value* expression in DuckDB, not a type
+        // modifier, so INTERVAL is deliberately not on the type-keyword list.
+        assert_eq!(
+            redact_sql("SELECT * FROM t WHERE d > now() - INTERVAL (9999) DAY"),
+            "SELECT * FROM t WHERE d > now() - INTERVAL (?) DAY"
+        );
+    }
+
+    #[test]
+    fn redaction_does_not_treat_a_call_as_a_type_specification() {
+        // Only the type keywords open a preserved paren; a function call whose
+        // argument happens to be numeric is still a value.
+        assert_eq!(
+            redact_sql("SELECT count(1), round(amount, 2) FROM t WHERE id = 7"),
+            "SELECT count(?), round(amount, ?) FROM t WHERE id = ?"
         );
     }
 

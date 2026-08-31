@@ -21,6 +21,18 @@ service Data {
   rpc CatalogPull(CatalogPullRequest) returns (JsonResponse);
   // Transient attach → list the catalog's tables/columns → detach.
   rpc CatalogDescribe(CatalogDescribeRequest) returns (JsonResponse);
+  // READ a pond's OpenLineage trail (newest first). A read, never a switch:
+  // lineage stays fixed at pond creation and no RPC can turn it on or off.
+  // This exists so a node that does not own the pond can forward to the one
+  // that does — the events are files on the node that RAN the query — which is
+  // what makes the agent-facing `get_lineage` tool work behind a gateway.
+  rpc GetLineage(GetLineageRequest) returns (JsonResponse);
+}
+
+// `since` is an INCLUSIVE lower bound and `before` an EXCLUSIVE upper one, both
+// RFC 3339; empty means unbounded. `limit` 0 is rejected rather than reinterpreted.
+message GetLineageRequest {
+  string pond = 1; uint32 limit = 2; string since = 3; string before = 4;
 }
 
 message LoadDatasetRequest { string pond = 1; string dataset = 2; }
@@ -34,7 +46,15 @@ message CatalogDescribeRequest {
   string pond = 1; string catalog = 2; map<string, string> params = 3;
 }
 
-message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; }
+// `lineage` is opt-in per pond and FIXED for the pond's lifetime — there is
+// deliberately no enable/disable RPC (turning it on later would leave a hole at
+// the start of the provenance record). Proto3 defaults it to false, so an older
+// client simply gets a pond with lineage off. `describe_pond`'s JSON reports it
+// under `pond.lineage`, so a caller can tell whether the pond has a trail to
+// read. Events are OpenLineage JSONL files in the pond's own `lineage/`
+// directory, read back through the `get_lineage` MCP tool — there is no SQL
+// view over them (docs/lineage.md, "Cut: the SQL catalog over the events").
+message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; bool lineage = 4; }
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }
 message DropPondRequest { string pond = 1; bool confirm = 2; }
 message DropPondResponse { }

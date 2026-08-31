@@ -23,6 +23,14 @@ pub struct PondInfo {
     /// Agent-discovery text: what this pond is for (empty = none).
     #[serde(default)]
     pub description: String,
+    /// Whether this pond records OpenLineage events into its `lineage`
+    /// directory. Opt-in at creation and fixed for the pond's lifetime; off by
+    /// default, so a deployment that does not want it pays nothing. Carried
+    /// from the registry to the node the same way `tier` and `extensions` are,
+    /// and describe reports it so a caller can tell whether `get_lineage` will
+    /// have anything to read before it asks.
+    #[serde(default)]
+    pub lineage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +86,35 @@ pub struct LoadDatasetResult {
 pub struct PullResult {
     pub catalog: String,
     pub query: String,
+}
+
+/// A page of a pond's OpenLineage trail, newest first — what `get_lineage`
+/// returns. The events are the recorded JSON **verbatim** (see
+/// `latiq_lineage::reader`), so a consumer can replay them into an OpenLineage
+/// backend unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineagePage {
+    pub pond_id: String,
+    pub pond_name: String,
+    /// The directory these events live in, on the node that ran the queries.
+    /// Handed back so a caller that wants SQL over the whole trail — filtering
+    /// or aggregating, which this paged read deliberately does not do — can
+    /// `read_json_auto('<dir>/*.jsonl')` instead of pulling every event through
+    /// its own context.
+    pub lineage_dir: String,
+    pub events: Vec<serde_json::Value>,
+    /// Older events matched than this page could carry. Read the next page by
+    /// passing the oldest `eventTime` in `events` as the next call's `before`
+    /// (exclusive) — the page is cut on a timestamp boundary, so that walks the
+    /// history backwards without skipping or repeating an event.
+    pub truncated: bool,
+    /// Lines skipped because they were not valid JSON. Reported rather than
+    /// swallowed: a short answer must not look like a complete one.
+    pub malformed_lines: usize,
+    /// Whole batch files (up to 64 events each) that could not be read. Same
+    /// reason as `malformed_lines`, one level up.
+    #[serde(default)]
+    pub unreadable_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

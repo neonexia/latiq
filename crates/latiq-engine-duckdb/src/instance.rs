@@ -159,7 +159,7 @@ mod tests {
     fn applies_resource_limits_to_the_instance() {
         use latiq_common::ResourceLimits;
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.limits = Some(ResourceLimits {
             memory_bytes: 512 * 1024 * 1024,
             cores: 1,
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn opens_attaches_and_round_trips() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         inst.conn
             .execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1),(2);")
@@ -207,7 +207,7 @@ mod tests {
             .execute_batch("INSTALL inet;")
             .unwrap();
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.extensions = vec!["inet".to_string()];
         let inst = PondInstance::open(&loc).unwrap();
         // Our LOAD plumbing landed it on the instance (test our integration, not
@@ -227,7 +227,7 @@ mod tests {
     fn pond_session_timezone_is_utc() {
         // Results must be deterministic regardless of the host OS timezone.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         let tz: String = inst
             .conn
@@ -242,7 +242,7 @@ mod tests {
         // `expire_snapshots(older_than => now() - INTERVAL '1 week')`) binds on a
         // pond with NO explicitly-requested extensions.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         let ok: bool = inst
             .conn
@@ -258,7 +258,7 @@ mod tests {
         // autoinstall is off → LOADing an unavailable extension errors (no
         // download), so a cache miss never silently downloads in the pond path.
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.extensions = vec!["definitely_not_an_extension_xyz".to_string()];
         let err = match PondInstance::open(&loc) {
             Ok(_) => panic!("expected open to fail for a missing extension"),

@@ -14,9 +14,12 @@
 //! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
 //! watcher thread interrupts the running statement when the `AbortToken` is
 //! cancelled, and exits when the operation completes.
-use crate::exec::{run_explain, run_read, run_read_arrow, run_write};
+use crate::exec::{
+    annotate_schemas, in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow,
+    run_write,
+};
 use crate::instance::PondInstance;
-use latiq_common::Identity;
+use latiq_common::{DatasetRef, Identity, QueryMeta};
 use latiq_engine::{
     AbortToken, ArrowSink, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary,
     TableInfo,
@@ -31,6 +34,66 @@ use std::time::Duration;
 pub struct DuckEngine {
     /// Per-pond engine resources, keyed by catalog URI.
     ponds: Mutex<HashMap<String, Arc<Pond>>>,
+    /// The linked DuckDB's version, asked once (see `version`).
+    version: std::sync::OnceLock<String>,
+}
+
+/// What the bound plan said a statement reads and writes, or `None` when the
+/// pond did not opt into lineage.
+///
+/// The `Option` is the opt-in, made unmissable: extraction costs a second bind
+/// (~380 µs against a 2.16 ms query, ~14–18% on LOCAL tables — much more on
+/// remote files, where the second bind repeats the glob and schema sniff; see
+/// `exec::referenced_tables`), and not paying it for a pond that records no
+/// lineage is the entire justification for the per-pond flag. Every call site
+/// therefore goes through here rather than deciding for itself.
+type PlanDatasets = Option<(Vec<DatasetRef>, Vec<DatasetRef>)>;
+
+/// Runs inside the caller's `run_with_abort`, so the extra bind is **abortable**
+/// — a remote glob at bind time can take as long as the query, and an
+/// uncancellable one would leave a client's cancel waiting on work it cannot
+/// see.
+fn plan_datasets(loc: &PondLocation, inst: &PondInstance, sql: &str) -> PlanDatasets {
+    loc.lineage
+        .then(|| referenced_tables(inst, sql, &loc.catalog_name))
+}
+
+/// Fill in the columns of the pond's own datasets, in one lookup.
+///
+/// Gated by the same `Option` as the extraction itself, so a pond without
+/// lineage does not pay for it — and called at a point each path chooses: an
+/// output's columns exist only *after* the statement ran, and an input's must
+/// be read inside the read's own transaction to describe what the rows came
+/// from. Best-effort throughout (`exec::annotate_schemas` warns and returns).
+fn annotate(loc: &PondLocation, inst: &PondInstance, datasets: &mut PlanDatasets) {
+    if let Some((inputs, outputs)) = datasets {
+        annotate_schemas(inst, &loc.catalog_name, inputs, outputs);
+    }
+}
+
+/// Attach what the plan found to the statement's meta. A no-op for a pond
+/// without lineage, so `tables_touched` stays empty exactly where nothing asked
+/// for it.
+fn apply_datasets(meta: &mut QueryMeta, datasets: PlanDatasets) {
+    if let Some((inputs, outputs)) = datasets {
+        meta.set_datasets(inputs, outputs);
+    }
+}
+
+/// Re-file a dataset that a transient `ATTACH` put under the catalog's local
+/// `alias` in the SOURCE's own namespace.
+///
+/// The alias is a pond-local name — the operator's registry entry, mounted for
+/// the duration of one pull — so `ext.main.widgets` says nothing another tool's
+/// lineage can join on, and leaving `namespace` empty would hand the table the
+/// *pond's* namespace and claim the lakehouse's data as ours. Anything not
+/// under the alias (the pond table the pull creates) is left exactly as it is.
+fn externalize(mut ds: DatasetRef, alias: &str, namespace: &str) -> DatasetRef {
+    if let Some(rest) = ds.name.strip_prefix(&format!("{alias}.")) {
+        ds.name = rest.to_string();
+        ds.namespace = Some(namespace.to_string());
+    }
+    ds
 }
 
 /// One pond's engine resources. Still **one DuckDB database per pond**
@@ -209,7 +272,15 @@ impl DuckEngine {
     }
 
     /// Run a read on a pooled connection. The connection is dropped rather than
-    /// reused if the read failed.
+    /// reused unless the read succeeded.
+    ///
+    /// Not reusable *until proven otherwise*: `f` can panic (a cell conversion,
+    /// a sink, an encoder), and an assignment after the call is skipped entirely
+    /// when it does. `ReadGuard::drop` still runs during the unwind, so a
+    /// connection left mid-transaction — with a `ROLLBACK` that the pending
+    /// interrupt may have refused — would otherwise be pooled and wedge every
+    /// later reader of this pond. The `Err` path and the panic path must reach
+    /// the same conclusion.
     fn with_read<T>(
         &self,
         loc: &PondLocation,
@@ -217,6 +288,7 @@ impl DuckEngine {
     ) -> Result<T, EngineError> {
         let pond = self.pond(loc)?;
         let mut g = pond.checkout_read()?;
+        g.reusable = false;
         let out = f(&g);
         g.reusable = out.is_ok();
         out
@@ -258,6 +330,22 @@ impl DuckEngine {
 }
 
 impl QueryEngine for DuckEngine {
+    fn version(&self) -> String {
+        // Asked of the linked library itself (an in-memory connection needs no
+        // pond and no extensions), then cached: a hard-coded string would be
+        // wrong the first time the bundled DuckDB is bumped, and the lineage
+        // trail would claim a version that never ran anything.
+        self.version
+            .get_or_init(|| {
+                duckdb::Connection::open_in_memory()
+                    .and_then(|c| c.query_row("SELECT version()", [], |r| r.get::<_, String>(0)))
+                    // An engine that cannot say its version must not break a
+                    // query over it: the facet is simply less specific.
+                    .unwrap_or_default()
+            })
+            .clone()
+    }
+
     fn init_pond(&self, loc: &PondLocation) -> Result<(), EngineError> {
         // Opening the instance attaches the pond's DuckLake catalog (creating the
         // catalog file on first open) and validates it's usable. No Latiq objects
@@ -272,8 +360,34 @@ impl QueryEngine for DuckEngine {
         sql: &str,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
+        // The read-only guard first, so a write submitted here is rejected
+        // before the binder is handed a statement this surface does not accept
+        // — and before it pays for provenance it is going to discard.
+        if !latiq_engine::is_read_only(sql) {
+            return Err(EngineError::ReadOnlyViolation);
+        }
         self.with_read(loc, |i| {
-            Self::run_with_abort(i, &abort, |i| run_read(i, sql))
+            // Both under ONE abort watcher: the extra bind is real work (a
+            // remote glob can dominate the query) and must be interruptible.
+            Self::run_with_abort(i, &abort, |i| {
+                // One read-only transaction over both, so the version the plan
+                // records for an input is the snapshot the rows actually came
+                // from (`exec::in_read_txn`).
+                in_read_txn(i, |i| {
+                    // Before the run, not after: extraction binds the
+                    // statement, and a statement that has already run may no
+                    // longer bind (a dropped table, a table the same batch
+                    // created). Same order on every path, so provenance does
+                    // not depend on the statement.
+                    let mut datasets = plan_datasets(loc, i, sql);
+                    // Inside this transaction, so the columns recorded are the
+                    // ones the rows came from.
+                    annotate(loc, i, &mut datasets);
+                    let mut res = run_read(i, sql)?;
+                    apply_datasets(&mut res.meta, datasets);
+                    Ok(res)
+                })
+            })
         })
     }
 
@@ -283,9 +397,33 @@ impl QueryEngine for DuckEngine {
         sql: &str,
         abort: AbortToken,
         sink: &mut dyn ArrowSink,
-    ) -> Result<(), EngineError> {
+    ) -> Result<QueryMeta, EngineError> {
+        // Guard first, as in `read_query` — same reason.
+        if !latiq_engine::is_read_only(sql) {
+            return Err(EngineError::ReadOnlyViolation);
+        }
         self.with_read(loc, |i| {
-            Self::run_with_abort(i, &abort, |i| run_read_arrow(i, sql, &abort, sink))
+            // One abort watcher over both, as in `read_query`. The transaction
+            // stays open across the whole batch stream — a correctness gain, in
+            // that the stream is now snapshot-consistent rather than resolving
+            // the catalog per statement — and a cancellation mid-stream unwinds
+            // through `in_read_txn`, which rolls back before the connection is
+            // discarded.
+            //
+            // That makes the sink's backpressure part of this transaction's
+            // lifetime: a consumer that stops reading holds a DuckLake snapshot
+            // pinned, not just a pool connection. `ArrowSink::batch` must
+            // therefore stay cancellation-responsive — see `ChannelSink` in
+            // `latiq-agent-core`, whose send wakes on the abort token.
+            Self::run_with_abort(i, &abort, |i| {
+                in_read_txn(i, |i| {
+                    let mut datasets = plan_datasets(loc, i, sql);
+                    annotate(loc, i, &mut datasets);
+                    let mut meta = run_read_arrow(i, sql, &abort, sink)?;
+                    apply_datasets(&mut meta, datasets);
+                    Ok(meta)
+                })
+            })
         })
     }
 
@@ -298,13 +436,50 @@ impl QueryEngine for DuckEngine {
     ) -> Result<QueryResult, EngineError> {
         let pond = self.pond(loc)?;
         let guard = lock_recover(&pond.writer);
+        // One abort watcher over the extraction AND the write. The extraction
+        // holds the pond's writer mutex — deliberately, because it must happen
+        // before the write (a `DROP TABLE t` no longer binds once it has run,
+        // so extracting afterwards loses the output of exactly the statements
+        // whose output matters most) and moving it outside the lock would let
+        // another write land in between and change what it resolves against.
+        // The cost is that a slow bind delays other writers to this pond; being
+        // abortable is what keeps that bounded.
         Self::run_with_abort(&guard, &abort, |i| {
-            run_write(i, sql, identity, &loc.catalog_name)
+            let mut datasets = plan_datasets(loc, i, sql);
+            let mut res = run_write(i, sql, identity, &loc.catalog_name)?;
+            // AFTER the statement: a `CREATE TABLE … AS`'s target has no
+            // columns to describe until it exists, and a dropped table has none
+            // to describe at all — which is why a failed write records none
+            // either: the `QueryEngine::plan_datasets` recovery path below
+            // recovers the datasets and deliberately not their columns.
+            annotate(loc, i, &mut datasets);
+            apply_datasets(&mut res.meta, datasets);
+            Ok(res)
         })
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
         self.with_read(loc, |i| run_explain(i, sql))
+    }
+
+    fn plan_datasets(&self, loc: &PondLocation, sql: &str) -> Option<QueryMeta> {
+        if !loc.lineage {
+            return None;
+        }
+        // A READ connection, not the writer: this runs after a write already
+        // failed, and making the recovery of its provenance queue ahead of the
+        // next write would charge every other writer for one failure. There is
+        // no abort token here — the operation is over — so this bind is not
+        // interruptible; it is bounded by being on the failure path only.
+        let (inputs, outputs) = self
+            .with_read(loc, |i| Ok(referenced_tables(i, sql, &loc.catalog_name)))
+            .ok()?;
+        if inputs.is_empty() && outputs.is_empty() {
+            return None;
+        }
+        let mut meta = QueryMeta::default();
+        meta.set_datasets(inputs, outputs);
+        Some(meta)
     }
 
     fn open_pond_count(&self) -> usize {
@@ -355,7 +530,7 @@ impl QueryEngine for DuckEngine {
         alias: &str,
         params: &std::collections::BTreeMap<String, String>,
         query: &str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<QueryMeta, EngineError> {
         // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
         // write into the pond — must run on the writer connection, not a pooled
         // read one whose session state other readers would then observe.
@@ -363,6 +538,12 @@ impl QueryEngine for DuckEngine {
         let guard = lock_recover(&pond.writer);
         let plan = crate::attachers::plan(catalog_type, alias, params)?;
         attach_catalog(&guard.conn, &plan)?;
+        // Extracted while the catalog is still ATTACHED and before the pull
+        // runs — the only window where both sides bind: afterwards the external
+        // tables are detached and the pull's own target already exists. Gated
+        // on the pond's lineage flag like every other path, so a pond that did
+        // not opt in pays nothing for the second bind.
+        let mut datasets = plan_datasets(loc, &guard, query);
         // Run the pull query (a CREATE TABLE … in the pond's default catalog),
         // then tear the attachment down regardless of the outcome.
         let ran = guard
@@ -370,7 +551,23 @@ impl QueryEngine for DuckEngine {
             .execute_batch(query)
             .map_err(|e| EngineError::Engine(format!("pull query: {e}")));
         teardown_catalog(&guard.conn, &plan);
-        ran
+        ran?;
+        // The pull's own target is a pond table, and it exists now. The source
+        // side is external and is skipped, exactly as an `s3://` input is.
+        annotate(loc, &guard, &mut datasets);
+        let mut meta = QueryMeta::default();
+        apply_datasets(
+            &mut meta,
+            datasets.map(|(inputs, outputs)| {
+                let f = |ds: Vec<DatasetRef>| {
+                    ds.into_iter()
+                        .map(|d| externalize(d, &plan.alias, &plan.namespace))
+                        .collect()
+                };
+                (f(inputs), f(outputs))
+            }),
+        );
+        Ok(meta)
     }
 
     fn describe_catalog(
@@ -465,10 +662,11 @@ mod tests {
         // If ATTACH fails, the secret must NOT linger on the reused pond connection
         // (Latiq stores zero credentials — invariant 6).
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         let plan = crate::attachers::AttachPlan {
             alias: "leaktest".into(),
+            namespace: "ducklake:/nonexistent_dir_xyz/meta.duckdb".into(),
             load: vec![],
             secrets: vec![(
                 "leak_sec".into(),
@@ -498,7 +696,7 @@ mod tests {
     #[test]
     fn cancels_long_running_query_and_recovers() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
 
@@ -538,7 +736,7 @@ mod tests {
     fn recovers_from_poisoned_mutex() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
 
@@ -578,7 +776,7 @@ mod tests {
         use std::ops::ControlFlow;
 
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
         eng.write_query(
@@ -637,7 +835,7 @@ mod tests {
         // different connection must observe committed writes. Checked on a fresh
         // pooled connection AND on a reused one.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let id = Identity::claimed(Some("writer"));
         eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
@@ -667,7 +865,7 @@ mod tests {
         // The Scenario B fix: a checked-out reader must not block a write. If
         // reads still took the writer mutex this would deadlock.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let id = Identity::claimed(Some("w"));
         eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
@@ -682,7 +880,7 @@ mod tests {
     #[test]
     fn pool_hands_out_distinct_connections_and_respects_its_bound() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap();
         let pond = eng.pond(&loc).unwrap();
@@ -712,11 +910,45 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_read_does_not_return_its_connection_to_the_pool() {
+        // `g.reusable = out.is_ok()` after the call is SKIPPED when `f` panics,
+        // so a panic (a cell conversion, a sink, an encoder) used to pool a
+        // connection that may still be mid-transaction with a stale interrupt —
+        // wedging every later reader of the pond. The `Err` path and the panic
+        // path must reach the same conclusion, which is why the guard is now
+        // cleared before `f` runs rather than set after it.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap();
+        let pond = eng.pond(&loc).unwrap();
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eng.with_read(&loc, |_| -> Result<(), EngineError> {
+                panic!("a sink blew up mid-read")
+            })
+        }));
+        assert!(
+            panicked.is_err(),
+            "the panic must propagate, not be absorbed"
+        );
+        let st = lock_recover(&pond.reads.state);
+        assert!(
+            st.idle.is_empty(),
+            "a connection whose read panicked must not be handed to the next reader"
+        );
+        assert_eq!(
+            st.created, 0,
+            "and it must be accounted as discarded, or the pool leaks its bound"
+        );
+    }
+
+    #[test]
     fn pooled_connections_are_utc_like_the_primary() {
         // Session state is not inherited by a clone; if we failed to re-apply it,
         // pooled reads would render timestamps in the host timezone.
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let tz = eng
             .read_query(
@@ -733,7 +965,7 @@ mod tests {
         // Many readers on a shared pond — the product's "agents share a pond" case.
         use std::sync::Arc as StdArc;
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = StdArc::new(DuckEngine::new());
         eng.write_query(
             &loc,
@@ -763,7 +995,7 @@ mod tests {
         // resolved limits change — otherwise the new tier silently does nothing.
         use latiq_common::ResourceLimits;
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.limits = Some(ResourceLimits {
             memory_bytes: 1024 * 1024 * 1024,
             cores: 2,
@@ -807,12 +1039,12 @@ mod tests {
         // The read pool must follow, or uncapping raises the thread budget while
         // leaving concurrent readers queued behind a mid-tier-sized pool.
         let fs = TempFs::new();
-        let mut loc = fs.create_pond(PondId::new()).unwrap();
+        let mut loc = fs.create_pond(PondId::new(), false).unwrap();
         loc.limits = None; // the `none` tier
         let eng = DuckEngine::new();
         let uncapped = eng.pond(&loc).unwrap().reads.max;
 
-        let mut medium = fs.create_pond(PondId::new()).unwrap();
+        let mut medium = fs.create_pond(PondId::new(), false).unwrap();
         medium.limits = Some(latiq_common::ResourceLimits {
             memory_bytes: 4 * 1024 * 1024 * 1024,
             cores: 4,
@@ -833,7 +1065,7 @@ mod tests {
     #[test]
     fn forget_pond_evicts_cached_instance() {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         eng.init_pond(&loc).unwrap(); // opens + caches the instance
         assert_eq!(

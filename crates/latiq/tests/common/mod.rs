@@ -207,6 +207,10 @@ async fn start_node_with_auth(
         &internal_endpoint,
         control_endpoint,
         tmp.path(),
+        // No lineage backend in the harness: the sink is covered where it can
+        // be observed (`latiq-agent-core/tests/agent_ops.rs`), and a full-stack
+        // node posting to nowhere would prove nothing this does not.
+        None,
     )
     .await
     .expect("build pond-node ops");

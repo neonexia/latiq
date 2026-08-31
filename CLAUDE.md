@@ -28,7 +28,7 @@ Plus one internal surface: **Control gRPC** (pond-node → control-plane; routin
 2. **CLI/SDK speak gRPC.** Data ops (allocate/drop/read/write/explain) → **Data/Query gRPC on the pond node**. Metadata reads (pond list/describe) + admin (node/policy) → **Admin gRPC on the control plane**.
 3. **The control plane is NEVER in the query data path.** Queries execute on the **pond node** only. The control plane holds the registry/routing/policy — metadata, never data.
 4. **Split by ownership.** The pond node owns storage + engine (so allocate/drop/queries go there). The control plane owns the registry (so pure metadata reads go there, and work even when pond nodes are down).
-5. **`latiq-agent-core` is PROTOCOL-NEUTRAL.** No MCP / gRPC / HTTP / transport types may appear in `latiq-agent-core`. Every surface (MCP, Data gRPC, future A2A) is an **inbound adapter** that maps its protocol onto `AgentOps`. **A new surface is a new adapter, never a change to the core.**
+5. **`latiq-agent-core` and `latiq-lineage` are PROTOCOL-NEUTRAL.** No MCP / gRPC / HTTP / transport types may appear in them. Every surface (MCP, Data gRPC, future A2A) is an **inbound adapter** that maps its protocol onto `AgentOps`. **A new surface is a new adapter, never a change to the core.** The one deliberate exception is `latiq-lineage`'s OpenLineage HTTP sink — HTTP by definition — isolated behind the **`http-sink` Cargo feature** that only `latiq-pond-node` enables (outside dev-dependencies): with the feature off the crate does not even depend on `reqwest`, so Cargo enforces the neutrality of the rest. What the neutral code sees is `EventSink`, a trait over `&str`.
 6. **Pure DuckLake — nothing on top.** Attribution rides DuckLake's native `set_commit_message`; callers read history via native `pond.snapshots()` and tables/columns via `SHOW TABLES`/`information_schema`. **No Latiq objects in the pond catalog** (no `_latiq` schema, views, or macros) and no shadow store of pond data/snapshots/attribution. (The DuckDB adapter may use `duckdb_tables()` *internally* for `describe_schema`; governance/policy metadata in the control-plane registry is a *different plane*. Both allowed.)
 7. **One DuckDB instance per pond** (mutex-guarded, reused across queries) — the unit of **resource isolation** (per-pond memory/CPU caps live on the instance; DuckDB's `memory_limit`/`threads` are instance-global) and of concurrency ownership (one process owns each catalog file; independent instances racing on one catalog lose writes). Never go back to instance-per-query.
 8. **Hard separation of surfaces.** Agents (MCP) cannot do admin; operators (Admin gRPC) are not agents; data clients (Data gRPC) are not agents. Different transports, different audiences, different attribution.
@@ -48,6 +48,7 @@ Plus one internal surface: **Control gRPC** (pond-node → control-plane; routin
 - the Data/Query gRPC **inbound adapter** → `AgentOps` (shipped — `latiq-pond-node/src/data_service.rs` + `stream_service.rs`).
 - `latiq-client` — MCP client. **Agent-sim / MCP tests only** (invariant 1).
 - `latiq-engine` (`QueryEngine` trait) + `latiq-engine-duckdb` (DuckDB/DuckLake adapter, instance-per-pond).
+- `latiq-lineage` — **protocol-neutral** OpenLineage (core spec `2-0-2`): events + facets, the batching JSONL writer into the pond's own `lineage/` dir, the reader `get_lineage` pages, and the optional HTTP sink behind the `http-sink` feature. Opt-in per pond; a lineage failure never reaches a query (`docs/lineage.md`).
 - `latiq-storage` — `PondStorage`: LocalFs + TempFs.
 - `latiq-control-plane` — DuckDB registry + migrations + Control/Admin gRPC. Sole writer to its registry; never in the query path.
 - `latiq-pond-node` — wires surfaces + `AgentOps` + engine + storage + `GrpcControlPlane`; node registration/heartbeat.
@@ -75,6 +76,7 @@ Tests are categorized by **layer** and **surface/feature** so a given change run
 - MCP surface change → `cargo test -p latiq-mcp && cargo test -p latiq --test mcp`
 - Data gRPC change → `cargo test -p latiq --test query_grpc`
 - Control plane change → `cargo test -p latiq-control-plane && cargo test -p latiq --test admin`
+- Lineage change → `cargo test -p latiq-lineage && cargo test -p latiq-agent-core --test agent_ops` (the emitter + writer registry live there; `cargo test lineage` adds the surface e2e in `crates/latiq/tests/mcp.rs`)
 - Everything → `cargo test --workspace`
 
 ## Build commands

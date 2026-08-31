@@ -53,6 +53,14 @@ pub struct PondNodeConfig {
     /// When set, every surface on this node requires a verified bearer token.
     /// `None` keeps the relaxed identity of the embedded and dev paths.
     pub auth: Option<latiq_auth::AuthConfig>,
+    /// An OpenLineage-compatible receiver to ALSO post events to, e.g.
+    /// `http://marquez:5000/api/v1/lineage`. The full endpoint, not a base URL.
+    ///
+    /// Purely additive and off by default: lineage-enabled ponds always write
+    /// their own files, and this is what makes those events outlive the pond
+    /// that produced them (dropping a pond destroys its local trail). A backend
+    /// that is down, slow or dead can never fail, slow or block a query.
+    pub lineage_backend_url: Option<String>,
 }
 
 /// Install the standard + optional DuckDB extensions into the local cache so a
@@ -68,7 +76,12 @@ pub fn warm_extensions() -> Result<(), Box<dyn std::error::Error>> {
 /// Periodically refresh this node's resource + load gauges. The per-pond
 /// in-flight gauge is maintained inline in AgentOps; this samples the node-level
 /// gauges + process CPU/memory.
-pub fn spawn_node_collector(ops: Arc<AgentOps>) {
+/// `sink` is the node's optional lineage backend, if one is configured: its
+/// POSTs happen on a task nobody awaits, so these three gauges are the only way
+/// an operator can answer "is anything actually leaving this node?" -- and, more
+/// to the point, "is the backend keeping up?", which `..._dropped` climbing is
+/// the only signal of.
+pub fn spawn_node_collector(ops: Arc<AgentOps>, sink: Option<Arc<latiq_lineage::HttpSink>>) {
     tokio::spawn(async move {
         let mut sampler = latiq_metrics::ProcessSampler::new();
         loop {
@@ -76,6 +89,11 @@ pub fn spawn_node_collector(ops: Arc<AgentOps>) {
             latiq_metrics::record_process_gauges(&mut sampler);
             metrics::gauge!("latiq_inflight_queries").set(ops.inflight().len() as f64);
             metrics::gauge!("latiq_node_open_ponds").set(ops.open_pond_count() as f64);
+            if let Some(sink) = sink.as_deref() {
+                metrics::gauge!("latiq_lineage_sink_events_submitted").set(sink.submitted() as f64);
+                metrics::gauge!("latiq_lineage_sink_events_posted").set(sink.posted() as f64);
+                metrics::gauge!("latiq_lineage_sink_events_dropped").set(sink.dropped() as f64);
+            }
         }
     });
 }
@@ -88,6 +106,7 @@ pub async fn build_ops(
     internal_endpoint: &str,
     control_endpoint: &str,
     data_dir: &std::path::Path,
+    lineage_sink: Option<Arc<dyn latiq_lineage::EventSink>>,
 ) -> anyhow::Result<Arc<AgentOps>> {
     let mut reg = ControlClient::connect(control_endpoint.to_string()).await?;
     reg.register_node(RegisterNodeRequest {
@@ -104,10 +123,15 @@ pub async fn build_ops(
     // Forward requests for ponds this node doesn't own to the owning node. The
     // node's own `internal_endpoint` is the identity it compares against, so a
     // pond whose registry endpoint matches runs locally; everything else forwards.
-    let ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
+    let mut ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
         internal_endpoint.to_string(),
         Arc::new(GrpcForwarder::new()),
     );
+    // `None` = no backend configured, which is the default: lineage-enabled
+    // ponds still write their own files, and nothing is posted anywhere.
+    if let Some(sink) = lineage_sink {
+        ops = ops.with_lineage_sink(sink);
+    }
     Ok(Arc::new(ops))
 }
 
@@ -145,7 +169,33 @@ pub async fn serve_data(
 
 /// Run a pond node: register with the control plane, start a heartbeat loop, and
 /// serve the agent MCP surface + the Data/Query gRPC surface (blocks).
+///
+/// **Serves until the process ends.** This is the entry point for EMBEDDED
+/// callers -- `latiq-sdk`'s `LocalCluster` and, through it, the Python wheel --
+/// so it must not install a signal handler: a library that replaces a host
+/// process's `SIGTERM` disposition can stop `kill` from terminating that
+/// process, and would let a signal aimed at the host silently tear down the
+/// embedded node while the host runs on. The binary drives shutdown explicitly
+/// through [`run_pond_node_until`].
 pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
+    // `pending()` never resolves, so the `select!` inside can only be decided
+    // by the server future -- exactly the behaviour this has always had.
+    run_pond_node_until(cfg, std::future::pending::<()>()).await
+}
+
+/// [`run_pond_node`], stopping when `shutdown` resolves.
+///
+/// The seam the `latiq` binary uses to hand in SIGTERM/Ctrl-C. It lives here
+/// rather than in this crate's own signal handling on purpose: **whoever owns
+/// the process owns its signals**, and that is the binary, never a library a
+/// host embedded.
+///
+/// On shutdown it flushes buffered lineage under a bound -- see
+/// [`shutdown_lineage`], which is explicit that this is not a graceful drain.
+pub async fn run_pond_node_until(
+    cfg: PondNodeConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+) -> anyhow::Result<()> {
     // Latiq is built on the ducklake + httpfs extensions — ensure they load BEFORE
     // we register or serve, so a node that can't function never joins the cluster.
     // Fail fast with a clear error rather than degrading per pond.
@@ -178,6 +228,21 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
+    // Built BEFORE the node registers or serves, like the verifier and the
+    // public URL: a malformed backend URL must stop the node loudly, not become
+    // a warning on every query for the life of the process. `None` = no backend
+    // configured, the default.
+    //
+    // Kept as the concrete type as well as the neutral one: the collector
+    // publishes its counters, while `AgentOps` must only ever see `EventSink`.
+    let lineage_sink: Option<Arc<latiq_lineage::HttpSink>> =
+        match cfg.lineage_backend_url.as_deref() {
+            Some(url) => Some(Arc::new(
+                latiq_lineage::HttpSink::new(url).map_err(|e| anyhow::anyhow!("{e}"))?,
+            )),
+            None => None,
+        };
+
     let mcp_endpoint = format!("http://{}/mcp", cfg.mcp_addr);
     let ops = build_ops(
         &cfg.node_id,
@@ -185,6 +250,9 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         &cfg.internal_endpoint,
         &cfg.control_endpoint,
         &cfg.data_dir,
+        lineage_sink
+            .clone()
+            .map(|s| s as Arc<dyn latiq_lineage::EventSink>),
     )
     .await?;
 
@@ -200,7 +268,7 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
     if let Some(metrics_addr) = cfg.metrics_addr {
         let handle = latiq_metrics::init_recorder();
         metrics::gauge!("latiq_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
-        spawn_node_collector(ops.clone());
+        spawn_node_collector(ops.clone(), lineage_sink.clone());
         tokio::spawn(async move {
             if let Err(e) = latiq_metrics::serve_metrics(metrics_addr, handle).await {
                 eprintln!("metrics server error: {e}");
@@ -259,11 +327,140 @@ pub async fn run_pond_node(cfg: PondNodeConfig) -> anyhow::Result<()> {
         cfg.node_id, cfg.data_addr
     );
     println!("  pond storage: {}", cfg.data_dir.display());
+    if let Some(url) = cfg.lineage_backend_url.as_deref() {
+        println!("  lineage:      also posting events to {url}");
+    }
     // The MCP surface gets the SAME verifier as Data/Stream (a surface left
     // unauthenticated is the whole node's auth) and the SAME advertised URL, so
     // the two challenges can never point at different documents.
-    serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url))
-        .await
-        .map_err(|e| anyhow::anyhow!("mcp server error: {e}"))?;
-    Ok(())
+    let served = ops.clone();
+    let result = tokio::select! {
+        r = serve_mcp(cfg.mcp_addr, ops, verifier, Some(mcp_public_url)) => {
+            r.map_err(|e| anyhow::anyhow!("mcp server error: {e}"))
+        }
+        _ = shutdown => {
+            tracing::info!("shutdown requested; flushing buffered lineage");
+            Ok(())
+        }
+    };
+
+    shutdown_lineage(served).await;
+    result
+}
+
+/// The most the node will spend on its shutdown work before exiting anyway.
+///
+/// Bounded because everything in it can stall: the file flush fsyncs (an NFS
+/// mount or an EIO makes that unbounded) and shares a blocking pool with batch
+/// writes, extension warming and `getaddrinfo`, while the sink drain is waiting
+/// on a network. An operator's escape from a node that will not die used to be
+/// a second Ctrl-C -- which is gone the moment anything installs a signal
+/// handler -- so the bound has to come from us. **Losing some events is
+/// strictly better than a node that will not die.**
+///
+/// It is a CEILING, not a cost: a node with no backend configured drains
+/// instantly and a healthy one nearly so, so this is only ever spent when
+/// something is already stuck. That is what makes it affordable to exceed
+/// `latiq_lineage`'s `POST_TIMEOUT`, which it must: the drain cannot outrun a
+/// POST that is already in flight, so a budget below that ceiling would mean
+/// one hung backend at shutdown discards the entire backlog -- the exact case
+/// the drain exists for. The `const` assertion below keeps the two composed.
+/// The upper bound is the orchestrator's termination grace period (30s by
+/// default on k8s), which SIGKILLs the node regardless.
+const SHUTDOWN_BUDGET: Duration = Duration::from_secs(15);
+
+/// The relationship above, enforced rather than described.
+const _: () = assert!(
+    SHUTDOWN_BUDGET.as_secs() > latiq_lineage::sink::POST_TIMEOUT.as_secs(),
+    "SHUTDOWN_BUDGET must exceed the sink's POST_TIMEOUT, or the drain cannot outlast one \
+     in-flight POST and a hung backend loses the whole backlog"
+);
+
+/// Land what lineage is buffered, then go. **This is not a graceful drain**, and
+/// the difference matters: the Data/Stream gRPC server is a separate spawned
+/// task that keeps accepting, and in-flight MCP requests are cancelled with the
+/// server future rather than allowed to finish. What this promises is narrower
+/// and worth exactly its cost -- everything already buffered at signal time
+/// lands. A query that completes after the flush records events that are lost,
+/// as it would have been before this existed.
+///
+/// Two halves, in this order and for a reason:
+///
+/// 1. `flush_lineage` writes each pond's buffered batch to its own files. It
+///    does BLOCKING, fsyncing io, so it runs on the blocking pool. `Drop`
+///    already covers a teardown that drops the last `AgentOps` -- but SIGTERM
+///    drops nothing, it ends the process, and up to one batch per pond (64
+///    events) would go with it. That batch is the last few queries before the
+///    node went down, which is precisely the window an incident asks about.
+/// 2. `drain_lineage_sink` posts what the optional HTTP backend still has
+///    queued -- up to 1024 events, i.e. everything that piled up while the
+///    backend was down. Without it the shutdown flush would save the local
+///    copy of exactly the events the sink exists to get OFF the node.
+async fn shutdown_lineage(ops: Arc<AgentOps>) {
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_BUDGET;
+    let flushing = ops.clone();
+    if tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || flushing.flush_lineage()),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            budget_ms = SHUTDOWN_BUDGET.as_millis() as u64,
+            "lineage files did not finish flushing before the shutdown budget ran out; exiting \
+             anyway with some events unwritten"
+        );
+        return;
+    }
+    // Whatever is left of the budget. The sink bounds itself with it and warns
+    // about anything it could not post, so there is nothing to log here.
+    ops.drain_lineage_sink(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        .await;
+}
+
+#[cfg(test)]
+mod tests {
+    /// The embedded path must install NO signal handler.
+    ///
+    /// `run_pond_node` is not only the binary's node path -- `latiq-sdk`'s
+    /// `LocalCluster::start`, and therefore the Python wheel, calls it. A
+    /// library that installs a process-wide handler replaces its host's
+    /// `SIG_DFL` disposition without emulating it, so `kill <pid>` on a Python
+    /// process that merely embedded a pond can stop terminating it, and a
+    /// signal aimed at the host silently tears down the embedded node while the
+    /// host runs on. The handler therefore lives in `crates/latiq/src/main.rs`.
+    ///
+    /// A source guard and not a runtime one, stated plainly: proving it at
+    /// runtime means reading the process's `sigaction` disposition before and
+    /// after starting an embedded node, which needs a live control plane, a
+    /// bound port and `libc` -- for a property whose only failure mode is
+    /// someone reintroducing these three tokens into this crate. The
+    /// counter-assertions below are what stop it passing vacuously.
+    #[test]
+    fn the_embedded_node_path_installs_no_signal_handler() {
+        // Only the NON-test half: this module names the forbidden tokens as
+        // string literals, and a guard that searches itself always matches.
+        let src = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("this file has a #[cfg(test)] module, and this test is in it")
+            .0;
+        for token in ["tokio::signal", "SignalKind", "ctrl_c"] {
+            assert!(
+                !src.contains(token),
+                "`{token}` is back in latiq-pond-node: signal handling belongs to the binary                  (crates/latiq/src/main.rs), because this crate is also what the embedded SDK                  and the Python wheel run in a host process"
+            );
+        }
+        // Anti-vacuity, both directions. The seam must exist (or the guard is
+        // trivially satisfied by a crate that never shuts down at all), and the
+        // haystack must be the real file.
+        assert!(
+            src.contains("pub async fn run_pond_node_until("),
+            "the shutdown seam the binary drives is gone; without it the handler has nowhere              to live but here"
+        );
+        assert!(
+            src.contains("async fn shutdown_lineage("),
+            "the shutdown work itself is gone, so this guard is protecting nothing"
+        );
+    }
 }

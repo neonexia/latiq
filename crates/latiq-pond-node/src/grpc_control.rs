@@ -57,6 +57,7 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         tier: m.tier,
         extensions: m.extensions,
         description: m.description,
+        lineage: m.lineage,
     }
 }
 
@@ -100,6 +101,7 @@ impl ControlPlane for GrpcControlPlane {
         policy_json: &str,
         tier: &str,
         extensions: &[String],
+        lineage: bool,
     ) -> Result<PondInfo, AgentError> {
         let mut c = self.client.clone();
         let created = c
@@ -113,6 +115,7 @@ impl ControlPlane for GrpcControlPlane {
                 // (MCP/agent allocate defaults empty); the CLI/SDK set it via the
                 // Control gRPC create_pond_assignment directly.
                 description: String::new(),
+                lineage,
             })
             .await
             .map_err(status_err)?

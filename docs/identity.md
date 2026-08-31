@@ -257,6 +257,14 @@ FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;
 **Read both columns.** `author` alone cannot distinguish a verified writer from
 one merely claiming that name.
 
+The author is recorded *inside the transaction Latiq owns*, immediately before
+the commit. Caller SQL that does its own `COMMIT` (or `BEGIN`/`ROLLBACK`/`START
+TRANSACTION`) closes that transaction first, and the snapshot lands with no
+author at all — identity never reaches history. The write path does **not**
+police this (the read path rejects transaction control for an unrelated reason:
+it must not close the read bracket), so it is stated as guidance on every
+agent-facing surface rather than enforced by scanning SQL.
+
 Accepted v0 trade-off: `author` is the **bare** subject, so subjects from two
 different issuers collide when an operator groups history by `author`. The issuer
 is in `commit_extra_info` — group by the pair to be exact. Qualifying the author

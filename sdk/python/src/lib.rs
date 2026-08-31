@@ -86,17 +86,27 @@ impl PyDatabase {
     }
 
     /// Allocate a pond → handle. `db.create_pond(name="work", tier="medium", description="…")`.
-    #[pyo3(signature = (name=None, tier="medium", description=""))]
+    ///
+    /// `lineage=True` opts the pond into OpenLineage provenance for every query.
+    /// Off by default, as on every other surface, and **fixed for the pond's
+    /// lifetime** — turning it on later would leave a hole at the start of the
+    /// record, so there is no call to change it.
+    #[pyo3(signature = (name=None, tier="medium", description="", lineage=false))]
     fn create_pond(
         &self,
         py: Python<'_>,
         name: Option<&str>,
         tier: &str,
         description: &str,
+        lineage: bool,
     ) -> PyResult<PyPond> {
         let inner = self.inner.clone();
         let info = py
-            .allow_threads(|| inner.create_pond(name, tier, description).map(|p| p.info))
+            .allow_threads(|| {
+                inner
+                    .create_pond(name, tier, description, lineage)
+                    .map(|p| p.info)
+            })
             .map_err(err)?;
         Ok(info_to_pypond(&self.inner, info))
     }
@@ -111,7 +121,7 @@ impl PyDatabase {
         Ok(info_to_pypond(&self.inner, info))
     }
 
-    /// Ponds keyed by name: `{name: {pond_id, tier, node_id, description}}`.
+    /// Ponds keyed by name: `{name: {pond_id, tier, node_id, description, lineage}}`.
     fn list_ponds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let inner = self.inner.clone();
         let map = py.allow_threads(|| inner.list_ponds()).map_err(err)?;
@@ -122,6 +132,7 @@ impl PyDatabase {
             v.set_item("tier", &info.tier)?;
             v.set_item("node_id", &info.node_id)?;
             v.set_item("description", &info.description)?;
+            v.set_item("lineage", info.lineage)?;
             d.set_item(name, v)?;
         }
         Ok(d)
@@ -186,6 +197,13 @@ impl PyPond {
     fn description(&self) -> String {
         self.info.description.clone()
     }
+    /// Whether this pond records OpenLineage events (into its own `lineage/`
+    /// directory on its node). Fixed at creation; agents read the events with
+    /// the `get_lineage` MCP tool.
+    #[getter]
+    fn lineage(&self) -> bool {
+        self.info.lineage
+    }
 
     /// Run SQL. Reads → `pyarrow.Table` (streamed, uncapped); writes execute and
     /// return an empty table. `pond.query(sql="SELECT …")`.
@@ -209,7 +227,9 @@ impl PyPond {
     #[pyo3(signature = (sql))]
     fn explain(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
         let (inner, pond) = (self.inner.clone(), self.info.name.clone());
-        let v = py.allow_threads(|| inner.explain(&pond, sql)).map_err(err)?;
+        let v = py
+            .allow_threads(|| inner.explain(&pond, sql))
+            .map_err(err)?;
         json_to_py(py, &v)
     }
 

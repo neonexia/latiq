@@ -49,6 +49,10 @@ pub struct AllocateArgs {
         description = "Optional DuckDB extensions to load on this pond, e.g. [\"spatial\",\"fts\"]. Signed/official extensions only; must be available on the deployment. See the latiq://guidance resource for the supported set."
     )]
     pub extensions: Option<Vec<String>>,
+    #[schemars(
+        description = "Record OpenLineage provenance for every query on this pond, readable with get_lineage (default false). Chosen here and FIXED for the pond's lifetime — no RPC turns it on later, so a pond allocated without it can never explain its own history; the only recovery is a new pond. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'. See latiq://recipes/lineage."
+    )]
+    pub lineage: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -121,6 +125,25 @@ pub struct CatalogPullArgs {
         description = "Runtime config + credentials as key→value, e.g. {\"token\":\"<bearer>\"}. NOT stored."
     )]
     pub set: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LineageArgs {
+    #[schemars(description = "Pond id or name")]
+    pub pond: String,
+    #[schemars(
+        description = "How many events to return, newest first (default 50, max 500). Two events are recorded per operation. Must be at least 1 — `0` is rejected, not read as 'no limit'."
+    )]
+    pub limit: Option<u32>,
+    #[schemars(
+        description = "Only events at or after this RFC-3339 instant, INCLUSIVE, e.g. `2026-08-14T10:00:00Z`. For catching up: pass the newest `eventTime` you already have to see what happened since (that one event comes back again, because the bound includes its own instant)."
+    )]
+    pub since: Option<String>,
+    #[schemars(
+        description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE. This is the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it to get the next older page. Pages are cut on a timestamp boundary, so this never repeats or skips an event — except for a FULL page whose events ALL share one `eventTime`, which is returned uncut, so a cursor from it skips the rest of that millisecond; raise `limit` if that happens."
+    )]
+    pub before: Option<String>,
 }
 
 /// The HTTP header carrying the CLAIMED leaf id. Same name as the gRPC metadata
@@ -344,7 +367,9 @@ impl LatiqServer {
         description = "Allocate a new pond — a private DuckLake workspace you can write to and query with SQL. \
 Optionally pass a `name` (Latiq generates one if omitted). Returns `pond_id` + `pond_name`. \
 Use this first when you have a task that needs its own data space; use list_ponds to find or join an existing one. \
-Then write_query to create tables and load data, and read_query to query. See latiq://guidance.",
+Then write_query to create tables and load data, and read_query to query. \
+DECIDE `lineage` NOW: provenance recording is set here and can never be turned on later — if this pond's work may have to explain where its data came from, pass `lineage: true`, because the only recovery is starting over in a new pond. \
+See latiq://guidance.",
         annotations(
             title = "Allocate pond",
             read_only_hint = false,
@@ -370,7 +395,11 @@ Then write_query to create tables and load data, and read_query to query. See la
             }
         };
         Ok(with_bearer(tok, async {
-            match self.ops.allocate_pond(&id, a.name, "{}", tier, &exts).await {
+            match self
+                .ops
+                .allocate_pond(&id, a.name, "{}", tier, &exts, a.lineage.unwrap_or(false))
+                .await
+            {
                 Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
                 Err(e) => err_envelope(e.envelope()),
             }
@@ -382,6 +411,7 @@ Then write_query to create tables and load data, and read_query to query. See la
     #[tool(
         description = "Describe a pond: its metadata (name, owner, created_at) plus a summary of its tables. \
 Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying. \
+The response's `lineage` flag says whether this pond records provenance — check it before get_lineage, and before you rely on a pond to be explainable later (it cannot be switched on). \
 To discover tables/columns in detail, read_query `SHOW TABLES` or `SELECT * FROM information_schema.columns`.",
         annotations(
             title = "Describe pond",
@@ -433,7 +463,7 @@ Follow with describe_pond on a candidate to inspect its tables.",
 
     /// Drop a pond and reclaim its storage. Destructive.
     #[tool(
-        description = "Drop a pond and reclaim its storage. DESTRUCTIVE and not reversible — all tables and data in the pond are removed (the audit trail is preserved). \
+        description = "Drop a pond and reclaim its storage. DESTRUCTIVE and not reversible — all tables and data in the pond are removed, and its lineage trail goes with them (the deployment's access log is preserved). Read what you still need from get_lineage BEFORE dropping. \
 Only drop a pond when its work is finished. Do NOT drop a pond other agents may still be using; check list_ponds first.",
         annotations(
             title = "Drop pond",
@@ -465,7 +495,7 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
     /// For writes/DDL use write_query. Results are bounded by the inline cap.
     #[tool(
         description = "Run a read-only SQL query (SELECT, or read-only metadata like SHOW/DESCRIBE) against a pond. \
-For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here. \
+For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here, as is transaction control (BEGIN/COMMIT/ROLLBACK): Latiq manages the transaction. \
 Latiq prefers ANSI SQL; DuckDB extensions are tolerated. Discover tables with `SHOW TABLES` (or `information_schema.tables`/`information_schema.columns`) first. \
 Do: add WHERE/LIMIT on selective columns and call explain_query if unsure of cost. Don't: unbounded `SELECT *` on large tables — results are capped (~10k rows); narrow, aggregate, or materialize with CREATE TABLE AS SELECT. \
 Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correct. See latiq://recipes/large-results.",
@@ -493,10 +523,13 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     }
 
     /// Run a write/DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/CTAS) against a
-    /// pond. Writes are attributed to your agent identity.
+    /// pond. Writes are attributed to your agent identity, which Latiq records
+    /// inside the transaction it owns — caller SQL must not do its own
+    /// BEGIN/COMMIT/ROLLBACK.
     #[tool(
         description = "Run a write or DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE TABLE AS SELECT) against a pond. \
 Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` — `commit_extra_info` carries the verified-vs-claimed evidence). \
+Latiq runs your statement inside its OWN transaction and records the author just before committing, so send plain statements — several are fine, but do NOT include BEGIN/COMMIT/ROLLBACK/START TRANSACTION. Your own COMMIT ends Latiq's transaction before the author is written, and the change lands in the pond's history with NO author. \
 Marked destructive because it CAN delete data; clients may require approval. \
 Load external public files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'` (public/anonymous only). \
 Do: add column COMMENTs so other agents understand your tables. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",
@@ -721,7 +754,55 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
         })
         .await)
     }
+
+    /// Read the pond's OpenLineage trail — canonical events, newest first.
+    #[tool(
+        description = "Read a pond's PROVENANCE — the OpenLineage events Latiq recorded for every query on it, NEWEST FIRST. \
+Use it to answer 'where did this table come from?', 'who wrote it, and was that identity verified?', 'what did that run read?'. \
+Only ponds allocated with `lineage: true` record anything; asking a pond that does not returns an error saying so — that is deliberately \
+distinct from an empty list, so you can tell 'we were not recording' from 'nothing happened'. \
+Each operation contributes a START and a terminal (COMPLETE/FAIL/ABORT) event sharing one `run.runId`; the identity, SQL shape, datasets read/written and the DuckLake snapshot ride the facets. \
+Bounded on purpose — `limit` defaults to 50 (max 500) and a page also stops at ~256 KB — so a busy pond cannot flood your context. \
+PAGING: `truncated` true means OLDER events remain — page backwards with `before`, catch up with `since` (both documented on the arguments). \
+Read `malformed_lines` / `unreadable_files`: non-zero means this page is missing events that were recorded. \
+Events are returned verbatim: valid OpenLineage 2-0-2, replayable into any OpenLineage consumer unchanged. \
+To FILTER or AGGREGATE the whole trail instead of paging it, read_query over the returned `lineage_dir`: \
+`SELECT * FROM read_json_auto('<lineage_dir>/*.jsonl')` — facets differ per event, so the inferred schema can shift between queries; SELECT the fields you need. \
+A record, not proof: these are files in the pond, reachable by anything that can write SQL there. See latiq://recipes/lineage.",
+        annotations(
+            title = "Get lineage",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn get_lineage(
+        &self,
+        Parameters(a): Parameters<LineageArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (id, tok) = self.identity(&ctx)?;
+        // The core clamps the upper end and refuses 0; the DEFAULT lives here,
+        // because "how much of an agent's context may one answer cost" is a
+        // question about this surface's audience.
+        let limit = a.limit.unwrap_or(DEFAULT_LINEAGE_LIMIT) as usize;
+        Ok(with_bearer(tok, async {
+            match self
+                .ops
+                .get_lineage(&id, &a.pond, limit, a.since.as_deref(), a.before.as_deref())
+                .await
+            {
+                Ok(page) => ok_value(serde_json::to_value(page).unwrap_or_default()),
+                Err(e) => err_envelope(e.envelope()),
+            }
+        })
+        .await)
+    }
 }
+
+/// Events one `get_lineage` returns when the agent does not choose. Modest: an
+/// agent asking for provenance is spending its context window on the answer.
+const DEFAULT_LINEAGE_LIMIT: u32 = 50;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LatiqServer {
@@ -735,11 +816,13 @@ impl ServerHandler for LatiqServer {
         )
         .with_instructions(
             "Latiq — the agent-native data pond. Allocate a pond (a private DuckLake workspace), \
-write/read SQL with native attribution. \
+write/read SQL with native attribution. Latiq owns the transaction around every write — send plain statements, never BEGIN/COMMIT/ROLLBACK. \
 FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new one; then write_query/read_query. \
 TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
 pull_catalog for an external database/lakehouse (iceberg) — you pull a subset into the pond, then work there \
 (external catalogs are never queried live). \
+WHO YOU ARE: your identity arrives in the transport (bearer token + the `latiq-agent-id` header), never as a tool argument — no tool takes one, so don't look for it. \
+PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be explainable later; it cannot be enabled afterwards. \
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow; tool errors carry \
 suggest/see links to latiq:// resources. Prompts provide SOPs for common multi-agent workflows.",
         )

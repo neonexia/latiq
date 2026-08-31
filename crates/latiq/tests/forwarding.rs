@@ -36,6 +36,7 @@ async fn allocate_and_locate(stack: &MultiStack, name: &str) -> String {
             name: name.into(),
             policy_json: String::new(),
             tier: String::new(),
+            lineage: false,
         },
         "alice",
     ))
@@ -265,6 +266,7 @@ async fn allocate_and_locate_authed(stack: &MultiStack, name: &str, token: &str)
             name: name.into(),
             policy_json: String::new(),
             tier: String::new(),
+            lineage: false,
         },
         "dave",
         token,
@@ -309,6 +311,7 @@ async fn hop_pair(
         name: pond.into(),
         policy_json: String::new(),
         tier: String::new(),
+        lineage: false,
     };
     let r = match alloc_token {
         Some(t) => bearer_req(msg, "dave", t),
@@ -463,6 +466,7 @@ async fn forwarding_concurrent_tokens_stay_isolated_per_request() {
                     name: pond.clone(),
                     policy_json: String::new(),
                     tier: String::new(),
+                    lineage: false,
                 },
                 "dave",
                 &token,

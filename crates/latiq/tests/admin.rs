@@ -35,6 +35,7 @@ async fn pond_list_reads_from_control_plane() {
             name: "alpha".into(),
             policy_json: String::new(),
             tier: String::new(),
+            lineage: false,
         },
         "alice",
     ))
@@ -74,6 +75,7 @@ async fn pond_lifecycle_description_shown_in_list() {
             tier: "medium".into(),
             extensions: vec![],
             description: "nightly etl scratch".into(),
+            lineage: false,
         })
         .await
         .unwrap();
@@ -543,6 +545,7 @@ mod catalogs {
                 name: "work".into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "agent-x",
         ))
@@ -623,6 +626,7 @@ mod catalogs {
                 name: "shop".into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "agent-x",
         ))
@@ -838,6 +842,7 @@ mod catalogs_iceberg {
                 name: "shop".into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "agent-x",
         ))
@@ -1047,7 +1052,8 @@ mod sdk_auth {
         let (c, g) = (control.clone(), gateway.clone());
         let err = blocking(move || {
             let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
-            db.create_pond(Some("sdkauth"), "medium", "").unwrap();
+            db.create_pond(Some("sdkauth"), "medium", "", false)
+                .unwrap();
             db.query("sdkauth", "SELECT 1 AS n")
                 .unwrap_err()
                 .to_string()
@@ -1129,7 +1135,8 @@ mod sdk_auth {
         let (c, g, t) = (server.clone(), gateway.clone(), token);
         let listed = blocking(move || {
             let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
-            db.create_pond(Some("sdkadmin"), "medium", "").unwrap();
+            db.create_pond(Some("sdkadmin"), "medium", "", false)
+                .unwrap();
             db.list_ponds().unwrap()
         })
         .await;

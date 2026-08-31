@@ -70,7 +70,7 @@ async fn access_trail_records_the_verified_subject_and_issuer() {
         "https://idp.example/realms/latiq",
         Some("svc-admin"),
     );
-    ops.allocate_pond(&id, Some("audited".into()), "{}", "medium", &[])
+    ops.allocate_pond(&id, Some("audited".into()), "{}", "medium", &[], false)
         .await
         .unwrap();
 
@@ -81,6 +81,7 @@ async fn access_trail_records_the_verified_subject_and_issuer() {
         "{}",
         "medium",
         &[],
+        false,
     )
     .await
     .unwrap();
@@ -136,7 +137,7 @@ async fn access_trail_records_the_verified_subject_and_issuer() {
 
     // A FAILED op must leave a record too — the whole point of the change. The
     // name is taken, so this allocation cannot succeed.
-    ops.allocate_pond(&id, Some("audited".into()), "{}", "medium", &[])
+    ops.allocate_pond(&id, Some("audited".into()), "{}", "medium", &[], false)
         .await
         .expect_err("the name is already taken");
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
