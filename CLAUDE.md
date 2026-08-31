@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `docs/dev.md` — how to build, run, and manually test the current system (`./dev.sh` + CLI).
 - Per-crate `crates/*/CLAUDE.md` — local invariants for that crate.
 - Per-area `e2e/CLAUDE.md`, `deploy/CLAUDE.md` — the nightly e2e suite and deployment/packaging (+ `docs/releasing.md` for publishing).
-- `docs/superpowers/notes/m1-spike-findings.md` — spike-confirmed crate APIs.
+
+The non-obvious, confirmed facts about our two load-bearing dependencies live with the code that has to obey them: **duckdb-rs/DuckLake** (ATTACH form, `Connection` is not `Send`, `interrupt_handle()`, native `set_commit_message` attribution) in `crates/latiq-engine-duckdb/CLAUDE.md`; **rmcp** (required features, axum as a direct dep, client disconnects never reaching the handler) in `crates/latiq-mcp/CLAUDE.md`.
 
 ## Surfaces & audiences (the spine of the design)
 
