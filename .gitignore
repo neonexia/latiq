@@ -12,3 +12,7 @@
 
 # Prometheus TSDB if you run `prometheus` from deploy/ with the example config.
 /deploy/data
+
+# Internal working notes — kept on disk for the local agent workflow, never published.
+/.claude/handoffs/
+/docs/superpowers/
