@@ -4,6 +4,11 @@ How Latiq is packaged and run. The whole system is the **one `latiq` binary**; t
 role is the command (`serve` = control plane, `node add` = pond node, else the CLI).
 `ENTRYPOINT ["latiq"]`; compose/k8s pick the role.
 
+**`deploy/` is the single home for deployment artifacts** — the user compose, the
+cluster compose, the fixtures, both Dockerfiles, the CLI installer. `README.md`
+here is the human front door (which file is which); this file is the invariants.
+Nothing deployment-shaped should live outside this directory or in another repo.
+
 ## The cluster compose (`deploy/cluster/`)
 Control plane + pond nodes behind an **nginx gateway** — the single front door:
 - **Data + Stream gRPC → `:51500`** — round-robin across nodes (stateless; the
@@ -19,16 +24,26 @@ Control plane + pond nodes behind an **nginx gateway** — the single front door
 - `cluster/docker-compose.yml` — the **repo/CI/dev** stack: mounts `./nginx.conf`,
   and carries the `test`/`scale`/`tools` **profiles** (Prometheus + MinIO +
   Iceberg-REST for internal testing; a 3rd node for scale-out; an in-network `cli`).
-- `latiq-compose.yml` — the **minimal external-user** deployment: control plane +
-  2 pond nodes + gateway, **no profiles**, **pure images + ports** (no inline
-  configs, no mounts) so it runs clone-free and **identically under Docker AND
-  Podman**. Mirrored to the public `neonexia/latiq-deploy` repo:
-  `curl -O https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml && docker compose up -d` (or `podman compose up -d`).
+- `docker-compose.yml` (repo root of `deploy/`) — the **minimal external-user**
+  deployment: control plane + 2 pond nodes + gateway, **no profiles**, **pure
+  images + ports** (no inline configs, no mounts) so it runs clone-free and
+  **identically under Docker AND Podman**. It is fetched directly from this repo:
+  `curl -O https://raw.githubusercontent.com/neonexia/latiq/main/deploy/docker-compose.yml && docker compose up -d` (or `podman compose up -d`).
+  **Keep it mount-free** — a single bind mount both breaks the clone-free path and
+  is the most likely thing to break Podman.
+
+`install.sh` installs the client-only CLI from **this repo's** rolling `cli-latest`
+release (`LATIQ_RELEASE_REPO`/`LATIQ_RELEASE_TAG` override it; a `v*` tag works as
+a pin). Three places name that release — `install.sh`, `nightly.yml`'s
+`publish-cli`, `release.yml`'s `publish-cli` — **change them together** or the
+installer and the publisher silently disagree. (It used to point at
+`neonexia/latiq-deploy`, from when this repo was private; those assets are left
+untouched and still resolve, so nothing breaks for existing users mid-flight.)
 
 **The gateway image.** So the user compose stays pure-images, the gateway is a
 published image — `latiq-gateway` (`deploy/gateway.Dockerfile` = `nginx` + baked
 `cluster/nginx.conf`, the **one** gateway-config source). Built + pushed alongside
-`latiq` by the nightly publish + `release-images.yml`. **Both** GHCR packages
+`latiq` by the nightly publish + `release.yml`. **Both** GHCR packages
 (`latiq`, `latiq-gateway`) must be **public** for anonymous pulls.
 
 Keep the two composes in sync when the topology changes (manual for now). The
@@ -75,7 +90,7 @@ default, and without the mapper every token fails the audience check as an opaqu
 rejection. Verified token: `iss=http://keycloak:8080/realms/latiq`,
 `aud=["latiq","account"]`.
 
-`latiq-compose.yml` is **deliberately untouched** by all of this: the external-user
+`docker-compose.yml` is **deliberately untouched** by all of this: the external-user
 deployment stays pure images + ports, no profiles, no mounts.
 
 ## Lineage backend (`LATIQ_LINEAGE_BACKEND_URL` — optional, pond node only)
@@ -100,9 +115,17 @@ POST, so it is the only signal a backend has stopped keeping up.
    Service/Ingress; the front-door + forwarding model is unchanged.
 
 ## Publishing
-See `docs/releasing.md`. We ship **binaries only** for now — the `latiq` **wheel →
-PyPI** and the **image → GHCR**, one version each, from the **test-gated +
-change-gated** nightly publish (inert unless `PUBLISH_NIGHTLY=true` + a PyPI
-trusted publisher). **No Rust crates, no public repo** until we open-source
-(crates.io would make the source public; a wheel/image is a binary). `#55` tracks
-the open-source readiness checklist.
+See `docs/releasing.md`. We ship **binaries only** — the `latiq` **wheel → PyPI**,
+the **`latiq` + `latiq-gateway` images → GHCR**, and the **client-only CLI
+binaries → GitHub releases**. **No Rust crates** (crates.io is out of scope; the
+crates are not a product).
+
+Two publish paths, both **test-gated on the same reusable workflow**
+(`.github/workflows/verify.yml` — refactored out of the nightly for exactly this
+reason, #55):
+- **`nightly.yml`** — rolling + change-gated. Wheel `0.1.0.devYYYYMMDDHHMM`, image
+  `:nightly` / `:nightly-<stamp>`. Inert unless `PUBLISH_NIGHTLY=true`.
+- **`release.yml`** — a `v<x>.<y>.<z>` tag. GitHub release + wheel + images
+  `:<version>` + CLI binaries. `latest` only moves from 1.0.0 on.
+
+**Never add a publishing step that does not `needs:` the verify job.**

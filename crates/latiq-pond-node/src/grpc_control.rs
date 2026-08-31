@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! `GrpcControlPlane` — implements agent-core's `ControlPlane` over a tonic
 //! Control client, so a pond-node (separate process) reaches the control-plane
 //! registry remotely. `ControlClient<Channel>` is cheaply cloneable, so each
@@ -9,6 +23,8 @@ use latiq_proto::v1::*;
 use tonic::transport::Channel;
 use tonic::Code;
 
+/// The deployed `ControlPlane`: registry calls over the wire. Cheap to clone —
+/// the channel underneath multiplexes, so cloning does not open a connection.
 #[derive(Clone)]
 pub struct GrpcControlPlane {
     client: ControlClient<Channel>,

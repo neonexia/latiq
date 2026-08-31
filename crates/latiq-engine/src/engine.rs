@@ -1,9 +1,29 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The `QueryEngine` port: everything Latiq asks of a SQL engine, and nothing
+//! about which one. Implemented by `latiq-engine-duckdb` today; the core depends
+//! on this trait so a second engine is a new crate, not a change upstream.
 use crate::abort::AbortToken;
 use crate::arrow_stream::ArrowSink;
 use crate::result::{ExplainResult, QueryResult, SchemaSummary};
 use latiq_common::Identity;
 use latiq_storage::PondLocation;
 
+/// Why a statement did not produce a result. The variants an agent can act on
+/// (`Parse`, `ReadOnlyViolation`, `Cancelled`, `Timeout`) are distinct from the
+/// catch-all `Engine`, because each maps to a different `ErrorKind` upstream.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("query parse error: {0}")]

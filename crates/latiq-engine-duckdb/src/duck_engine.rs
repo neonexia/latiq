@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! `DuckEngine` — the DuckDB + DuckLake implementation of `QueryEngine`.
 //!
 //! **One DuckDB instance (database) per pond** (spec §5, Decision 3), reached
@@ -30,6 +44,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+/// The shipped `QueryEngine`. Owns every pond instance this node has opened and
+/// keeps them cached — one DuckDB database per pond, reused across queries, never
+/// instance-per-query (invariant 7). `forget_pond` is the only way an entry
+/// leaves the map.
 #[derive(Default)]
 pub struct DuckEngine {
     /// Per-pond engine resources, keyed by catalog URI.

@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Ephemeral pond storage backed by a self-cleaning temp dir. For tests.
 use crate::local_fs::LocalFs;
 use crate::location::PondLocation;
@@ -5,6 +19,9 @@ use crate::storage::{PondStorage, StorageError};
 use latiq_common::PondId;
 use tempfile::TempDir;
 
+/// A [`LocalFs`] under a temp dir that is removed when this value drops — so a
+/// test gets real storage behaviour without leaving ponds behind. Keep it alive
+/// for as long as the engine holds the ponds open.
 pub struct TempFs {
     _dir: TempDir, // dropped → removed
     inner: LocalFs,

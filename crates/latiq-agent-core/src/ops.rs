@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! AgentOps — the protocol-neutral agent operations. Composes ControlPlane +
 //! PondStorage + QueryEngine. Engine calls (blocking DuckDB) run on the blocking
 //! pool; cancellation flows through the in-flight registry's AbortToken.
@@ -38,8 +52,13 @@ use tracing::info;
 /// worse than none at all.
 const LINEAGE_RECIPE: &str = "latiq://recipes/lineage";
 
+/// Node-wide limits on what an op may return inline. The cap is the reason a
+/// read has a bounded worst case at all, so raising it raises every surface's
+/// per-request memory ceiling at once.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Rows a materialized (non-streaming) read may return before it fails with
+    /// `result_cap_exceeded`. Streamed reads (`read_arrow`) are not capped.
     pub inline_row_cap: usize,
 }
 
@@ -51,6 +70,14 @@ impl Default for AgentConfig {
     }
 }
 
+/// Every operation Latiq offers, expressed once and without a protocol. MCP,
+/// Data gRPC and Stream gRPC are all inbound adapters onto this — a new surface
+/// is a new adapter, never a change in here (invariant 5).
+///
+/// The public op methods are also the single place attribution happens: each
+/// one audits (`access::record`) and, for a pond that opted in, emits lineage.
+/// Doing that inside a helper instead would record the same operation twice
+/// under two names. Cheap to `clone` (everything behind it is an `Arc`).
 #[derive(Clone)]
 pub struct AgentOps {
     control: Arc<dyn ControlPlane>,

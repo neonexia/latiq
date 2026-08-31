@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! The Latiq MCP server: exposes the agent tools (pond + query + dataset/catalog)
 //! over rmcp Streamable-HTTP.
 //!
@@ -153,6 +167,9 @@ const AGENT_ID_HEADER: &str = "latiq-agent-id";
 /// RFC 9728's fixed location for the protected-resource metadata document.
 pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
 
+/// The agent-facing MCP handler: the tool router plus the `AgentOps` behind it.
+/// Agents only — there is nothing administrative on this surface, and the CLI
+/// and SDK never reach it (invariants 1 and 8).
 #[derive(Clone)]
 pub struct LatiqServer {
     ops: Arc<AgentOps>,

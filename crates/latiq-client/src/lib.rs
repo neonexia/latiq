@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! latiq-client — an MCP client wrapper over the Latiq agent surface. For
 //! integration tests and agent simulation ONLY (invariant 1: the CLI and SDK are
 //! not agents and speak gRPC, never MCP). A dev-dependency, never shipped.
@@ -19,6 +33,9 @@ pub struct CallOutcome {
     pub is_error: bool,
 }
 
+/// A connected MCP session, standing in for an agent. Tests drive the agent
+/// surface through this so they exercise the same path a real model does —
+/// nothing shipped may depend on it (invariant 1).
 pub struct LatiqClient {
     service: RunningService<RoleClient, ()>,
 }

@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! `GrpcForwarder` — the transport behind agent-core's `Forwarder` trait. When a
 //! node receives a request for a pond owned by a *different* node, AgentOps calls
 //! this to run the op on the owner via its Data gRPC and relay the result. The
@@ -26,6 +40,9 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status, Streaming};
 
+/// The deployed `Forwarder`: one op run on a peer node over its Data/Stream
+/// gRPC. Caches a channel per peer endpoint, so a hot pond on another node does
+/// not pay a connection per request.
 #[derive(Default)]
 pub struct GrpcForwarder {
     /// One channel per peer endpoint. tonic channels multiplex concurrent RPCs,

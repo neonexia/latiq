@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! JWKS fetch + cache. Verification is offline after the first fetch: no IdP
 //! round-trip on the request path, because this sits in front of every query.
 //!
@@ -57,6 +71,10 @@ pub fn discover_uri(issuer: &str) -> String {
     )
 }
 
+/// One issuer's signing keys, fetched lazily and then served offline. Most of
+/// the state here exists to bound refetching: this lookup is what an
+/// unauthenticated caller reaches first, so an unbounded refetch-on-miss would
+/// turn attacker traffic into traffic against the customer's IdP.
 pub struct JwksCache {
     uri: String,
     keys: RwLock<HashMap<String, SigningKey>>,

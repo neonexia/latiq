@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! The file sink: batched JSONL in the pond's own `lineage` directory.
 //!
 //! What a batch write guarantees, precisely — the loose version of this claim
@@ -64,6 +78,10 @@ struct Buffer {
     overflowing: bool,
 }
 
+/// One pond's lineage writer: buffers events and writes them as batches, per
+/// the durability rules in the module doc. Every failure mode below `record()`
+/// is absorbed here — a full buffer, an unwritable directory, a poisoned lock —
+/// because nothing in this type may ever fail the query that produced the event.
 pub struct LineageWriter {
     /// `None` disables the writer entirely — a rejected directory (see
     /// [`LineageWriter::with_limits`]) must not fall back to *somewhere else*.

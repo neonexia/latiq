@@ -1,0 +1,384 @@
+name: Release
+
+# A DELIBERATE, versioned release: push a `v<major>.<minor>.<patch>` tag.
+#
+# This replaces `release-images.yml`, which published the GHCR image on any `v*`
+# tag with NO test step at all (#55) — a tagged release could ship code that had
+# never been built, let alone tested. Here every publishing job `needs: verify`,
+# and `verify` is the SAME reusable workflow the nightly runs (`verify.yml`):
+# fmt + clippy + the full workspace test suite, the iceberg/MinIO catalog e2e,
+# the dockerized cluster scale-out, the `e2e/` suite (SDK + MCP agent + perf)
+# against a gatewayed 3-node cluster, and the authenticated-cluster e2e.
+#
+# Nothing here can publish an artifact whose tests did not pass: there is no
+# `continue-on-error`, no `if: always()`, and no publishing job that omits
+# `verify` from its `needs`.
+#
+# `workflow_dispatch` is the manual escape hatch — re-run a release after a
+# transient CI failure by selecting the SAME `v*` tag in the ref picker. It is
+# idempotent: an existing GitHub release is reused, `gh release upload` uses
+# `--clobber`, and the image/wheel builds overwrite by tag. (PyPI is the one
+# exception — it refuses to re-upload an existing version; see docs/releasing.md.)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Linking bundled DuckDB with full debug info OOMs the runner's linker
+  # (ld ... signal 7 [Bus error]); CI doesn't debug from these binaries.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # Cheap and first: refuse a malformed tag, and refuse a tag whose version does
+  # not match the version in the tree. One version, four places it shows up (git
+  # tag, wheel, image, release) — if they can drift, they will.
+  meta:
+    name: resolve + check the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -eu
+          case "$REF" in
+            v[0-9]*.[0-9]*.[0-9]*) : ;;
+            *)
+              echo "::error::Release runs on a v<major>.<minor>.<patch> tag; got '${REF}'."
+              echo "::error::On a manual run, pick the tag (not a branch) in the ref selector."
+              exit 1 ;;
+          esac
+          version="${REF#v}"
+
+          # The wheel version comes from pyproject.toml (maturin reads it) and the
+          # binary's from the workspace Cargo.toml. Both must already equal the tag
+          # — we do NOT rewrite them here, because a released artifact should be
+          # buildable from the tagged tree byte-for-byte.
+          py=$(grep -m1 -E '^version = ' sdk/python/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          rs=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          fail=0
+          if [ "$py" != "$version" ]; then
+            echo "::error file=sdk/python/pyproject.toml::version is '${py}' but the tag says '${version}'"
+            fail=1
+          fi
+          if [ "$rs" != "$version" ]; then
+            echo "::error file=Cargo.toml::[workspace.package] version is '${rs}' but the tag says '${version}'"
+            fail=1
+          fi
+          if [ "$fail" = "1" ]; then
+            echo "::error::Bump the versions, commit, and re-tag. See docs/releasing.md."
+            exit 1
+          fi
+
+          # 0.x is pre-1.0: mark the GitHub release a prerelease and DON'T move the
+          # `latest` image tag. `latest` starts meaning something at 1.0.0.
+          case "$version" in
+            0.*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "releasing ${version} (prerelease=${prerelease})"
+
+  # THE GATE. Identical to what the nightly runs — see verify.yml.
+  verify:
+    name: verify
+    needs: meta
+    uses: ./.github/workflows/verify.yml
+
+  # The GitHub release itself, created first so the wheel + CLI jobs have
+  # somewhere to attach their assets.
+  release:
+    name: GitHub release (generated notes)
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # --generate-notes diffs against the previous tag
+      - name: Create (or reuse) the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -eu
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists — reusing it"
+            exit 0
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" \
+              --generate-notes --prerelease
+          else
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" \
+              --generate-notes --latest
+          fi
+
+  # The manylinux x86_64 wheel → PyPI, built the same way the nightly builds it.
+  # Trusted publishing (OIDC), so there is no PyPI token anywhere; PyPI matches on
+  # the WORKFLOW FILENAME, so `release.yml` needs its own trusted-publisher entry
+  # alongside `nightly.yml`'s (docs/releasing.md). No version stamping — `meta`
+  # already proved pyproject.toml carries the tag's version.
+  wheel:
+    name: publish the wheel (PyPI + release asset)
+    needs: [meta, verify, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach the wheel to the release
+      id-token: write   # PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        env:
+          # DuckDB's release (-O3) compile is memory-heavy; cap parallelism so it
+          # doesn't OOM the runner inside the manylinux container.
+          CARGO_BUILD_JOBS: "2"
+        with:
+          command: build
+          target: x86_64
+          # 2_28 = AlmaLinux 8 toolchain: modern GCC + the C++11 CXX ABI DuckDB
+          # requires. The default (manylinux2014/CentOS 7) has the legacy ABI
+          # (DuckDB refuses) AND a proto2-only protoc (can't parse our proto3).
+          manylinux: "2_28"
+          args: --release -m sdk/python/Cargo.toml -o dist
+          before-script-linux: |
+            # The container's distro protoc is too old (proto2-only) — install a
+            # modern protoc binary so latiq-proto's proto3 compiles. `-f` makes curl
+            # fail (non-zero) on an HTTP error instead of writing an error page to the
+            # file (which then fails unzip with "end-of-central-directory not found");
+            # retries ride out transient GitHub blips. Verify the zip before using it.
+            set -e
+            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
+            # (--retry-all-errors is unavailable on the container's older curl.)
+            curl -fsSL --retry 5 -o /tmp/protoc.zip \
+              https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
+            unzip -t /tmp/protoc.zip >/dev/null
+            unzip -o /tmp/protoc.zip -d /usr/local
+            protoc --version
+      - name: Publish the wheel to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+      - name: Attach the wheel to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release upload "$TAG" --repo "$REPO" --clobber dist/*.whl
+
+  # Both GHCR images, tagged with the version. `latest` moves ONLY for a >=1.0.0
+  # release — a 0.x prerelease must not become what an unpinned `docker pull`
+  # gets. (`nightly.yml` owns the separate rolling `:nightly` tag.)
+  images:
+    name: publish the images (GHCR)
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      # The container driver is required for `cache-to: type=gha` (the default
+      # docker driver can't export the cache).
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata (tags + labels)
+        id: imgmeta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/latiq
+          tags: |
+            type=raw,value=${{ needs.meta.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.meta.outputs.prerelease == 'false' }}
+      - name: Build + push the latiq image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.imgmeta.outputs.tags }}
+          labels: ${{ steps.imgmeta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # The gateway image (nginx + baked front-door config) — so the user compose
+      # stays pure images on a tagged release too. Same tags, same rules.
+      - name: Gateway image metadata
+        id: gwmeta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/latiq-gateway
+          tags: |
+            type=raw,value=${{ needs.meta.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.meta.outputs.prerelease == 'false' }}
+      - name: Build + push the gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/cluster
+          file: deploy/gateway.Dockerfile
+          push: true
+          tags: ${{ steps.gwmeta.outputs.tags }}
+          labels: ${{ steps.gwmeta.outputs.labels }}
+
+  # The client-only CLI (no DuckDB, ~4 MB), cross-compiled for the four platforms
+  # `deploy/install.sh` knows about. Same matrix as the nightly's `build-cli`.
+  build-cli:
+    name: build CLI (${{ matrix.name }})
+    needs: [meta, verify]
+    strategy:
+      matrix:
+        include:
+          - { name: darwin-arm64,  os: macos-14,      target: aarch64-apple-darwin }
+          - { name: darwin-x86_64, os: macos-14,      target: x86_64-apple-darwin }
+          - { name: linux-x86_64,  os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64,   os: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc + cross linker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          if [ "${{ matrix.cross }}" = "true" ]; then sudo apt-get install -y gcc-aarch64-linux-gnu; fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build the client-only CLI
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build -p latiq --no-default-features --release --target ${{ matrix.target }}
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/latiq" "out/latiq-${{ matrix.name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: out/latiq-${{ matrix.name }}
+
+  # Attach the CLI to the version release AND refresh the rolling `cli-latest`
+  # release that `deploy/install.sh` downloads from by default. Both live in this
+  # repo now, so the default GITHUB_TOKEN is enough (no cross-repo PAT).
+  publish-cli:
+    name: publish the CLI binaries
+    needs: [meta, verify, release, build-cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: cli
+          pattern: cli-*
+          merge-multiple: true
+      - name: Upload to the release + refresh `cli-latest`
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          INSTALL: "curl -fsSL https://raw.githubusercontent.com/neonexia/latiq/main/deploy/install.sh | sh"
+        run: |
+          set -eu
+          chmod +x cli/latiq-*
+          gh release upload "$TAG" --repo "$REPO" --clobber cli/latiq-*
+          # `--latest=false`: `cli-latest` is a rolling asset bucket, not the
+          # repo's newest release — the `v*` tag keeps that badge.
+          gh release view cli-latest --repo "$REPO" >/dev/null 2>&1 \
+            || gh release create cli-latest --repo "$REPO" --latest=false \
+                 --title "Latiq CLI (rolling)" \
+                 --notes "Prebuilt client-only \`latiq\` CLI. Install: ${INSTALL}"
+          gh release upload cli-latest --repo "$REPO" --clobber cli/latiq-*
+          gh release edit cli-latest --repo "$REPO" \
+            --notes "Client-only \`latiq\` CLI, version ${VERSION}. Install: ${INSTALL}"
+
+  # Post-publish proof that the SHIPPED artifacts work for an external user: the
+  # published compose pulls the JUST-PUSHED GHCR images, `pip install latiq==<v>`
+  # takes the JUST-PUBLISHED wheel from PyPI, and the SDK + MCP agent suites run
+  # against that. Nothing under test is built from the working tree. Mirrors the
+  # nightly's `verify-deployment`.
+  verify-release:
+    name: verify user path (user compose + GHCR image + PyPI wheel)
+    needs: [meta, wheel, images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # for deploy/docker-compose.yml + e2e/ test code
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Take the user compose
+        run: cp deploy/docker-compose.yml docker-compose.yml
+      # NOTE: no `docker login` — this tests the ANONYMOUS pull a real user makes.
+      # Requires both GHCR packages to be PUBLIC (one-time org setting).
+      - name: Bring up the cluster from the published images (pinned to this release)
+        env:
+          LATIQ_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.meta.outputs.version }}
+          LATIQ_GATEWAY_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq-gateway:${{ needs.meta.outputs.version }}
+        run: docker compose up -d
+      - name: Wait for control plane + nodes healthy
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      - name: pip install latiq==<version> from PyPI (retry for propagation)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          for i in $(seq 1 12); do
+            python -m pip install "latiq==${VERSION}" && break
+            echo "waiting for PyPI to serve ${VERSION} (attempt $i)"; sleep 15
+          done
+          python -m pip install -r e2e/sdk/requirements.txt
+          npm ci --prefix e2e/agent
+      - name: SDK e2e against the released cluster
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: pytest e2e/sdk -v
+      - name: Agent harness (MCP) against the released cluster
+        env:
+          LATIQ_MCP: http://localhost:51510/mcp
+        run: npm --prefix e2e/agent test
+      - name: Cluster logs on failure
+        if: failure()
+        run: docker compose logs --tail=300
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

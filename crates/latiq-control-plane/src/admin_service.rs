@@ -1,3 +1,17 @@
+// Copyright 2026 Neonexia
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Admin gRPC service (the latiq CLI calls this).
 //!
 //! With an issuer configured this surface is an OAuth 2.1 resource server: an
@@ -17,6 +31,9 @@ use latiq_proto::v1::*;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 
+/// The operators' surface. It reads and writes the registry directly and holds
+/// no `AgentOps`, so nothing here can run a query — which is what keeps the
+/// control plane out of the data path.
 pub struct AdminService {
     pub registry: Registry,
     verifier: Option<std::sync::Arc<latiq_auth::Verifier>>,
