@@ -1,0 +1,279 @@
+name: Verify
+
+# The full verification suite, as ONE reusable workflow so that everything which
+# can publish an artifact runs the SAME checks. Called by:
+#   - `nightly.yml`  — the rolling, change-gated publish.
+#   - `release.yml`  — a `v*` version tag (see #55: tagged releases used to
+#                      publish with no tests at all).
+# Adding a check here gates BOTH paths. Do not inline a check into a caller.
+on:
+  workflow_call:
+
+# These jobs only read the repo. Publishing permissions live in the callers.
+permissions:
+  contents: read
+
+# NOTE: a caller's workflow-level `env:` does NOT reach a called workflow, so
+# these are declared here rather than inherited.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Linking bundled DuckDB with full debug info OOMs the runner's linker
+  # (ld ... signal 7 [Bus error]); CI doesn't debug from these binaries.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  checks:
+    name: fmt + clippy + test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Full suite incl. the deterministic datasets + DuckLake-catalog e2e.
+      - run: cargo test --workspace
+
+  iceberg:
+    name: iceberg + minio catalog e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Bring up MinIO + Iceberg REST + seed a table
+        run: ./deploy/iceberg-minio/up.sh
+      - name: Run the ignored iceberg e2e
+        env:
+          LATIQ_ICEBERG_ENDPOINT: http://localhost:8181
+          LATIQ_ICEBERG_WAREHOUSE: demo
+          LATIQ_ICEBERG_TOKEN: dummy
+          LATIQ_S3_ENDPOINT: http://localhost:9000
+          LATIQ_S3_ACCESS_KEY: admin
+          LATIQ_S3_SECRET_KEY: password
+        run: cargo test -p latiq --test catalogs_iceberg -- --ignored --nocapture
+
+  cluster-scale-out:
+    name: dockerized cluster + scale-out e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Build the single-binary image once (DuckDB compiles from source — slow).
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:ci .
+      - name: Bring up the 2-node cluster
+        working-directory: deploy/cluster
+        run: |
+          LATIQ_IMAGE=latiq:ci docker compose up -d \
+            control-plane pond-node-1 pond-node-2
+      - name: Wait for the control plane + nodes to be healthy
+        working-directory: deploy/cluster
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Scale-out e2e (add a 3rd node, allocate, query)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: ./scale_out_test.sh
+      - name: Cluster logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        run: docker compose logs --tail=200
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        run: docker compose --profile scale down -v
+
+  e2e-suite:
+    name: e2e — SDK + agent (MCP) + perf, gateway + multi-node
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The single-binary image (DuckDB compiles from source — slow).
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:ci .
+      # The Python SDK wheel, built from this repo (not PyPI). Debug profile +
+      # CARGO_PROFILE_DEV_DEBUG=0 keeps it fast and avoids the linker OOM.
+      - name: Build + install the latiq wheel
+        run: |
+          python3 -m venv .e2e
+          . .e2e/bin/activate
+          pip install -U pip maturin
+          maturin build -m sdk/python/Cargo.toml -o dist
+          pip install dist/*.whl -r e2e/sdk/requirements.txt
+      # The `pip install latiq` + connect("local") path: a real single-node Latiq
+      # in-process, no cluster. Multi-node tests self-skip. (No LATIQ_GATEWAY.)
+      - name: SDK e2e (EMBEDDED — the pip-install standalone path)
+        run: |
+          . .e2e/bin/activate
+          pytest e2e/sdk -v
+      - name: Install the agent harness deps
+        run: npm ci --prefix e2e/agent
+      - name: Bring up the 3-node cluster + gateway
+        working-directory: deploy/cluster
+        run: |
+          LATIQ_IMAGE=latiq:ci docker compose --profile scale up -d \
+            control-plane pond-node-1 pond-node-2 pond-node-3 gateway
+      - name: Wait for control plane + 3 nodes healthy
+        working-directory: deploy/cluster
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 4 ] && break
+            sleep 3
+          done
+          docker compose ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      # 1) SDK (data) — all surfaces, multi-node forwarding, Arrow→pandas, streaming.
+      - name: SDK e2e (Python, against the gateway)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: |
+          . .e2e/bin/activate
+          pytest e2e/sdk -v
+      # 2) Agent (MCP) — every tool + resources + prompts, through the MCP gateway.
+      - name: Agent harness (Vercel AI SDK MCP, against the gateway)
+        env:
+          LATIQ_MCP: http://localhost:51510/mcp
+        run: npm --prefix e2e/agent test
+      # 3) Perf — mid-size ingest/read/latency + cross-node fan, recorded + floored.
+      - name: Perf (Python SDK, against the gateway)
+        env:
+          LATIQ_CONTROL: http://localhost:51400
+          LATIQ_GATEWAY: http://localhost:51500
+        run: |
+          . .e2e/bin/activate
+          python e2e/perf/run_perf.py
+      - name: Cluster logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        run: docker compose logs --tail=300
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        run: docker compose --profile scale down -v
+
+  # Identity v0 end-to-end against an AUTHENTICATED cluster. Deliberately a job of
+  # its own rather than a flag on `e2e-suite`: the unauthenticated cluster is the
+  # default deployment and must keep being tested exactly as it is. Everything auth
+  # lives in `deploy/cluster/auth.env` + the compose `auth` profile — this workflow
+  # sets no issuer/audience/gateway env of its own.
+  auth-e2e:
+    name: auth e2e — Keycloak + SDK + agent (MCP), in-network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # The wheel MUST exist before `auth-tests-sdk` starts: that runner installs
+      # latiq from /repo/dist. Release profile — the auth suite drives a real
+      # cluster, and a debug wheel is pointlessly slow.
+      - name: Build the latiq wheel (release) into dist/
+        run: |
+          python -m pip install -U pip maturin
+          maturin build --release -m sdk/python/Cargo.toml -o dist
+      # Same image, built the same way as the other cluster jobs.
+      - name: Build latiq image
+        run: docker build -f deploy/Dockerfile -t latiq:ci .
+      - name: Bring up the authenticated cluster (+ Keycloak)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: docker compose --env-file auth.env up -d
+      - name: Wait for control plane + nodes healthy
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: |
+          for _ in $(seq 1 60); do
+            up=$(docker compose --env-file auth.env ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose --env-file auth.env ps
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      # Keycloak imports its realm on startup and is the slowest thing here. It
+      # publishes NO ports by design, so the runner cannot poll it — poll from
+      # INSIDE the compose network instead, with a throwaway `run --no-deps` on the
+      # SDK runner image (python is all we need; the slim image has no curl).
+      - name: Wait for the Keycloak realm (polled in-network — it has no ports)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: |
+          ok=0
+          docker compose --env-file auth.env run --rm --no-deps -T auth-tests-sdk '
+            for _ in $(seq 1 60); do
+              python -c "import urllib.request; urllib.request.urlopen(\"http://keycloak:8080/realms/latiq/.well-known/openid-configuration\", timeout=3)" >/dev/null 2>&1 && exit 0
+              sleep 5
+            done
+            exit 1
+          ' && ok=1
+          if [ "$ok" != "1" ]; then
+            echo "::error::Keycloak never served http://keycloak:8080/realms/latiq/.well-known/openid-configuration within ~5 min (realm import failed or the container is unhealthy)"
+            docker compose --env-file auth.env logs --no-color keycloak
+            exit 1
+          fi
+      - name: SDK auth e2e (in-network, wheel from dist/)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: docker compose --env-file auth.env run --rm -T auth-tests-sdk
+      - name: Agent (MCP) auth e2e (in-network)
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: docker compose --env-file auth.env run --rm -T auth-tests-agent
+      # An auth failure with no server logs is nearly undebuggable — dump everything.
+      - name: Cluster + Keycloak logs on failure
+        if: failure()
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: docker compose --env-file auth.env logs --no-color
+      - name: Tear down
+        if: always()
+        working-directory: deploy/cluster
+        env:
+          LATIQ_IMAGE: latiq:ci
+        run: docker compose --env-file auth.env down -v

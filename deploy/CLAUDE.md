@@ -32,15 +32,18 @@ Control plane + pond nodes behind an **nginx gateway** — the single front door
   **Keep it mount-free** — a single bind mount both breaks the clone-free path and
   is the most likely thing to break Podman.
 
-`install.sh` installs the client-only CLI. Its download URL still points at the
-`cli-latest` release of `neonexia/latiq-deploy` because that is where the nightly
-`publish-cli` job uploads the assets; if those move to this repo's releases,
-change **both** `install.sh` and `nightly.yml` together.
+`install.sh` installs the client-only CLI from **this repo's** rolling `cli-latest`
+release (`LATIQ_RELEASE_REPO`/`LATIQ_RELEASE_TAG` override it; a `v*` tag works as
+a pin). Three places name that release — `install.sh`, `nightly.yml`'s
+`publish-cli`, `release.yml`'s `publish-cli` — **change them together** or the
+installer and the publisher silently disagree. (It used to point at
+`neonexia/latiq-deploy`, from when this repo was private; those assets are left
+untouched and still resolve, so nothing breaks for existing users mid-flight.)
 
 **The gateway image.** So the user compose stays pure-images, the gateway is a
 published image — `latiq-gateway` (`deploy/gateway.Dockerfile` = `nginx` + baked
 `cluster/nginx.conf`, the **one** gateway-config source). Built + pushed alongside
-`latiq` by the nightly publish + `release-images.yml`. **Both** GHCR packages
+`latiq` by the nightly publish + `release.yml`. **Both** GHCR packages
 (`latiq`, `latiq-gateway`) must be **public** for anonymous pulls.
 
 Keep the two composes in sync when the topology changes (manual for now). The
@@ -112,9 +115,17 @@ POST, so it is the only signal a backend has stopped keeping up.
    Service/Ingress; the front-door + forwarding model is unchanged.
 
 ## Publishing
-See `docs/releasing.md`. We ship **binaries only** for now — the `latiq` **wheel →
-PyPI** and the **image → GHCR**, one version each, from the **test-gated +
-change-gated** nightly publish (inert unless `PUBLISH_NIGHTLY=true` + a PyPI
-trusted publisher). **No Rust crates, no public repo** until we open-source
-(crates.io would make the source public; a wheel/image is a binary). `#55` tracks
-the open-source readiness checklist.
+See `docs/releasing.md`. We ship **binaries only** — the `latiq` **wheel → PyPI**,
+the **`latiq` + `latiq-gateway` images → GHCR**, and the **client-only CLI
+binaries → GitHub releases**. **No Rust crates** (crates.io is out of scope; the
+crates are not a product).
+
+Two publish paths, both **test-gated on the same reusable workflow**
+(`.github/workflows/verify.yml` — refactored out of the nightly for exactly this
+reason, #55):
+- **`nightly.yml`** — rolling + change-gated. Wheel `0.1.0.devYYYYMMDDHHMM`, image
+  `:nightly` / `:nightly-<stamp>`. Inert unless `PUBLISH_NIGHTLY=true`.
+- **`release.yml`** — a `v<x>.<y>.<z>` tag. GitHub release + wheel + images
+  `:<version>` + CLI binaries. `latest` only moves from 1.0.0 on.
+
+**Never add a publishing step that does not `needs:` the verify job.**

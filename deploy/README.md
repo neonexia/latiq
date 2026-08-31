@@ -62,9 +62,9 @@ latiq pond list
 ```
 
 macOS + Linux, arm64 + x86_64. Installs to `~/.local/bin` (`LATIQ_BIN_DIR` to
-change that). The prebuilt binaries currently come from the `cli-latest` release
-of `neonexia/latiq-deploy`, which the nightly publishes — override with
-`LATIQ_RELEASE_REPO` / `LATIQ_RELEASE_TAG`.
+change that). The prebuilt binaries come from this repo's rolling **`cli-latest`**
+release, refreshed by the nightly and by every tagged release. To pin a version,
+`LATIQ_RELEASE_TAG=v0.2.0` (`LATIQ_RELEASE_REPO` overrides the repo).
 
 ## The multi-node cluster — `cluster/`
 
@@ -103,7 +103,8 @@ this harness). See [`iceberg-minio/README.md`](iceberg-minio/README.md).
   exists so `docker-compose.yml` can stay pure images with no mounts. Build:
   `docker build -f deploy/gateway.Dockerfile -t ghcr.io/neonexia/latiq-gateway:dev deploy/cluster`
 
-Both are published by the nightly and by `release-images.yml`. Both GHCR packages
+Both are published by the nightly (`:nightly`) and by `release.yml` on a `v*` tag
+(`:<version>`, plus `:latest` from 1.0.0 on). Both GHCR packages
 must be **public** for the clone-free path to work.
 
 `prometheus.example.yml` is a scrape config for pointing a host-native Prometheus
