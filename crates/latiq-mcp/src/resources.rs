@@ -120,7 +120,7 @@ Use this to coordinate: see who created a table before extending it.\n\
 ```\nget_lineage {pond:'audited', since:'2026-08-14T10:00:00Z'}\n```\n\
 `malformed_lines` and `unreadable_files` are non-zero when the page is missing events that were recorded — a short answer never pretends to be a complete one.\n\
 Each operation records a START and a terminal (COMPLETE / FAIL / ABORT) event sharing one `run.runId`. \
-Standard facets carry the SQL shape (`job.facets.sql`, literals redacted), the engine, the error message on a failure, and each dataset's DuckLake snapshot (`inputs[].facets.version`). \
+Standard facets carry the SQL shape (`job.facets.sql`, literals redacted), the engine, the error message on a failure, each dataset's DuckLake snapshot (`inputs[].facets.version`), and its columns (`inputs[]`/`outputs[].facets.schema.fields` — name + the engine's own type). A dataset OUTSIDE the pond (an s3 object, a Parquet file, another catalog) carries no `schema` facet: those columns are not ours to state, and absent means unknown rather than empty. \
 Latiq's own facets carry the caller (`run.facets.latiq_identity`), the pond (`job.facets.latiq_pond`), and the outcome + duration (`run.facets.latiq_query`, on the terminal event only).\n\
 The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consumer unchanged.\n\n\
 **Reading the identity facet.** Verified caller:\n\

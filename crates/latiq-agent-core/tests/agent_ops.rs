@@ -1419,6 +1419,163 @@ mod lineage {
         );
     }
 
+    #[tokio::test]
+    async fn lineage_datasets_carry_their_columns_and_the_job_name_says_the_pond_once() {
+        // Both defects a live Marquez surfaced, on the same events because they
+        // are the same event:
+        //
+        //  * every dataset came back with `"fields": []`, so a table was a node
+        //    you could click into and learn nothing from;
+        //  * every job was `shop.write_query.shop.main.…` — the pond once as
+        //    the pond and once as the DuckLake catalog alias, which IS the pond
+        //    name.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let pond = ops
+            .allocate_pond(&id, Some("shop".into()), "{}", "medium", &[], true)
+            .await
+            .unwrap();
+        ops.write_query(
+            &id,
+            "shop",
+            "CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))",
+        )
+        .await
+        .unwrap();
+        ops.write_query(&id, "shop", "INSERT INTO orders VALUES (1,'ada',9.99)")
+            .await
+            .unwrap();
+        ops.write_query(
+            &id,
+            "shop",
+            "CREATE TABLE customer_totals AS \
+             SELECT customer, sum(amount) AS total FROM orders GROUP BY customer",
+        )
+        .await
+        .unwrap();
+        ops.flush_lineage();
+
+        let events = events_in(&storage, &pond.pond_id);
+        let ctas = events
+            .iter()
+            .find(|e| {
+                event_type(e) == "COMPLETE"
+                    && facet(e, "job", "sql")["query"]
+                        .as_str()
+                        .is_some_and(|q| q.contains("customer_totals"))
+            })
+            .expect("the CTAS completed");
+
+        // The name a consumer keys the job on: the pond, the op, and the table
+        // WITHOUT the catalog segment that only repeats the pond.
+        assert_eq!(
+            ctas["job"]["name"],
+            json!("shop.write_query.main.customer_totals"),
+            "the pond must appear once in a job name: {ctas:#}"
+        );
+        // The DATASET name is unchanged and still fully qualified — Marquez
+        // keys datasets on it, and it is correct as it is.
+        assert_eq!(
+            ctas["outputs"][0]["name"],
+            json!("shop.main.customer_totals"),
+            "only the job name loses the catalog, never the dataset"
+        );
+
+        let columns = |ds: &Value| -> Value { ds["facets"]["schema"]["fields"].clone() };
+        assert_eq!(
+            columns(&ctas["outputs"][0]),
+            json!([
+                { "name": "customer", "type": "VARCHAR" },
+                { "name": "total", "type": "DECIMAL(38,2)" },
+            ]),
+            "the table the run produced must carry its columns: {ctas:#}"
+        );
+        assert_eq!(
+            columns(&ctas["inputs"][0]),
+            json!([
+                { "name": "id", "type": "INTEGER" },
+                { "name": "customer", "type": "VARCHAR" },
+                { "name": "amount", "type": "DECIMAL(10,2)" },
+            ]),
+            "and so must the table it read: {ctas:#}"
+        );
+        // Every facet carries the two mandatory base fields — a facet that
+        // skipped `Facet::stamp` would be rejected by a real consumer.
+        let schema_facet = &ctas["outputs"][0]["facets"]["schema"];
+        assert!(
+            schema_facet["_producer"].is_string()
+                && schema_facet["_schemaURL"]
+                    .as_str()
+                    .is_some_and(|u| u.contains("SchemaDatasetFacet")),
+            "the schema facet must identify itself: {schema_facet:#}"
+        );
+
+        // An EXTERNAL dataset carries no `schema` facet at all — not an empty
+        // one. A consumer reads a missing facet as "not stated" and an empty
+        // `fields` as "this table has no columns", and only the first is true.
+        let tmp = tempfile::tempdir().unwrap();
+        let parquet = tmp.path().join("probe.parquet");
+        let parquet = parquet.display();
+        ops.write_query(
+            &id,
+            "shop",
+            &format!("COPY (SELECT 1 AS id) TO '{parquet}' (FORMAT PARQUET)"),
+        )
+        .await
+        .unwrap();
+        ops.read_query(
+            &id,
+            "shop",
+            &format!("SELECT * FROM read_parquet('{parquet}')"),
+        )
+        .await
+        .unwrap();
+        ops.flush_lineage();
+        let events = events_in(&storage, &pond.pond_id);
+        let external = events
+            .iter()
+            .find(|e| {
+                event_type(e) == "COMPLETE"
+                    && e["inputs"][0]["namespace"] == json!("file")
+                    && facet(e, "job", "sql")["query"]
+                        .as_str()
+                        .is_some_and(|q| q.contains("read_parquet"))
+            })
+            .expect("the parquet read is in the trail");
+        assert!(
+            external["inputs"][0]["facets"].get("schema").is_none(),
+            "an external dataset's columns are not ours to state: {external:#}"
+        );
+
+        // A read carries the input's columns too, on both events of the run.
+        ops.read_query(&id, "shop", "SELECT customer FROM customer_totals")
+            .await
+            .unwrap();
+        ops.flush_lineage();
+        let events = events_in(&storage, &pond.pond_id);
+        let read: Vec<&Value> = events
+            .iter()
+            .filter(|e| {
+                facet(e, "job", "sql")["query"] == json!("SELECT customer FROM customer_totals")
+            })
+            .collect();
+        assert_eq!(read.len(), 2, "one read, one event pair");
+        for event in &read {
+            assert_eq!(
+                event["job"]["name"],
+                json!("shop.read_query.main.customer_totals")
+            );
+            assert_eq!(
+                columns(&event["inputs"][0]),
+                json!([
+                    { "name": "customer", "type": "VARCHAR" },
+                    { "name": "total", "type": "DECIMAL(38,2)" },
+                ]),
+                "a read's input must say what it read: {event:#}"
+            );
+        }
+    }
+
     /// A local DuckLake catalog with one table, as an operator would register
     /// it: `(metadata_path, data_path)`. A throwaway in-memory DuckDB builds
     /// it, so it is a real external source rather than a fixture — the plan has
@@ -1843,6 +2000,10 @@ mod lineage {
                 ),
             ),
             (
+                "schema",
+                include_str!("../../latiq-lineage/spec/facets/SchemaDatasetFacet-1-1-1.json"),
+            ),
+            (
                 "processing_engine",
                 include_str!("../../latiq-lineage/spec/facets/ProcessingEngineRunFacet-1-1-1.json"),
             ),
@@ -1990,6 +2151,7 @@ mod lineage {
             "sql",
             "jobType",
             "errorMessage",
+            "schema",
         ] {
             assert!(
                 seen.contains(required),

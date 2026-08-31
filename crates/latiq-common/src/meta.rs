@@ -44,6 +44,32 @@ pub struct DatasetRef {
     /// statement's own `snapshot_id` rather than finding it here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<i64>,
+    /// The dataset's columns, for the OpenLineage `SchemaDatasetFacet`. Empty
+    /// unless the engine could read them **cheaply and truthfully**: a table in
+    /// the pond's own catalog, on a pond that opted into lineage. An external
+    /// dataset (`s3://…`, a Parquet file, another catalog) is deliberately left
+    /// empty — we do not have its columns without paying for them, and a
+    /// guessed schema is worse than an absent one.
+    ///
+    /// **Not on the wire** (`serde(skip)`): this exists for the lineage
+    /// emitter, which runs in the same process as the engine — a forwarded op
+    /// records on its owner, so these never need to cross a hop. Serializing
+    /// them would put a column list for every table on every `_meta` envelope,
+    /// widening a client-visible contract for a consumer that is not the
+    /// client.
+    #[serde(skip)]
+    pub fields: Vec<DatasetField>,
+}
+
+/// One column of a dataset: what OpenLineage's `SchemaDatasetFacet` calls a
+/// field. `type_name` is the **engine's own** type name (`DECIMAL(10,2)`,
+/// `VARCHAR`), passed through rather than normalised — normalising would tell a
+/// consumer something the engine did not say. There is no description: we have
+/// none, and inventing one is the column-level version of inventing an input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatasetField {
+    pub name: String,
+    pub type_name: String,
 }
 
 impl DatasetRef {
@@ -53,6 +79,7 @@ impl DatasetRef {
             namespace: None,
             name: format!("{catalog}.{schema}.{table}"),
             version: None,
+            fields: Vec::new(),
         }
     }
 
@@ -77,6 +104,7 @@ impl DatasetRef {
             namespace: Some(namespace),
             name,
             version: None,
+            fields: Vec::new(),
         }
     }
 }

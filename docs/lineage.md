@@ -82,6 +82,23 @@ it created is the output, and the source table is an input under the
 warehouse) rather than the pond-local alias it was mounted as, so our events
 join with the source's own lineage exactly as an `s3://` or `file` dataset does.
 
+**Datasets carry their columns**, on the standard `SchemaDatasetFacet`
+(`inputs[]`/`outputs[].facets.schema.fields`) — a name and the engine's own type
+name per column, `DECIMAL(10,2)` and not a normalised `DECIMAL`. Without it a
+dataset renders in a consumer as a node you can click into and learn nothing
+from, which is exactly what the first live Marquez run showed. The write target
+and every input **in the pond's own catalog** are covered, resolved in **one**
+`information_schema` lookup per statement (the same catalog, so it is one round
+trip whether the statement touched one table or five) — on the read path inside
+the read's own transaction, so the columns describe the snapshot the rows came
+from, and on the write path *after* the statement, because a `CREATE TABLE … AS`
+has no target to describe until it exists. **External datasets carry no schema
+facet**: an `s3://` object, a Parquet file or another catalog would each cost a
+remote sniff, and a guessed schema is worse than an absent one. A failed write
+records none either — the table it was aiming at may not exist. Like every other
+part of this, the lookup is best-effort: a failure warns and the event goes out
+without the facet.
+
 **Versions are native DuckLake snapshots**, on the standard
 `datasetVersion` facet. A read reports the exact snapshot it observed; a write
 reports the snapshot it committed. This is where being pure DuckLake pays off:
@@ -237,6 +254,17 @@ facet:
 Same discipline as identity: verify what's verifiable, record the rest as
 claimed, and never let a claim carry authority.
 
+**The job name is `{pond}.{op}.{target}`** (`{pond}.{op}` when no dataset
+resolves), under the single `latiq` job namespace. A pond table's name is fully
+qualified as `{catalog}.{schema}.{table}` and a pond's DuckLake catalog alias
+**is** its name, so that leading segment is dropped when it equals the pond —
+`shop.write_query.main.customer_totals`, not the stuttering
+`shop.write_query.shop.main.customer_totals` a real Marquez displayed. A catalog
+that is *not* the pond is kept: it is genuinely different information, and
+dropping it would merge two tables into one job. The **dataset** name keeps its
+full qualification either way — consumers key datasets on it. A job must recur
+across runs, so the name never contains a run id, a timestamp or the SQL.
+
 **The parent facet is not emitted yet**, and that absence is deliberate rather
 than an oversight: **no transport carries a workflow id today**, and
 identity-shaped context arrives in the transport and never in a tool or RPC
@@ -306,9 +334,12 @@ provenance to every agent, and any filtering would be advisory rather than
 enforced. If it is ever wanted it arrives *with* authorization, as a filtered
 node-wide read, not by widening a pond's trail.
 
-**Table-level, not column-level.** Column-level lineage is a stated OpenLineage
-facet and much harder. Getting tables approximately right is worth far more now
-than getting columns perfectly right later.
+**Table-level, not column-level.** Column-*lineage* — which input column fed
+which output column — is a separate OpenLineage facet
+(`ColumnLineageDatasetFacet`) and much harder; it is not emitted. Each dataset
+does say what its own columns ARE (the `schema` facet above); what is missing is
+the mapping between them. Getting tables approximately right is worth far more
+now than getting columns perfectly right later.
 
 ---
 

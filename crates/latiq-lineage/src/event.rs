@@ -360,6 +360,26 @@ pub mod facets {
         )
     }
 
+    /// `SchemaDatasetFacet` — the dataset's columns, in the table's own order.
+    ///
+    /// Takes `(name, type)` pairs and nothing else: the schema also allows a
+    /// per-field `description` and nested `fields`, and we have neither. An
+    /// invented description is the dataset equivalent of an invented input, and
+    /// the type is whatever the engine calls it (`DECIMAL(10,2)`, `VARCHAR`) —
+    /// normalising it here would tell a consumer something the engine did not
+    /// say.
+    pub fn schema<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Facet {
+        let fields: Vec<Value> = fields
+            .into_iter()
+            .map(|(name, ty)| serde_json::json!({ "name": name, "type": ty }))
+            .collect();
+        Facet::stamp(
+            "schema",
+            spec_url("1-1-1", "SchemaDatasetFacet"),
+            &serde_json::json!({ "fields": fields }),
+        )
+    }
+
     /// `ErrorMessageRunFacet`. `programmingLanguage` is required by the schema.
     pub fn error_message(message: &str) -> Facet {
         Facet::stamp(
@@ -478,9 +498,22 @@ pub fn dataset_namespace(pond_id: &str) -> String {
 ///
 /// `{pond}.{op}.{target}` when a dataset resolves (the written table, or the
 /// first input read), `{pond}.{op}` when nothing does.
+///
+/// A pond table's name is fully qualified as `{catalog}.{schema}.{table}`, and
+/// a pond's DuckLake catalog alias **is** its name — so the raw form stuttered
+/// (`shop.write_query.shop.main.customer_totals`, as a real Marquez showed it).
+/// That leading segment is dropped when, and only when, it equals the pond:
+/// `shop.read_query.warehouse.main.orders` names a genuinely different catalog,
+/// and merging that into the pond's own would merge two tables into one job.
 pub fn job_name(pond_name: &str, op: &str, target: Option<&str>) -> String {
     match target {
-        Some(target) => format!("{pond_name}.{op}.{target}"),
+        Some(target) => {
+            let target = target
+                .strip_prefix(pond_name)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .unwrap_or(target);
+            format!("{pond_name}.{op}.{target}")
+        }
         None => format!("{pond_name}.{op}"),
     }
 }
@@ -581,5 +614,60 @@ mod tests {
             "orders.write_query.main.orders"
         );
         assert_eq!(job_name("orders", "read_query", None), "orders.read_query");
+    }
+
+    #[test]
+    fn job_name_drops_a_catalog_segment_that_only_repeats_the_pond() {
+        // Regression pin, found against a real Marquez: every job read
+        // `shop.write_query.shop.main.customer_totals`. A dataset arrives
+        // fully qualified as `{catalog}.{schema}.{table}`, and the DuckLake
+        // catalog alias IS the pond name (`PondLocation.catalog_name`), so the
+        // pond appeared twice in every job name for no added information.
+        assert_eq!(
+            job_name("shop", "write_query", Some("shop.main.customer_totals")),
+            "shop.write_query.main.customer_totals"
+        );
+
+        // The other half: a catalog that is NOT the pond is real information —
+        // dropping it would merge two different tables into one job.
+        assert_eq!(
+            job_name("shop", "read_query", Some("warehouse.main.orders")),
+            "shop.read_query.warehouse.main.orders"
+        );
+        // Only a whole leading segment counts: `shopify.…` is a different
+        // catalog whose name happens to start with the pond's.
+        assert_eq!(
+            job_name("shop", "read_query", Some("shopify.main.orders")),
+            "shop.read_query.shopify.main.orders"
+        );
+        // An external target (an `s3://` key, a file path) has no catalog to
+        // strip and must survive untouched.
+        assert_eq!(
+            job_name("shop", "write_query", Some("raw/export.parquet")),
+            "shop.write_query.raw/export.parquet"
+        );
+    }
+
+    #[test]
+    fn schema_facet_carries_columns_in_order_and_invents_no_description() {
+        // The facet a real Marquez renders as the table's columns. Two things
+        // it must not do: reorder the columns (the order IS the table's), and
+        // fabricate a `description` — we have none, and absent is honest where
+        // a made-up one is not.
+        let facet = facets::schema([("id", "INTEGER"), ("amount", "DECIMAL(10,2)")]);
+        let body = serde_json::to_value(&facet).expect("facet serializes");
+        assert_eq!(
+            body["fields"],
+            serde_json::json!([
+                { "name": "id", "type": "INTEGER" },
+                { "name": "amount", "type": "DECIMAL(10,2)" },
+            ]),
+            "the columns, in the table's own order, with DuckDB's type names as-is"
+        );
+        assert_eq!(
+            facet.key(),
+            "schema",
+            "the standard facet key a consumer looks under"
+        );
     }
 }

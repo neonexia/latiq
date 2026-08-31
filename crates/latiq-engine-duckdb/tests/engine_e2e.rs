@@ -808,6 +808,136 @@ mod lineage {
     }
 
     #[test]
+    fn lineage_datasets_carry_their_columns_except_where_we_would_be_guessing() {
+        // A dataset with no columns is a node a consumer can click into and
+        // learn nothing from — which is exactly what a real Marquez showed.
+        // Three claims, each of which fails on its own:
+        //
+        //  * the WRITE TARGET carries its columns, and they only exist after
+        //    the statement ran (a schema read before the CTAS finds nothing);
+        //  * an INPUT in the pond's own catalog carries them too — the same
+        //    catalog, so it costs no extra round trip;
+        //  * an EXTERNAL dataset carries NONE. We do not have its columns
+        //    cheaply, and absent is correct where guessed is not.
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let id = Identity::claimed(Some("agent-a"));
+        let mut loc = fs.create_pond(PondId::new(), true).unwrap();
+        loc.lineage = true;
+        let cols = |ds: &DatasetRef| -> Vec<(String, String)> {
+            ds.fields
+                .iter()
+                .map(|f| (f.name.clone(), f.type_name.clone()))
+                .collect()
+        };
+        let declared = vec![
+            ("id".to_string(), "INTEGER".to_string()),
+            ("customer".to_string(), "VARCHAR".to_string()),
+            // The type is the engine's own name, passed through rather than
+            // normalised — a consumer that sees `DECIMAL(10,2)` learns the
+            // precision, and `DECIMAL` would have lost it.
+            ("amount".to_string(), "DECIMAL(10,2)".to_string()),
+        ];
+        eng.write_query(
+            &loc,
+            "CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))",
+            &id,
+            AbortToken::new(),
+        )
+        .unwrap();
+        eng.write_query(
+            &loc,
+            "INSERT INTO orders VALUES (1,'ada',9.99)",
+            &id,
+            AbortToken::new(),
+        )
+        .unwrap();
+
+        // A CTAS: the output did not exist when the statement was planned.
+        let ctas = eng
+            .write_query(
+                &loc,
+                "CREATE TABLE totals AS SELECT customer, count(*) AS n FROM orders GROUP BY customer",
+                &id,
+                AbortToken::new(),
+            )
+            .unwrap();
+        assert_eq!(ctas.meta.outputs[0].name, "pond.main.totals");
+        assert_eq!(
+            cols(&ctas.meta.outputs[0])
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>(),
+            vec!["customer", "n"],
+            "the write target's columns, in the table's own order: {:?}",
+            ctas.meta.outputs[0]
+        );
+        assert!(
+            cols(&ctas.meta.outputs[0])
+                .iter()
+                .all(|(_, t)| !t.is_empty()),
+            "every column must carry a type"
+        );
+        assert_eq!(
+            cols(&ctas.meta.inputs[0]),
+            declared,
+            "and the input it read, resolved in the same lookup"
+        );
+
+        // The read path: the columns are looked up inside the read's own
+        // transaction, so they describe the snapshot the rows came from.
+        let read = eng
+            .read_query(&loc, "SELECT id FROM orders", AbortToken::new())
+            .unwrap();
+        assert_eq!(cols(&read.meta.inputs[0]), declared);
+
+        // An external file: no schema facet, rather than a guessed one.
+        let parquet = loc.data_path.to_string() + "/probe.parquet";
+        eng.write_query(
+            &loc,
+            &format!("COPY (SELECT 1 AS id) TO '{parquet}' (FORMAT PARQUET)"),
+            &id,
+            AbortToken::new(),
+        )
+        .unwrap();
+        let external = eng
+            .read_query(
+                &loc,
+                &format!("SELECT * FROM read_parquet('{parquet}')"),
+                AbortToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            external.meta.inputs[0].namespace.as_deref(),
+            Some("file"),
+            "the fixture must really be an external dataset, or the next \
+             assertion is vacuous"
+        );
+        assert!(
+            external.meta.inputs[0].fields.is_empty(),
+            "an external dataset's columns are not ours to state: {:?}",
+            external.meta.inputs[0]
+        );
+
+        // A pond that did not opt in resolves no datasets at all, so it pays
+        // for no schema lookup either — pinned as the absence of the *only*
+        // thing that could carry one.
+        let mut off = fs.create_pond(PondId::new(), false).unwrap();
+        off.lineage = false;
+        eng.write_query(
+            &off,
+            "CREATE TABLE quiet(i INTEGER)",
+            &id,
+            AbortToken::new(),
+        )
+        .unwrap();
+        let quiet = eng
+            .read_query(&off, "SELECT * FROM quiet", AbortToken::new())
+            .unwrap();
+        assert!(quiet.meta.inputs.is_empty() && quiet.meta.outputs.is_empty());
+    }
+
+    #[test]
     fn lineage_every_query_path_reports_its_datasets() {
         // Three engine entry points produce a meta, and each is the read path
         // for a different surface: `read_arrow` is what the CLI and SDK use, so
