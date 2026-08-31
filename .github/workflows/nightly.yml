@@ -428,27 +428,30 @@ jobs:
         run: pytest e2e/sdk -v
 
   # Prove the REAL external-user path against the JUST-PUBLISHED artifacts — no
-  # repo build, no repo compose. Fetch the compose from the public latiq-deploy
-  # repo (as a user would), `docker compose up` pulls the published GHCR image,
-  # `pip install latiq` from PyPI, then run the SDK + agent (MCP) suites against
-  # the gatewayed cluster. Only the TEST CODE comes from this repo (contributors
-  # have it); everything under test is a shipped artifact.
+  # repo build. `deploy/docker-compose.yml` IS the file users curl (deploy/ is the
+  # single source of truth for it), so we use the checked-out copy rather than
+  # round-tripping it through raw.githubusercontent: same bytes, and the job
+  # cannot silently go green against a stale published mirror. `docker compose up`
+  # then pulls the published GHCR image and `pip install latiq` the PyPI wheel,
+  # and the SDK + agent (MCP) suites run against the gatewayed cluster. Everything
+  # UNDER TEST is a shipped artifact; only the compose and the test code are local.
   verify-deployment:
-    name: verify user path (remote compose + GHCR image + PyPI wheel)
+    name: verify user path (user compose + GHCR image + PyPI wheel)
     needs: [gate, publish]
     if: needs.gate.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4   # for e2e/ test code only
+      - uses: actions/checkout@v4   # for deploy/docker-compose.yml + e2e/ test code
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # Fetch the compose exactly as a user does (public repo, no clone of latiq).
-      - name: Fetch the published compose
-        run: curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/neonexia/latiq-deploy/main/docker-compose.yml
+      # The exact file a user curls from deploy/. Copied to the working dir so the
+      # rest of the job's bare `docker compose` commands resolve it as a user's do.
+      - name: Take the user compose
+        run: cp deploy/docker-compose.yml docker-compose.yml
       # NOTE: no `docker login` — this tests the ANONYMOUS pull a real user makes.
       # Requires the GHCR `latiq` package to be PUBLIC (one-time org setting).
       - name: Bring up the cluster from the published images (pinned to this run)
