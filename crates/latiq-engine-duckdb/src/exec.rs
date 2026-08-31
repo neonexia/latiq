@@ -2,7 +2,7 @@
 //! write (txn-wrapped + native DuckLake attribution), and explain.
 use crate::instance::PondInstance;
 use duckdb::types::ValueRef;
-use latiq_common::{Identity, QueryMeta};
+use latiq_common::{DatasetField, DatasetRef, Identity, QueryMeta};
 use latiq_engine::{is_read_only, AbortToken, ArrowSink, EngineError, ExplainResult, QueryResult};
 use std::time::Instant;
 
@@ -144,6 +144,100 @@ fn max_snapshot(inst: &PondInstance, cat_quoted: &str) -> Option<i64> {
         .flatten()
 }
 
+/// An open `BEGIN TRANSACTION READ ONLY`, rolled back on drop unless committed.
+///
+/// Drop-based, not `ROLLBACK` at each error site, because these connections are
+/// **pooled and reused**: one missed early return leaves an open transaction
+/// that wedges the connection for every later reader. `?` inside the
+/// transaction must be as safe as an explicit error path, and only `Drop` makes
+/// that true for paths nobody has written yet.
+struct ReadTxn<'a> {
+    inst: &'a PondInstance,
+    open: bool,
+}
+
+impl<'a> ReadTxn<'a> {
+    fn begin(inst: &'a PondInstance) -> Result<Self, EngineError> {
+        inst.conn
+            .execute_batch("BEGIN TRANSACTION READ ONLY")
+            .map_err(|e| EngineError::Engine(e.to_string()))?;
+        Ok(Self { inst, open: true })
+    }
+
+    fn commit(mut self) -> Result<(), EngineError> {
+        self.inst
+            .conn
+            .execute_batch("COMMIT")
+            .map_err(|e| EngineError::Engine(e.to_string()))?;
+        // Cleared only on success. A failed COMMIT most likely aborted the
+        // transaction itself, in which case Drop's ROLLBACK is a no-op — this
+        // is defensive, not a claim about what DuckDB does with a failed
+        // commit, and it costs one refused statement on a connection the
+        // caller is about to discard anyway.
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl Drop for ReadTxn<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            // Best effort: on the cancellation path the statement was
+            // interrupted, so this ROLLBACK may itself be refused. The caller
+            // discards a connection whose read errored, so a transaction we
+            // could not close never reaches another reader.
+            let _ = self.inst.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+/// Run `f` inside a read-only transaction on `inst`.
+///
+/// The transaction is the whole point: everything `f` does — provenance
+/// extraction and the read itself — resolves against **one** pinned catalog
+/// snapshot. Unbracketed they are separate implicit transactions, so a commit
+/// landing between them makes the version recorded for an input describe a
+/// state the query never read, which is precisely the claim that version is
+/// there to make.
+///
+/// There is no separate snapshot accessor: each DuckLake scan already carries
+/// its own `snapshot.snapshot_id` in the bound plan (see [`scan_datasets`]),
+/// and *because* the extraction now runs inside this transaction, that value
+/// **is** the one the read observed. Measured across 17 read shapes, every
+/// input from this pond's catalog arrives versioned that way, so asking
+/// `current_snapshot()` as well would have been a second question with the
+/// same answer, charged to every lineage read.
+///
+/// Measured (200 iterations, 200k-row aggregate, release): plain read
+/// 1.94–1.99 ms, bracketed 1.68–1.72 ms. One transaction amortises the
+/// per-statement catalog-snapshot resolution that auto-commit repeats, so the
+/// bracket is a saving, not a cost — which is why `read_query`/`read_arrow`
+/// take one for every pond, not only a lineage pond's.
+///
+/// Scope: the two `QueryEngine` read paths. `describe_schema`,
+/// `describe_catalog` and `explain_query` deliberately stay unbracketed —
+/// single-statement introspection with no version to record and nothing to keep
+/// consistent across statements.
+///
+/// The bracket's integrity depends on the read guard refusing transaction
+/// control: a `COMMIT` inside the user's SQL ends *this* transaction, and a
+/// following `BEGIN` leaves a fresh one for [`ReadTxn::commit`] to close
+/// without complaint. `latiq_engine::is_read_only` rejects those keywords for
+/// that reason (verified reachable before it did).
+///
+/// Pinning is **lazy** — taken at the first catalog-touching statement, not at
+/// `BEGIN` — so whichever of `f`'s statements runs first establishes it.
+pub fn in_read_txn<T>(
+    inst: &PondInstance,
+    f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
+) -> Result<T, EngineError> {
+    let txn = ReadTxn::begin(inst)?;
+    // Any error here — including a cancellation — drops `txn` and rolls back.
+    let out = f(inst)?;
+    txn.commit()?;
+    Ok(out)
+}
+
 /// Execute a statement and materialize its result rows aligned to column names.
 /// Works for any statement — a SELECT yields its rows; a write/DDL executes and
 /// yields DuckDB's summary row (which write callers drop). Multi-statement input
@@ -203,10 +297,11 @@ pub fn run_read_arrow(
     sql: &str,
     abort: &AbortToken,
     sink: &mut dyn ArrowSink,
-) -> Result<(), EngineError> {
+) -> Result<QueryMeta, EngineError> {
     if !is_read_only(sql) {
         return Err(EngineError::ReadOnlyViolation);
     }
+    let t0 = Instant::now();
     let mut stmt = inst
         .conn
         .prepare(sql)
@@ -214,20 +309,26 @@ pub fn run_read_arrow(
     let arrow = stmt
         .query_arrow([])
         .map_err(|e| EngineError::Engine(e.to_string()))?;
+    // A meta even for a stream: it is how the streamed read's provenance (and
+    // its row count) reaches the caller, which otherwise sees only batches.
+    let mut meta = QueryMeta::default();
     // Schema is available even for an empty result, so downstream IPC/JSON always
     // has columns.
     if sink.schema(arrow.get_schema()).is_break() {
-        return Ok(());
+        meta.duration_ms = t0.elapsed().as_millis() as u64;
+        return Ok(meta);
     }
     for batch in arrow {
         if abort.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
+        meta.rows += batch.num_rows() as u64;
         if sink.batch(batch).is_break() {
             break;
         }
     }
-    Ok(())
+    meta.duration_ms = t0.elapsed().as_millis() as u64;
+    Ok(meta)
 }
 
 /// Run a read-only query, materializing rows aligned to column names.
@@ -238,6 +339,11 @@ pub fn run_read_arrow(
 /// where read-only *enforcement* as a permission belongs. Its remaining failure
 /// mode is benign: at worst it rejects an unusual read, never lets a write slip
 /// through unattributed.
+///
+/// (The engine read paths now call this inside [`in_read_txn`], where DuckDB
+/// *does* refuse a write — "transaction is launched in read-only mode". Demoting
+/// the heuristic to a fast-fail hint in front of that enforcement is a real
+/// improvement and a deliberately separate change; this one does not touch it.)
 pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineError> {
     if !is_read_only(sql) {
         return Err(EngineError::ReadOnlyViolation);
@@ -362,6 +468,356 @@ pub fn run_write(
     }
 }
 
+// ------------------------------------------------------------- provenance
+//
+// What a statement reads and writes, taken from DuckDB's **bound plan**
+// (`json_serialize_plan`). Everything below is best-effort: it must never fail
+// a query and must never execute one.
+
+/// Largest plan JSON we will parse. The plan scales with the number of
+/// *literals*, not tables — a 1000-element `IN` list serializes to ~338 KB —
+/// so a cap is what keeps a pathological query from paying a multi-megabyte
+/// JSON parse for provenance. Over the cap we record nothing, and say so.
+///
+/// Counted in **bytes** (`strlen`), not characters: DuckDB's `length()` counts
+/// characters, so a plan full of non-ASCII literals would cross the boundary at
+/// up to ~4x this and make the constant's name a lie.
+const MAX_PLAN_JSON_BYTES: usize = 512 * 1024;
+
+/// The datasets a statement reads and writes, as `(inputs, outputs)`, from the
+/// **bound** plan. `pond` is the pond's catalog name, used only to make the
+/// diagnostics below identifiable.
+///
+/// Bound, not parsed: `SELECT * FROM v` where `v` joins two tables resolves to
+/// those two base tables here, where the parse tree only ever says `v`. Writes
+/// resolve too (`json_serialize_sql` refuses them outright).
+///
+/// **Cost — and where the published figure does not apply.** This is a SECOND
+/// bind of the statement (~380 µs against a 2.16 ms query, ~14–18%). That
+/// measurement was taken on **local tables only**. DuckDB's binder globs and
+/// sniffs files at bind time — `json_serialize_plan` on `read_csv('missing')`
+/// comes back with an `io` error, not a plan — so a query over
+/// `read_parquet('s3://…/*.parquet')` pays the remote listing and schema sniff
+/// **twice**. Enabling lineage on a pond that reads from object storage is
+/// therefore materially more expensive than the local figure suggests.
+///
+/// Three properties this must keep, in order of how badly a regression hurts:
+///
+/// 1. **It never fails a query.** No `Result`, no panic, no unwrap:
+///    unparseable SQL, an unknown table, a renamed plan key and a plan too big
+///    to parse all yield no datasets. They do not, however, yield SILENCE —
+///    see [`PlanSkip`].
+/// 2. **It never executes the statement.** `json_serialize_plan` binds and
+///    plans; it does not run. That is what disqualified `EXPLAIN ANALYZE` and
+///    profiling, and it is pinned by a test.
+/// 3. **The SQL is a bound parameter**, cast explicitly (a bare `?` is
+///    rejected) — never concatenated into the extraction query.
+pub fn referenced_tables(
+    inst: &PondInstance,
+    sql: &str,
+    pond: &str,
+) -> (Vec<DatasetRef>, Vec<DatasetRef>) {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    match serialized_plan(inst, sql) {
+        Ok(plan) => {
+            walk_plan(&plan, &mut inputs, &mut outputs);
+            if inputs.is_empty() && outputs.is_empty() {
+                // Legitimate for `SELECT 1` — and the exact shape a renamed
+                // plan key would also take, which is why it is not silent.
+                tracing::debug!(pond, "lineage: the plan named no datasets");
+            }
+        }
+        Err(skip) => tracing::warn!(
+            pond,
+            reason = skip.reason(),
+            "lineage: no provenance for this statement"
+        ),
+    }
+    (dedup(inputs), dedup(outputs))
+}
+
+/// Fill in the columns of every dataset that lives in **this pond's own
+/// catalog**, in ONE lookup for all of them.
+///
+/// One query, not one per table: the datasets of a statement are all in the
+/// same `information_schema`, so a per-table round trip would charge a join
+/// over five tables five times for information one query already returns.
+/// Everything not in the pond's catalog — an `s3://` object, a Parquet file, a
+/// transiently attached catalog — is skipped rather than guessed: we do not
+/// have its columns cheaply, and a wrong schema is worse than an absent one.
+///
+/// **When to call it matters on each side.** An output's columns only exist
+/// *after* the statement ran (a `CREATE TABLE … AS` has no target to describe
+/// before it); an input's must be read inside the read's own transaction, or
+/// the columns recorded may not be the ones the rows came from.
+///
+/// Best-effort, like [`referenced_tables`]: a failure logs why and leaves the
+/// datasets exactly as they were. It must never fail a query.
+pub fn annotate_schemas(
+    inst: &PondInstance,
+    catalog: &str,
+    inputs: &mut [DatasetRef],
+    outputs: &mut [DatasetRef],
+) {
+    // `{catalog}.{schema}.{table}`, and only for a dataset the pond owns (an
+    // external one carries its own namespace).
+    let qualified = |d: &DatasetRef| -> Option<(String, String)> {
+        if d.namespace.is_some() {
+            return None;
+        }
+        let rest = d.name.strip_prefix(catalog)?.strip_prefix('.')?;
+        let (schema, table) = rest.split_once('.')?;
+        (!table.contains('.')).then(|| (schema.to_string(), table.to_string()))
+    };
+    let wanted: std::collections::BTreeSet<(String, String)> = inputs
+        .iter()
+        .chain(outputs.iter())
+        .filter_map(&qualified)
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    // Escaped as SQL literals, never concatenated raw: these names come from
+    // DuckDB's own plan, but they originate in caller SQL and a quote in an
+    // identifier must not be able to end the literal.
+    let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let pairs = wanted
+        .iter()
+        .map(|(s, t)| format!("({}, {})", lit(s), lit(t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT table_schema, table_name, column_name, data_type \
+         FROM information_schema.columns \
+         WHERE table_catalog = {} AND (table_schema, table_name) IN ({pairs}) \
+         ORDER BY table_schema, table_name, ordinal_position",
+        lit(catalog)
+    );
+    let mut by_table: std::collections::HashMap<(String, String), Vec<DatasetField>> =
+        std::collections::HashMap::new();
+    let collected = inst.conn.prepare(&query).and_then(|mut stmt| {
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (schema, table, column, ty) = row?;
+            by_table
+                .entry((schema, table))
+                .or_default()
+                .push(DatasetField {
+                    name: column,
+                    type_name: ty,
+                });
+        }
+        Ok(())
+    });
+    if let Err(e) = collected {
+        // Loud for the same reason `referenced_tables` is: an event whose
+        // datasets lost their columns looks exactly like one whose tables never
+        // had any. The message is DuckDB's own and quotes no user SQL.
+        tracing::warn!(pond = catalog, error = %e, "lineage: no column schema for this statement");
+        return;
+    }
+    for ds in inputs.iter_mut().chain(outputs.iter_mut()) {
+        if let Some(key) = qualified(ds) {
+            if let Some(fields) = by_table.get(&key) {
+                ds.fields = fields.clone();
+            }
+        }
+    }
+}
+
+/// Why an extraction produced nothing.
+///
+/// The distinction is the whole point: "this statement touched no datasets" and
+/// "we could not find out what it touched" look identical in an event, and this
+/// feature's own thesis is that silently under-reporting provenance is the
+/// worst failure mode there is. Every variant is logged by
+/// [`referenced_tables`], so a pond whose events lost their datasets says so in
+/// the node's log instead of looking complete.
+#[derive(Debug)]
+enum PlanSkip {
+    /// The plan was larger than [`MAX_PLAN_JSON_BYTES`] and was never parsed.
+    OverCap,
+    /// DuckDB would not bind or serialize the statement — a syntax error, an
+    /// unknown table, a missing file. Carries the plan's `error_type` only:
+    /// binder messages quote the SQL back, and the SQL is redacted everywhere
+    /// else it is recorded, so it must not leak through a log line here.
+    NotPlanned(String),
+    /// The extraction query itself failed — an interrupted statement, a
+    /// connection in a bad state.
+    Unavailable,
+    /// The plan came back as something that is not JSON at all: a serialisation
+    /// change, and the loudest reason of the four.
+    Unreadable,
+}
+
+impl PlanSkip {
+    fn reason(&self) -> String {
+        match self {
+            Self::OverCap => format!("plan larger than {MAX_PLAN_JSON_BYTES} bytes"),
+            Self::NotPlanned(kind) => format!("duckdb would not plan it ({kind})"),
+            Self::Unavailable => "the extraction query did not run".into(),
+            Self::Unreadable => "the plan was not JSON".into(),
+        }
+    }
+}
+
+/// The bound plan as JSON, or why there is none. `json_serialize_plan` reports
+/// failure **in band** — it returns `{"error":true,…}` for a syntax error or a
+/// missing table rather than raising — so that shape is handled here.
+fn serialized_plan(inst: &PondInstance, sql: &str) -> Result<serde_json::Value, PlanSkip> {
+    // The cap is applied INSIDE DuckDB so an oversized plan is never carried
+    // across the boundary and never handed to serde_json. `strlen` is BYTES;
+    // `length` would count characters (verified: `length('héllo')` = 5,
+    // `strlen('héllo')` = 6).
+    let query = format!(
+        "SELECT CASE WHEN strlen(p) <= {MAX_PLAN_JSON_BYTES} THEN p END \
+         FROM (SELECT json_serialize_plan(?::VARCHAR)::VARCHAR AS p)"
+    );
+    let json: Option<String> = inst
+        .conn
+        .query_row(&query, [sql], |r| r.get(0))
+        .map_err(|_| PlanSkip::Unavailable)?;
+    let json = json.ok_or(PlanSkip::OverCap)?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|_| PlanSkip::Unreadable)?;
+    if value.get("error").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(PlanSkip::NotPlanned(
+            value
+                .get("error_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+/// Walk every node of the plan, collecting scans as inputs and write/DDL
+/// targets as outputs. Recursive over the whole document rather than only
+/// `children`, because the operators we care about hang off several different
+/// keys and a missed branch is a silently under-reported lineage.
+fn walk_plan(
+    node: &serde_json::Value,
+    inputs: &mut Vec<DatasetRef>,
+    outputs: &mut Vec<DatasetRef>,
+) {
+    match node {
+        serde_json::Value::Object(obj) => {
+            match obj.get("type").and_then(serde_json::Value::as_str) {
+                Some("LOGICAL_GET") => inputs.extend(scan_datasets(obj)),
+                // The write targets: the table entry sits under `table_info`…
+                Some("LOGICAL_INSERT" | "LOGICAL_UPDATE" | "LOGICAL_DELETE") => {
+                    outputs.extend(obj.get("table_info").and_then(entry_dataset));
+                }
+                // …and under `info` for DDL.
+                Some("LOGICAL_CREATE_TABLE" | "LOGICAL_CREATE_VIEW" | "LOGICAL_DROP") => {
+                    outputs.extend(obj.get("info").and_then(entry_dataset));
+                }
+                // `COPY … TO` is the pond's export path, and its target is a
+                // real output: without this the event shows what the export
+                // read and nothing it produced, so the edge that leaves the
+                // pond is missing while the event still looks complete. The
+                // target keeps its standard scheme, exactly as an external
+                // input does — `file_path` is the whole destination for a
+                // partitioned write too (it is then a directory).
+                Some("LOGICAL_COPY_TO_FILE") => {
+                    outputs.extend(
+                        obj.get("file_path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(DatasetRef::external),
+                    );
+                }
+                _ => {}
+            }
+            for value in obj.values() {
+                walk_plan(value, inputs, outputs);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                walk_plan(item, inputs, outputs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a `LOGICAL_GET` reads. **The key names differ per table function**, and
+/// they are serialisation internals with no stability guarantee — a DuckDB
+/// upgrade that renames one would silently under-report, which is exactly the
+/// failure mode that disqualified the C API. `lineage_plan_key_names_still_*`
+/// in `tests/engine_e2e.rs` fails loudly when that happens.
+///
+/// Note which catalog is which: for `ducklake_scan` the GET's own
+/// `catalog_name`/`schema_name` name the *table function* (`system.main`), and
+/// the table is in `function_data`. Reading the outer pair would file every
+/// pond table under `system`.
+fn scan_datasets(get: &serde_json::Map<String, serde_json::Value>) -> Vec<DatasetRef> {
+    let Some(fd) = get.get("function_data").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let text = |k: &str| fd.get(k).and_then(serde_json::Value::as_str);
+    // ducklake_scan — and its snapshot, which is the version this input was
+    // read at, free of charge.
+    if let (Some(c), Some(s), Some(t)) = (
+        text("catalog_name"),
+        text("schema_name"),
+        text("table_name"),
+    ) {
+        let mut ds = DatasetRef::table(c, s, t);
+        ds.version = fd
+            .get("snapshot")
+            .and_then(|s| s.get("snapshot_id"))
+            .and_then(serde_json::Value::as_i64);
+        return vec![ds];
+    }
+    // Core `seq_scan` (a temp table, or a plain attached DuckDB catalog).
+    if let (Some(c), Some(s), Some(t)) = (text("catalog"), text("schema"), text("table")) {
+        return vec![DatasetRef::table(c, s, t)];
+    }
+    // `read_parquet` / `read_csv` and friends: external files, which keep their
+    // standard scheme so another tool's lineage can join on them.
+    fd.get("files")
+        .and_then(serde_json::Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(DatasetRef::external)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A catalog entry (`TABLE_ENTRY`, `VIEW_ENTRY`, a `DROP_INFO`) as a dataset.
+/// The name lives under a different key per entry kind — `table` for a table,
+/// `view_name` for a view, `name` for a drop.
+fn entry_dataset(entry: &serde_json::Value) -> Option<DatasetRef> {
+    let obj = entry.as_object()?;
+    let text = |k: &str| obj.get(k).and_then(serde_json::Value::as_str);
+    let name = text("table")
+        .or_else(|| text("view_name"))
+        .or_else(|| text("name"))?;
+    Some(DatasetRef::table(text("catalog")?, text("schema")?, name))
+}
+
+/// Same dataset twice (an `UPDATE`'s target, a self-join) is one dataset — but
+/// the **version** is part of its identity: a time-travel self-join
+/// (`FROM a AT (VERSION => 1) JOIN a`) reads two genuinely different states of
+/// one table, and collapsing them would report a single snapshot for both.
+fn dedup(mut datasets: Vec<DatasetRef>) -> Vec<DatasetRef> {
+    let mut seen = std::collections::HashSet::new();
+    datasets.retain(|d| seen.insert((d.namespace.clone(), d.name.clone(), d.version)));
+    datasets
+}
+
 /// Wrap DuckDB `EXPLAIN`, returning the raw plan text. Richer estimate parsing
 /// is a later refinement (Slice 0+ surfaces the plan; estimates are coarse).
 pub fn run_explain(inst: &PondInstance, sql: &str) -> Result<ExplainResult, EngineError> {
@@ -413,7 +869,7 @@ mod tests {
 
     fn pond() -> (TempFs, PondInstance) {
         let fs = TempFs::new();
-        let loc = fs.create_pond(PondId::new()).unwrap();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
         let inst = PondInstance::open(&loc).unwrap();
         (fs, inst)
     }
@@ -449,6 +905,86 @@ mod tests {
             !attr.rows.is_empty(),
             "expected attribution rows for agent-test"
         );
+    }
+
+    #[test]
+    fn lineage_skip_reason_distinguishes_why_there_is_no_provenance() {
+        // "This statement touched nothing" and "we could not find out what it
+        // touched" are the same empty result to a caller, and this feature's
+        // whole thesis is that silently under-reporting provenance is the worst
+        // failure mode. The classification below is what the warn/debug lines
+        // in `referenced_tables` are built on, so it is pinned here rather than
+        // in a log-capture binary (each of those statically links DuckDB).
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("a"));
+        run_write(&inst, "CREATE TABLE a(id INTEGER, v VARCHAR)", &id, "pond").unwrap();
+
+        assert!(
+            serialized_plan(&inst, "SELECT * FROM a").is_ok(),
+            "a statement that plans must not be reported as a skip"
+        );
+        assert!(
+            matches!(
+                serialized_plan(&inst, "SELEC bogus"),
+                Err(PlanSkip::NotPlanned(ref kind)) if kind == "parser"
+            ),
+            "a syntax error is DuckDB refusing to plan, and says which kind"
+        );
+        assert!(
+            matches!(
+                serialized_plan(&inst, "SELECT * FROM nope"),
+                Err(PlanSkip::NotPlanned(ref kind)) if kind == "catalog"
+            ),
+            "an unknown table is a catalog error, not the same as a syntax error"
+        );
+        // Over the cap: the same shape the byte-cap test exercises end to end.
+        let huge = format!("SELECT * FROM a WHERE a.v = '{}'", "x".repeat(600_000));
+        assert!(
+            matches!(serialized_plan(&inst, &huge), Err(PlanSkip::OverCap)),
+            "an oversized plan is skipped deliberately, not a DuckDB failure"
+        );
+        // Every reason is a real sentence an operator can act on — a blank one
+        // would make the log line useless.
+        for skip in [
+            PlanSkip::OverCap,
+            PlanSkip::NotPlanned("io".into()),
+            PlanSkip::Unavailable,
+            PlanSkip::Unreadable,
+        ] {
+            assert!(skip.reason().len() > 10, "empty reason for {skip:?}");
+        }
+    }
+
+    #[test]
+    fn read_transaction_pins_the_plan_to_what_the_read_returns_and_leaves_none_open() {
+        // The version recorded for an input comes from the bound plan, and is
+        // the observed one only because the extraction runs inside the same
+        // transaction as the read. Both must therefore name the snapshot the
+        // rows came from, and the transaction must not outlive the call.
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("a"));
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1)", &id, "pond").unwrap();
+        let latest: i64 = inst
+            .conn
+            .query_row("SELECT max(snapshot_id) FROM pond.snapshots()", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let (rows, inputs) = in_read_txn(&inst, |i| {
+            let (inputs, _) = referenced_tables(i, "SELECT * FROM t", "pond");
+            Ok((run_read(i, "SELECT * FROM t")?.rows.len(), inputs))
+        })
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(
+            inputs[0].version,
+            Some(latest),
+            "the input must carry the snapshot the transaction read at"
+        );
+        // The connection is not left mid-transaction: this write would fail
+        // inside one, both because it is read-only and because COMMIT never ran.
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond").unwrap();
     }
 
     #[test]

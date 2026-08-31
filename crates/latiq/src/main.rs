@@ -11,7 +11,7 @@ use latiq_common::ErrorEnvelope;
 #[cfg(feature = "server")]
 use latiq_control_plane::{serve_control_plane, Registry};
 #[cfg(feature = "server")]
-use latiq_pond_node::{run_pond_node, PondNodeConfig};
+use latiq_pond_node::{run_pond_node_until, PondNodeConfig};
 use latiq_proto::v1::admin_client::AdminClient;
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
@@ -286,6 +286,14 @@ struct NodeAddArgs {
     /// the issuer identifier is not a reachable address.
     #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
     auth_jwks_uri: Option<String>,
+    /// An OpenLineage-compatible receiver to ALSO post lineage events to, e.g.
+    /// http://marquez:5000/api/v1/lineage. The FULL endpoint, not a base URL.
+    /// Additive and off by default: ponds allocated with lineage always write
+    /// their own event files, and a backend that is down or slow can never
+    /// affect a query. Set it when lineage must outlive the pond -- dropping a
+    /// pond destroys its local trail. No credentials are sent.
+    #[arg(long, env = "LATIQ_LINEAGE_BACKEND_URL")]
+    lineage_backend_url: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -311,6 +319,13 @@ enum PondCmd {
         /// discover it (shown in `pond list`/`describe`).
         #[arg(short, long)]
         description: Option<String>,
+        /// Record OpenLineage provenance for every query on this pond, into
+        /// its own `lineage/` directory (agents read it with the `get_lineage`
+        /// MCP tool). Off by default (it costs disk and a little per-query
+        /// time). Chosen here and FIXED for the pond's lifetime — there is no
+        /// way to turn it on afterwards.
+        #[arg(long)]
+        lineage: bool,
     },
     /// List ponds (control-plane registry; works even if nodes are down).
     List {
@@ -910,22 +925,71 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     // forwarding). Defaults to loopback so single-host runs are unchanged; in
     // containers `--advertise-addr pond-node-1:51401` makes forwarding routable.
     let advertise = advertise_endpoint(a.advertise_addr.as_deref(), a.port);
-    run_pond_node(PondNodeConfig {
-        node_id: a.node_id,
-        mcp_addr: mcp_addr.parse()?,
-        data_addr: data_addr.parse()?,
-        internal_endpoint: advertise,
-        control_endpoint: control_addr(),
-        // Blank means absent (compose interpolation passes empty strings); the
-        // node then derives the published URL from --advertise-addr as before.
-        public_mcp_url: non_blank(a.public_mcp_url),
-        data_dir: root.join("ponds"),
-        metrics_addr: Some(metrics_addr),
-        // `None` unless --auth-issuer was given: no flags means the relaxed
-        // (claimed) identity path this node has always run.
-        auth,
-    })
+    // The signal handler lives HERE, in the binary, and not in
+    // `latiq-pond-node`: `run_pond_node` is also what `latiq-sdk`'s embedded
+    // `LocalCluster` (and through it the Python wheel) calls, and a library
+    // that installs a process-wide handler replaces its host's `SIG_DFL`
+    // disposition without emulating it -- `kill` on a Python process that
+    // merely embedded a pond would stop terminating it. Whoever owns the
+    // process owns its signals; that is this file.
+    run_pond_node_until(
+        PondNodeConfig {
+            node_id: a.node_id,
+            mcp_addr: mcp_addr.parse()?,
+            data_addr: data_addr.parse()?,
+            internal_endpoint: advertise,
+            control_endpoint: control_addr(),
+            // Blank means absent (compose interpolation passes empty strings);
+            // the node then derives the published URL from --advertise-addr.
+            public_mcp_url: non_blank(a.public_mcp_url),
+            data_dir: root.join("ponds"),
+            metrics_addr: Some(metrics_addr),
+            // `None` unless --auth-issuer was given: no flags means the relaxed
+            // (claimed) identity path this node has always run.
+            auth,
+            // Blank means absent, like --public-mcp-url: compose interpolation
+            // passes the variable through empty, and an empty string must mean
+            // "no backend", never a URL the node fails to parse at startup.
+            lineage_backend_url: non_blank(a.lineage_backend_url),
+        },
+        shutdown_signal(),
+    )
     .await
+}
+
+/// Resolves when this process is asked to stop: SIGTERM (how a container
+/// runtime stops a node) or Ctrl-C.
+///
+/// Installed only on the `node add` path of the binary. What it buys is
+/// narrow and deliberate: the node's buffered lineage gets flushed instead of
+/// dying with the process. It is **not** a graceful drain -- see
+/// `latiq_pond_node::run_pond_node_until` -- and the shutdown work it triggers
+/// is bounded, because installing this handler also takes away the operator's
+/// second-Ctrl-C escape from a process that will not exit.
+#[cfg(feature = "server")]
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // If the handler cannot be installed there is nothing useful to do but
+        // fall back to Ctrl-C: refusing to serve over it would be worse.
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = tokio::signal::ctrl_c() => {}
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "could not listen for SIGTERM; only Ctrl-C will flush lineage");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 // ---- gRPC clients (friendly connection errors) --------------------------
@@ -1085,6 +1149,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             extensions,
             agent_id,
             description,
+            lineage,
         } => {
             // Validate the requested extensions against the allowlist before we
             // call the control plane, so a typo/community name fails locally.
@@ -1106,6 +1171,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                     tier,
                     extensions: exts,
                     description: description.unwrap_or_default(),
+                    lineage,
                 })
                 .await
             {
@@ -1140,7 +1206,7 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                             serde_json::json!({
                                 "pond_id": p.pond_id, "name": p.name, "owner": p.owner,
                                 "node_id": p.node_id, "tier": p.tier, "created_at": p.created_at,
-                                "description": p.description,
+                                "description": p.description, "lineage": p.lineage,
                             })
                         })
                         .collect();

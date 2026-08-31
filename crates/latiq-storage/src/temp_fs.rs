@@ -25,14 +25,14 @@ impl Default for TempFs {
 }
 
 impl PondStorage for TempFs {
-    fn create_pond(&self, id: PondId) -> Result<PondLocation, StorageError> {
-        self.inner.create_pond(id)
+    fn create_pond(&self, id: PondId, lineage: bool) -> Result<PondLocation, StorageError> {
+        self.inner.create_pond(id, lineage)
     }
     fn pond_location(&self, id: PondId) -> Result<PondLocation, StorageError> {
         self.inner.pond_location(id)
     }
-    fn ensure_pond(&self, id: PondId) -> Result<PondLocation, StorageError> {
-        self.inner.ensure_pond(id)
+    fn ensure_pond(&self, id: PondId, lineage: bool) -> Result<PondLocation, StorageError> {
+        self.inner.ensure_pond(id, lineage)
     }
     fn drop_pond(&self, id: PondId) -> Result<(), StorageError> {
         self.inner.drop_pond(id)
@@ -50,7 +50,7 @@ mod tests {
     fn proves_the_seam_with_a_second_backend() {
         let fs = TempFs::new();
         let id = PondId::new();
-        let loc = fs.create_pond(id).unwrap();
+        let loc = fs.create_pond(id, false).unwrap();
         assert!(loc.catalog_uri.starts_with("ducklake:duckdb:"));
         assert!(fs.pond_exists(id));
     }

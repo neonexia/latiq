@@ -56,6 +56,31 @@ def test_embedded_handle_lifecycle_and_arrow_query():
             pass
 
 
+def test_lineage_is_an_opt_in_at_creation_and_readable_afterwards():
+    """The allocation flag, on the surface most users touch. `lineage` is fixed
+    for the pond's lifetime, so a caller can only get it right here — and can
+    only tell whether `get_lineage` will have anything to say by reading it
+    back. Reading it back is asserted on BOTH values: a property hard-coded to
+    True would pass a one-pond test."""
+    with tempfile.TemporaryDirectory() as root:
+        db = latiq.connect(server="local", root=root)
+
+        traced = db.create_pond(name="traced", lineage=True)
+        quiet = db.create_pond(name="quiet")  # off by default, as everywhere else
+
+        assert traced.lineage is True
+        assert quiet.lineage is False, "lineage defaults to off"
+
+        ponds = db.list_ponds()
+        assert ponds["traced"]["lineage"] is True
+        assert ponds["quiet"]["lineage"] is False
+
+        # A handle fetched fresh from the server carries it too, so a caller who
+        # did not allocate the pond can still tell.
+        assert db.get_pond(pond="traced").lineage is True
+        assert db.get_pond(pond="quiet").lineage is False
+
+
 def test_arrow_types_and_handle_repr():
     with tempfile.TemporaryDirectory() as root:
         db = latiq.connect(server="local", root=root)

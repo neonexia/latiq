@@ -23,4 +23,18 @@ pub struct PondLocation {
     /// LOADed from the deployment image — never installed in the pond path.
     #[serde(default)]
     pub extensions: Vec<String>,
+    /// Whether this pond records lineage — the per-pond opt-in from its registry
+    /// record, off by default. Storage leaves this false; AgentOps sets it from
+    /// the pond info, the same path `tier` and `extensions` take. It rides on
+    /// the location so the storage layer knows to materialize `lineage_dir`,
+    /// and so later stages can decide whether to emit events for this pond.
+    #[serde(default)]
+    pub lineage: bool,
+    /// Where this pond's OpenLineage `.jsonl` event files live,
+    /// `<root>/<pond-id>/lineage` (no trailing separator). Computed
+    /// unconditionally — only its
+    /// *existence on disk* reflects the `lineage` opt-in, and because it sits
+    /// inside the pond directory, `drop_pond` reaps it with everything else.
+    #[serde(default)]
+    pub lineage_dir: String,
 }

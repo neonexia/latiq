@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqQueryFacet.json",
+  "$defs": {
+    "LatiqQueryFacet": {
+      "description": "What Latiq operation this run was, how it ended, and how long it took. `durationMeaning` states what the duration measures, because a streaming read's duration is establishment time, not completion time.",
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "description": "The Latiq operation, e.g. read_query|write_query|read_arrow|explain_query.",
+              "type": "string"
+            },
+            "outcome": {
+              "description": "ok|error|cancelled.",
+              "type": "string"
+            },
+            "durationMs": {
+              "description": "Elapsed milliseconds, as measured by `durationMeaning`.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "durationMeaning": {
+              "description": "completion|establishment.",
+              "type": "string"
+            },
+            "traceId": {
+              "description": "The `latiq-trace-id` this run was logged under, so a lineage event joins to the access trail.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "outcome",
+            "durationMs",
+            "durationMeaning"
+          ]
+        }
+      ],
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "latiq_query": {
+      "$ref": "#/$defs/LatiqQueryFacet"
+    }
+  }
+}

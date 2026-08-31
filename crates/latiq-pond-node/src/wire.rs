@@ -56,4 +56,44 @@ mod tests {
         let decoded = query_result_from_json(&query_value(qr.clone())).unwrap();
         assert_eq!(decoded, qr);
     }
+
+    #[test]
+    fn a_read_that_records_the_version_it_observed_is_still_labelled_a_read() {
+        // Pins the inference above, which is load-bearing and was unguarded.
+        // A read now records the DuckLake snapshot it actually observed — but on
+        // the input dataset, NOT in `meta.snapshot_id`. Moving it into
+        // `snapshot_id` would relabel every read on the Data gRPC wire as
+        // `write_query`, which is why the version lives where it does.
+        let mut input = latiq_common::DatasetRef::table("pond", "main", "t");
+        input.version = Some(42);
+        let mut meta = QueryMeta {
+            rows: 1,
+            ..Default::default()
+        };
+        meta.set_datasets(vec![input], vec![]);
+        assert_eq!(meta.snapshot_id, None, "a read creates no snapshot");
+        let read = query_value(QueryResult {
+            columns: vec!["i".into()],
+            rows: vec![vec![serde_json::json!(1)]],
+            meta,
+        });
+        assert_eq!(read["statement"], "read_query");
+        assert_eq!(
+            read["_meta"]["inputs"][0]["version"],
+            serde_json::json!(42),
+            "and the observed version still reaches the wire, on the input"
+        );
+
+        // The other half of the same equality: a real write, which does carry a
+        // snapshot id, must still be labelled a write.
+        let write = query_value(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            meta: QueryMeta {
+                snapshot_id: Some(42),
+                ..Default::default()
+            },
+        });
+        assert_eq!(write["statement"], "write_query");
+    }
 }

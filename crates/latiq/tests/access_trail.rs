@@ -252,6 +252,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
             name: "trail".into(),
             policy_json: String::new(),
             tier: String::new(),
+            lineage: false,
         },
         "agent-7",
         &token,

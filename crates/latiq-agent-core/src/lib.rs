@@ -6,6 +6,10 @@ pub mod control;
 pub mod error;
 pub mod forward;
 pub mod inflight;
+/// The lineage emitter. Private: unlike `access`, which every surface calls, it
+/// is reached only from the public ops methods — one emit per operation, on the
+/// node that ran it (see the module doc).
+pub(crate) mod lineage;
 pub mod ops;
 pub mod registry_control;
 pub mod trace;
@@ -22,6 +26,6 @@ pub use ops::{AgentConfig, AgentOps};
 pub use registry_control::RegistryControlPlane;
 pub use trace::{current_trace_id, new_trace_id, with_trace_id};
 pub use types::{
-    AllocateResult, CatalogInfo, DatasetInfo, DatasetTableInfo, DescribeResult, LoadDatasetResult,
-    PondInfo, PullResult,
+    AllocateResult, CatalogInfo, DatasetInfo, DatasetTableInfo, DescribeResult, LineagePage,
+    LoadDatasetResult, PondInfo, PullResult,
 };

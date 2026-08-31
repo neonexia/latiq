@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/lineage-facets-1-0-0/crates/latiq-lineage/spec/facets/1-0-0/LatiqIdentityFacet.json",
+  "$defs": {
+    "LatiqIdentityFacet": {
+      "description": "The identity Latiq attributed this run to. `verified` distinguishes a principal proven by a validated token from a relaxed-mode claim; `agentIdVerified` is always false because the agent id is a claimed leaf that rides an HTTP header and never carries authority.",
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "verified": {
+              "description": "Whether `subject`/`issuer` came from a validated token.",
+              "type": "boolean"
+            },
+            "subject": {
+              "description": "The verified principal, and null whenever `verified` is false — a relaxed-mode caller has no principal, and an empty string would render as a blank owner rather than as its absence. `agentId` carries the claimed leaf in that case.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "issuer": {
+              "description": "The token issuer, absent in relaxed mode.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agentId": {
+              "description": "The claimed agent leaf from the `latiq-agent-id` header.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agentIdVerified": {
+              "description": "Always false: the agent id is claimed, never verified.",
+              "type": "boolean",
+              "const": false
+            }
+          },
+          "required": [
+            "verified",
+            "subject",
+            "agentIdVerified"
+          ]
+        }
+      ],
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "latiq_identity": {
+      "$ref": "#/$defs/LatiqIdentityFacet"
+    }
+  }
+}

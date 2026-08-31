@@ -21,6 +21,7 @@ fn alloc(name: &str) -> AllocatePondRequest {
         name: name.into(),
         policy_json: String::new(),
         tier: String::new(),
+        lineage: false,
     }
 }
 fn q(pond: &str, sql: &str) -> QueryRequest {
@@ -47,6 +48,7 @@ async fn pond_lifecycle_tier_recorded_and_described() {
             name: "big".into(),
             policy_json: String::new(),
             tier: "large".into(),
+            lineage: false,
         },
         "a",
     ))
@@ -588,6 +590,7 @@ mod arrow_stream {
                 name: pond.into(),
                 policy_json: String::new(),
                 tier: String::new(),
+                lineage: false,
             },
             "a",
         ))
@@ -689,5 +692,178 @@ mod arrow_stream {
         let (rows, col0, _) = drain(streaming).await;
         assert_eq!(rows, 0, "empty result");
         assert_eq!(col0, "i", "schema present even with zero rows");
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// Lineage is a **per-pond opt-in, off by default**: chosen when the pond is
+/// created, stored in the control-plane registry, reported by describe, and
+/// fixed for the pond's lifetime. Two ponds on one node can differ.
+///
+/// A submodule rather than a separate binary (tests/CLAUDE.md rule 5): same
+/// surface, same harness, and a binary costs a statically linked DuckDB.
+// ---------------------------------------------------------------------------
+mod lineage {
+    use super::{client, req};
+    use latiq_proto::v1::control_client::ControlClient;
+    use latiq_proto::v1::*;
+
+    fn alloc(name: &str, lineage: bool) -> AllocatePondRequest {
+        AllocatePondRequest {
+            name: name.into(),
+            policy_json: String::new(),
+            tier: String::new(),
+            lineage,
+        }
+    }
+
+    /// The `pond` half of a describe response.
+    async fn described(ep: &str, pond: &str) -> serde_json::Value {
+        let mut c = client(ep).await;
+        let d = c
+            .describe_pond(req(DescribePondRequest { pond: pond.into() }, "a"))
+            .await
+            .expect("describe")
+            .into_inner();
+        let v: serde_json::Value = serde_json::from_str(&d.json).expect("describe returns JSON");
+        v["pond"].clone()
+    }
+
+    #[tokio::test]
+    async fn lineage_is_off_by_default() {
+        // Lineage costs disk (every read and write emits) and per-query plan
+        // extraction, so the default deployment must pay nothing: a pond
+        // allocated without asking for it reports lineage disabled.
+        let s = crate::common::start_stack().await;
+        let mut c = client(&s.data_endpoint).await;
+        c.allocate_pond(req(alloc("plain", false), "a"))
+            .await
+            .expect("allocate");
+
+        assert_eq!(
+            described(&s.data_endpoint, "plain").await["lineage"],
+            serde_json::Value::Bool(false),
+            "a pond allocated without asking for lineage must report it disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_enabled_at_creation_is_reported_by_describe() {
+        let s = crate::common::start_stack().await;
+        let mut c = client(&s.data_endpoint).await;
+        c.allocate_pond(req(alloc("traced", true), "a"))
+            .await
+            .expect("allocate");
+
+        assert_eq!(
+            described(&s.data_endpoint, "traced").await["lineage"],
+            serde_json::Value::Bool(true),
+            "describe must report the lineage the pond was created with"
+        );
+
+        // ...and it is a property of the pond in the REGISTRY, not something the
+        // node that served the allocate remembers. Re-read it from the control
+        // plane, which never saw the original request, so this cannot pass on a
+        // value cached in the node's memory.
+        let mut cp = ControlClient::connect(s.control_endpoint.clone())
+            .await
+            .expect("control plane");
+        let info = cp
+            .get_pond_info(GetPondInfoRequest {
+                pond_ref: "traced".into(),
+            })
+            .await
+            .expect("get_pond_info")
+            .into_inner()
+            .pond
+            .expect("pond info");
+        assert!(
+            info.lineage,
+            "lineage must survive the round trip through the control-plane registry"
+        );
+
+        // Two ponds on one node differ: the flag is per pond, not per node.
+        let mut c = client(&s.data_endpoint).await;
+        c.allocate_pond(req(alloc("untraced", false), "a"))
+            .await
+            .expect("allocate");
+        assert_eq!(
+            described(&s.data_endpoint, "untraced").await["lineage"],
+            serde_json::Value::Bool(false),
+            "a second pond on the same node keeps its own setting"
+        );
+    }
+
+    /// A DESIGN pin, not a behaviour test. Lineage is fixed for the pond's
+    /// lifetime: turning it on later would leave a gap at the start of the
+    /// pond's history that reads as "nothing happened" rather than "we were not
+    /// recording" — worse than having no lineage at all. So there is
+    /// deliberately NO enable/disable RPC on any surface, and this fails the
+    /// build if one appears. Reversing it needs a deliberate backfill story.
+    ///
+    /// It pins the SETTER, not the word: `Data.GetLineage` reads the trail (and
+    /// is what lets a node forward an agent's `get_lineage` to the pond's
+    /// owner), which takes nothing away from the invariant. The guard was
+    /// widened from "no rpc name contains lineage" to "no rpc name MUTATES
+    /// lineage" for exactly that reason — more precise about the real property,
+    /// not merely quieter.
+    #[test]
+    fn lineage_setting_is_fixed_for_the_pond_lifetime() {
+        const DATA: &str = include_str!("../../latiq-proto/proto/latiq/v1/data.proto");
+        const CONTROL: &str = include_str!("../../latiq-proto/proto/latiq/v1/control.proto");
+        const ADMIN: &str = include_str!("../../latiq-proto/proto/latiq/v1/admin.proto");
+
+        let mut rpcs = 0usize;
+        for (file, src) in [
+            ("data.proto", DATA),
+            ("control.proto", CONTROL),
+            ("admin.proto", ADMIN),
+        ] {
+            for line in src.lines() {
+                let Some(rest) = line.trim().strip_prefix("rpc ") else {
+                    continue;
+                };
+                rpcs += 1;
+                let method = rest.split('(').next().unwrap_or_default().trim();
+                let lower = method.to_ascii_lowercase();
+                let mutates = ["set", "enable", "disable", "update", "toggle", "configure"]
+                    .iter()
+                    .any(|verb| lower.starts_with(verb));
+                assert!(
+                    !(lower.contains("lineage") && mutates),
+                    "{file} declares `rpc {method}`: lineage is chosen at pond creation \
+                     and fixed for the pond's lifetime — enabling it later would leave a \
+                     hole at the start of the provenance record"
+                );
+            }
+        }
+
+        // Anti-vacuity (tests/CLAUDE.md rule 3): a guard that scanned nothing —
+        // renamed files, a changed `rpc` spelling — would pass while guarding
+        // nothing. Pin that every declared RPC was seen, and that the flag it is
+        // guarding really is on the wire at creation time.
+        assert_eq!(rpcs, 34, "every declared RPC must have been scanned");
+        // The widened guard must still bite: a setter spelled any of the ways
+        // above is refused. Without this the loosening could have been a
+        // silent removal.
+        for forbidden in ["SetLineage", "EnableLineage", "UpdateLineage"] {
+            let lower = forbidden.to_ascii_lowercase();
+            assert!(
+                ["set", "enable", "disable", "update", "toggle", "configure"]
+                    .iter()
+                    .any(|verb| lower.starts_with(verb))
+                    && lower.contains("lineage"),
+                "the guard would not have caught `rpc {forbidden}`"
+            );
+        }
+        assert!(
+            DATA.contains("bool lineage"),
+            "the Data surface must carry the lineage flag at allocate + describe"
+        );
+        assert!(
+            CONTROL.contains("bool lineage"),
+            "the Control surface must carry it too — the CLI's `pond create` goes \
+             straight to the control plane, bypassing AgentOps"
+        );
     }
 }

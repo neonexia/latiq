@@ -67,6 +67,9 @@ pub struct PondInfo {
     pub node_id: String,
     pub tier: String,
     pub description: String,
+    /// Whether this pond records OpenLineage events (into the pond's own
+    /// `lineage/` directory on its node). Fixed at creation.
+    pub lineage: bool,
 }
 
 /// A handle to a pond: metadata + SQL. `db.get_pond("x").query("SELECT …")`.
@@ -240,11 +243,18 @@ impl Latiq {
     }
 
     /// Allocate a pond and return a handle. `description` is agent-discovery text.
+    ///
+    /// `lineage` records OpenLineage provenance for every query (written as JSONL
+    /// into the pond's own `lineage/` directory on its node; agents read it with
+    /// the `get_lineage` MCP tool). The choice is made here and is **fixed for the
+    /// pond's lifetime and cannot be enabled later** — turning it on later would
+    /// leave a hole at the start of the record. Off (`false`) costs nothing.
     pub fn create_pond(
         &self,
         name: Option<&str>,
         tier: &str,
         description: &str,
+        lineage: bool,
     ) -> Result<Pond<'_>> {
         let info = self.rt.block_on(async {
             let mut c = self.control().await?;
@@ -256,6 +266,7 @@ impl Latiq {
                     tier: tier.to_string(),
                     extensions: vec![],
                     description: description.to_string(),
+                    lineage,
                 })
                 .await?
                 .into_inner();
@@ -300,6 +311,7 @@ impl Latiq {
             node_id: String::new(),
             tier: m.tier,
             description: m.description,
+            lineage: m.lineage,
         })
     }
 
@@ -320,6 +332,7 @@ impl Latiq {
                             node_id: p.node_id,
                             tier: p.tier,
                             description: p.description,
+                            lineage: p.lineage,
                         },
                     )
                 })
@@ -677,6 +690,10 @@ impl LocalCluster {
             metrics_addr: None,
             // The embedded stack is in-process and single-user: relaxed identity.
             auth: None,
+            // The embedded stack has no configuration surface for a backend and
+            // often no network at all; lineage-enabled ponds still write their
+            // own files, which is what `get_lineage` reads.
+            lineage_backend_url: None,
         };
         rt.spawn(async move {
             let _ = run_pond_node(cfg).await;
