@@ -28,6 +28,9 @@ use latiq_proto::v1::*;
 use std::sync::Arc;
 use tonic::{Code, Request, Response, Status};
 
+/// The unary half of the CLI/SDK surface: allocate, drop, describe, explain, and
+/// materialized query results (bounded by the inline row cap). Large reads go
+/// through [`crate::StreamService`] instead.
 pub struct DataService {
     ops: Arc<AgentOps>,
     verifier: Option<Arc<Verifier>>,

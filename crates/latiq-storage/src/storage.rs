@@ -16,6 +16,9 @@
 use crate::location::PondLocation;
 use latiq_common::PondId;
 
+/// Why a pond's storage could not be provisioned or resolved. Backend-neutral:
+/// anything a specific backend knows (a path, an S3 status) is flattened into
+/// `Io`'s message.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("pond already exists: {0}")]

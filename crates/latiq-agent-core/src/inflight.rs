@@ -24,6 +24,9 @@ struct Entry {
     pond_id: Option<String>,
 }
 
+/// The node's set of cancellable running ops. Shared across `AgentOps` clones
+/// (all state is behind `Arc`), so a cancel arriving on one surface reaches a
+/// query started on another.
 #[derive(Clone, Default)]
 pub struct InFlightRegistry {
     map: Arc<Mutex<HashMap<String, Entry>>>,

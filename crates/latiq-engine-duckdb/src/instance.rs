@@ -55,6 +55,9 @@ pub fn warm_optional_extensions() {
     }
 }
 
+/// One pond's open DuckDB database, with its DuckLake catalog attached and its
+/// tier's caps applied. The caps are instance-global in DuckDB, which is why the
+/// instance — not the connection — is the unit of per-pond isolation.
 pub struct PondInstance {
     pub conn: Connection,
     /// Quoted catalog alias for this pond. Kept so [`PondInstance::clone_for_read`]

@@ -41,6 +41,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tonic::transport::Server;
 
+/// Everything one pond node needs to come up. The three address fields are
+/// distinct on purpose and easy to confuse: `mcp_addr`/`data_addr` are what this
+/// process binds, `internal_endpoint` is what peer nodes dial, and
+/// `public_mcp_url` is what clients dial.
 pub struct PondNodeConfig {
     pub node_id: String,
     /// Address to serve the agent MCP surface on.

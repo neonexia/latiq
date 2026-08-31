@@ -71,6 +71,10 @@ pub fn discover_uri(issuer: &str) -> String {
     )
 }
 
+/// One issuer's signing keys, fetched lazily and then served offline. Most of
+/// the state here exists to bound refetching: this lookup is what an
+/// unauthenticated caller reaches first, so an unbounded refetch-on-miss would
+/// turn attacker traffic into traffic against the customer's IdP.
 pub struct JwksCache {
     uri: String,
     keys: RwLock<HashMap<String, SigningKey>>,

@@ -22,6 +22,9 @@
 //! (`latiq-engine-duckdb`) maps the merged param set to `CREATE SECRET`/`ATTACH`.
 use std::collections::BTreeMap;
 
+/// One supported external-catalog type. Adding a type is a row in [`TYPES`]
+/// plus an attacher arm in `latiq-engine-duckdb`; nothing else keys off the
+/// type name.
 pub struct CatalogTypeSpec {
     pub name: &'static str,
     /// Params that MAY be persisted at `catalog add` (locator metadata only —

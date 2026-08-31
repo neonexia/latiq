@@ -78,6 +78,9 @@ struct UnverifiedIssuer {
     iss: Option<String>,
 }
 
+/// One trusted issuer. The `issuer` string and the URL we fetch keys from are
+/// separate fields because they are separate things: one is an identifier that
+/// is matched, the other an address that is dialed.
 #[derive(Debug, Clone)]
 pub struct IssuerConfig {
     /// Compared as a STRING against the token's `iss`. Never dialed.
@@ -88,6 +91,9 @@ pub struct IssuerConfig {
     pub jwks_uri: Option<String>,
 }
 
+/// A deployment's verification policy. Configuring one turns every surface into
+/// an OAuth 2.1 resource server; omitting it leaves identity relaxed (claimed,
+/// default anonymous) — which is the default and what the SDK and tests run.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// The `aud` this deployment expects. One value across all issuers: the
@@ -96,6 +102,9 @@ pub struct AuthConfig {
     pub issuers: Vec<IssuerConfig>,
 }
 
+/// Turns a token string into a verified [`Identity`], or refuses. Share one per
+/// deployment: it holds the per-issuer key caches, and a second instance would
+/// re-fetch every JWKS and double the traffic aimed at the customer's IdP.
 pub struct Verifier {
     cfg: AuthConfig,
     /// One cache PER ISSUER -- two IdPs may legitimately publish the same `kid`

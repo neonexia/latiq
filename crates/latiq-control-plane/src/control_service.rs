@@ -19,6 +19,9 @@ use latiq_proto::v1::control_server::Control;
 use latiq_proto::v1::*;
 use tonic::{Request, Response, Status};
 
+/// The internal node-facing surface: registration, heartbeats, and the routing
+/// and registry lookups a node needs to serve a pond. Not an external surface —
+/// no CLI, SDK or agent calls this.
 pub struct ControlService {
     pub registry: Registry,
 }

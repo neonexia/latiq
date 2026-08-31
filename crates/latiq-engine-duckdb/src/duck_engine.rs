@@ -44,6 +44,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+/// The shipped `QueryEngine`. Owns every pond instance this node has opened and
+/// keeps them cached — one DuckDB database per pond, reused across queries, never
+/// instance-per-query (invariant 7). `forget_pond` is the only way an entry
+/// leaves the map.
 #[derive(Default)]
 pub struct DuckEngine {
     /// Per-pond engine resources, keyed by catalog URI.

@@ -167,6 +167,9 @@ const AGENT_ID_HEADER: &str = "latiq-agent-id";
 /// RFC 9728's fixed location for the protected-resource metadata document.
 pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
 
+/// The agent-facing MCP handler: the tool router plus the `AgentOps` behind it.
+/// Agents only — there is nothing administrative on this surface, and the CLI
+/// and SDK never reach it (invariants 1 and 8).
 #[derive(Clone)]
 pub struct LatiqServer {
     ops: Arc<AgentOps>,

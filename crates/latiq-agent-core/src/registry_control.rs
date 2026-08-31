@@ -20,6 +20,9 @@ use crate::types::{CatalogInfo, DatasetInfo, DatasetTableInfo, PondInfo};
 use latiq_control_plane::registry::PondRow;
 use latiq_control_plane::{ControlPlaneError, Registry};
 
+/// `ControlPlane` served straight from the registry in this process — no gRPC
+/// hop. What the SDK's `"local"` mode and the in-process tests run on; a
+/// deployed pond node uses `GrpcControlPlane` instead.
 pub struct RegistryControlPlane {
     registry: Registry,
 }

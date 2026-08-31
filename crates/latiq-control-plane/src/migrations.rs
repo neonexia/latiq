@@ -147,6 +147,9 @@ pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE ponds ADD COLUMN lineage BOOLEAN DEFAULT FALSE;",
 ];
 
+/// Apply every migration newer than the recorded version, in order. Runs on
+/// every `Registry::open`, so a fresh registry and an upgraded one converge on
+/// the same schema; the version table is the only state it consults.
 pub fn run_migrations(conn: &Connection) -> Result<(), ControlPlaneError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _latiq_schema_version (version INTEGER NOT NULL);",

@@ -72,7 +72,9 @@ impl PondTier {
         }
     }
 
-    /// Parse a tier name; unknown/empty falls back to the default (`medium`).
+    /// Parse a tier name, case- and whitespace-insensitively. `None` for an
+    /// unknown or empty name — the caller decides whether that is an error or a
+    /// fall back to the default; this never silently picks a tier.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
             "none" | "uncapped" => Some(PondTier::None),

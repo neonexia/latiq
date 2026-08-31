@@ -40,6 +40,9 @@ use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status, Streaming};
 
+/// The deployed `Forwarder`: one op run on a peer node over its Data/Stream
+/// gRPC. Caches a channel per peer endpoint, so a hot pond on another node does
+/// not pay a connection per request.
 #[derive(Default)]
 pub struct GrpcForwarder {
     /// One channel per peer endpoint. tonic channels multiplex concurrent RPCs,

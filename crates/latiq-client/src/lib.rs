@@ -33,6 +33,9 @@ pub struct CallOutcome {
     pub is_error: bool,
 }
 
+/// A connected MCP session, standing in for an agent. Tests drive the agent
+/// surface through this so they exercise the same path a real model does —
+/// nothing shipped may depend on it (invariant 1).
 pub struct LatiqClient {
     service: RunningService<RoleClient, ()>,
 }

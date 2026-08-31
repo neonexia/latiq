@@ -16,6 +16,9 @@
 use latiq_common::{ErrorEnvelope, ErrorKind};
 use latiq_engine::EngineError;
 
+/// The core's one error type: a newtype over [`ErrorEnvelope`], so an error that
+/// crosses a node hop or a surface boundary keeps the kind and guidance it was
+/// created with rather than being re-derived at each layer.
 #[derive(Debug, Clone)]
 pub struct AgentError(ErrorEnvelope);
 

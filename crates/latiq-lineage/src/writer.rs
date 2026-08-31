@@ -78,6 +78,10 @@ struct Buffer {
     overflowing: bool,
 }
 
+/// One pond's lineage writer: buffers events and writes them as batches, per
+/// the durability rules in the module doc. Every failure mode below `record()`
+/// is absorbed here — a full buffer, an unwritable directory, a poisoned lock —
+/// because nothing in this type may ever fail the query that produced the event.
 pub struct LineageWriter {
     /// `None` disables the writer entirely — a rejected directory (see
     /// [`LineageWriter::with_limits`]) must not fall back to *somewhere else*.

@@ -19,6 +19,9 @@ use crate::storage::{PondStorage, StorageError};
 use latiq_common::PondId;
 use tempfile::TempDir;
 
+/// A [`LocalFs`] under a temp dir that is removed when this value drops — so a
+/// test gets real storage behaviour without leaving ponds behind. Keep it alive
+/// for as long as the engine holds the ponds open.
 pub struct TempFs {
     _dir: TempDir, // dropped → removed
     inner: LocalFs,

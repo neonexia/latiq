@@ -26,6 +26,9 @@ use latiq_common::Identity;
 use latiq_engine::{ExplainResult, QueryResult};
 use std::collections::BTreeMap;
 
+/// Runs one op on the node that owns the pond. Every method takes the owner's
+/// endpoint, so the core never holds a connection or a peer identity — the
+/// implementation does.
 #[async_trait::async_trait]
 pub trait Forwarder: Send + Sync {
     async fn read(
