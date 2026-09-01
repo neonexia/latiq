@@ -283,6 +283,9 @@ impl TestIdp {
                 issuer: self.issuer.clone(),
                 jwks_uri: Some(self.jwks_uri.clone()),
             }],
+            // The fixture is on loopback, so the plaintext guard exempts it
+            // already; tests must never need the escape.
+            allow_insecure_jwks: false,
         }
     }
 

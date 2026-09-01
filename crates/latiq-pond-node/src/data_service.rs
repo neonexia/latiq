@@ -61,6 +61,9 @@ impl DataService {
         self
     }
 
+    // See `identity_of` below: the `Err` is tonic's `Status`, whose size we do
+    // not control and whose shape the RPC handler signatures require.
+    #[allow(clippy::result_large_err)]
     async fn identity<T>(
         &self,
         req: &Request<T>,
@@ -126,6 +129,10 @@ pub(crate) fn bearer_of<T>(req: &Request<T>) -> Option<String> {
 /// activity and a partial one of everything else. `op` is the RPC being
 /// attempted; there is no verified identity yet, so the record carries only the
 /// caller's claim.
+// `Err` is `tonic::Status` (~176 bytes), returned verbatim by the RPC handlers
+// that call this. tonic fixes that signature, so the lint's suggestion (box the
+// error) is not available to us; it is a size hint, not a correctness one.
+#[allow(clippy::result_large_err)]
 pub(crate) async fn identity_of<T>(
     verifier: Option<&Arc<Verifier>>,
     challenge: Option<&str>,

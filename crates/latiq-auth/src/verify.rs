@@ -100,6 +100,14 @@ pub struct AuthConfig {
     /// audience names US, not who vouched for the caller.
     pub audience: String,
     pub issuers: Vec<IssuerConfig>,
+    /// Permit a plaintext-http JWKS URI to a NON-loopback host. Off in every
+    /// production path and deliberately unpleasant to name: fetching signing
+    /// keys in the clear hands anyone on-path the ability to mint identities.
+    /// It exists for one case — an IdP container on a private Docker network
+    /// (`deploy/cluster/`'s auth profile: `http://keycloak:8080/...`), which is
+    /// neither loopback nor able to present a certificate. Setting it warns on
+    /// every startup. See `docs/identity.md`.
+    pub allow_insecure_jwks: bool,
 }
 
 /// Turns a token string into a verified [`Identity`], or refuses. Share one per
@@ -167,7 +175,7 @@ impl Verifier {
                 Some(u) if !u.is_empty() => u.to_string(),
                 _ => discover_uri(&name),
             };
-            let uri = checked_jwks_uri(&uri)?;
+            let uri = checked_jwks_uri(&uri, cfg.allow_insecure_jwks)?;
             issuers.push(IssuerConfig {
                 issuer: name.clone(),
                 jwks_uri: Some(uri.clone()),
@@ -176,7 +184,11 @@ impl Verifier {
         }
 
         Ok(Self {
-            cfg: AuthConfig { audience, issuers },
+            cfg: AuthConfig {
+                audience,
+                issuers,
+                allow_insecure_jwks: cfg.allow_insecure_jwks,
+            },
             caches,
         })
     }
@@ -317,7 +329,12 @@ fn unverified_issuer(token: &str) -> Result<String, AuthError> {
 /// Loopback is exempt from the https requirement because tests and
 /// `./dev.sh --auth` legitimately run a fake IdP there, and there is no network
 /// to be on-path of.
-fn checked_jwks_uri(uri: &str) -> Result<String, AuthError> {
+///
+/// `allow_insecure` is [`AuthConfig::allow_insecure_jwks`] — the deliberate,
+/// off-by-default escape for a containerised IdP on a private network, where
+/// the host is neither loopback nor able to present a certificate. It relaxes
+/// THIS ARM ONLY, and warns every time it is used. Never set it in production.
+fn checked_jwks_uri(uri: &str, allow_insecure: bool) -> Result<String, AuthError> {
     // Caught on the RAW string, before parsing: for a special scheme the WHATWG
     // parser silently promotes the first path segment to the authority, so BOTH
     // `https:///jwks` (empty authority) and `https:/jwks` (no `//` at all)
@@ -345,6 +362,17 @@ fn checked_jwks_uri(uri: &str) -> Result<String, AuthError> {
     match parsed.scheme() {
         "https" => {}
         "http" if is_loopback(&parsed) => {}
+        // Loud, unconditional, and every startup: an operator who left this on
+        // by accident must see it in the logs, not discover it after a forged
+        // token. `warn!` rather than `debug!` for exactly that reason.
+        "http" if allow_insecure => tracing::warn!(
+            jwks_uri = %uri,
+            "INSECURE: fetching JWKS signing keys over plaintext http to a non-loopback host \
+             because --auth-allow-insecure-jwks (LATIQ_AUTH_ALLOW_INSECURE_JWKS) is set. Anyone \
+             who can intercept this fetch can substitute their own signing keys and mint any \
+             identity, defeating authentication entirely. This exists for local/test deployments \
+             where the IdP is a container on a private network. NEVER set it in production."
+        ),
         "http" => {
             return Err(AuthError::Invalid(format!(
                 "jwks uri '{uri}' is plaintext http to a non-loopback host: signing keys must be \
@@ -383,7 +411,12 @@ mod tests {
     use super::checked_jwks_uri;
 
     fn allowed(uri: &str) -> bool {
-        checked_jwks_uri(uri).is_ok()
+        checked_jwks_uri(uri, false).is_ok()
+    }
+
+    /// The same call the `--auth-allow-insecure-jwks` escape makes.
+    fn allowed_with_escape(uri: &str) -> bool {
+        checked_jwks_uri(uri, true).is_ok()
     }
 
     #[test]
@@ -445,6 +478,42 @@ mod tests {
         assert!(allowed("http://127.1/jwks"));
         assert!(allowed("http://2130706433/jwks"));
         assert!(allowed("http://[::ffff:127.0.0.1]/jwks"));
+    }
+
+    /// The half that matters: if anyone ever flips the escape's default, this
+    /// fails. `deploy/cluster/`'s auth profile opts in so Keycloak can be reached
+    /// at `http://keycloak:8080` on a private compose network; nothing else does,
+    /// and nothing may make that the default. Asserted on the message, not
+    /// `is_err()`, so it cannot pass because of the empty-host or scheme arm.
+    #[test]
+    fn plaintext_to_a_container_host_is_refused_unless_explicitly_allowed() {
+        let uri = "http://keycloak:8080/realms/latiq/protocol/openid-connect/certs";
+        let e = checked_jwks_uri(uri, false).expect_err("plaintext http off loopback must refuse");
+        assert!(
+            e.to_string()
+                .contains("plaintext http to a non-loopback host"),
+            "refused for the wrong reason: {e}"
+        );
+        assert_eq!(
+            checked_jwks_uri(uri, true).expect("the explicit escape must allow it"),
+            uri,
+            "the escape must return the URI that will actually be fetched"
+        );
+    }
+
+    /// The escape is scoped to the http/non-loopback arm alone. A malformed or
+    /// unsupported URI is still a misconfiguration, not something to wave
+    /// through, and the backslash bypass this guard was written for stays shut.
+    #[test]
+    fn the_escape_relaxes_only_the_plaintext_arm() {
+        assert!(!allowed_with_escape("ftp://idp.example/jwks"));
+        assert!(!allowed_with_escape("https:///jwks"));
+        assert!(!allowed_with_escape("http:/jwks"));
+        assert!(!allowed_with_escape("idp.example/jwks"));
+        // Still https-only in spirit: this one is now permitted, but only
+        // because it IS plaintext-off-loopback -- the host is `evil.com`, which
+        // an operator who set the flag has accepted responsibility for.
+        assert!(allowed_with_escape("http://evil.com\\@127.0.0.1/jwks"));
     }
 
     #[test]

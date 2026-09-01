@@ -401,6 +401,7 @@ async fn forwarding_token_the_owner_rejects_surfaces_as_unauthenticated() {
     let idp_b = latiq_auth::test_support::TestIdp::start_alt().await;
     let both = latiq_auth::AuthConfig {
         audience: "latiq".into(),
+        allow_insecure_jwks: false,
         issuers: vec![
             idp_a.auth_config().issuers[0].clone(),
             idp_b.auth_config().issuers[0].clone(),

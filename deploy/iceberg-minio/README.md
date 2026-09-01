@@ -19,7 +19,7 @@ Endpoints once up:
 
 ## Run the e2e
 
-The iceberg e2e (`crates/latiq/tests/catalogs_iceberg.rs`) is `#[ignore]`d so it
+The iceberg e2e (`mod catalogs_iceberg` in `crates/latiq/tests/admin.rs`) is `#[ignore]`d so it
 never runs in the normal suite. With the harness up:
 
 ```bash
@@ -27,7 +27,8 @@ LATIQ_ICEBERG_ENDPOINT=http://localhost:8181 \
 LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
 LATIQ_S3_ENDPOINT=http://localhost:9000 \
 LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
-cargo test -p latiq --test catalogs_iceberg -- --ignored --nocapture
+cargo test -p latiq --test admin -- --ignored --exact --nocapture \
+  catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond
 ```
 
 It registers the catalog, `describe`s it (finds `demo.widgets`), `pull`s a subset
@@ -35,7 +36,7 @@ into a pond, and verifies the rows landed — the same flow an agent runs over M
 
 In CI this is the opt-in `iceberg` job (commit message contains `[iceberg-ci]`,
 or trigger the workflow manually). The deterministic **DuckLake** catalog e2e
-(`tests/catalogs.rs`) covers the attacher path on every push without Docker.
+(`mod catalogs` in `tests/admin.rs`) covers the attacher path on every push without Docker.
 
 ## Runtime: Docker or Podman
 
@@ -53,7 +54,8 @@ LATIQ_ICEBERG_ENDPOINT=http://localhost:18181 \
 LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
 LATIQ_S3_ENDPOINT=http://localhost:19000 \
 LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
-cargo test -p latiq --test catalogs_iceberg -- --ignored --nocapture
+cargo test -p latiq --test admin -- --ignored --exact --nocapture \
+  catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond
 ```
 
 > Verified green under Podman (`podman compose` + `apache/iceberg-rest-fixture` +

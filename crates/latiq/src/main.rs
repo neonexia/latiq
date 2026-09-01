@@ -234,6 +234,20 @@ struct ServeArgs {
     /// the issuer identifier is not a reachable address.
     #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
     auth_jwks_uri: Option<String>,
+    /// DANGEROUS, TEST/DEV ONLY. Fetch JWKS signing keys over plaintext http
+    /// from a NON-loopback host. Anyone who can intercept that fetch serves
+    /// their own keys and mints any identity, so this defeats authentication
+    /// outright; it warns on every startup. It exists for one case: an IdP
+    /// container on a private network (`deploy/cluster/`'s auth profile reaches
+    /// Keycloak at http://keycloak:8080), which is neither loopback nor able to
+    /// present a certificate. Never set it in production -- use https.
+    #[arg(
+        long,
+        env = "LATIQ_AUTH_ALLOW_INSECURE_JWKS",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    auth_allow_insecure_jwks: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -241,7 +255,10 @@ struct ServeArgs {
 enum NodeCmd {
     /// Start a pond node and register it with the control plane.
     #[cfg(feature = "server")]
-    Add(NodeAddArgs),
+    // Boxed: `NodeAddArgs` carries every server flag and dwarfs the two
+    // metadata variants beside it (clippy::large_enum_variant), so the whole
+    // enum would be sized by the one variant the CLI takes least often.
+    Add(Box<NodeAddArgs>),
     /// List registered pond nodes.
     List,
     /// Describe a registered pond node.
@@ -300,6 +317,20 @@ struct NodeAddArgs {
     /// the issuer identifier is not a reachable address.
     #[arg(long, env = "LATIQ_AUTH_JWKS_URI")]
     auth_jwks_uri: Option<String>,
+    /// DANGEROUS, TEST/DEV ONLY. Fetch JWKS signing keys over plaintext http
+    /// from a NON-loopback host. Anyone who can intercept that fetch serves
+    /// their own keys and mints any identity, so this defeats authentication
+    /// outright; it warns on every startup. It exists for one case: an IdP
+    /// container on a private network (`deploy/cluster/`'s auth profile reaches
+    /// Keycloak at http://keycloak:8080), which is neither loopback nor able to
+    /// present a certificate. Never set it in production -- use https.
+    #[arg(
+        long,
+        env = "LATIQ_AUTH_ALLOW_INSECURE_JWKS",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    auth_allow_insecure_jwks: Option<String>,
     /// An OpenLineage-compatible receiver to ALSO post lineage events to, e.g.
     /// http://marquez:5000/api/v1/lineage. The FULL endpoint, not a base URL.
     /// Additive and off by default: ponds allocated with lineage always write
@@ -414,7 +445,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "server")]
         Command::Serve(a) => run_serve(a).await,
         #[cfg(feature = "server")]
-        Command::Node(NodeCmd::Add(a)) => run_node_add(a).await,
+        Command::Node(NodeCmd::Add(a)) => run_node_add(*a).await,
         Command::Node(NodeCmd::List) => node_list().await,
         Command::Node(NodeCmd::Describe { node_id }) => node_describe(node_id).await,
         Command::Pond(cmd) => run_pond_cmd(cmd).await,
@@ -830,6 +861,29 @@ fn non_blank(v: Option<String>) -> Option<String> {
     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Parse an opt-in-to-something-unsafe flag. Bare `--flag` yields "true" via
+/// `default_missing_value`; an env var may also arrive empty (compose passes
+/// every variable through), which `non_blank` reads as "not set" -- an empty
+/// LATIQ_AUTH_ALLOW_INSECURE_JWKS must mean OFF, not on. Anything that is
+/// neither true nor false is an error rather than a silent `false`: the one
+/// outcome worse than refusing to start is starting with a security control the
+/// operator believes is in a state it is not.
+#[cfg(feature = "server")]
+fn dangerous_flag(v: Option<String>, name: &str) -> Result<bool> {
+    match non_blank(v)
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        None | Some("false") | Some("0") | Some("no") => Ok(false),
+        Some("true") | Some("1") | Some("yes") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "{name} is set to '{other}', which is neither true nor false. Leave it unset (the \
+             safe default) or set it to true."
+        )),
+    }
+}
+
 /// Build the auth config the server surfaces verify against, from the three
 /// `--auth-*` flags. `None` = the relaxed (claimed-identity) path this binary
 /// has always taken; there is no partial state in between.
@@ -843,6 +897,7 @@ fn auth_config(
     issuers: Vec<String>,
     audience: Option<String>,
     jwks_uri: Option<String>,
+    allow_insecure_jwks: Option<String>,
 ) -> Result<Option<latiq_auth::AuthConfig>> {
     let issuers: Vec<String> = issuers
         .into_iter()
@@ -869,6 +924,10 @@ fn auth_config(
     }
     Ok(Some(latiq_auth::AuthConfig {
         audience,
+        allow_insecure_jwks: dangerous_flag(
+            allow_insecure_jwks,
+            "--auth-allow-insecure-jwks / LATIQ_AUTH_ALLOW_INSECURE_JWKS",
+        )?,
         issuers: issuers
             .into_iter()
             .map(|issuer| latiq_auth::IssuerConfig {
@@ -885,7 +944,12 @@ async fn run_serve(a: ServeArgs) -> Result<()> {
     init_tracing();
     // Resolved BEFORE anything binds: an incoherent auth config must stop the
     // process, never quietly downgrade it to unauthenticated.
-    let auth = auth_config(a.auth_issuer, a.auth_audience, a.auth_jwks_uri)?;
+    let auth = auth_config(
+        a.auth_issuer,
+        a.auth_audience,
+        a.auth_jwks_uri,
+        a.auth_allow_insecure_jwks,
+    )?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -923,7 +987,12 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
     // Resolved BEFORE the node registers or serves, for the same reason as
     // `run_serve`: a node that comes up with a half-configured verifier is a
     // node accepting unauthenticated callers.
-    let auth = auth_config(a.auth_issuer, a.auth_audience, a.auth_jwks_uri)?;
+    let auth = auth_config(
+        a.auth_issuer,
+        a.auth_audience,
+        a.auth_jwks_uri,
+        a.auth_allow_insecure_jwks,
+    )?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -1702,24 +1771,26 @@ mod tests {
     #[test]
     fn auth_config_is_absent_when_no_issuer_is_set() {
         // The default path: no flags, no env → no verifier anywhere.
-        assert!(auth_config(vec![], None, None).unwrap().is_none());
+        assert!(auth_config(vec![], None, None, None).unwrap().is_none());
         // An EMPTY issuer env var is the same as an unset one.
-        assert!(auth_config(vec![String::new()], None, None)
+        assert!(auth_config(vec![String::new()], None, None, None)
             .unwrap()
             .is_none());
-        assert!(auth_config(vec!["  ".into()], Some("latiq".into()), None)
-            .unwrap()
-            .is_none());
+        assert!(
+            auth_config(vec!["  ".into()], Some("latiq".into()), None, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(feature = "server")]
     #[test]
     fn auth_config_requires_an_audience_with_an_issuer() {
-        let e = auth_config(vec!["https://idp".into()], None, None)
+        let e = auth_config(vec!["https://idp".into()], None, None, None)
             .expect_err("an issuer without an audience must fail fast");
         assert!(e.to_string().contains("--auth-audience"), "got {e}");
         // A blank audience is an absent one.
-        assert!(auth_config(vec!["https://idp".into()], Some("  ".into()), None).is_err());
+        assert!(auth_config(vec!["https://idp".into()], Some("  ".into()), None, None).is_err());
     }
 
     #[cfg(feature = "server")]
@@ -1729,6 +1800,7 @@ mod tests {
             vec!["https://a".into(), "https://b".into()],
             Some("latiq".into()),
             Some("https://a/jwks".into()),
+            None,
         )
         .expect_err("an ambiguous jwks uri must fail fast");
         assert!(e.to_string().contains("--auth-jwks-uri"), "got {e}");
@@ -1740,6 +1812,7 @@ mod tests {
         let cfg = auth_config(
             vec!["https://a".into(), " https://b ".into(), String::new()],
             Some(" latiq ".into()),
+            None,
             None,
         )
         .unwrap()
@@ -1757,10 +1830,53 @@ mod tests {
             vec!["https://a".into()],
             Some("latiq".into()),
             Some("https://a/keys".into()),
+            None,
         )
         .unwrap()
         .expect("issuers configured");
         assert_eq!(cfg.issuers[0].jwks_uri.as_deref(), Some("https://a/keys"));
+    }
+
+    /// The plaintext-JWKS escape is OFF unless someone asks for it in words, and
+    /// an empty env var (compose passes every variable through) is not asking.
+    /// Only `deploy/cluster/`'s auth profile sets it; if this ever defaults to
+    /// true, every deployment silently accepts MITM'd signing keys.
+    #[cfg(feature = "server")]
+    #[test]
+    fn auth_config_keeps_the_insecure_jwks_escape_off_unless_asked() {
+        let built = |allow: Option<&str>| {
+            auth_config(
+                vec!["https://a".into()],
+                Some("latiq".into()),
+                None,
+                allow.map(str::to_string),
+            )
+        };
+        for off in [None, Some(""), Some("   "), Some("false"), Some("FALSE")] {
+            assert!(
+                !built(off)
+                    .unwrap()
+                    .expect("issuers configured")
+                    .allow_insecure_jwks,
+                "the escape must stay off for {off:?}"
+            );
+        }
+        for on in [Some("true"), Some("TRUE"), Some(" true ")] {
+            assert!(
+                built(on)
+                    .unwrap()
+                    .expect("issuers configured")
+                    .allow_insecure_jwks,
+                "an explicit {on:?} must turn the escape on"
+            );
+        }
+        // Neither true nor false: refuse to start rather than pick a state the
+        // operator did not choose.
+        let e = built(Some("maybe")).expect_err("a non-boolean value must fail fast");
+        assert!(
+            e.to_string().contains("--auth-allow-insecure-jwks"),
+            "got {e}"
+        );
     }
 
     #[test]
