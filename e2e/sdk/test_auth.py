@@ -131,11 +131,18 @@ def db(token):
 
 @pytest.fixture(scope="session")
 def anon_db():
-    """The same client with no token at all. `token=None` still falls back to
-    $LATIQ_TOKEN, which the auth runners never set — assert that so a stray env
-    var can't quietly turn the negative tests into passes."""
-    assert not os.environ.get("LATIQ_TOKEN"), "$LATIQ_TOKEN must be unset here"
-    return latiq.connect(server=SERVER, query_gateway=GATEWAY)
+    """The same client with no token at all.
+
+    `token=""` — NOT `token=None`, and not an assertion about the environment.
+    `None` falls back to `$LATIQ_TOKEN`, so a stray env var would quietly turn
+    these negative tests into passes; a blank token means "no token" in the SDK
+    (`latiq-sdk`'s `connect_with_token` trims and drops empties, precisely so an
+    empty `Authorization: Bearer ` is never sent) and never consults the
+    environment. This used to assert `$LATIQ_TOKEN` was unset, which was correct
+    but contradicted `./dev.sh --auth`, whose banner tells you to export exactly
+    that variable — following both documented workflows failed at fixture setup.
+    Asking for no token is stronger than asserting nobody set one."""
+    return latiq.connect(server=SERVER, query_gateway=GATEWAY, token="")
 
 
 def _refused(exc: Exception) -> None:

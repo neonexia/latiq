@@ -146,6 +146,20 @@ impl Pond<'_> {
     }
 }
 
+/// The bearer token a client presents: an explicit value wins outright — a
+/// BLANK one included, which means "explicitly no token" and must NOT fall back
+/// to `$LATIQ_TOKEN`. `e2e/sdk/test_auth.py`'s `anon_db` builds its deliberately
+/// anonymous client that way, and an env fallback there would silently turn the
+/// negative auth tests green. Blank resolves to `None` in either direction: an
+/// empty `Authorization: Bearer ` is rejected as malformed rather than absent.
+fn resolve_token(explicit: Option<&str>, from_env: Option<String>) -> Option<String> {
+    explicit
+        .map(str::to_string)
+        .or(from_env)
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+}
+
 impl Latiq {
     /// Connect. `server == "local"` starts an in-process cluster backed by `root`
     /// (default `~/.latiq/local`); any other value is a remote control-plane URL.
@@ -177,11 +191,7 @@ impl Latiq {
         query_gateway: Option<&str>,
         token: Option<&str>,
     ) -> Result<Self> {
-        let token = token
-            .map(str::to_string)
-            .or_else(|| std::env::var("LATIQ_TOKEN").ok())
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
+        let token = resolve_token(token, std::env::var("LATIQ_TOKEN").ok());
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -821,6 +831,57 @@ fn lazy_channel(endpoint: &str) -> Result<Channel> {
     Ok(Channel::from_shared(endpoint.to_string())
         .with_context(|| format!("invalid endpoint {endpoint}"))?
         .connect_lazy())
+}
+
+/// The token-resolution rules, pinned where they are pure (no server, no env
+/// mutation, so no cross-test races): `resolve_token` takes the environment's
+/// value as an argument precisely so this can be a unit test.
+#[cfg(test)]
+mod token_resolution {
+    use super::resolve_token;
+
+    #[test]
+    fn an_explicit_token_wins_over_the_environment() {
+        assert_eq!(
+            resolve_token(Some("explicit"), Some("from-env".into())),
+            Some("explicit".to_string())
+        );
+    }
+
+    #[test]
+    fn no_explicit_token_falls_back_to_the_environment() {
+        assert_eq!(
+            resolve_token(None, Some("from-env".into())),
+            Some("from-env".to_string())
+        );
+        assert_eq!(resolve_token(None, None), None);
+    }
+
+    #[test]
+    fn a_blank_explicit_token_means_anonymous_and_ignores_the_environment() {
+        // The property `e2e/sdk/test_auth.py`'s `anon_db` relies on: asking for
+        // no token must produce no token even when `$LATIQ_TOKEN` holds a valid
+        // one, or every negative auth test would pass while authenticated.
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                resolve_token(Some(blank), Some("a-valid-token".into())),
+                None,
+                "an explicitly blank token ({blank:?}) must not fall back to $LATIQ_TOKEN"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blank_environment_token_is_no_token_rather_than_an_empty_bearer() {
+        // `LATIQ_TOKEN=` in a compose file or a `.env` is "unset", not a header.
+        assert_eq!(resolve_token(None, Some("".into())), None);
+        assert_eq!(resolve_token(None, Some("  ".into())), None);
+        // …and a real one is trimmed, not passed through with its whitespace.
+        assert_eq!(
+            resolve_token(None, Some(" tok \n".into())),
+            Some("tok".to_string())
+        );
+    }
 }
 
 /// Structural guards on how this file builds gRPC clients.
