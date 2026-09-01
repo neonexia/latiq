@@ -2062,4 +2062,65 @@ mod tests {
             "INSERT INTO t VALUES (?)"
         );
     }
+
+    /// `tier_limits` is the seam between a pond's **persisted tier name** and
+    /// the caps the engine applies, and it is assigned at six call sites. It had
+    /// no test: a regression collapsing every tier to `medium` would have been
+    /// invisible, because the two tests that read `threads` back out of DuckDB
+    /// build their `ResourceLimits` by hand and never go through this mapping.
+    #[test]
+    fn tier_limits_maps_every_persisted_tier_name_to_its_caps() {
+        let ladder = [
+            PondTier::None,
+            PondTier::XSmall,
+            PondTier::Small,
+            PondTier::Medium,
+            PondTier::Large,
+            PondTier::XLarge,
+        ];
+        for t in ladder {
+            assert_eq!(
+                tier_limits(t.as_str()),
+                t.limits(),
+                "`{}` must resolve to its own caps, not another tier's",
+                t.as_str()
+            );
+        }
+        // Anti-vacuity: the loop above passes trivially if every tier resolved
+        // to the same thing, so pin that the tiers really are distinct — this is
+        // the "everything fell back to medium" regression.
+        let distinct: std::collections::BTreeSet<_> = ladder
+            .iter()
+            .map(|t| tier_limits(t.as_str()).map(|l| (l.memory_bytes, l.cores)))
+            .collect();
+        assert_eq!(distinct.len(), ladder.len(), "tiers collapsed onto each other");
+
+        // The uncapped tier is the one that must map to "apply nothing" — a
+        // fallback to `medium` here would silently re-cap an operator-granted
+        // uncapped pond.
+        assert_eq!(tier_limits("none"), None);
+        assert_eq!(tier_limits("uncapped"), None, "the documented alias too");
+
+        // Unknown / empty / whitespace fall back to medium, which is documented
+        // behaviour: a pond whose tier string we cannot read stays capped rather
+        // than becoming uncapped.
+        let medium = PondTier::Medium.limits();
+        assert!(medium.is_some(), "medium must cap, or the fallback is moot");
+        for unknown in ["", "   ", "huge", "unlimited", "MEDIUM-ish"] {
+            assert_eq!(
+                tier_limits(unknown),
+                medium,
+                "`{unknown}` must fall back to medium, never to uncapped"
+            );
+        }
+        // Case and padding are the real shapes a persisted/CLI-supplied name
+        // takes, and they must reach the tier, not the fallback.
+        assert_eq!(tier_limits(" X-LARGE "), PondTier::XLarge.limits());
+        assert_ne!(
+            tier_limits(" X-LARGE "),
+            medium,
+            "a recognised tier must not resolve to the fallback"
+        );
+    }
+
 }
