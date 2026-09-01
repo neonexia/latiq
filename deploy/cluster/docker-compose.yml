@@ -46,6 +46,9 @@ services:
       # in this topology, so that is what the node publishes as its RFC 9728
       # `resource` and points its 401 challenge at. A property of the topology,
       # not of auth mode -- hence a plain value, set whether or not auth is on.
+      # It is ALSO the MCP `Host` allow-list (rmcp's DNS-rebinding guard is
+      # loopback-only by default): unset or wrong here and every JSON-RPC POST
+      # through the gateway is a 403, while discovery keeps answering.
       LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
@@ -75,6 +78,9 @@ services:
       # in this topology, so that is what the node publishes as its RFC 9728
       # `resource` and points its 401 challenge at. A property of the topology,
       # not of auth mode -- hence a plain value, set whether or not auth is on.
+      # It is ALSO the MCP `Host` allow-list (rmcp's DNS-rebinding guard is
+      # loopback-only by default): unset or wrong here and every JSON-RPC POST
+      # through the gateway is a 403, while discovery keeps answering.
       LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
@@ -107,6 +113,9 @@ services:
       # in this topology, so that is what the node publishes as its RFC 9728
       # `resource` and points its 401 challenge at. A property of the topology,
       # not of auth mode -- hence a plain value, set whether or not auth is on.
+      # It is ALSO the MCP `Host` allow-list (rmcp's DNS-rebinding guard is
+      # loopback-only by default): unset or wrong here and every JSON-RPC POST
+      # through the gateway is a 403, while discovery keeps answering.
       LATIQ_PUBLIC_MCP_URL: http://gateway:51510/mcp
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}

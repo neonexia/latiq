@@ -365,6 +365,53 @@ pub fn resolve_public_mcp_url(
         .unwrap_or_else(|| format!("http://{mcp_addr}/mcp")))
 }
 
+/// The `Host` authorities rmcp's Streamable-HTTP transport will accept.
+///
+/// rmcp defends against DNS rebinding by rejecting any request whose `Host` is
+/// not loopback (`403 Forbidden: Host header is not allowed`). That default is
+/// right for an MCP server an agent runs on its own laptop and WRONG for every
+/// deployment we ship: agents reach Latiq through the gateway, so the `Host`
+/// they send is the gateway's (`gateway:51510`, `latiq.example.com`) and every
+/// JSON-RPC POST is refused — while RFC 9728 discovery and the 401 challenge,
+/// served by our own axum routes rather than by rmcp, keep working. The failure
+/// therefore *looks* like an auth problem and is not one.
+///
+/// So keep rmcp's loopback defaults AND add the one name we already know agents
+/// dial: the host of the public MCP URL (`--public-mcp-url` /
+/// `$LATIQ_PUBLIC_MCP_URL`, see `resolve_public_mcp_url`). The guard stays on —
+/// it just learns the deployment's real front door.
+///
+/// **The host only, never `host:port`.** A port-qualified entry matches only
+/// that exact port in rmcp, and proxies routinely rewrite the port out of the
+/// `Host` they forward — nginx's `$host` is documented as the name *without*
+/// the port, so our own gateway sends `Host: gateway` for a front door on
+/// `:51510`. A port would also buy nothing: an attacker who can reach this
+/// socket at all has already matched the port, and the whole defense is against
+/// an unrecognized *name*.
+pub fn mcp_allowed_hosts(public_url: Option<&str>) -> Vec<String> {
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if let Some(host) = public_url.and_then(public_url_host) {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+/// The bare host of a public MCP URL. `None` when the URL is not absolute or
+/// carries no host — `resolve_public_mcp_url` already rejects those at startup,
+/// so reaching here means the loopback defaults are all we can honestly allow.
+fn public_url_host(public_url: &str) -> Option<String> {
+    let url = url::Url::parse(public_url).ok()?;
+    // `host_str` brackets an IPv6 literal (`[::1]`); rmcp strips the brackets
+    // on both sides of the comparison, so either form matches.
+    url.host_str().map(str::to_string)
+}
+
 /// The RFC 9728 document URL for a resource identifier — the well-known path on
 /// the resource's own origin. Derived so the document a challenge points at and
 /// the document we serve can never disagree; a gateway that rewrites paths
@@ -910,10 +957,15 @@ pub async fn serve_mcp_with_listener(
     public_url: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mcp_verifier = verifier.clone();
+    // rmcp's DNS-rebinding guard defaults to loopback-only, which rejects every
+    // POST that arrives through the gateway. Teach it the URL agents dial.
+    // (`StreamableHttpServerConfig` is `#[non_exhaustive]` — builder, not literal.)
+    let config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(mcp_allowed_hosts(public_url.as_deref()));
     let service = StreamableHttpService::new(
         move || Ok(LatiqServer::new(ops.clone()).with_verifier(mcp_verifier.clone())),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        config,
     );
     let mut router = axum::Router::new().nest_service("/mcp", service);
 
@@ -965,7 +1017,40 @@ pub async fn serve_mcp_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{advertised_mcp_url, protected_resource_metadata_url, resolve_public_mcp_url};
+    use super::{
+        advertised_mcp_url, mcp_allowed_hosts, protected_resource_metadata_url,
+        resolve_public_mcp_url,
+    };
+
+    #[test]
+    fn allowed_hosts_keep_loopback_and_add_the_public_host() {
+        // The gateway case, and the whole reason this exists: agents dial
+        // `gateway`, and rmcp's loopback-only default 403s it.
+        //
+        // The port is deliberately NOT carried over: rmcp matches a
+        // port-qualified entry only against that exact port, and nginx's `$host`
+        // forwards the name without one — so `gateway:51510` here would still
+        // reject the very request this fix exists for.
+        assert_eq!(
+            mcp_allowed_hosts(Some("http://gateway:51510/mcp")),
+            vec!["localhost", "127.0.0.1", "::1", "gateway"]
+        );
+        assert_eq!(
+            mcp_allowed_hosts(Some("https://latiq.example.com/mcp")),
+            vec!["localhost", "127.0.0.1", "::1", "latiq.example.com"]
+        );
+    }
+
+    #[test]
+    fn allowed_hosts_are_loopback_only_without_a_usable_public_url() {
+        // Nothing to widen the guard with => it must stay closed, not open.
+        let loopback = vec!["localhost", "127.0.0.1", "::1"];
+        assert_eq!(mcp_allowed_hosts(None), loopback);
+        assert_eq!(mcp_allowed_hosts(Some("not a url")), loopback);
+        assert_eq!(mcp_allowed_hosts(Some("/mcp")), loopback);
+        // Already covered by the defaults — don't list it twice.
+        assert_eq!(mcp_allowed_hosts(Some("http://localhost/mcp")), loopback);
+    }
 
     #[test]
     fn advertised_url_takes_the_host_from_the_advertise_endpoint() {

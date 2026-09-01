@@ -17,7 +17,15 @@ Control plane + pond nodes behind an **nginx gateway** — the single front door
 - **MCP HTTP → `:51510`** — **must be sticky** (`ip_hash` in `nginx.conf`): MCP
   Streamable-HTTP sessions are **node-local** (rmcp's in-memory session manager),
   so a round-robined request lands on a node without the session → `session not
-  found`. Cross-node pond ops still forward.
+  found`. Cross-node pond ops still forward. It also **must** carry the client's
+  `Host` through (`proxy_set_header Host $host`) and that host **must** match
+  `LATIQ_PUBLIC_MCP_URL` on every node: rmcp's DNS-rebinding guard is
+  loopback-only by default, and the node widens it to that URL's host — bare,
+  since `$host` drops the port and rmcp matches a port-qualified entry only
+  against that exact port. A mismatch is `403 Forbidden: Host header is not
+  allowed` on every JSON-RPC POST while discovery still answers, so it reads as
+  an auth failure and is not one. Found by the auth e2e, whose runners dial
+  `gateway:51510` from inside the network rather than `localhost`.
 - Control + Admin gRPC → control plane `:51400` (node-less).
 
 **Two composes, on purpose.**
