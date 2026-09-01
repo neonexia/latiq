@@ -135,10 +135,21 @@ jobs:
           pip install dist/*.whl -r e2e/sdk/requirements.txt
       # The `pip install latiq` + connect("local") path: a real single-node Latiq
       # in-process, no cluster. Multi-node tests self-skip. (No LATIQ_GATEWAY.)
+      # The wheel's own test suite (sdk/python/tests) — the Python API surface,
+      # incl. the `lineage` allocation flag nothing else in CI covers. The wheel
+      # is pip-installed into .e2e (not an editable/source install), so this runs
+      # against the built artifact. Here it gates BEFORE publishing; the
+      # post-publish jobs re-run it against the wheel PyPI actually served.
+      - name: The wheel's own test suite (against the installed wheel)
+        run: |
+          . .e2e/bin/activate
+          pytest sdk/python/tests -v
+      # `--latiq-mode` makes the run assert what it was supposed to prove: without
+      # it a suite where every test skipped would still exit 0 (see conftest.py).
       - name: SDK e2e (EMBEDDED — the pip-install standalone path)
         run: |
           . .e2e/bin/activate
-          pytest e2e/sdk -v
+          pytest e2e/sdk -v --latiq-mode=embedded
       - name: Install the agent harness deps
         run: npm ci --prefix e2e/agent
       - name: Bring up the 3-node cluster + gateway
@@ -168,9 +179,11 @@ jobs:
         env:
           LATIQ_CONTROL: http://localhost:51400
           LATIQ_GATEWAY: http://localhost:51500
+        # `remote` additionally REQUIRES the multi-node placement/forwarding test
+        # to have run — the reason this job builds a cluster (see conftest.py).
         run: |
           . .e2e/bin/activate
-          pytest e2e/sdk -v
+          pytest e2e/sdk -v --latiq-mode=remote
       # 2) Agent (MCP) — every tool + resources + prompts, through the MCP gateway.
       - name: Agent harness (Vercel AI SDK MCP, against the gateway)
         env:

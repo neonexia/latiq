@@ -178,8 +178,17 @@ jobs:
             echo "waiting for PyPI to serve ${v} (attempt $i)"; sleep 15
           done
           python -m pip install -r e2e/sdk/requirements.txt
+      # The wheel's OWN test suite (sdk/python/tests) — the Python API a user
+      # calls, including the `lineage` allocation flag, which nothing else in CI
+      # covers. It imports only `latiq` + pyarrow, so run from the repo root it
+      # exercises the INSTALLED (published) wheel, not a source tree. pytest exits
+      # 5 when it collects nothing, so a moved/renamed suite fails here.
+      - name: The wheel's own test suite (against the published wheel)
+        run: pytest sdk/python/tests -v
+      # `--latiq-mode` makes the run assert what it was supposed to prove: without
+      # it a suite where every test skipped would still exit 0 (see conftest.py).
       - name: Embedded smoke against the installed wheel
-        run: pytest e2e/sdk -v
+        run: pytest e2e/sdk -v --latiq-mode=embedded
 
   # Prove the REAL external-user path against the JUST-PUBLISHED artifacts — no
   # repo build. `deploy/docker-compose.yml` IS the file users curl (deploy/ is the
@@ -242,7 +251,9 @@ jobs:
         env:
           LATIQ_CONTROL: http://localhost:51400
           LATIQ_GATEWAY: http://localhost:51500
-        run: pytest e2e/sdk -v
+        # `remote` additionally REQUIRES the multi-node placement/forwarding test
+        # to have run — the reason a cluster was started at all (see conftest.py).
+        run: pytest e2e/sdk -v --latiq-mode=remote
       - name: Agent harness (MCP) against the deployed cluster
         env:
           LATIQ_MCP: http://localhost:51510/mcp
