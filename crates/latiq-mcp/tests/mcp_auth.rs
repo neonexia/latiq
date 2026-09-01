@@ -182,6 +182,88 @@ async fn auth_metadata_falls_back_to_the_bound_address_when_nothing_is_advertise
 }
 
 // ---------------------------------------------------------------------------
+// rmcp's DNS-rebinding guard, over the wire. Loopback-only by default, so every
+// deployment where agents dial a gateway (all of ours) 403s on the first POST
+// while discovery still answers — the failure reads as an auth problem and is
+// not one. These pin that the guard is widened to exactly the advertised front
+// door, and to nothing else.
+// ---------------------------------------------------------------------------
+
+/// Serve MCP with no auth on loopback, advertising `public_url`.
+async fn serve_open(public_url: Option<&str>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let public = public_url.map(String::from);
+    tokio::spawn(async move {
+        serve_mcp_with_listener(listener, build_ops(), None, public)
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if reqwest::get(format!("{base}/mcp")).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    base
+}
+
+/// An MCP `initialize` POST carrying an explicit `Host`, as a client dialling
+/// that name through a gateway would send.
+async fn initialize_with_host(base: &str, host: &str) -> (u16, String) {
+    let res = reqwest::Client::new()
+        .post(format!("{base}/mcp"))
+        .header(reqwest::header::HOST, host)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    (status, res.text().await.unwrap_or_default())
+}
+
+#[tokio::test]
+async fn auth_host_guard_accepts_the_advertised_gateway_host() {
+    // The exact shape of the containerised auth e2e: the node binds loopback,
+    // agents dial `http://gateway:51510/mcp`, and nginx passes that `Host`
+    // through. Without the public URL in the allow-list this is a 403
+    // "Forbidden: Host header is not allowed" on every JSON-RPC POST.
+    let base = serve_open(Some("http://gateway:51510/mcp")).await;
+    let (status, body) = initialize_with_host(&base, "gateway:51510").await;
+    assert_eq!(
+        status, 200,
+        "the advertised front door must be served, not rebuffed: {body}"
+    );
+    // What nginx ACTUALLY forwards: `proxy_set_header Host $host` is documented
+    // as the name WITHOUT the port, so the node sees `gateway`. Pinning only the
+    // `host:port` form above would leave the real deployment broken.
+    let (status, body) = initialize_with_host(&base, "gateway").await;
+    assert_eq!(
+        status, 200,
+        "the port-stripped Host a proxy forwards must be served too: {body}"
+    );
+}
+
+#[tokio::test]
+async fn auth_host_guard_still_rejects_an_unadvertised_host() {
+    // The guard is widened, never removed: a Host we never advertised is still
+    // a possible DNS-rebinding attempt and must stay a 403.
+    let base = serve_open(Some("http://gateway:51510/mcp")).await;
+    let (status, body) = initialize_with_host(&base, "evil.example.com").await;
+    assert_eq!(status, 403, "an unadvertised Host must be refused: {body}");
+    // A name that merely CONTAINS the advertised one is a different name.
+    let (status, body) = initialize_with_host(&base, "gateway.evil.com").await;
+    assert_eq!(
+        status, 403,
+        "a lookalike Host must not match by substring: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The full agent loop: a real Latiq MCP server driven by the real latiq-client,
 // across the network boundary.
 // ---------------------------------------------------------------------------
