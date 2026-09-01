@@ -155,6 +155,28 @@ pub struct QueryMeta {
     pub warnings: Vec<Warning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// The node that ACTUALLY EXECUTED this statement — its **advertised
+    /// internal endpoint**, the same string the registry stores as the pond's
+    /// `node_endpoint` and that a peer dials to forward. Not the node that
+    /// received the request: a request that landed on a non-owner is forwarded,
+    /// and this then names the OWNER, so the difference between the two is
+    /// visible to the caller and provable in a test.
+    ///
+    /// The endpoint rather than the node id because it is the value an operator
+    /// debugging a cluster can act on (dial it, grep its logs, match it against
+    /// `pond describe`), and because it is the only node identifier that already
+    /// crosses the registry — a node id would have to be plumbed there first.
+    ///
+    /// `"in-process"` on a node with no advertised endpoint (single-node,
+    /// embedded SDK), matching the lineage emitter's `nodeId` for the same
+    /// situation: a constant rather than an empty string, so "one node, nothing
+    /// to forward to" never reads as "we forgot to record it".
+    ///
+    /// Empty (and omitted from the wire) only where nothing executed anything —
+    /// a default-constructed meta. A forwarding node must never overwrite the
+    /// value it relayed with its own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub served_by: String,
 }
 
 impl QueryMeta {
@@ -238,6 +260,25 @@ mod tests {
         assert_eq!(v["rows"], 10);
         assert!(v.get("snapshot_id").is_none());
         assert!(v.get("warnings").is_none(), "empty warnings omitted");
+        assert!(
+            v.get("served_by").is_none(),
+            "an unset served_by is omitted, never an empty string on the wire"
+        );
+    }
+
+    #[test]
+    fn served_by_round_trips_verbatim() {
+        // The value a forwarding node relays must arrive byte-identical: it is
+        // the owner's endpoint, and a client (or a test) compares it for
+        // equality against what the registry reports as the pond's owner.
+        let m = QueryMeta {
+            served_by: "http://127.0.0.1:9092".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["served_by"], "http://127.0.0.1:9092");
+        let back: QueryMeta = serde_json::from_value(v).unwrap();
+        assert_eq!(back.served_by, "http://127.0.0.1:9092");
     }
 
     #[test]

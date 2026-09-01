@@ -119,7 +119,17 @@ async fn encode_to_chunks(read: ArrowReadStream, tx: mpsc::Sender<Result<ArrowCh
     };
     // try_new already wrote the schema message into the buffer.
     let schema_bytes = std::mem::take(writer.get_mut());
-    if tx.send(Ok(ArrowChunk { ipc: schema_bytes })).await.is_err() {
+    // Who is serving this read rides the FIRST chunk, beside the schema: a
+    // forwarding peer resolves its stream as soon as the schema is known, so a
+    // name delivered any later would arrive after it had already answered.
+    if tx
+        .send(Ok(ArrowChunk {
+            ipc: schema_bytes,
+            served_by: read.served_by.clone(),
+        }))
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -132,7 +142,17 @@ async fn encode_to_chunks(read: ArrowReadStream, tx: mpsc::Sender<Result<ArrowCh
                     return;
                 }
                 let chunk = std::mem::take(writer.get_mut());
-                if tx.send(Ok(ArrowChunk { ipc: chunk })).await.is_err() {
+                // `served_by` only on the first chunk (above): repeating it on
+                // every batch would put a node name on the wire per batch for a
+                // fact that cannot change mid-stream.
+                if tx
+                    .send(Ok(ArrowChunk {
+                        ipc: chunk,
+                        served_by: String::new(),
+                    }))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -145,7 +165,12 @@ async fn encode_to_chunks(read: ArrowReadStream, tx: mpsc::Sender<Result<ArrowCh
     if writer.finish().is_ok() {
         let tail = std::mem::take(writer.get_mut());
         if !tail.is_empty() {
-            let _ = tx.send(Ok(ArrowChunk { ipc: tail })).await;
+            let _ = tx
+                .send(Ok(ArrowChunk {
+                    ipc: tail,
+                    served_by: String::new(),
+                }))
+                .await;
         }
     }
 }

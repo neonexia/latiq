@@ -140,14 +140,26 @@ fn parse_json(json: &str) -> Result<serde_json::Value, AgentError> {
         .map_err(|e| AgentError::internal(format!("forward decode json: {e}")))
 }
 
-/// Deliver the schema on the oneshot the first time the decoder knows it.
+/// What resolves before a forwarded read can be handed back: the peer's schema
+/// and the name of the node the peer says is actually serving it.
+struct Served {
+    schema: SchemaRef,
+    served_by: String,
+}
+
+/// Deliver the schema on the oneshot the first time the decoder knows it, with
+/// whoever the peer said is serving the read.
 fn deliver_schema(
-    schema_tx: &mut Option<oneshot::Sender<Result<SchemaRef, AgentError>>>,
+    schema_tx: &mut Option<oneshot::Sender<Result<Served, AgentError>>>,
     decoder: &StreamDecoder,
+    served_by: &str,
 ) {
     if schema_tx.is_some() {
         if let Some(sc) = decoder.schema() {
-            let _ = schema_tx.take().unwrap().send(Ok(sc));
+            let _ = schema_tx.take().unwrap().send(Ok(Served {
+                schema: sc,
+                served_by: served_by.to_string(),
+            }));
         }
     }
 }
@@ -156,21 +168,32 @@ fn deliver_schema(
 /// background task pushes chunk bytes through a `StreamDecoder`, delivering the
 /// schema (once known) on a oneshot and batches on a bounded channel. Per-batch,
 /// nothing is fully buffered.
+///
+/// The peer's `served_by` rides the same oneshot as the schema, because the
+/// caller needs both at the same moment — when it builds the stream it hands
+/// back — and the peer puts both on its first chunk.
 fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamParts {
-    let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
+    let (schema_tx, schema_rx) = oneshot::channel::<Result<Served, AgentError>>();
     let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
 
     tokio::spawn(async move {
         let mut decoder = StreamDecoder::new();
         let mut schema_tx = Some(schema_tx);
+        // Whatever the peer last told us about who is serving this read. Only
+        // the first chunk carries it, and it is recorded before the schema is
+        // delivered from that same chunk.
+        let mut served_by = String::new();
         loop {
             match streaming.message().await {
                 Ok(Some(chunk)) => {
+                    if !chunk.served_by.is_empty() {
+                        served_by = chunk.served_by;
+                    }
                     let mut buf = Buffer::from_vec(chunk.ipc);
                     loop {
                         match decoder.decode(&mut buf) {
                             Ok(Some(batch)) => {
-                                deliver_schema(&mut schema_tx, &decoder);
+                                deliver_schema(&mut schema_tx, &decoder, &served_by);
                                 if batch_tx.send(Ok(batch)).await.is_err() {
                                     return;
                                 }
@@ -194,13 +217,16 @@ fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamP
                         }
                     }
                     // Schema-only chunk / empty result: surface the schema now.
-                    deliver_schema(&mut schema_tx, &decoder);
+                    deliver_schema(&mut schema_tx, &decoder, &served_by);
                 }
                 Ok(None) => {
                     // Stream ended; ensure the schema (or an error) was delivered.
                     if let Some(s) = schema_tx.take() {
                         let _ = match decoder.schema() {
-                            Some(sc) => s.send(Ok(sc)),
+                            Some(sc) => s.send(Ok(Served {
+                                schema: sc,
+                                served_by: served_by.clone(),
+                            })),
                             None => s.send(Err(AgentError::internal("forward arrow: no schema"))),
                         };
                     }
@@ -229,7 +255,7 @@ fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamP
 }
 
 struct ArrowReadStreamParts {
-    schema_rx: oneshot::Receiver<Result<SchemaRef, AgentError>>,
+    schema_rx: oneshot::Receiver<Result<Served, AgentError>>,
     batch_rx: mpsc::Receiver<Result<RecordBatch, AgentError>>,
 }
 
@@ -281,16 +307,22 @@ impl Forwarder for GrpcForwarder {
         let parts = decode_arrow_stream(streaming);
         // The schema (and any pre-stream error) resolves before we hand back the
         // stream, mirroring the local path.
-        let schema = parts
+        let served = parts
             .schema_rx
             .await
             .map_err(|_| AgentError::internal("forward arrow: stream closed before schema"))??;
         // No meta: the peer that RAN this query is the one that records its
         // lineage, and inventing one here would put datasets on the wrong node.
-        Ok(ArrowReadStream::new(
-            schema,
-            Box::pin(ReceiverStream::new(parts.batch_rx)),
-        ))
+        //
+        // `served_by` is the deliberate exception, and for the opposite reason:
+        // it is not invented here but RELAYED verbatim from the peer. Naming
+        // this node instead — or leaving it empty — would make a forwarded read
+        // indistinguishable from one this node served itself, which is the one
+        // thing the field exists to distinguish.
+        Ok(
+            ArrowReadStream::new(served.schema, Box::pin(ReceiverStream::new(parts.batch_rx)))
+                .with_served_by(served.served_by),
+        )
     }
 
     async fn write(

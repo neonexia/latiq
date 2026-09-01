@@ -230,8 +230,7 @@ impl AgentOps {
         let Some(writer) = self.lineage_writer(rec.info) else {
             return; // nothing to do, and never anything to fail
         };
-        let node_id = self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE);
-        if crate::lineage::record(&writer, node_id, rec) {
+        if crate::lineage::record(&writer, self.node_id(), rec) {
             tokio::task::spawn_blocking(move || writer.flush());
         }
     }
@@ -345,6 +344,15 @@ impl AgentOps {
             return None;
         }
         Some((fwd.as_ref(), owner))
+    }
+
+    /// What this node calls itself when it says "I ran this": its advertised
+    /// internal endpoint, or `in-process` where there is none (single-node,
+    /// embedded SDK). One definition for `QueryMeta::served_by` and the lineage
+    /// event's `nodeId`, so an operator correlating the two never has to
+    /// reconcile two spellings of the same node.
+    fn node_id(&self) -> &str {
+        self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE)
     }
 
     fn parse_id(pond_id: &str) -> Result<PondId, AgentError> {
@@ -1050,6 +1058,11 @@ impl AgentOps {
             schema,
             batches: Box::pin(ReceiverStream::new(batch_rx)),
             meta: Some(meta_rx),
+            // This node is running the engine, so this node is the one serving
+            // it. Set here and not in the meta the blocking producer sends,
+            // because the streaming adapter must announce it on its first chunk
+            // — long before the last batch resolves that meta.
+            served_by: self.node_id().to_string(),
         })
     }
 
@@ -1134,6 +1147,7 @@ impl AgentOps {
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut batches = stream.batches;
         let meta = stream.meta;
+        let served_by = stream.served_by;
         while let Some(b) = batches.next().await {
             append_batch_rows(&b?, &columns, &mut rows)?;
             if rows.len() > self.config.inline_row_cap {
@@ -1158,6 +1172,11 @@ impl AgentOps {
             None => QueryMeta::default(),
         };
         meta.rows = n;
+        // From the STREAM, not from this node: on a forwarded read the stream
+        // was produced by the peer and carries the peer's name, which is the
+        // one the caller must see. Assigning `self.node_id()` here is exactly
+        // the bug the field exists to catch.
+        meta.served_by = served_by;
         Ok(QueryResult {
             columns,
             rows,
@@ -1289,7 +1308,7 @@ impl AgentOps {
 
         let (result, from_plan) = out?;
         *planned = from_plan;
-        let qr = match result {
+        let mut qr = match result {
             Ok(qr) => qr,
             Err(e) => {
                 let ae = AgentError::from(e);
@@ -1307,6 +1326,11 @@ impl AgentOps {
             if write { "write" } else { "read" },
             t0.elapsed(),
         );
+        // Stamped on the LOCAL path only, and this is the whole discipline
+        // behind the field: the forwarded path returns the peer's result
+        // untouched further up, so a relayed meta keeps the owner's name and
+        // never acquires the greeter's.
+        qr.meta.served_by = self.node_id().to_string();
         Ok(qr)
     }
 

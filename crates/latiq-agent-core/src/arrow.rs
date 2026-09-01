@@ -41,6 +41,15 @@ pub struct ArrowReadStream {
     /// peer's wire chunks carries no meta, and the peer that ran the query is
     /// the one that records its lineage anyway.
     pub meta: Option<tokio::sync::oneshot::Receiver<QueryMeta>>,
+    /// The node that is producing these batches (`QueryMeta::served_by`).
+    ///
+    /// A field of its own rather than part of `meta`, because it must be known
+    /// when the stream is CREATED and `meta` only resolves when the last batch
+    /// has been produced: the gRPC stream adapter has to put this on the first
+    /// chunk it writes, and the collecting edge must be able to report it even
+    /// for a stream that carries no meta at all (one decoded from a peer's
+    /// chunks). Empty only where no producer said.
+    pub served_by: String,
 }
 
 impl ArrowReadStream {
@@ -51,6 +60,14 @@ impl ArrowReadStream {
             schema,
             batches,
             meta: None,
+            served_by: String::new(),
         }
+    }
+
+    /// Name the node producing this stream. The forwarder calls it with what the
+    /// PEER reported, never with its own id — relaying, not claiming.
+    pub fn with_served_by(mut self, served_by: impl Into<String>) -> Self {
+        self.served_by = served_by.into();
+        self
     }
 }

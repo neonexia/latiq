@@ -86,4 +86,12 @@ message JsonResponse { string json = 1; }
 service Stream {
   rpc ReadArrow(QueryRequest) returns (stream ArrowChunk);
 }
-message ArrowChunk { bytes ipc = 1; }
+message ArrowChunk {
+  bytes ipc = 1;
+  // The node that is actually executing this read, as `QueryMeta.served_by`
+  // (its advertised internal endpoint). Set on the FIRST chunk — the one
+  // carrying the schema message — and left empty on the rest, so a forwarding
+  // node learns who served the read before the first batch arrives and relays
+  // that name instead of its own.
+  string served_by = 2;
+}
