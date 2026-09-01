@@ -247,14 +247,24 @@ services:
       LATIQ_GATEWAY: gateway:51500
       LATIQ_SERVER: http://control-plane:51400
     entrypoint: ["/bin/sh", "-c"]
+    # `--no-index` is load-bearing: without it a missing/stale wheel in
+    # /repo/dist silently falls back to PyPI, and the auth suite would go green
+    # against the PUBLISHED latiq instead of this branch's code.
+    #
+    # These notes are YAML comments, NOT lines of the folded scalar below: `>-`
+    # joins its lines with SPACES, so a `#` anywhere in it commented out the
+    # whole command. `sh -c '# … pip install … && pytest …'` runs nothing and
+    # exits 0 — the nightly's `SDK auth e2e` step was green without ever
+    # installing the wheel or running a test. Keep prose out of the scalar.
+    #
+    # `--latiq-mode=auth` fails the run if the auth tests were skipped instead of
+    # executed (e.g. LATIQ_AUTH_ISSUER not reaching the container) — see
+    # e2e/sdk/conftest.py.
     command:
       - >-
-        # --no-index is load-bearing: without it a missing/stale wheel in
-        # /repo/dist silently falls back to PyPI, and the auth suite would go
-        # green against the PUBLISHED latiq instead of this branch's code.
         pip install --no-cache-dir --no-index --find-links /repo/dist latiq &&
         pip install --no-cache-dir -r /repo/e2e/sdk/requirements.txt &&
-        pytest /repo/e2e/sdk/test_auth.py -v
+        pytest /repo/e2e/sdk/test_auth.py -v --latiq-mode=auth
     depends_on: [gateway, keycloak]
 
   # One-shot in-network MCP agent auth tests (the agent harness is Node).

@@ -367,11 +367,21 @@ jobs:
           done
           python -m pip install -r e2e/sdk/requirements.txt
           npm ci --prefix e2e/agent
+      # The wheel's OWN test suite (sdk/python/tests) — the Python API a user
+      # calls, including the `lineage` allocation flag, which nothing else in CI
+      # covers. It imports only `latiq` + pyarrow and drives `connect("local")`,
+      # so it needs no cluster and runs against the INSTALLED (published) wheel.
+      # This is the release counterpart of the nightly's embedded verification.
+      # pytest exits 5 when it collects nothing, so a moved suite fails here.
+      - name: The wheel's own test suite (embedded, against the published wheel)
+        run: pytest sdk/python/tests -v
       - name: SDK e2e against the released cluster
         env:
           LATIQ_CONTROL: http://localhost:51400
           LATIQ_GATEWAY: http://localhost:51500
-        run: pytest e2e/sdk -v
+        # `remote` additionally REQUIRES the multi-node placement/forwarding test
+        # to have run — without it a green run proves nothing (see conftest.py).
+        run: pytest e2e/sdk -v --latiq-mode=remote
       - name: Agent harness (MCP) against the released cluster
         env:
           LATIQ_MCP: http://localhost:51510/mcp
