@@ -1031,6 +1031,166 @@ mod tests {
             .unwrap()
     }
 
+    /// The pond's largest snapshot id, or -1 when it has none. `run_write`
+    /// decides "was this a write?" by whether this advanced, so a rollback test
+    /// that only counted rows would miss a snapshot landing without its data.
+    fn max_snapshot_id(inst: &PondInstance) -> i64 {
+        max_snapshot(inst, "\"pond\"").unwrap_or(-1)
+    }
+
+    /// A statement that fails *inside* the transaction must roll the whole
+    /// transaction back: no partial rows, no snapshot, and — the failure mode
+    /// that actually hurts — no transaction left open on the pooled connection.
+    ///
+    /// The failure is a cast that binds and fails at execution, so the first
+    /// statement of the batch really has run and really has rows to lose by the
+    /// time the second one dies. Anything rejected at prepare time would leave
+    /// nothing to roll back and prove nothing.
+    #[test]
+    fn write_rollback_undoes_a_partial_write_and_leaves_the_pond_usable() {
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE src(s VARCHAR)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO src VALUES ('nope')", &id, "pond").unwrap();
+        let snapshot_before = max_snapshot_id(&inst);
+
+        let err = run_write(
+            &inst,
+            "INSERT INTO t VALUES (42); INSERT INTO t SELECT CAST(s AS INTEGER) FROM src",
+            &id,
+            "pond",
+        )
+        .expect_err("a runtime cast failure must fail the write");
+        // Why it failed, not merely that it did: an execution failure inside the
+        // transaction is an engine error carrying DuckDB's own message, never a
+        // parse error (the batch bound fine) and never a read-only violation.
+        match &err {
+            EngineError::Engine(msg) => assert!(
+                msg.contains("Conversion Error") && msg.contains("nope"),
+                "expected the failing cast's own message, got: {msg}"
+            ),
+            other => panic!("expected EngineError::Engine, got {other:?}"),
+        }
+
+        // Consistency: the 42 that DID execute is not visible, and no snapshot
+        // was published for a transaction that never completed.
+        let rows = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
+        assert_eq!(
+            rows.rows[0][0],
+            serde_json::json!(0),
+            "the partial write must not be visible after the rollback"
+        );
+        assert_eq!(
+            max_snapshot_id(&inst),
+            snapshot_before,
+            "a failed write must not advance the pond's snapshot"
+        );
+
+        // The connection is not wedged: without the ROLLBACK the transaction
+        // stays open and this write's own BEGIN is refused.
+        let ok = run_write(&inst, "INSERT INTO t VALUES (7)", &id, "pond").unwrap();
+        assert!(
+            ok.meta.snapshot_id.is_some(),
+            "the pond must still take writes after a rolled-back one"
+        );
+        let rows = run_read(&inst, "SELECT i FROM t").unwrap();
+        assert_eq!(rows.rows, vec![vec![serde_json::json!(7)]]);
+    }
+
+    /// The second rollback arm: the user's statement succeeded and only our
+    /// `set_commit_message` failed. Forced by naming a catalog the instance does
+    /// not have — a mis-plumbed catalog name is exactly how this arm is reached
+    /// in production, and the pond must not keep a write it could not attribute.
+    #[test]
+    fn write_rollback_when_attribution_cannot_be_recorded() {
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        let snapshot_before = max_snapshot_id(&inst);
+
+        let err = run_write(&inst, "INSERT INTO t VALUES (1)", &id, "not_this_catalog")
+            .expect_err("attribution against an unknown catalog must fail the write");
+        match &err {
+            EngineError::Engine(msg) => assert!(
+                msg.contains("set_commit_message"),
+                "expected the failing attribution call's message, got: {msg}"
+            ),
+            other => panic!("expected EngineError::Engine, got {other:?}"),
+        }
+
+        let rows = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
+        assert_eq!(
+            rows.rows[0][0],
+            serde_json::json!(0),
+            "an unattributable write must be rolled back, not kept"
+        );
+        assert_eq!(max_snapshot_id(&inst), snapshot_before);
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond")
+            .expect("the pond must still take writes");
+    }
+
+    /// The `COMMIT` arm, and the one documented way to reach it: caller SQL that
+    /// closes our bracket itself (`crates/latiq-engine-duckdb/CLAUDE.md` — the
+    /// write path deliberately does not scan SQL, so this is reachable by
+    /// contract, not by accident). Our `COMMIT` then finds no transaction.
+    ///
+    /// Both halves of that contract are pinned here because they differ in what
+    /// survives: a caller `ROLLBACK` loses the write, a caller `COMMIT` keeps it
+    /// but lands it **unattributed** (`author IS NULL` — the documented tell).
+    /// Either way the error must surface and the connection must stay usable.
+    #[test]
+    fn write_commit_failure_surfaces_and_does_not_wedge_the_pond() {
+        let (_fs, inst) = pond();
+        let id = Identity::claimed(Some("agent-test"));
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+
+        for (sql, expect_rows) in [
+            ("INSERT INTO t VALUES (1); ROLLBACK", 0),
+            ("INSERT INTO t VALUES (5); COMMIT", 1),
+        ] {
+            let err = match run_write(&inst, sql, &id, "pond") {
+                Ok(r) => panic!("expected `{sql}` to fail at COMMIT, got {r:?}"),
+                Err(e) => e,
+            };
+            let EngineError::Engine(msg) = &err else {
+                panic!("expected EngineError::Engine for `{sql}`, got {err:?}");
+            };
+            assert!(
+                msg.contains("no transaction is active"),
+                "expected the failure to come from OUR commit finding no \
+                 transaction (`{sql}`), got: {msg}"
+            );
+            let rows = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
+            assert_eq!(
+                rows.rows[0][0],
+                serde_json::json!(expect_rows),
+                "wrong surviving row count for `{sql}`"
+            );
+        }
+        // The caller's own COMMIT landed a snapshot with no author — the
+        // documented tell that our attribution never reached it.
+        let unattributed = run_read(
+            &inst,
+            "SELECT count(*) AS c FROM pond.snapshots() WHERE author IS NULL AND snapshot_id > 0",
+        )
+        .unwrap();
+        assert_eq!(
+            unattributed.rows[0][0],
+            serde_json::json!(1),
+            "caller-committed work must land exactly once, unattributed"
+        );
+        // Not wedged: the next write commits normally and IS attributed.
+        let ok = run_write(&inst, "INSERT INTO t VALUES (9)", &id, "pond").unwrap();
+        let sid = ok.meta.snapshot_id.expect("a normal write still commits");
+        let author = run_read(
+            &inst,
+            &format!("SELECT author FROM pond.snapshots() WHERE snapshot_id = {sid}"),
+        )
+        .unwrap();
+        assert_eq!(author.rows[0][0], serde_json::json!("agent-test"));
+    }
+
     #[test]
     fn write_with_trailing_comment_does_not_wedge_the_pond() {
         let (_fs, inst) = pond();
@@ -1216,6 +1376,112 @@ mod tests {
         assert_eq!(res.rows[0][0], serde_json::json!([1, 2, 3]));
         assert_eq!(res.rows[0][1], serde_json::json!({"x": 1, "y": "hi"}));
         assert_eq!(res.rows[0][2], serde_json::json!({"k": [10, 20]}));
+    }
+
+    /// Every `value_to_json` arm, pinned to the **exact** JSON we emit — value
+    /// and shape both, because a consumer parses these and a `Decimal` that
+    /// silently became a JSON number (or an `Interval` that became a string)
+    /// is a wire-format break, not a cosmetic one.
+    ///
+    /// Invariant 10: this asserts *our* conversion, never DuckDB's semantics.
+    /// Each case is one column of one real query, so the arm is reached the way
+    /// a caller reaches it. Only the exactly-representable float values are used
+    /// (1.5, 2.5) so the assertion is about our mapping, not float printing.
+    #[test]
+    fn result_encoding_covers_every_value_arm_with_an_exact_shape() {
+        let (_fs, inst) = pond();
+        // (label, SQL expression, the JSON we promise for it)
+        let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+            ("NULL", "NULL::INTEGER", serde_json::Value::Null),
+            ("BOOLEAN", "true", serde_json::json!(true)),
+            ("BOOLEAN false", "false", serde_json::json!(false)),
+            ("TINYINT", "(-8)::TINYINT", serde_json::json!(-8)),
+            ("SMALLINT", "(-16)::SMALLINT", serde_json::json!(-16)),
+            ("INTEGER", "(-32)::INTEGER", serde_json::json!(-32)),
+            ("BIGINT", "(-64)::BIGINT", serde_json::json!(-64)),
+            ("UTINYINT", "255::UTINYINT", serde_json::json!(255)),
+            ("USMALLINT", "65535::USMALLINT", serde_json::json!(65535)),
+            (
+                "UINTEGER",
+                "4294967295::UINTEGER",
+                serde_json::json!(4294967295u32),
+            ),
+            // Above i64::MAX: u64 has its own serde_json::Number, so this must
+            // stay a number with full precision (unlike HugeInt, which cannot).
+            (
+                "UBIGINT",
+                "18446744073709551615::UBIGINT",
+                serde_json::json!(18446744073709551615u64),
+            ),
+            ("FLOAT", "1.5::FLOAT", serde_json::json!(1.5)),
+            ("DOUBLE", "2.5::DOUBLE", serde_json::json!(2.5)),
+            // A STRING, not a number: DECIMAL is exact and JSON numbers are not,
+            // so rendering 3.14 as a float would hand the consumer a value that
+            // is no longer the one stored.
+            ("DECIMAL", "3.14::DECIMAL(5,2)", serde_json::json!("3.14")),
+            (
+                "DECIMAL wide",
+                "123456789012345678.90::DECIMAL(38,2)",
+                serde_json::json!("123456789012345678.90"),
+            ),
+            // An OBJECT of the three independent components, not a string: a
+            // month is not a fixed number of days, so any single scalar would
+            // have to invent a calendar.
+            (
+                "INTERVAL",
+                "INTERVAL 1 MONTH + INTERVAL 2 DAY + INTERVAL 3 SECOND",
+                serde_json::json!({"months": 1, "days": 2, "nanos": 3_000_000_000i64}),
+            ),
+            // Lowercase hex, no prefix, no separators.
+            ("BLOB", "'ab'::BLOB", serde_json::json!("6162")),
+            (
+                "BLOB non-ascii",
+                "'\\xFF\\x00'::BLOB",
+                serde_json::json!("ff00"),
+            ),
+            ("ENUM", "'x'::ENUM('x','y')", serde_json::json!("x")),
+            ("VARCHAR", "'hi'", serde_json::json!("hi")),
+            // TimeUnit: only Microsecond was ever exercised. Second carries no
+            // fraction; Nanosecond truncates to microseconds (our format's
+            // resolution) rather than rounding or overflowing.
+            (
+                "TIMESTAMP_S",
+                "'2021-07-01 13:45:06'::TIMESTAMP_S",
+                serde_json::json!("2021-07-01 13:45:06"),
+            ),
+            (
+                "TIMESTAMP_MS",
+                "'2021-07-01 13:45:06.123'::TIMESTAMP_MS",
+                serde_json::json!("2021-07-01 13:45:06.123000"),
+            ),
+            (
+                "TIMESTAMP_NS",
+                "'2021-07-01 13:45:06.123456789'::TIMESTAMP_NS",
+                serde_json::json!("2021-07-01 13:45:06.123456"),
+            ),
+            // The same arms, reached through the nested containers: a LIST and a
+            // STRUCT must map their elements with the identical rules, not fall
+            // back to a Debug rendering.
+            (
+                "LIST of DECIMAL",
+                "[1.10::DECIMAL(4,2), 2.20::DECIMAL(4,2)]",
+                serde_json::json!(["1.10", "2.20"]),
+            ),
+            (
+                "STRUCT of BOOLEAN/BLOB/FLOAT",
+                "{'b': false, 'raw': 'ab'::BLOB, 'f': 1.5::FLOAT}",
+                serde_json::json!({"b": false, "raw": "6162", "f": 1.5}),
+            ),
+        ];
+        // Anti-vacuity: the loop must actually run, and this count is what makes
+        // a case silently dropped from the table a failing test.
+        assert_eq!(cases.len(), 25, "the value-arm table lost or gained a case");
+        for (label, expr, expected) in &cases {
+            let res = run_read(&inst, &format!("SELECT {expr} AS v"))
+                .unwrap_or_else(|e| panic!("{label}: query failed: {e:?}"));
+            assert_eq!(res.rows.len(), 1, "{label}: expected exactly one row");
+            assert_eq!(&res.rows[0][0], expected, "{label}: wrong JSON encoding");
+        }
     }
 
     #[test]

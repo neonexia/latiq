@@ -120,6 +120,12 @@ fn ducklake(
 
 /// Build an `s3` secret from `s3_access_key`/`s3_secret_key` (+ endpoint/region)
 /// for catalogs whose storage backend is MinIO/S3. SigV4 keys ride in at pull.
+///
+/// **One implementation for every catalog type** with an S3-backed store
+/// (`ducklake`; `iceberg` behind MinIO/Polaris). It was duplicated per type,
+/// which meant a fix to the escaping — the injection-adjacent part, since both
+/// keys are caller-supplied — could land on one copy and silently miss the
+/// other.
 fn s3_secret_line(alias: &str, params: &BTreeMap<String, String>) -> Option<(String, String)> {
     let k = params.get("s3_access_key").filter(|s| !s.is_empty())?;
     let s = params.get("s3_secret_key").filter(|s| !s.is_empty())?;
@@ -134,6 +140,7 @@ fn s3_secret_line(alias: &str, params: &BTreeMap<String, String>) -> Option<(Str
         lines.push(format!("REGION '{}'", esc(region)));
     }
     if let Some(ep) = params.get("s3_endpoint").filter(|s| !s.is_empty()) {
+        // DuckDB's s3 ENDPOINT wants host:port; the scheme rides in USE_SSL.
         let (host, ssl) = if let Some(rest) = ep.strip_prefix("http://") {
             (rest, "false")
         } else if let Some(rest) = ep.strip_prefix("https://") {
@@ -185,37 +192,10 @@ fn iceberg(
         ", AUTHORIZATION_TYPE none".to_string()
     };
 
-    // Optional S3 storage backend (e.g. MinIO behind Polaris). SigV4 keys.
-    if let (Some(k), Some(s)) = (
-        params.get("s3_access_key").filter(|s| !s.is_empty()),
-        params.get("s3_secret_key").filter(|s| !s.is_empty()),
-    ) {
-        let name = format!("_latiq_{alias}_s3");
-        let mut lines = vec![
-            "TYPE s3".to_string(),
-            format!("KEY_ID '{}'", esc(k)),
-            format!("SECRET '{}'", esc(s)),
-            "URL_STYLE 'path'".to_string(),
-        ];
-        if let Some(region) = params.get("s3_region").filter(|s| !s.is_empty()) {
-            lines.push(format!("REGION '{}'", esc(region)));
-        }
-        if let Some(ep) = params.get("s3_endpoint").filter(|s| !s.is_empty()) {
-            // DuckDB's s3 ENDPOINT wants host:port; the scheme rides in USE_SSL.
-            let (host, ssl) = if let Some(rest) = ep.strip_prefix("http://") {
-                (rest, "false")
-            } else if let Some(rest) = ep.strip_prefix("https://") {
-                (rest, "true")
-            } else {
-                (ep.as_str(), "true")
-            };
-            lines.push(format!("ENDPOINT '{}'", esc(host)));
-            lines.push(format!("USE_SSL {ssl}"));
-        }
-        secrets.push((
-            name.clone(),
-            format!("CREATE OR REPLACE SECRET {name} ({})", lines.join(", ")),
-        ));
+    // Optional S3 storage backend (e.g. MinIO behind Polaris). SigV4 keys —
+    // same builder as every other S3-backed catalog type, see `s3_secret_line`.
+    if let Some(line) = s3_secret_line(alias, params) {
+        secrets.push(line);
     }
 
     let attach = format!(
@@ -273,6 +253,132 @@ mod tests {
         let plan = plan("iceberg", "lake", &p).unwrap();
         assert!(plan.secrets.is_empty());
         assert!(plan.attach.contains("AUTHORIZATION_TYPE none"));
+    }
+
+    /// S3 params common to the secret-line tests. The "secrets" here are
+    /// obviously synthetic; nothing real is ever put in a test fixture.
+    fn s3_params(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut p = params(&[("s3_access_key", "AK"), ("s3_secret_key", "SK")]);
+        p.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        p
+    }
+
+    /// The key and the secret are caller-supplied and land inside SQL string
+    /// literals, so this is the injection boundary: a `'` must be doubled (and
+    /// nothing else may be), or the literal ends early and the rest of the
+    /// value becomes SQL. Backslash is deliberately NOT touched — DuckDB's
+    /// single-quoted literals have no backslash escape, so escaping it would
+    /// corrupt a key that legitimately contains one.
+    #[test]
+    fn s3_secret_escapes_quotes_only_and_cannot_inject_clauses() {
+        let p = s3_params(&[("s3_access_key", "a'b\\c"), ("s3_secret_key", "x'; DROP")]);
+        let (name, sql) = s3_secret_line("lake", &p).expect("both keys present");
+        assert_eq!(name, "_latiq_lake_s3");
+        assert!(
+            sql.contains("KEY_ID 'a''b\\c'"),
+            "the quote must be doubled and the backslash left alone"
+        );
+        assert!(
+            sql.contains("SECRET 'x''; DROP'"),
+            "a quote in the secret must stay inside the literal"
+        );
+        // The injection property itself: whatever the values contain, the
+        // statement still declares exactly one secret with exactly one of each
+        // clause. A single un-doubled quote would let `; DROP` out and change
+        // these counts.
+        for clause in ["CREATE OR REPLACE SECRET", "TYPE s3", "KEY_ID", "SECRET '"] {
+            assert_eq!(
+                sql.matches(clause).count(),
+                1,
+                "hostile key material must not add a second `{clause}` clause"
+            );
+        }
+    }
+
+    /// `http://` means plaintext and `https://` means TLS; a bare host is
+    /// assumed TLS. Getting this backwards either fails to connect to a MinIO
+    /// dev endpoint or — the bad direction — sends SigV4 credentials in the
+    /// clear to an endpoint the operator wrote as `https://`.
+    #[test]
+    fn s3_secret_use_ssl_follows_the_endpoint_scheme_and_strips_it() {
+        for (endpoint, host, ssl) in [
+            ("http://minio:9000", "minio:9000", "false"),
+            ("https://s3.example.com", "s3.example.com", "true"),
+            ("s3.example.com", "s3.example.com", "true"),
+        ] {
+            let p = s3_params(&[("s3_endpoint", endpoint)]);
+            let (_, sql) = s3_secret_line("lake", &p).unwrap();
+            assert!(
+                sql.contains(&format!("ENDPOINT '{host}'")),
+                "{endpoint}: the scheme must be stripped from ENDPOINT"
+            );
+            assert!(
+                sql.contains(&format!("USE_SSL {ssl}")),
+                "{endpoint}: expected USE_SSL {ssl}"
+            );
+        }
+        // No endpoint at all: neither clause is emitted, so DuckDB's own AWS
+        // default endpoint stands rather than being pinned to an empty host.
+        let bare = s3_secret_line("lake", &s3_params(&[])).unwrap().1;
+        assert!(!bare.contains("ENDPOINT"), "no endpoint param, no ENDPOINT");
+        assert!(!bare.contains("USE_SSL"));
+    }
+
+    #[test]
+    fn s3_secret_region_is_optional_and_escaped() {
+        let with = s3_secret_line("lake", &s3_params(&[("s3_region", "eu-west-1")]))
+            .unwrap()
+            .1;
+        assert!(with.contains("REGION 'eu-west-1'"));
+        // Empty is treated as absent, not as `REGION ''` (which DuckDB would
+        // take as a real, wrong region).
+        let empty = s3_secret_line("lake", &s3_params(&[("s3_region", "")]))
+            .unwrap()
+            .1;
+        assert!(!empty.contains("REGION"), "an empty region must be omitted");
+    }
+
+    #[test]
+    fn s3_secret_needs_both_keys() {
+        assert!(s3_secret_line("lake", &params(&[])).is_none());
+        assert!(s3_secret_line("lake", &params(&[("s3_access_key", "AK")])).is_none());
+        assert!(s3_secret_line("lake", &params(&[("s3_secret_key", "SK")])).is_none());
+        // Present-but-empty is not "supplied": half a credential must not build
+        // a secret that then fails obscurely inside DuckDB.
+        assert!(s3_secret_line(
+            "lake",
+            &params(&[("s3_access_key", "AK"), ("s3_secret_key", "")])
+        )
+        .is_none());
+    }
+
+    /// The two S3-backed catalog types must build the **same** secret from the
+    /// same params. This block was duplicated once; the regression it guards is
+    /// a fix landing on one copy only.
+    #[test]
+    fn s3_secret_is_identical_across_catalog_types() {
+        let mut ducklake_params = s3_params(&[("s3_endpoint", "http://minio:9000")]);
+        ducklake_params.insert("metadata_path".into(), "ducklake:m.db".into());
+        ducklake_params.insert("data_path".into(), "s3://b/d".into());
+        let mut iceberg_params = s3_params(&[("s3_endpoint", "http://minio:9000")]);
+        iceberg_params.insert("endpoint".into(), "https://polaris/api".into());
+
+        let d = plan("ducklake", "lake", &ducklake_params).unwrap();
+        let i = plan("iceberg", "lake", &iceberg_params).unwrap();
+        let s3_of = |p: &AttachPlan| {
+            p.secrets
+                .iter()
+                .find(|(n, _)| n.ends_with("_s3"))
+                .expect("an s3 secret")
+                .clone()
+        };
+        assert_eq!(
+            s3_of(&d),
+            s3_of(&i),
+            "both catalog types must share one s3 secret builder"
+        );
+        // …and it really is built (not two identically-absent secrets).
+        assert!(s3_of(&d).1.contains("USE_SSL false"));
     }
 
     #[test]

@@ -1006,6 +1006,116 @@ mod tests {
         }
     }
 
+    /// DuckDB renders `memory_limit` back as a human string ("512.0 MiB",
+    /// "4.0 GiB"). Parse it into bytes so the assertion is about the number we
+    /// set, not about DuckDB's formatting.
+    fn parse_bytes(s: &str) -> u64 {
+        let (n, unit) = s.split_once(' ').unwrap_or_else(|| panic!("odd size: {s}"));
+        let n: f64 = n.parse().unwrap_or_else(|_| panic!("odd size: {s}"));
+        let scale = match unit {
+            "KiB" => 1024u64,
+            "MiB" => 1024 * 1024,
+            "GiB" => 1024 * 1024 * 1024,
+            "TiB" => 1024u64.pow(4),
+            "Bytes" | "B" => 1,
+            other => panic!("unknown size unit {other} in {s}"),
+        };
+        (n * scale as f64) as u64
+    }
+
+    /// Every tier, end to end: `PondTier::limits()` -> `PondLocation.limits` ->
+    /// the settings DuckDB actually reports. `x-small`, `x-large` and `none` had
+    /// never been opened by any test at all, and the two tests that read
+    /// `threads` back out build their `ResourceLimits` by hand — so the tier
+    /// table itself was never compared against a running instance.
+    ///
+    /// Each tier gets its OWN pond. Instance caps are per-instance and instances
+    /// are cached per pond (invariant 7), so reusing one pond would risk reading
+    /// a stale instance's settings rather than the tier's.
+    #[test]
+    fn tier_caps_reach_duckdb_for_every_tier() {
+        use latiq_common::PondTier;
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let setting = |loc: &latiq_storage::PondLocation, name: &str| -> String {
+            eng.read_query(
+                loc,
+                &format!("SELECT current_setting('{name}')::VARCHAR AS v"),
+                AbortToken::new(),
+            )
+            .unwrap()
+            .rows[0][0]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let open_at = |tier: PondTier| {
+            let mut loc = fs.create_pond(PondId::new(), false).unwrap();
+            loc.limits = tier.limits();
+            loc
+        };
+
+        let mut capped = 0;
+        for tier in [
+            PondTier::XSmall,
+            PondTier::Small,
+            PondTier::Medium,
+            PondTier::Large,
+            PondTier::XLarge,
+        ] {
+            let lim = tier.limits().expect("every named tier caps");
+            let loc = open_at(tier);
+            let name = tier.as_str();
+            assert_eq!(
+                setting(&loc, "threads"),
+                lim.cores.to_string(),
+                "{name}: DuckDB's thread budget must be the tier's core budget"
+            );
+            assert_eq!(
+                parse_bytes(&setting(&loc, "memory_limit")),
+                lim.memory_bytes,
+                "{name}: DuckDB's memory_limit must be the tier's memory budget"
+            );
+            capped += 1;
+        }
+        assert_eq!(capped, 5, "every capped tier must have been checked");
+
+        // The uncapped tier issues no SET at all, so the reference is DuckDB's
+        // own default in THIS process — read from a bare connection that never
+        // went through `PondInstance`. Pinning numbers here would make the test
+        // depend on the host's core count and RAM.
+        let bare = duckdb::Connection::open_in_memory().unwrap();
+        let default = |name: &str| -> String {
+            bare.query_row(
+                &format!("SELECT current_setting('{name}')::VARCHAR"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let none = open_at(PondTier::None);
+        assert_eq!(
+            setting(&none, "threads"),
+            default("threads"),
+            "the `none` tier must leave DuckDB's own thread default in force"
+        );
+        assert_eq!(
+            setting(&none, "memory_limit"),
+            default("memory_limit"),
+            "the `none` tier must leave DuckDB's own memory default in force"
+        );
+        // Anti-vacuity: the two assertions above would also pass if our SET
+        // plumbing were dead everywhere, so prove a cap is observably different
+        // from the default on this host.
+        let xs = open_at(PondTier::XSmall);
+        assert_ne!(
+            setting(&xs, "memory_limit"),
+            default("memory_limit"),
+            "x-small's cap must be distinguishable from the uncapped default, \
+             or this test cannot tell capped from uncapped"
+        );
+    }
+
     #[test]
     fn retiering_a_pond_reopens_it_with_the_new_caps() {
         // A pond can be re-tiered after creation. Limits are applied when the

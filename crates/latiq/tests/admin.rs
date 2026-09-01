@@ -73,6 +73,135 @@ async fn pond_list_reads_from_control_plane() {
     assert!(!p.created_at.is_empty());
 }
 
+/// `latiq pond set-tier` (Admin `PondSetTier`) had no functional test — only
+/// registry-level state, which proves the string was stored and nothing about
+/// the caps ever reaching the pond. This drives the real RPC against a running
+/// node and reads the settings back out of DuckDB through a normal read query,
+/// so the whole seam is covered: registry write -> the node re-resolving the
+/// tier -> re-opening the instance with the new caps.
+///
+/// It also covers the operator escape hatch: `none` is refused at allocate time
+/// (see the surface tests) but IS grantable here, and the pond must then run
+/// genuinely uncapped.
+#[tokio::test]
+async fn policy_set_tier_applies_the_new_caps_including_the_uncapped_grant() {
+    let s = start_stack().await;
+    let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+    data.allocate_pond(id_req(
+        AllocatePondRequest {
+            name: "retiered".into(),
+            policy_json: String::new(),
+            tier: "medium".into(),
+            lineage: false,
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+        .await
+        .unwrap();
+
+    // Read a DuckDB setting through the ordinary read path, so what is asserted
+    // is what a query on this pond actually runs under.
+    let setting = |data: &mut DataClient<tonic::transport::Channel>, name: &'static str| {
+        let mut data = data.clone();
+        async move {
+            let r = data
+                .read_query(id_req(
+                    QueryRequest {
+                        pond: "retiered".into(),
+                        sql: format!("SELECT current_setting('{name}')::VARCHAR AS v"),
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            let v: serde_json::Value = serde_json::from_str(&r.json).unwrap();
+            v["rows"][0][0].as_str().unwrap().to_string()
+        }
+    };
+
+    let medium = latiq_common::PondTier::Medium.limits().unwrap();
+    assert_eq!(
+        setting(&mut data, "threads").await,
+        medium.cores.to_string(),
+        "the pond must start under its allocated tier's caps"
+    );
+
+    // Down-tier: the caps must actually change on the running node, not just in
+    // the registry row.
+    let x_small = latiq_common::PondTier::XSmall.limits().unwrap();
+    let resp = admin
+        .pond_set_tier(PondSetTierRequest {
+            pond: "retiered".into(),
+            tier: "x-small".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.tier, "x-small");
+    assert_eq!(
+        setting(&mut data, "threads").await,
+        x_small.cores.to_string(),
+        "set-tier must reach the engine, not only the registry"
+    );
+    let capped_memory = setting(&mut data, "memory_limit").await;
+
+    // The operator grant. `none` is refused at allocate time on every caller
+    // surface; here it must be accepted, and the pond must then run under
+    // DuckDB's own defaults rather than any tier's caps.
+    admin
+        .pond_set_tier(PondSetTierRequest {
+            pond: "retiered".into(),
+            tier: "none".into(),
+        })
+        .await
+        .expect("an operator MUST be able to grant the uncapped tier");
+    // The reference is DuckDB's own default in this process, read from a bare
+    // connection that never went through a pond — pinning numbers would make
+    // this depend on the host's cores and RAM.
+    let bare = duckdb::Connection::open_in_memory().unwrap();
+    let default = |name: &str| -> String {
+        bare.query_row(
+            &format!("SELECT current_setting('{name}')::VARCHAR"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        setting(&mut data, "threads").await,
+        default("threads"),
+        "an uncapped pond must run under DuckDB's own thread default"
+    );
+    let uncapped_memory = setting(&mut data, "memory_limit").await;
+    assert_eq!(
+        uncapped_memory,
+        default("memory_limit"),
+        "an uncapped pond must run under DuckDB's own memory default"
+    );
+    // Anti-vacuity: the two assertions above would also pass if the caps had
+    // never been applied at any point, so prove the capped state was observably
+    // different from the uncapped one on this host.
+    assert_ne!(
+        capped_memory, uncapped_memory,
+        "x-small's cap must be distinguishable from uncapped, or this test \
+         cannot tell a granted `none` from a set-tier that did nothing"
+    );
+
+    // …and the registry agrees with what the node is running.
+    let ponds = admin
+        .pond_list(PondListRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .ponds;
+    let p = ponds.iter().find(|p| p.name == "retiered").unwrap();
+    assert_eq!(p.tier, "none");
+}
+
 #[tokio::test]
 async fn pond_lifecycle_description_shown_in_list() {
     // The CLI/SDK create path (Control gRPC create_pond_assignment) carries a
