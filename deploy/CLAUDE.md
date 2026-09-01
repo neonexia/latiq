@@ -78,10 +78,25 @@ docker compose --env-file auth.env run --rm auth-tests-agent
 `auth.env` sets **`COMPOSE_PROFILES=auth`** (Compose reads it from an env file like
 any other setting, so no `--profile` flag) *and* `LATIQ_AUTH_ISSUER` /
 `LATIQ_AUTH_AUDIENCE`. Two mechanisms, two jobs: **`profiles:`** gates whether a
-service *starts* (keycloak, `auth-tests-*`); **`${VAR:-default}`** injects the
+service *starts* (keycloak); **`${VAR:-default}`** injects the
 issuer/audience into the **existing** control-plane + pond-node definitions — a
 profile can't do that. Without the env file the issuer renders **empty**, and the
 binary normalizes a blank issuer to "auth off".
+
+**The two runners sit in their OWN profile (`auth-tests`), and must.** A profile
+is what `up` starts, so an `auth`-profiled runner is launched *eagerly* by
+`docker compose --env-file auth.env up -d` — the moment `gateway` comes up,
+seconds before Keycloak has imported its realm. That phantom run fails
+(`fetch failed`: connection refused on the token endpoint), races the real
+`run --rm` over the same bind-mounted `/repo` (two `npm ci` into one
+`node_modules`), and surfaces in the on-failure log dump looking exactly like the
+real step failing — which is how it read for the whole of run 33557528403.
+`docker compose run <svc>` enables the target service's own profiles, so the
+explicit invocations above are unaffected — and do **not** "help" it along with
+`--profile auth-tests`: that flag *replaces* `COMPOSE_PROFILES` from the env
+file rather than adding to it, which un-defines `keycloak` and fails the project
+outright (`service "auth-tests-sdk" depends on undefined service "keycloak"`).
+Name the service and let Compose work it out.
 
 **Everything is in-network, on purpose.** `keycloak:8080` resolves via Docker DNS
 for the servers *and* for the two one-shot test runners (`auth-tests-sdk` on

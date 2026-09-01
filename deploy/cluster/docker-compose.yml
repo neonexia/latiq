@@ -235,10 +235,19 @@ services:
   # One-shot in-network SDK auth tests: installs the built wheel from /repo/dist
   # and runs the auth suite against the gateway. Like `cli`, it runs on the compose
   # network so `gateway`, `control-plane` and `keycloak` all resolve.
+  #
+  # Profile `auth-tests`, NOT `auth`: `auth.env` sets COMPOSE_PROFILES=auth, so an
+  # `auth`-profiled runner is started eagerly by `up -d` — the instant `gateway`
+  # starts, seconds before Keycloak has finished importing its realm. That phantom
+  # run then fails (`fetch failed` / connection refused on the token endpoint),
+  # races the real `run --rm` over the same bind-mounted /repo (two concurrent
+  # `npm ci` into one node_modules), and its output shows up in the failure log
+  # dump as if the real step had failed. `docker compose run <svc>` enables the
+  # target service's own profiles, so the explicit invocations below still work.
   auth-tests-sdk:
     image: python:3.11-slim
     restart: "no"
-    profiles: ["auth"]
+    profiles: ["auth-tests"]
     working_dir: /repo
     volumes:
       - ../..:/repo
@@ -283,7 +292,7 @@ services:
   auth-tests-agent:
     image: node:22-slim
     restart: "no"
-    profiles: ["auth"]
+    profiles: ["auth-tests"]   # see auth-tests-sdk: `auth` would make `up -d` run it
     working_dir: /repo/e2e/agent
     volumes:
       - ../..:/repo
