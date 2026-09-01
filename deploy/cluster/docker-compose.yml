@@ -23,6 +23,11 @@ services:
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
+      # TEST-ONLY. Keycloak is a container on this private compose network at
+      # http://keycloak:8080, so the JWKS fetch is plaintext to a non-loopback
+      # host -- which the verifier refuses by default, and must keep refusing.
+      # Blank (= off) unless auth.env turns it on. Never in a real deployment.
+      LATIQ_AUTH_ALLOW_INSECURE_JWKS: ${LATIQ_AUTH_ALLOW_INSECURE_JWKS:-}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:52400/metrics"]
       interval: 3s
@@ -45,6 +50,11 @@ services:
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
+      # TEST-ONLY. Keycloak is a container on this private compose network at
+      # http://keycloak:8080, so the JWKS fetch is plaintext to a non-loopback
+      # host -- which the verifier refuses by default, and must keep refusing.
+      # Blank (= off) unless auth.env turns it on. Never in a real deployment.
+      LATIQ_AUTH_ALLOW_INSECURE_JWKS: ${LATIQ_AUTH_ALLOW_INSECURE_JWKS:-}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:
@@ -69,6 +79,11 @@ services:
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
+      # TEST-ONLY. Keycloak is a container on this private compose network at
+      # http://keycloak:8080, so the JWKS fetch is plaintext to a non-loopback
+      # host -- which the verifier refuses by default, and must keep refusing.
+      # Blank (= off) unless auth.env turns it on. Never in a real deployment.
+      LATIQ_AUTH_ALLOW_INSECURE_JWKS: ${LATIQ_AUTH_ALLOW_INSECURE_JWKS:-}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:
@@ -96,6 +111,11 @@ services:
       # Blank unless auth mode. Set by auth.env; a blank issuer = auth off.
       LATIQ_AUTH_ISSUER: ${LATIQ_AUTH_ISSUER:-}
       LATIQ_AUTH_AUDIENCE: ${LATIQ_AUTH_AUDIENCE:-latiq}
+      # TEST-ONLY. Keycloak is a container on this private compose network at
+      # http://keycloak:8080, so the JWKS fetch is plaintext to a non-loopback
+      # host -- which the verifier refuses by default, and must keep refusing.
+      # Blank (= off) unless auth.env turns it on. Never in a real deployment.
+      LATIQ_AUTH_ALLOW_INSECURE_JWKS: ${LATIQ_AUTH_ALLOW_INSECURE_JWKS:-}
     depends_on:
       control-plane: { condition: service_healthy }
     healthcheck:

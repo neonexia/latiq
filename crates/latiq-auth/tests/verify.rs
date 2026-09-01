@@ -25,6 +25,7 @@ const AUD: &str = "latiq";
 fn config(idp: &TestIdp) -> AuthConfig {
     AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![IssuerConfig {
             issuer: idp.issuer.clone(),
             jwks_uri: Some(idp.jwks_uri.clone()),
@@ -200,6 +201,7 @@ async fn auth_accepts_tokens_from_either_configured_issuer() {
     let b = TestIdp::start_alt().await;
     let verifier = Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![
             IssuerConfig {
                 issuer: a.issuer.clone(),
@@ -238,6 +240,7 @@ async fn auth_a_token_cannot_borrow_another_issuers_identity() {
     let b = TestIdp::start_alt().await;
     let verifier = Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![
             IssuerConfig {
                 issuer: a.issuer.clone(),
@@ -286,6 +289,7 @@ fn auth_rejects_a_plaintext_jwks_uri() {
     // keys and mints arbitrary identities.
     Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![IssuerConfig {
             issuer: "https://idp.example/realms/latiq".to_string(),
             jwks_uri: Some("http://idp.example/realms/latiq/jwks".to_string()),
@@ -296,6 +300,7 @@ fn auth_rejects_a_plaintext_jwks_uri() {
     // Also when derived from a plaintext issuer.
     Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![IssuerConfig {
             issuer: "http://idp.example/realms/latiq".to_string(),
             jwks_uri: None,
@@ -313,6 +318,7 @@ fn auth_allows_plaintext_jwks_on_loopback() {
     // test `loopback_forms` in `src/verify.rs`, which covers six.
     Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![IssuerConfig {
             issuer: "http://localhost:8080/realms/latiq".to_string(),
             jwks_uri: Some("http://127.0.0.1:8080/jwks".to_string()),
@@ -330,18 +336,21 @@ fn auth_rejects_a_degenerate_config() {
 
     Verifier::new(AuthConfig {
         audience: String::new(),
+        allow_insecure_jwks: false,
         issuers: vec![issuer()],
     })
     .expect_err("an empty audience means nothing pins the token to us");
 
     Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![],
     })
     .expect_err("auth with no issuers can never succeed");
 
     Verifier::new(AuthConfig {
         audience: AUD.to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![issuer(), issuer()],
     })
     .expect_err("a duplicate issuer entry is a misconfiguration");
@@ -559,6 +568,7 @@ fn auth_config_is_stored_normalized() {
     // enforced -- and what the metadata document will later publish.
     let v = Verifier::new(AuthConfig {
         audience: "  latiq  ".to_string(),
+        allow_insecure_jwks: false,
         issuers: vec![IssuerConfig {
             issuer: "  https://idp.example  ".to_string(),
             jwks_uri: None,

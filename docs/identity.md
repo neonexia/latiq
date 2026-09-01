@@ -160,6 +160,39 @@ The parts worth stating explicitly:
   the HTTP client will actually dial, because hand-rolled authority splitting
   disagrees with the WHATWG parser in ways an attacker can use.
 
+#### `--auth-allow-insecure-jwks` — a test/development escape, never production
+
+There is exactly one deployment shape the loopback exemption does not cover: an
+IdP running as a **container on a private network**, reached by service name.
+`deploy/cluster/`'s auth profile is that shape — Keycloak is at
+`http://keycloak:8080/realms/latiq/protocol/openid-connect/certs`, which is
+neither loopback nor able to present a certificate any client would trust. The
+guard refused it, and the containerised auth e2e could not start at all.
+
+The answer is **not** to widen the guard — "private network" is not a property a
+process can verify, and a rule that tried would be exactly the kind of
+hand-rolled host check this guard exists to replace. Instead there is an explicit
+opt-out:
+
+```
+--auth-allow-insecure-jwks     (env: LATIQ_AUTH_ALLOW_INSECURE_JWKS)
+```
+
+- **Off by default**, and an empty env var (compose passes every variable through)
+  means off. A value that is neither true nor false is a startup **error**, not a
+  silent `false`.
+- It relaxes the plaintext-http-to-a-non-loopback-host arm and **nothing else**:
+  an unsupported scheme, an empty host and a missing authority are still refused.
+- When set, every node `warn!`s on **every** startup, naming the URI and the
+  consequence. Enabling it quietly is not possible.
+- Set in **`deploy/cluster/auth.env`** only — the CI auth-e2e stack. It is not in
+  `deploy/docker-compose.yml` (the user-facing deployment) and not in `dev.sh`,
+  whose fake IdP is on loopback and needs no escape.
+
+The risk it accepts is total: an attacker who can intercept the JWKS fetch serves
+their own signing keys and mints any identity, including one that claims to be an
+operator. In production the IdP is reached over **https** and this stays unset.
+
 ### The JWKS cache is on the request path
 
 `kid` selects the key, so the cache lookup is the **first** thing an

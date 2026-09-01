@@ -193,6 +193,9 @@ async fn error_contract_allocate_with_no_node_is_precondition_not_notfound() {
 fn unusable_auth_config() -> latiq_auth::AuthConfig {
     latiq_auth::AuthConfig {
         audience: "latiq".to_string(),
+        // The point of this fixture: the default guard refuses it. Turning the
+        // escape on here would make the config usable and the test vacuous.
+        allow_insecure_jwks: false,
         issuers: vec![latiq_auth::IssuerConfig {
             issuer: "https://idp.example/realms/latiq".to_string(),
             jwks_uri: Some("http://idp.example/jwks".to_string()),
