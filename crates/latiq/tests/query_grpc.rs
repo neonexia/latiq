@@ -77,6 +77,50 @@ async fn pond_lifecycle_tier_recorded_and_described() {
     assert_eq!(v["pond"]["tier"], "large", "tier recorded + described");
 }
 
+/// The uncapped tier is an **operator grant**: an uncapped pond can starve every
+/// other pond on its node, so a workload must not be able to assign it to itself
+/// at allocate time. The rule lives in the registry, but the registry is not the
+/// surface an SDK or CLI reaches — so it is asserted here, on the wire, and on
+/// the *kind*, not merely on "it errored". A normal tier allocating in the same
+/// test is what stops this passing because allocate is broken outright.
+#[tokio::test]
+async fn policy_tier_none_is_refused_over_data_grpc() {
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    let with_tier = |name: &str, tier: &str| AllocatePondRequest {
+        name: name.into(),
+        policy_json: String::new(),
+        tier: tier.into(),
+        lineage: false,
+    };
+    // Every spelling the parser accepts, or the guard is bypassable by alias.
+    for tier in ["none", "uncapped", " NONE "] {
+        let status = c
+            .allocate_pond(req(with_tier("greedy", tier), "a"))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("tier `{tier}` must not be self-assignable"));
+        let env = envelope(&status);
+        assert_eq!(
+            env.kind,
+            latiq_common::ErrorKind::InvalidValue,
+            "tier `{tier}`: an operator-only tier is an invalid VALUE — not an \
+             unknown tier, and not an internal error. That distinction is the \
+             whole point: a caller must be able to tell `none exists but is not \
+             yours` from `no such tier`."
+        );
+        assert!(
+            env.message.contains("set-tier"),
+            "tier `{tier}`: the message must name the operator escape hatch, got: {}",
+            env.message
+        );
+    }
+    // The refusal is about the tier, not about allocate.
+    c.allocate_pond(req(with_tier("polite", "small"), "a"))
+        .await
+        .expect("a normal tier must still allocate");
+}
+
 #[tokio::test]
 async fn result_encoding_arrow_edge_renders_date_and_nested() {
     // The Data read path now collects from the Arrow hop and renders to JSON at

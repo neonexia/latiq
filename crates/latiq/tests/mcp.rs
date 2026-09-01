@@ -186,6 +186,50 @@ async fn mcp_prompts_sops_are_available_and_parameterized() {
     c.close().await.unwrap();
 }
 
+/// The uncapped tier is operator-only — an uncapped pond can starve every other
+/// pond on its node, so an *agent* must not be able to allocate itself one. The
+/// rule lives in the registry; this asserts the MCP surface actually carries it,
+/// with the structured kind an agent branches on rather than a bare tool error.
+#[tokio::test]
+async fn policy_tier_none_is_refused_over_mcp() {
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-greedy".into()))
+        .await
+        .unwrap();
+    // Every spelling the parser accepts, or the guard is bypassable by alias.
+    for tier in ["none", "uncapped", " NONE "] {
+        let mut args = Map::new();
+        args.insert("name".into(), format!("greedy-{}", tier.trim()).into());
+        args.insert("tier".into(), tier.into());
+        let out = c.call_tool("allocate_pond", args).await.unwrap();
+        assert!(
+            out.is_error,
+            "tier `{tier}` must not be self-assignable by an agent: {:?}",
+            out.value
+        );
+        assert_eq!(
+            out.value["kind"], "invalid_value",
+            "tier `{tier}`: an operator-only tier is an invalid VALUE — the \
+             agent must be able to tell it apart from an unknown tier, which is \
+             the one outcome this test exists to distinguish it from"
+        );
+        assert!(
+            out.value["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("set-tier")),
+            "tier `{tier}`: the message must name the operator escape hatch: {:?}",
+            out.value
+        );
+    }
+    // The refusal is about the tier, not about allocate_pond.
+    let mut ok = Map::new();
+    ok.insert("name".into(), "polite".into());
+    ok.insert("tier".into(), "small".into());
+    let out = c.call_tool("allocate_pond", ok).await.unwrap();
+    assert!(!out.is_error, "a normal tier must still allocate: {:?}", out.value);
+    c.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn mcp_error_contract_is_structured() {
     let s = start_stack().await;
