@@ -88,6 +88,10 @@ impl AdminService {
     /// the line an operator wants, and a `debug!` is off in every default
     /// configuration. So both failure paths emit an access record before
     /// returning, naming the RPC that was targeted.
+    // The `Err` is `tonic::Status` (~176 bytes) because this helper's result is
+    // returned straight out of an RPC handler, whose signature tonic fixes.
+    // Boxing here would only move the unboxing to every call site.
+    #[allow(clippy::result_large_err)]
     async fn identity_of<T>(
         &self,
         req: &Request<T>,
