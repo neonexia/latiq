@@ -19,6 +19,19 @@
 //! with e.g. `RUST_LOG=latiq::access=info`, or by grepping the `latiq::access`
 //! target / the `op=`/`pond=` fields.
 //!
+//! To follow ONE request, filter on `trace_id=`. It is the field that makes the
+//! trail work in a cluster: a request that lands on a node which does not own
+//! the pond is forwarded, and it is the OWNER that records it — the greeter
+//! returns before its own audit, so attribution stays on the node that ran the
+//! op. That leaves a record on a node the client never dialled, and the trace
+//! id is the only thing tying it back to the request that caused it (the
+//! forwarder replays the id in `latiq-trace-id`, so the greeter's spans and the
+//! owner's record agree). `-` where no
+//! trace scope is in force: the control plane's Admin twin (it answers alone
+//! and never forwards, so there is no second record to join to), and the
+//! Data/Stream surfaces' auth rejections, which are recorded at the door —
+//! before the handler enters the trace scope — and so cannot be followed.
+//!
 //! To ask *who* did something, filter on `subject=` **together with**
 //! `verified=true`: `agent=` is the caller's own claim and carries no authority
 //! (it is empty of meaning for authorization, useful only for correlating one
@@ -48,6 +61,10 @@ pub fn outcome<T, E>(res: &Result<T, E>) -> &'static str {
 
 /// Emit one access record. `pond` is `-` where the action is not about one pond
 /// (or where it never got far enough to resolve one).
+///
+/// The trace id is read from the ambient scope rather than passed in: every
+/// caller would otherwise have to remember to thread it, and a producer that
+/// forgot would emit a record that looks complete and is unjoinable.
 pub fn record(
     identity: &Identity,
     op: &str,
@@ -56,6 +73,7 @@ pub fn record(
     duration_ms: u64,
     outcome: &str,
 ) {
+    let trace_id = crate::trace::current_trace_id();
     tracing::info!(
         target: "latiq::access",
         agent = %identity.agent_id,          // CLAIMED. never authority.
@@ -64,6 +82,7 @@ pub fn record(
         verified = identity.verified,        // scopes subject/issuer, NOT agent
         op,
         pond = pond.unwrap_or("-"),
+        trace_id = trace_id.as_deref().unwrap_or("-"), // one request, across nodes
         duration_ms,
         summary = summary.unwrap_or(""),
         outcome,                             // ok | error — did it LAND?

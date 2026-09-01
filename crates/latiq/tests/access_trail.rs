@@ -33,15 +33,19 @@
 //! callsite is hit: a sibling test that touches `latiq::access` before any
 //! subscriber exists caches "never", and the capture then sees an empty buffer.
 //!
-//! That argument buys ONE SUBSCRIBER PER BINARY, not one test per binary. Both
+//! That argument buys ONE SUBSCRIBER PER BINARY, not one test per binary. The
 //! tests below install the identical subscriber, so it is installed once behind
 //! a `OnceLock` (`set_global_default` panics on a second call) and they share
 //! the buffer, each searching for its own distinct needles. Every lookup is
-//! narrowed by the RPC it is about, so neither test can match the other's
-//! records -- see `rejected: invalid token`, which both surfaces emit.
+//! narrowed by the RPC it is about AND by something only its own test emits --
+//! its agent claim, its pond, its trace id. The RPC alone is not enough: two
+//! tests both allocate a pond and both write, and `find` returns whichever
+//! record the interleaving happened to put first. See also `rejected: invalid
+//! token`, which both SURFACES emit within one test.
 mod common;
 
 use latiq_proto::v1::admin_client::AdminClient;
+use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
 use latiq_proto::v1::stream_client::StreamClient;
 use latiq_proto::v1::*;
@@ -212,6 +216,15 @@ async fn auth_admin_actions_are_attributed_in_the_access_trail() {
                 && line.contains("duration_ms=")
                 && line.contains("summary="),
             "operator records must carry the same fields as agent records: {line}"
+        );
+        // `trace_id` included, and `-` on purpose: an Admin call is answered by
+        // the control plane alone and has no second record on another node to
+        // be joined to. Omitting the field instead would make a `trace_id=`
+        // grep skip operator actions entirely -- one searchable stream with two
+        // field sets is two streams.
+        assert!(
+            line.contains("trace_id=\"-\""),
+            "the operator twin must carry trace_id too: {line}"
         );
     }
 
@@ -420,7 +433,9 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
             .to_string()
     };
 
-    let allocated = access("op=\"allocate_pond\"");
+    // Narrowed by agent, not just RPC: another test in this binary allocates a
+    // pond too, and its record would otherwise be a legal answer to this find.
+    let allocated = access_rpc("allocate_pond", "agent=agent-7");
     assert!(
         allocated.contains("outcome=\"ok\""),
         "a successful action must be marked as such: {allocated}"
@@ -432,7 +447,8 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
 
     // A failed write must NOT read like a successful one. Without `outcome` an
     // op that never touched the data is byte-identical to one that did.
-    let failed = access("op=\"write_query\"");
+    // Same reason, narrowed by the pond this test is about.
+    let failed = access_rpc("write_query", "pond=\"never-existed\"");
     assert!(
         failed.contains("outcome=\"error\""),
         "a failed query must be marked failed: {failed}"
@@ -544,4 +560,121 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         rejected_stream.contains("outcome=\"error\"") && rejected_stream.contains("verified=false"),
         "the Stream surface must record rejections like the Data surface: {rejected_stream}"
     );
+}
+
+/// A request tagged with the caller's own trace id and agent claim. No token:
+/// this stack runs relaxed (the default), and identity is not what is under
+/// test here.
+fn traced_req<T>(msg: T, agent: &str, trace_id: &str) -> Request<T> {
+    let mut r = Request::new(msg);
+    r.metadata_mut()
+        .insert("latiq-agent-id", agent.parse().unwrap());
+    r.metadata_mut()
+        .insert("latiq-trace-id", trace_id.parse().unwrap());
+    r
+}
+
+#[tokio::test]
+async fn access_trail_trace_id_ties_a_forwarded_op_to_the_request_that_started_it() {
+    // A forwarded op is AUDITED BY THE OWNER — the greeter returns before its
+    // own audit, deliberately, so attribution stays on the node that ran the
+    // query. That leaves the operator with a record on a node the client never
+    // dialled, and until now nothing in it referred back to the request: the
+    // access trail had no field an operator could follow across the hop.
+    //
+    // `trace_id` is that field. The client mints one, the greeter scopes it,
+    // the forwarder replays it in `latiq-trace-id`, and the owner records it —
+    // so the owner's record is reachable from the greeter's `forwarding to
+    // owner node` log and from the client's own id.
+    let captured = captured();
+    let stack = common::start_stack_n(2).await;
+
+    const FORWARDED: &str = "trace-forwarded-0001";
+    const DIRECT: &str = "trace-direct-0002";
+
+    let mut n0 = DataClient::connect(stack.nodes[0].data_endpoint.clone())
+        .await
+        .unwrap();
+    n0.allocate_pond(traced_req(
+        AllocatePondRequest {
+            name: "traced".into(),
+            policy_json: String::new(),
+            tier: String::new(),
+            lineage: false,
+        },
+        "alice",
+        "trace-allocate-0000",
+    ))
+    .await
+    .unwrap();
+    let owner = ControlClient::connect(stack.control_endpoint.clone())
+        .await
+        .unwrap()
+        .get_pond_location(GetPondLocationRequest {
+            pond_ref: "traced".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .node_endpoint;
+    let greeter = stack.other_than(&owner).data_endpoint.clone();
+    assert_ne!(greeter, owner, "the request must actually cross a node hop");
+
+    // Through the greeter: forwarded, and audited on the owner.
+    DataClient::connect(greeter)
+        .await
+        .unwrap()
+        .write_query(traced_req(
+            QueryRequest {
+                pond: "traced".into(),
+                sql: "CREATE TABLE t(i INTEGER)".into(),
+            },
+            "alice",
+            FORWARDED,
+        ))
+        .await
+        .unwrap();
+    // Straight to the owner: same pond, same op, a different id — so a trace_id
+    // that were a constant, or copied from the wrong request, is visible.
+    DataClient::connect(owner)
+        .await
+        .unwrap()
+        .write_query(traced_req(
+            QueryRequest {
+                pond: "traced".into(),
+                sql: "INSERT INTO t VALUES (1)".into(),
+            },
+            "alice",
+            DIRECT,
+        ))
+        .await
+        .unwrap();
+
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    let writes: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("latiq::access") && l.contains("op=\"write_query\""))
+        .filter(|l| l.contains("agent=alice"))
+        .collect();
+    assert_eq!(
+        writes.len(),
+        2,
+        "one record per write, both on the owner: {log}"
+    );
+    for id in [FORWARDED, DIRECT] {
+        let needle = format!("trace_id=\"{id}\"");
+        let found: Vec<_> = writes.iter().filter(|l| l.contains(&needle)).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly one record must carry {id}; the forwarded one proves the \
+             caller's id survived the hop instead of the owner minting a fresh \
+             one: {writes:?}"
+        );
+        assert!(
+            found[0].contains("outcome=\"ok\""),
+            "and it is the record of the write that landed: {}",
+            found[0]
+        );
+    }
 }
