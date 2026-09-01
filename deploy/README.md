@@ -88,7 +88,7 @@ Full instructions, the CLI recipes and the scale-out test:
 
 A real Iceberg REST catalog on MinIO, so Latiq's external-catalog attacher can be
 exercised end to end. `./iceberg-minio/up.sh` brings it up and seeds a table; the
-matching test is `crates/latiq/tests/catalogs_iceberg.rs` (`#[ignore]`d — it needs
+matching test is `crates/latiq/tests/admin.rs::catalogs_iceberg` (`#[ignore]`d — it needs
 this harness). See [`iceberg-minio/README.md`](iceberg-minio/README.md).
 
 ## Images — `Dockerfile`, `gateway.Dockerfile`

@@ -24,7 +24,8 @@
 #   LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
 #   LATIQ_S3_ENDPOINT=http://localhost:9000 \
 #   LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
-#   cargo test -p latiq --test catalogs_iceberg -- --ignored --nocapture
+#   cargo test -p latiq --test admin -- --ignored --exact --nocapture \
+  catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond
 set -euo pipefail
 cd "$(dirname "$0")"
 
