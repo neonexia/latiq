@@ -2093,7 +2093,11 @@ mod tests {
             .iter()
             .map(|t| tier_limits(t.as_str()).map(|l| (l.memory_bytes, l.cores)))
             .collect();
-        assert_eq!(distinct.len(), ladder.len(), "tiers collapsed onto each other");
+        assert_eq!(
+            distinct.len(),
+            ladder.len(),
+            "tiers collapsed onto each other"
+        );
 
         // The uncapped tier is the one that must map to "apply nothing" — a
         // fallback to `medium` here would silently re-cap an operator-granted
@@ -2122,5 +2126,4 @@ mod tests {
             "a recognised tier must not resolve to the fallback"
         );
     }
-
 }

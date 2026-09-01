@@ -226,7 +226,11 @@ async fn policy_tier_none_is_refused_over_mcp() {
     ok.insert("name".into(), "polite".into());
     ok.insert("tier".into(), "small".into());
     let out = c.call_tool("allocate_pond", ok).await.unwrap();
-    assert!(!out.is_error, "a normal tier must still allocate: {:?}", out.value);
+    assert!(
+        !out.is_error,
+        "a normal tier must still allocate: {:?}",
+        out.value
+    );
     c.close().await.unwrap();
 }
 

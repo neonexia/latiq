@@ -1401,7 +1401,11 @@ mod tests {
             ("BIGINT", "(-64)::BIGINT", serde_json::json!(-64)),
             ("UTINYINT", "255::UTINYINT", serde_json::json!(255)),
             ("USMALLINT", "65535::USMALLINT", serde_json::json!(65535)),
-            ("UINTEGER", "4294967295::UINTEGER", serde_json::json!(4294967295u32)),
+            (
+                "UINTEGER",
+                "4294967295::UINTEGER",
+                serde_json::json!(4294967295u32),
+            ),
             // Above i64::MAX: u64 has its own serde_json::Number, so this must
             // stay a number with full precision (unlike HugeInt, which cannot).
             (
@@ -1430,7 +1434,11 @@ mod tests {
             ),
             // Lowercase hex, no prefix, no separators.
             ("BLOB", "'ab'::BLOB", serde_json::json!("6162")),
-            ("BLOB non-ascii", "'\\xFF\\x00'::BLOB", serde_json::json!("ff00")),
+            (
+                "BLOB non-ascii",
+                "'\\xFF\\x00'::BLOB",
+                serde_json::json!("ff00"),
+            ),
             ("ENUM", "'x'::ENUM('x','y')", serde_json::json!("x")),
             ("VARCHAR", "'hi'", serde_json::json!("hi")),
             // TimeUnit: only Microsecond was ever exercised. Second carries no

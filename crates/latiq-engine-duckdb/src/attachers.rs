@@ -259,11 +259,7 @@ mod tests {
     /// obviously synthetic; nothing real is ever put in a test fixture.
     fn s3_params(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
         let mut p = params(&[("s3_access_key", "AK"), ("s3_secret_key", "SK")]);
-        p.extend(
-            extra
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string())),
-        );
+        p.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         p
     }
 
