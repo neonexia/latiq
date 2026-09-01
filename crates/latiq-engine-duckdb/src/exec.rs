@@ -1378,6 +1378,104 @@ mod tests {
         assert_eq!(res.rows[0][2], serde_json::json!({"k": [10, 20]}));
     }
 
+    /// Every `value_to_json` arm, pinned to the **exact** JSON we emit — value
+    /// and shape both, because a consumer parses these and a `Decimal` that
+    /// silently became a JSON number (or an `Interval` that became a string)
+    /// is a wire-format break, not a cosmetic one.
+    ///
+    /// Invariant 10: this asserts *our* conversion, never DuckDB's semantics.
+    /// Each case is one column of one real query, so the arm is reached the way
+    /// a caller reaches it. Only the exactly-representable float values are used
+    /// (1.5, 2.5) so the assertion is about our mapping, not float printing.
+    #[test]
+    fn result_encoding_covers_every_value_arm_with_an_exact_shape() {
+        let (_fs, inst) = pond();
+        // (label, SQL expression, the JSON we promise for it)
+        let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+            ("NULL", "NULL::INTEGER", serde_json::Value::Null),
+            ("BOOLEAN", "true", serde_json::json!(true)),
+            ("BOOLEAN false", "false", serde_json::json!(false)),
+            ("TINYINT", "(-8)::TINYINT", serde_json::json!(-8)),
+            ("SMALLINT", "(-16)::SMALLINT", serde_json::json!(-16)),
+            ("INTEGER", "(-32)::INTEGER", serde_json::json!(-32)),
+            ("BIGINT", "(-64)::BIGINT", serde_json::json!(-64)),
+            ("UTINYINT", "255::UTINYINT", serde_json::json!(255)),
+            ("USMALLINT", "65535::USMALLINT", serde_json::json!(65535)),
+            ("UINTEGER", "4294967295::UINTEGER", serde_json::json!(4294967295u32)),
+            // Above i64::MAX: u64 has its own serde_json::Number, so this must
+            // stay a number with full precision (unlike HugeInt, which cannot).
+            (
+                "UBIGINT",
+                "18446744073709551615::UBIGINT",
+                serde_json::json!(18446744073709551615u64),
+            ),
+            ("FLOAT", "1.5::FLOAT", serde_json::json!(1.5)),
+            ("DOUBLE", "2.5::DOUBLE", serde_json::json!(2.5)),
+            // A STRING, not a number: DECIMAL is exact and JSON numbers are not,
+            // so rendering 3.14 as a float would hand the consumer a value that
+            // is no longer the one stored.
+            ("DECIMAL", "3.14::DECIMAL(5,2)", serde_json::json!("3.14")),
+            (
+                "DECIMAL wide",
+                "123456789012345678.90::DECIMAL(38,2)",
+                serde_json::json!("123456789012345678.90"),
+            ),
+            // An OBJECT of the three independent components, not a string: a
+            // month is not a fixed number of days, so any single scalar would
+            // have to invent a calendar.
+            (
+                "INTERVAL",
+                "INTERVAL 1 MONTH + INTERVAL 2 DAY + INTERVAL 3 SECOND",
+                serde_json::json!({"months": 1, "days": 2, "nanos": 3_000_000_000i64}),
+            ),
+            // Lowercase hex, no prefix, no separators.
+            ("BLOB", "'ab'::BLOB", serde_json::json!("6162")),
+            ("BLOB non-ascii", "'\\xFF\\x00'::BLOB", serde_json::json!("ff00")),
+            ("ENUM", "'x'::ENUM('x','y')", serde_json::json!("x")),
+            ("VARCHAR", "'hi'", serde_json::json!("hi")),
+            // TimeUnit: only Microsecond was ever exercised. Second carries no
+            // fraction; Nanosecond truncates to microseconds (our format's
+            // resolution) rather than rounding or overflowing.
+            (
+                "TIMESTAMP_S",
+                "'2021-07-01 13:45:06'::TIMESTAMP_S",
+                serde_json::json!("2021-07-01 13:45:06"),
+            ),
+            (
+                "TIMESTAMP_MS",
+                "'2021-07-01 13:45:06.123'::TIMESTAMP_MS",
+                serde_json::json!("2021-07-01 13:45:06.123000"),
+            ),
+            (
+                "TIMESTAMP_NS",
+                "'2021-07-01 13:45:06.123456789'::TIMESTAMP_NS",
+                serde_json::json!("2021-07-01 13:45:06.123456"),
+            ),
+            // The same arms, reached through the nested containers: a LIST and a
+            // STRUCT must map their elements with the identical rules, not fall
+            // back to a Debug rendering.
+            (
+                "LIST of DECIMAL",
+                "[1.10::DECIMAL(4,2), 2.20::DECIMAL(4,2)]",
+                serde_json::json!(["1.10", "2.20"]),
+            ),
+            (
+                "STRUCT of BOOLEAN/BLOB/FLOAT",
+                "{'b': false, 'raw': 'ab'::BLOB, 'f': 1.5::FLOAT}",
+                serde_json::json!({"b": false, "raw": "6162", "f": 1.5}),
+            ),
+        ];
+        // Anti-vacuity: the loop must actually run, and this count is what makes
+        // a case silently dropped from the table a failing test.
+        assert_eq!(cases.len(), 25, "the value-arm table lost or gained a case");
+        for (label, expr, expected) in &cases {
+            let res = run_read(&inst, &format!("SELECT {expr} AS v"))
+                .unwrap_or_else(|e| panic!("{label}: query failed: {e:?}"));
+            assert_eq!(res.rows.len(), 1, "{label}: expected exactly one row");
+            assert_eq!(&res.rows[0][0], expected, "{label}: wrong JSON encoding");
+        }
+    }
+
     #[test]
     fn hugeint_beyond_i64_is_returned_as_string_not_truncated() {
         let (_fs, inst) = pond();
