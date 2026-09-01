@@ -196,6 +196,12 @@ fn audit(
         verified = identity.verified,        // scopes subject/issuer, NOT agent
         op,
         pond = pond.unwrap_or("-"),
+        // Present, and deliberately always `-`: the field set must be identical
+        // to the pond node's or a `trace_id=` grep would silently skip operator
+        // actions. There is nothing to put in it — an Admin call is answered by
+        // the control plane alone, never forwarded, so it has no second record
+        // on another node to be joined to.
+        trace_id = "-",
         duration_ms = started.elapsed().as_millis() as u64,
         summary,
         outcome,                             // ok | error — did it LAND?

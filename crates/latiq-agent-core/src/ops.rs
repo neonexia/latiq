@@ -230,8 +230,7 @@ impl AgentOps {
         let Some(writer) = self.lineage_writer(rec.info) else {
             return; // nothing to do, and never anything to fail
         };
-        let node_id = self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE);
-        if crate::lineage::record(&writer, node_id, rec) {
+        if crate::lineage::record(&writer, self.node_id(), rec) {
             tokio::task::spawn_blocking(move || writer.flush());
         }
     }
@@ -347,6 +346,15 @@ impl AgentOps {
         Some((fwd.as_ref(), owner))
     }
 
+    /// What this node calls itself when it says "I ran this": its advertised
+    /// internal endpoint, or `in-process` where there is none (single-node,
+    /// embedded SDK). One definition for `QueryMeta::served_by` and the lineage
+    /// event's `nodeId`, so an operator correlating the two never has to
+    /// reconcile two spellings of the same node.
+    fn node_id(&self) -> &str {
+        self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE)
+    }
+
     fn parse_id(pond_id: &str) -> Result<PondId, AgentError> {
         PondId::parse(pond_id).map_err(|e| AgentError::internal(format!("bad pond id: {e}")))
     }
@@ -452,7 +460,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("describe");
+            record_forward("describe_pond");
             return fwd.describe(owner, identity, pond_ref).await;
         }
         info!(op = "describe_pond", pond = pond_ref, "processing locally");
@@ -550,7 +558,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("drop");
+            record_forward("drop_pond");
             return fwd.drop_pond(owner, identity, pond_ref, confirm).await;
         }
         info!(op = "drop_pond", pond = pond_ref, "processing locally");
@@ -1050,6 +1058,11 @@ impl AgentOps {
             schema,
             batches: Box::pin(ReceiverStream::new(batch_rx)),
             meta: Some(meta_rx),
+            // This node is running the engine, so this node is the one serving
+            // it. Set here and not in the meta the blocking producer sends,
+            // because the streaming adapter must announce it on its first chunk
+            // — long before the last batch resolves that meta.
+            served_by: self.node_id().to_string(),
         })
     }
 
@@ -1084,7 +1097,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("read_arrow");
+            record_forward("read_query");
             // The owner audits the read it ran; we only collect its stream.
             let stream = fwd.read_arrow(owner, identity, pond_ref, sql).await?;
             return self.collect_stream(stream).await;
@@ -1134,6 +1147,7 @@ impl AgentOps {
         let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut batches = stream.batches;
         let meta = stream.meta;
+        let served_by = stream.served_by;
         while let Some(b) = batches.next().await {
             append_batch_rows(&b?, &columns, &mut rows)?;
             if rows.len() > self.config.inline_row_cap {
@@ -1158,6 +1172,11 @@ impl AgentOps {
             None => QueryMeta::default(),
         };
         meta.rows = n;
+        // From the STREAM, not from this node: on a forwarded read the stream
+        // was produced by the peer and carries the peer's name, which is the
+        // one the caller must see. Assigning `self.node_id()` here is exactly
+        // the bug the field exists to catch.
+        meta.served_by = served_by;
         Ok(QueryResult {
             columns,
             rows,
@@ -1186,7 +1205,11 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("query");
+            // The neutral `query` above is about the SQL (we cannot say read vs
+            // write before the engine classifies it); the metric label is about
+            // the RPC the caller invoked, which we do know — `op` is the whole
+            // value of the label.
+            record_forward(if write { "write_query" } else { "read_query" });
             return if write {
                 fwd.write(owner, identity, pond_ref, sql).await
             } else {
@@ -1289,7 +1312,7 @@ impl AgentOps {
 
         let (result, from_plan) = out?;
         *planned = from_plan;
-        let qr = match result {
+        let mut qr = match result {
             Ok(qr) => qr,
             Err(e) => {
                 let ae = AgentError::from(e);
@@ -1307,6 +1330,11 @@ impl AgentOps {
             if write { "write" } else { "read" },
             t0.elapsed(),
         );
+        // Stamped on the LOCAL path only, and this is the whole discipline
+        // behind the field: the forwarded path returns the peer's result
+        // untouched further up, so a relayed meta keeps the owner's name and
+        // never acquires the greeter's.
+        qr.meta.served_by = self.node_id().to_string();
         Ok(qr)
     }
 
@@ -1326,7 +1354,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("explain");
+            record_forward("explain_query");
             return fwd.explain(owner, identity, pond_ref, sql).await;
         }
         info!(op = "explain_query", pond = pond_ref, "processing locally");
@@ -1437,7 +1465,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("lineage");
+            record_forward("get_lineage");
             return fwd
                 .get_lineage(owner, identity, pond_ref, limit, since, before)
                 .await;
@@ -1688,6 +1716,18 @@ fn record_query_duration(pond: &str, op: &'static str, elapsed: std::time::Durat
 }
 /// Count an operation forwarded to another node (multi-node path), by op. Lets
 /// operators see how much traffic crosses node boundaries vs. runs locally.
+///
+/// `op` is the op as the CALLER invoked it — the same name the access trail
+/// records — so a spike here can be grepped there. It is emphatically NOT the
+/// internal hop the op happens to ride: `read_collected` forwards over the
+/// Arrow stream and used to be counted as `read_arrow`, which merged it with
+/// the genuinely streaming RPC and left `read_query` looking like it never
+/// crossed a node.
+///
+/// Called at the forward decision and nowhere else. Allocation deliberately has
+/// no counter: a pond placed on another node is not forwarded to it — nothing
+/// is dialled, the owner materializes it lazily on first use — and counting it
+/// would make this metric mean two different things.
 fn record_forward(op: &'static str) {
     metrics::counter!("latiq_forwarded_total", "op" => op).increment(1);
 }

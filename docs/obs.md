@@ -40,9 +40,9 @@ read/write/explain, dataset load, catalog pull/describe, and the Admin surface's
 operator actions — pure registry browsing, `list_datasets`/`list_catalogs` and
 their `get_*`, is deliberately not audited: no pond, no identity). Each carries
 `agent` (the caller's **claim**), `subject`/`issuer` (verified, empty when not),
-`verified`, `op`, `pond`, `duration_ms`, a redacted `summary` (SQL shape with
-literals replaced by `?`), and `outcome` (`ok`/`error` — failures and rejected
-calls are recorded too, not only successes). Operators grep the log files (or
+`verified`, `op`, `pond`, `trace_id`, `duration_ms`, a redacted `summary` (SQL
+shape with literals replaced by `?`), and `outcome` (`ok`/`error` — failures and
+rejected calls are recorded too, not only successes). Operators grep the log files (or
 query them in their log stack); with `LATIQ_LOG_FORMAT=json` the fields are
 structured.
 
@@ -51,6 +51,15 @@ To ask *who* did something, filter on `subject=` **together with**
 A streaming read (`read_arrow`) is recorded when the stream is **established**,
 not when it finishes — so `duration_ms` there measures establishment and
 `outcome` says whether the read started.
+
+To follow **one request**, filter on `trace_id=`. A request that lands on a node
+which does not own the pond is forwarded, and it is the **owner** that records
+it (the greeter returns before its own audit, so attribution stays on the node
+that ran the op) — under the trace id the client's request carried, which the
+greeter propagates. Without that field the record sits on a node the client
+never dialled with nothing tying it back to the request that caused it. `trace_id="-"` where there is no trace scope to inherit: the control
+plane's Admin surface (it answers alone and never forwards) and auth rejections
+(recorded at the door, before the handler enters the scope).
 
 ```bash
 # tail just the access trail
@@ -67,7 +76,14 @@ Each request gets a `trace_id` (from an incoming `latiq-trace-id` gRPC metadata
 header, or freshly generated at the edge). It is set as a task-local span field
 for the whole request and **propagated across the node-to-node forward hop** (the
 greeter stamps `latiq-trace-id` on its call to the owner). So one request's spans
-share a `trace_id` across nodes.
+share a `trace_id` across nodes — and so does the access record the owner writes.
+
+The response says who ran it: `_meta.served_by` on every query result names the
+node that **actually executed** the statement (its advertised internal endpoint,
+or `in-process` where a node advertises none). On a forwarded request that is the
+OWNER, not the node the client dialled — the cheapest way to see, from the client
+side, which node did the work. The Arrow stream carries the same value on its
+first chunk.
 
 **Correlate a request across nodes** by that id in your log stack:
 ```bash
@@ -105,7 +121,7 @@ snapshot, refreshed by a 5s in-process collector.
 | `latiq_pond_queries_total` | counter | `pond`, `op` | pond node | Query load **over time** |
 | `latiq_pond_query_duration_seconds` | histogram | `pond`, `op` | pond node | Query wall-clock latency (engine exec) → p50/p95/p99 |
 | `latiq_pond_errors_total` | counter | `pond`, `kind` | pond node | Errors **over time**, by `ErrorKind` |
-| `latiq_forwarded_total` | counter | `op` | pond node | Ops forwarded to another node (multi-node path) |
+| `latiq_forwarded_total` | counter | `op` | pond node | Ops forwarded to another node (multi-node path). `op` is the op as the **caller** invoked it — the same name the `latiq::access` trail records, so a spike here is greppable there. Allocation is absent on purpose: a pond placed on another node is never dialled. |
 | `latiq_build_info` | gauge | `version` | both | Always 1; carries the version label |
 
 > **Cardinality:** the `pond` label is intentional (per-pond visibility). Series

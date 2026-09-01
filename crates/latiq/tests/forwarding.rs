@@ -22,6 +22,7 @@ mod common;
 use common::{start_stack_n, start_stack_n_with_auth, MultiStack, NodeStack};
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
+use latiq_proto::v1::stream_client::StreamClient;
 use latiq_proto::v1::*;
 use tonic::{Code, Request};
 
@@ -72,6 +73,17 @@ fn rows(json: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(json).unwrap()["rows"].clone()
 }
 
+/// `_meta.served_by` — the node that actually EXECUTED the statement. Missing
+/// is a failure, not an empty string: a response that does not say who served
+/// it is exactly the state these tests exist to rule out.
+fn served_by(json: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
+    v["_meta"]["served_by"]
+        .as_str()
+        .unwrap_or_else(|| panic!("every query response must carry _meta.served_by: {json}"))
+        .to_string()
+}
+
 #[tokio::test]
 async fn forwarding_read_happy() {
     let stack = start_stack_n(2).await;
@@ -118,6 +130,111 @@ async fn forwarding_write_then_read_consistent() {
         .unwrap()
         .into_inner();
     assert_eq!(rows(&forwarded.json)[0][0], 42);
+}
+
+#[tokio::test]
+async fn forwarding_served_by_names_the_owner_not_the_greeter() {
+    // The response-level proof that a forward actually happened. Every other
+    // test in this file passes if forwarding silently degrades to "the greeter
+    // lazily creates its own empty pond and serves the request locally" —
+    // because a greeter serving its own pond returns a plausible answer to
+    // every one of them. This assertion is the one that cannot.
+    let stack = start_stack_n(2).await;
+    let owner = allocate_and_locate(&stack, "sb").await;
+    let greeter = stack.other_than(&owner).data_endpoint.clone();
+    assert_ne!(
+        greeter, owner,
+        "the two endpoints must differ or the equalities below prove nothing"
+    );
+    let mut o = client(&owner).await;
+    let mut g = client(&greeter).await;
+
+    // Direct: the node that received it is the node that ran it.
+    let direct = o
+        .write_query(req(q("sb", "CREATE TABLE t AS SELECT 7 AS i"), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(served_by(&direct.json), owner);
+
+    // Forwarded: the OWNER, from a request the greeter received.
+    let fwd_write = g
+        .write_query(req(q("sb", "INSERT INTO t VALUES (8)"), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        served_by(&fwd_write.json),
+        owner,
+        "a forwarded write is executed by the owner and must say so"
+    );
+    let fwd_read = g
+        .read_query(req(q("sb", "SELECT count(*) AS n FROM t"), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rows(&fwd_read.json)[0][0], 2, "the read saw both writes");
+    assert_eq!(
+        served_by(&fwd_read.json),
+        owner,
+        "a forwarded read is executed by the owner and must say so"
+    );
+}
+
+/// Drain an Arrow read from `endpoint` and return every non-empty `served_by`
+/// the peer put on a chunk. A `Vec` rather than an `Option` so a test can pin
+/// how MANY chunks claimed to serve the read: exactly one must, and a stream
+/// that names its server on every chunk is as wrong as one that names it never.
+async fn stream_served_by(endpoint: &str, pond: &str) -> Vec<String> {
+    let mut sc = StreamClient::connect(endpoint.to_string()).await.unwrap();
+    let mut st = sc
+        .read_arrow(req(q(pond, "SELECT i FROM t"), "alice"))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut named = Vec::new();
+    let mut chunks = 0;
+    while let Some(c) = st.message().await.unwrap() {
+        chunks += 1;
+        if !c.served_by.is_empty() {
+            named.push(c.served_by);
+        }
+    }
+    assert!(
+        chunks > 1,
+        "the read must produce a batch beyond the schema chunk, or 'exactly one \
+         chunk names the server' would be true of a one-chunk stream by default"
+    );
+    named
+}
+
+#[tokio::test]
+async fn forwarding_served_by_rides_the_arrow_stream_from_the_owner() {
+    // The streaming path has no `_meta` to carry the answer in: the owner puts
+    // its name on the first chunk and the greeter relays it. Without this, a
+    // forwarded stream would be indistinguishable from a local one.
+    let stack = start_stack_n(2).await;
+    let owner = allocate_and_locate(&stack, "sbs").await;
+    let greeter = stack.other_than(&owner).data_endpoint.clone();
+    assert_ne!(greeter, owner, "or the equalities below prove nothing");
+    let mut o = client(&owner).await;
+    o.write_query(req(
+        q("sbs", "CREATE TABLE t AS SELECT i FROM range(3) t(i)"),
+        "alice",
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        stream_served_by(&owner, "sbs").await,
+        vec![owner.clone()],
+        "a direct stream is served by the node dialled, said once"
+    );
+    assert_eq!(
+        stream_served_by(&greeter, "sbs").await,
+        vec![owner.clone()],
+        "a forwarded stream reports the OWNER, relayed verbatim and said once"
+    );
 }
 
 #[tokio::test]

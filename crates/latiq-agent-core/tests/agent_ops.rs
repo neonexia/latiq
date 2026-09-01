@@ -50,6 +50,23 @@ fn ops() -> AgentOps {
 }
 
 #[tokio::test]
+async fn served_by_reports_in_process_when_the_node_advertises_no_endpoint() {
+    // Single-node / embedded-SDK setups have no advertised endpoint to name.
+    // The documented answer is the constant, never an empty string: "one node,
+    // nothing to forward to" must not read as "we forgot to record it".
+    let ops = ops();
+    let id = Identity::claimed(Some("solo"));
+    ops.allocate_pond(&id, Some("solo-pond".into()), "{}", "medium", &[], false)
+        .await
+        .unwrap();
+    let r = ops
+        .read_query(&id, "solo-pond", "SELECT 1 AS one")
+        .await
+        .unwrap();
+    assert_eq!(r.meta.served_by, "in-process");
+}
+
+#[tokio::test]
 async fn full_agent_loop() {
     let ops = ops();
     let id = Identity::claimed(Some("agent-loop"));
@@ -467,6 +484,12 @@ mod forwarding {
 
     const PID: &str = "00000000-0000-0000-0000-000000000001";
 
+    /// What the fake owner stamps into every result it hands back — standing in
+    /// for the real owner's `run_query_local` / `read_arrow_local`. A greeter
+    /// that replaced it with its own name would be reporting that it served a
+    /// query it only relayed.
+    const OWNER_SAYS: &str = "http://owner:9092";
+
     /// Every pond resolves to a fixed owner endpoint (or none).
     struct FixedOwner {
         endpoint: Option<String>,
@@ -554,7 +577,10 @@ mod forwarding {
         QueryResult {
             columns: vec![tag.to_string()],
             rows: vec![],
-            meta: QueryMeta::default(),
+            meta: QueryMeta {
+                served_by: OWNER_SAYS.to_string(),
+                ..QueryMeta::default()
+            },
         }
     }
 
@@ -594,7 +620,8 @@ mod forwarding {
             Ok(ArrowReadStream::new(
                 std::sync::Arc::new(arrow::datatypes::Schema::empty()),
                 Box::pin(tokio_stream::iter(Vec::new())),
-            ))
+            )
+            .with_served_by(OWNER_SAYS))
         }
         async fn explain(
             &self,
@@ -785,6 +812,156 @@ mod forwarding {
             super::lineage::events_in(&owner_storage, PID).len(),
             2,
             "the owner records the write it actually ran, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_served_by_survives_the_hop_unchanged() {
+        // The proof that a request was really forwarded, and the reason the
+        // field exists: a greeter that could not forward would fall back to
+        // serving the pond itself and stamp its OWN name here, while every
+        // other assertion in this file still passed.
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(Some(OWNER_SAYS), "http://greeter:9092", fwd.clone());
+        let id = Identity::claimed(Some("a"));
+
+        let read = ops.read_query(&id, "pond-x", "SELECT 1").await.unwrap();
+        assert_eq!(
+            read.meta.served_by, OWNER_SAYS,
+            "a relayed read must keep the owner's name"
+        );
+        let write = ops
+            .write_query(&id, "pond-x", "CREATE TABLE t(i INT)")
+            .await
+            .unwrap();
+        assert_eq!(
+            write.meta.served_by, OWNER_SAYS,
+            "a relayed write must keep the owner's name"
+        );
+        // The collecting read rides the Arrow hop and rebuilds its meta from a
+        // stream the greeter decoded — the one path where the owner's name has
+        // no `_meta` to travel in and could plausibly be lost or replaced.
+        let collected = ops.read_collected(&id, "pond-x", "SELECT 1").await.unwrap();
+        assert_eq!(
+            collected.meta.served_by, OWNER_SAYS,
+            "the collected Arrow hop must report the owner, not the collector"
+        );
+        assert_eq!(
+            fwd.reads.load(Ordering::SeqCst) + fwd.writes.load(Ordering::SeqCst),
+            3,
+            "all three ops really went through the forwarder"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_served_by_names_this_node_when_it_runs_the_query() {
+        // The other half of the equality above: with no other owner to forward
+        // to, the node that received the request is the node that ran it, and
+        // says so. Without this, `served_by` could be a constant and the
+        // forwarded assertion would still pass.
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(Some("http://me:9092"), "http://me:9092", fwd.clone());
+        let id = Identity::claimed(Some("a"));
+
+        let r = ops
+            .read_query(&id, "pond-x", "SELECT 1 AS one")
+            .await
+            .unwrap();
+        assert_eq!(r.meta.served_by, "http://me:9092");
+        let c = ops
+            .read_collected(&id, "pond-x", "SELECT 1 AS one")
+            .await
+            .unwrap();
+        assert_eq!(
+            c.meta.served_by, "http://me:9092",
+            "the streamed-then-collected path names this node too"
+        );
+        assert_eq!(fwd.reads.load(Ordering::SeqCst), 0, "nothing was forwarded");
+    }
+
+    /// Every `latiq_forwarded_total` series the local recorder saw, as
+    /// `op` -> count.
+    fn forward_counts(rendered: &str) -> std::collections::BTreeMap<String, String> {
+        rendered
+            .lines()
+            .filter_map(|l| l.strip_prefix("latiq_forwarded_total{op=\""))
+            .filter_map(|rest| {
+                let (op, tail) = rest.split_once('"')?;
+                let count = tail.rsplit_once(' ')?.1;
+                Some((op.to_string(), count.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forwarding_counts_each_hop_under_the_op_the_caller_invoked() {
+        // The only metric- or log-based evidence that a request crossed a node
+        // boundary, and nothing asserted it -- so it was free to be wrong, and
+        // was: `read_collected` counted itself as `read_arrow`, merging the
+        // unary read with the streaming RPC and leaving `read_query` looking
+        // like it never forwarded at all.
+        //
+        // A local recorder (and so a plain `#[test]` driving a current-thread
+        // runtime): the `metrics` global is process-wide and installed once,
+        // and a test that read counters through it would see every other
+        // test's traffic.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(Some(OWNER_SAYS), "http://greeter:9092", fwd.clone());
+        let id = Identity::claimed(Some("a"));
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                ops.read_collected(&id, "pond-x", "SELECT 1").await.unwrap();
+                ops.read_query(&id, "pond-x", "SELECT 1").await.unwrap();
+                ops.write_query(&id, "pond-x", "CREATE TABLE t(i INT)")
+                    .await
+                    .unwrap();
+                ops.explain_query(&id, "pond-x", "SELECT 1").await.unwrap();
+                ops.describe_pond(&id, "pond-x").await.unwrap();
+            })
+        });
+
+        // An exact map, not a set of `contains`: it fails on a hop counted
+        // under the wrong op, a hop counted twice, and a hop not counted --
+        // and cannot pass on an empty render.
+        let expected = [
+            ("describe_pond", "1"),
+            ("explain_query", "1"),
+            // Both unary reads land here: the caller invoked `read_query` on
+            // either path, whichever internal hop carried it.
+            ("read_query", "2"),
+            ("write_query", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(forward_counts(&handle.render()), expected);
+
+        // The same ops on a node that OWNS the pond must add nothing: the
+        // counter measures hops, not requests.
+        let local = ops_with(Some("http://me:9092"), "http://me:9092", fwd);
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                local
+                    .read_collected(&id, "pond-x", "SELECT 1 AS one")
+                    .await
+                    .unwrap();
+                local
+                    .write_query(&id, "pond-x", "CREATE TABLE t(i INT)")
+                    .await
+                    .unwrap();
+            })
+        });
+        assert_eq!(
+            forward_counts(&handle.render()),
+            expected,
+            "a locally-served op must not be counted as forwarded"
         );
     }
 
