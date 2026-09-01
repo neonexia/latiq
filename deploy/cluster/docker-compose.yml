@@ -247,9 +247,20 @@ services:
       LATIQ_GATEWAY: gateway:51500
       LATIQ_SERVER: http://control-plane:51400
     entrypoint: ["/bin/sh", "-c"]
-    # `--no-index` is load-bearing: without it a missing/stale wheel in
-    # /repo/dist silently falls back to PyPI, and the auth suite would go green
-    # against the PUBLISHED latiq instead of this branch's code.
+    # latiq is installed by its explicit LOCAL PATH (`/repo/dist/latiq-*.whl`),
+    # never by name: that is what makes a silent fall back to the PUBLISHED latiq
+    # impossible, while its third-party deps (pyarrow, pandas, pytest — none of
+    # which are in /repo/dist) still resolve from PyPI normally. This used to be
+    # `--no-index --find-links /repo/dist latiq`, which blocked PyPI for the whole
+    # resolution and so could not install latiq's own `pyarrow>=14` dependency:
+    # `ERROR: No matching distribution found for pyarrow>=14`. Same one-command
+    # shape as verify.yml's non-auth SDK e2e. The leading `ls` fails loudly when
+    # dist/ has no wheel, instead of pip reporting an unexpanded glob.
+    #
+    # The `python -c` after it is the belt: it asserts PEP 610 recorded latiq as
+    # installed from a file:// URL under /repo/dist, so "the container tested the
+    # local build" is checked, not merely intended. A version compare could not do
+    # this — the local wheel and PyPI ship the same version string.
     #
     # These notes are YAML comments, NOT lines of the folded scalar below: `>-`
     # joins its lines with SPACES, so a `#` anywhere in it commented out the
@@ -262,8 +273,9 @@ services:
     # e2e/sdk/conftest.py.
     command:
       - >-
-        pip install --no-cache-dir --no-index --find-links /repo/dist latiq &&
-        pip install --no-cache-dir -r /repo/e2e/sdk/requirements.txt &&
+        ls /repo/dist/latiq-*.whl &&
+        pip install --no-cache-dir /repo/dist/latiq-*.whl -r /repo/e2e/sdk/requirements.txt &&
+        python -c "import json, sys, importlib.metadata as md; u = md.distribution('latiq').read_text('direct_url.json'); url = json.loads(u)['url'] if u else ''; sys.exit(0 if url.startswith('file:///repo/dist/') else 'latiq was NOT installed from /repo/dist (direct_url=' + repr(url) + ') -- refusing to run the auth suite against a foreign build')" &&
         pytest /repo/e2e/sdk/test_auth.py -v --latiq-mode=auth
     depends_on: [gateway, keycloak]
 
