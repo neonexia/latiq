@@ -460,7 +460,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("describe");
+            record_forward("describe_pond");
             return fwd.describe(owner, identity, pond_ref).await;
         }
         info!(op = "describe_pond", pond = pond_ref, "processing locally");
@@ -558,7 +558,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("drop");
+            record_forward("drop_pond");
             return fwd.drop_pond(owner, identity, pond_ref, confirm).await;
         }
         info!(op = "drop_pond", pond = pond_ref, "processing locally");
@@ -1097,7 +1097,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("read_arrow");
+            record_forward("read_query");
             // The owner audits the read it ran; we only collect its stream.
             let stream = fwd.read_arrow(owner, identity, pond_ref, sql).await?;
             return self.collect_stream(stream).await;
@@ -1205,7 +1205,11 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("query");
+            // The neutral `query` above is about the SQL (we cannot say read vs
+            // write before the engine classifies it); the metric label is about
+            // the RPC the caller invoked, which we do know — `op` is the whole
+            // value of the label.
+            record_forward(if write { "write_query" } else { "read_query" });
             return if write {
                 fwd.write(owner, identity, pond_ref, sql).await
             } else {
@@ -1350,7 +1354,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("explain");
+            record_forward("explain_query");
             return fwd.explain(owner, identity, pond_ref, sql).await;
         }
         info!(op = "explain_query", pond = pond_ref, "processing locally");
@@ -1461,7 +1465,7 @@ impl AgentOps {
                 owner,
                 "forwarding to owner node"
             );
-            record_forward("lineage");
+            record_forward("get_lineage");
             return fwd
                 .get_lineage(owner, identity, pond_ref, limit, since, before)
                 .await;
@@ -1712,6 +1716,18 @@ fn record_query_duration(pond: &str, op: &'static str, elapsed: std::time::Durat
 }
 /// Count an operation forwarded to another node (multi-node path), by op. Lets
 /// operators see how much traffic crosses node boundaries vs. runs locally.
+///
+/// `op` is the op as the CALLER invoked it — the same name the access trail
+/// records — so a spike here can be grepped there. It is emphatically NOT the
+/// internal hop the op happens to ride: `read_collected` forwards over the
+/// Arrow stream and used to be counted as `read_arrow`, which merged it with
+/// the genuinely streaming RPC and left `read_query` looking like it never
+/// crossed a node.
+///
+/// Called at the forward decision and nowhere else. Allocation deliberately has
+/// no counter: a pond placed on another node is not forwarded to it — nothing
+/// is dialled, the owner materializes it lazily on first use — and counting it
+/// would make this metric mean two different things.
 fn record_forward(op: &'static str) {
     metrics::counter!("latiq_forwarded_total", "op" => op).increment(1);
 }

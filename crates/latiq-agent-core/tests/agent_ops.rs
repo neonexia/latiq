@@ -879,6 +879,92 @@ mod forwarding {
         assert_eq!(fwd.reads.load(Ordering::SeqCst), 0, "nothing was forwarded");
     }
 
+    /// Every `latiq_forwarded_total` series the local recorder saw, as
+    /// `op` -> count.
+    fn forward_counts(rendered: &str) -> std::collections::BTreeMap<String, String> {
+        rendered
+            .lines()
+            .filter_map(|l| l.strip_prefix("latiq_forwarded_total{op=\""))
+            .filter_map(|rest| {
+                let (op, tail) = rest.split_once('"')?;
+                let count = tail.rsplit_once(' ')?.1;
+                Some((op.to_string(), count.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forwarding_counts_each_hop_under_the_op_the_caller_invoked() {
+        // The only metric- or log-based evidence that a request crossed a node
+        // boundary, and nothing asserted it -- so it was free to be wrong, and
+        // was: `read_collected` counted itself as `read_arrow`, merging the
+        // unary read with the streaming RPC and leaving `read_query` looking
+        // like it never forwarded at all.
+        //
+        // A local recorder (and so a plain `#[test]` driving a current-thread
+        // runtime): the `metrics` global is process-wide and installed once,
+        // and a test that read counters through it would see every other
+        // test's traffic.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(Some(OWNER_SAYS), "http://greeter:9092", fwd.clone());
+        let id = Identity::claimed(Some("a"));
+
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                ops.read_collected(&id, "pond-x", "SELECT 1").await.unwrap();
+                ops.read_query(&id, "pond-x", "SELECT 1").await.unwrap();
+                ops.write_query(&id, "pond-x", "CREATE TABLE t(i INT)")
+                    .await
+                    .unwrap();
+                ops.explain_query(&id, "pond-x", "SELECT 1").await.unwrap();
+                ops.describe_pond(&id, "pond-x").await.unwrap();
+            })
+        });
+
+        // An exact map, not a set of `contains`: it fails on a hop counted
+        // under the wrong op, a hop counted twice, and a hop not counted --
+        // and cannot pass on an empty render.
+        let expected = [
+            ("describe_pond", "1"),
+            ("explain_query", "1"),
+            // Both unary reads land here: the caller invoked `read_query` on
+            // either path, whichever internal hop carried it.
+            ("read_query", "2"),
+            ("write_query", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(forward_counts(&handle.render()), expected);
+
+        // The same ops on a node that OWNS the pond must add nothing: the
+        // counter measures hops, not requests.
+        let local = ops_with(Some("http://me:9092"), "http://me:9092", fwd);
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                local
+                    .read_collected(&id, "pond-x", "SELECT 1 AS one")
+                    .await
+                    .unwrap();
+                local
+                    .write_query(&id, "pond-x", "CREATE TABLE t(i INT)")
+                    .await
+                    .unwrap();
+            })
+        });
+        assert_eq!(
+            forward_counts(&handle.render()),
+            expected,
+            "a locally-served op must not be counted as forwarded"
+        );
+    }
+
     #[tokio::test]
     async fn forwarding_read_delegates_to_owner() {
         let fwd = Arc::new(RecordingForwarder::default());

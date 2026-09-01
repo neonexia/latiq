@@ -121,7 +121,7 @@ snapshot, refreshed by a 5s in-process collector.
 | `latiq_pond_queries_total` | counter | `pond`, `op` | pond node | Query load **over time** |
 | `latiq_pond_query_duration_seconds` | histogram | `pond`, `op` | pond node | Query wall-clock latency (engine exec) → p50/p95/p99 |
 | `latiq_pond_errors_total` | counter | `pond`, `kind` | pond node | Errors **over time**, by `ErrorKind` |
-| `latiq_forwarded_total` | counter | `op` | pond node | Ops forwarded to another node (multi-node path) |
+| `latiq_forwarded_total` | counter | `op` | pond node | Ops forwarded to another node (multi-node path). `op` is the op as the **caller** invoked it — the same name the `latiq::access` trail records, so a spike here is greppable there. Allocation is absent on purpose: a pond placed on another node is never dialled. |
 | `latiq_build_info` | gauge | `version` | both | Always 1; carries the version label |
 
 > **Cardinality:** the `pond` label is intentional (per-pond visibility). Series

@@ -1911,6 +1911,7 @@ dependencies = [
  "latiq-lineage",
  "latiq-storage",
  "metrics",
+ "metrics-exporter-prometheus",
  "serde",
  "serde_json",
  "tempfile",
