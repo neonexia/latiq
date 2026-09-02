@@ -22,12 +22,41 @@ use latiq_common::Identity;
 use latiq_storage::PondLocation;
 
 /// Why a statement did not produce a result. The variants an agent can act on
-/// (`Parse`, `ReadOnlyViolation`, `Cancelled`, `Timeout`) are distinct from the
-/// catch-all `Engine`, because each maps to a different `ErrorKind` upstream.
+/// are distinct from the catch-all `Engine`, because each maps to a different
+/// `ErrorKind` upstream.
+///
+/// **These variants say WHAT went wrong, never which engine call failed.** That
+/// distinction is the whole reason the middle four exist. Classifying by call
+/// site put `INSERT INTO nope` (rejected while *preparing*) in `Parse` and
+/// `CREATE TABLE t` where `t` exists (rejected while *executing*) in `Engine` →
+/// `internal` → "Retry; if it persists, report to your operator." Both are the
+/// same kind of mistake, both are the caller's to fix, and which one an agent
+/// was told depended on nothing but DuckDB's binder phasing. An engine adapter
+/// must map its own error classes onto these; it must not map its call stack.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    /// The statement is not valid SQL — a syntax error, and nothing else. Only
+    /// this variant may become `parse_error`.
     #[error("query parse error: {0}")]
     Parse(String),
+    /// The statement parses, but a name in it does not resolve against the
+    /// pond's catalog — or already exists there. Table, column, schema,
+    /// function: the fix is to look at what the pond actually has.
+    #[error("catalog error: {0}")]
+    Catalog(String),
+    /// A value in the statement cannot be converted to the type it is being
+    /// used as (`'notanint'` into an `INTEGER` column).
+    #[error("conversion error: {0}")]
+    Conversion(String),
+    /// A value is well-typed but violates a constraint on the target table
+    /// (primary key, unique, not null, check).
+    #[error("constraint error: {0}")]
+    Constraint(String),
+    /// A data source named in the statement could not be read or written —
+    /// a URL, an object-store path, a file. Outside the pond, and usually
+    /// outside this deployment.
+    #[error("source I/O error: {0}")]
+    SourceIo(String),
     #[error("read_query received a non-read statement; use write_query")]
     ReadOnlyViolation,
     #[error("query was cancelled")]

@@ -36,7 +36,7 @@ pub use bearer::{current_bearer, with_bearer};
 pub use control::ControlPlane;
 pub use deadline::QueryControls;
 pub use error::AgentError;
-pub use forward::Forwarder;
+pub use forward::{Forwarder, Peer};
 pub use inflight::InFlightRegistry;
 pub use ops::{AgentConfig, AgentOps};
 pub use registry_control::RegistryControlPlane;

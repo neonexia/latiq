@@ -188,6 +188,13 @@ pub(crate) fn to_status(e: AgentError) -> Status {
         // `Unavailable` (which invites a blind retry — only an operator can
         // resolve this), and emphatically not the `InvalidArgument` catch-all.
         ErrorKind::PondUnavailable => Code::FailedPrecondition,
+        // Named rather than left to the catch-all, because each says something
+        // the catch-all does not. A name that doesn't resolve IS an invalid
+        // argument (the statement is the argument), so it joins the group
+        // below; a source the statement could not reach is not — nothing about
+        // the request was malformed, the world was not in a state to serve it.
+        ErrorKind::CatalogError => Code::InvalidArgument,
+        ErrorKind::SourceUnavailable => Code::FailedPrecondition,
         ErrorKind::Storage | ErrorKind::Internal => Code::Internal,
         // ParseError / InvalidValue / MissingArgument / ReadOnlyViolation /
         // WriteToReservedSchema / ResultCapExceeded / UriNotAllowed

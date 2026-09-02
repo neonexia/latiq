@@ -17,7 +17,7 @@
 use crate::instance::PondInstance;
 use duckdb::types::ValueRef;
 use latiq_common::{DatasetField, DatasetRef, Identity, QueryMeta};
-use latiq_engine::{is_read_only, AbortToken, ArrowSink, EngineError, ExplainResult, QueryResult};
+use latiq_engine::{AbortToken, ArrowSink, EngineError, ExplainResult, QueryResult, SqlShape};
 use std::time::Instant;
 
 /// Convert a single DuckDB cell to a JSON value for the neutral result. Owns the
@@ -173,6 +173,7 @@ struct ReadTxn<'a> {
 impl<'a> ReadTxn<'a> {
     fn begin(inst: &'a PondInstance) -> Result<Self, EngineError> {
         inst.conn
+            // OUR statement, so OUR failure: not classified as the caller's.
             .execute_batch("BEGIN TRANSACTION READ ONLY")
             .map_err(|e| EngineError::Engine(e.to_string()))?;
         Ok(Self { inst, open: true })
@@ -252,6 +253,28 @@ pub fn in_read_txn<T>(
     Ok(out)
 }
 
+/// Prepare a caller's statement, with the two things `Connection::prepare` alone
+/// gets wrong for an agent.
+///
+/// **Empty is a parse error, said in words.** DuckDB accepts a blank statement
+/// and returns nothing at all, so a caller that sent an empty string would get
+/// an empty result set and no hint that it never asked anything. And the read
+/// guard no longer catches it: blank text is `Unrecognized`, not a write.
+///
+/// **Failures are classified by DuckDB's error class**, never by the fact that
+/// it was `prepare` that failed — DuckDB binds some statements here and defers
+/// others to execution, so the call site says nothing about what went wrong.
+fn prepare<'a>(inst: &'a PondInstance, sql: &str) -> Result<duckdb::Statement<'a>, EngineError> {
+    if sql.trim().is_empty() {
+        return Err(EngineError::Parse(
+            "The statement is empty — there is nothing to run.".into(),
+        ));
+    }
+    inst.conn
+        .prepare(sql)
+        .map_err(|e| crate::errclass::classify(&e))
+}
+
 /// Execute a statement and materialize its result rows aligned to column names.
 /// Works for any statement — a SELECT yields its rows; a write/DDL executes and
 /// yields DuckDB's summary row (which write callers drop). Multi-statement input
@@ -260,20 +283,12 @@ fn materialize(
     inst: &PondInstance,
     sql: &str,
 ) -> Result<(Vec<String>, Vec<Vec<serde_json::Value>>), EngineError> {
-    let mut stmt = inst
-        .conn
-        .prepare(sql)
-        .map_err(|e| EngineError::Parse(e.to_string()))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| EngineError::Engine(e.to_string()))?;
+    let mut stmt = prepare(inst, sql)?;
+    let mut rows = stmt.query([]).map_err(|e| crate::errclass::classify(&e))?;
     let mut out: Vec<Vec<serde_json::Value>> = Vec::new();
     let mut columns: Vec<String> = Vec::new();
     let mut have_columns = false;
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| EngineError::Engine(e.to_string()))?
-    {
+    while let Some(row) = rows.next().map_err(|e| crate::errclass::classify(&e))? {
         let stmt_ref = row.as_ref();
         if !have_columns {
             columns = stmt_ref
@@ -286,8 +301,7 @@ fn materialize(
         let mut cells = Vec::with_capacity(columns.len());
         for i in 0..columns.len() {
             cells.push(cell_to_json(
-                row.get_ref(i)
-                    .map_err(|e| EngineError::Engine(e.to_string()))?,
+                row.get_ref(i).map_err(|e| crate::errclass::classify(&e))?,
             ));
         }
         out.push(cells);
@@ -312,17 +326,14 @@ pub fn run_read_arrow(
     abort: &AbortToken,
     sink: &mut dyn ArrowSink,
 ) -> Result<QueryMeta, EngineError> {
-    if !is_read_only(sql) {
+    if latiq_engine::classify(sql) == SqlShape::Write {
         return Err(EngineError::ReadOnlyViolation);
     }
     let t0 = Instant::now();
-    let mut stmt = inst
-        .conn
-        .prepare(sql)
-        .map_err(|e| EngineError::Parse(e.to_string()))?;
+    let mut stmt = prepare(inst, sql)?;
     let arrow = stmt
         .query_arrow([])
-        .map_err(|e| EngineError::Engine(e.to_string()))?;
+        .map_err(|e| crate::errclass::classify(&e))?;
     // A meta even for a stream: it is how the streamed read's provenance (and
     // its row count) reaches the caller, which otherwise sees only batches.
     let mut meta = QueryMeta::default();
@@ -359,7 +370,7 @@ pub fn run_read_arrow(
 /// the heuristic to a fast-fail hint in front of that enforcement is a real
 /// improvement and a deliberately separate change; this one does not touch it.)
 pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineError> {
-    if !is_read_only(sql) {
+    if latiq_engine::classify(sql) == SqlShape::Write {
         return Err(EngineError::ReadOnlyViolation);
     }
     let t0 = Instant::now();
@@ -397,6 +408,11 @@ pub fn run_write(
     // Attribution is a DuckLake method on THIS pond's catalog (named after the
     // pond), so qualify + quote the catalog name.
     let cat = crate::instance::quote_ident(catalog);
+    // Used ONLY for our own framing — BEGIN, `set_commit_message`, COMMIT.
+    // Those are not the caller's SQL, so a failure in one is ours and stays
+    // `Engine` (→ `internal`, "report to your operator"), which for a
+    // mis-plumbed catalog name is exactly the right advice. The caller's
+    // statement goes through `materialize`, which classifies.
     let exec = |s: &str| {
         inst.conn
             .execute_batch(s)
@@ -846,15 +862,10 @@ pub fn run_explain(inst: &PondInstance, sql: &str) -> Result<ExplainResult, Engi
     let mut stmt = inst
         .conn
         .prepare(&explain_sql)
-        .map_err(|e| EngineError::Parse(e.to_string()))?;
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| EngineError::Engine(e.to_string()))?;
+        .map_err(|e| crate::errclass::classify(&e))?;
+    let mut rows = stmt.query([]).map_err(|e| crate::errclass::classify(&e))?;
     let mut plan = String::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| EngineError::Engine(e.to_string()))?
-    {
+    while let Some(row) = rows.next().map_err(|e| crate::errclass::classify(&e))? {
         let ncols = row.as_ref().column_names().len();
         for i in 0..ncols {
             if let Ok(ValueRef::Text(t)) = row.get_ref(i) {
@@ -1062,15 +1073,19 @@ mod tests {
             "pond",
         )
         .expect_err("a runtime cast failure must fail the write");
-        // Why it failed, not merely that it did: an execution failure inside the
-        // transaction is an engine error carrying DuckDB's own message, never a
-        // parse error (the batch bound fine) and never a read-only violation.
+        // Why it failed, not merely that it did. This test used to assert
+        // `EngineError::Engine` — i.e. that a cast DuckDB rejects at RUN time
+        // is indistinguishable from a crash of ours — which is the D7 bug
+        // itself: the caller reached `internal` + "retry, report to your
+        // operator" for a value it could have fixed. The failing statement is
+        // the caller's and DuckDB classes it `Conversion Error`, so that is
+        // what must come out, still carrying DuckDB's own message.
         match &err {
-            EngineError::Engine(msg) => assert!(
+            EngineError::Conversion(msg) => assert!(
                 msg.contains("Conversion Error") && msg.contains("nope"),
                 "expected the failing cast's own message, got: {msg}"
             ),
-            other => panic!("expected EngineError::Engine, got {other:?}"),
+            other => panic!("expected EngineError::Conversion, got {other:?}"),
         }
 
         // Consistency: the 42 that DID execute is not visible, and no snapshot
@@ -1111,6 +1126,11 @@ mod tests {
 
         let err = run_write(&inst, "INSERT INTO t VALUES (1)", &id, "not_this_catalog")
             .expect_err("attribution against an unknown catalog must fail the write");
+        // Still `Engine`, deliberately, even though DuckDB calls it a `Catalog
+        // Error`: the statement that failed is OURS, not the caller's, so the
+        // caller cannot fix it by looking up table names and `internal` +
+        // "report to your operator" is the honest answer. This is the boundary
+        // of the class-based classification — it applies to caller SQL only.
         match &err {
             EngineError::Engine(msg) => assert!(
                 msg.contains("set_commit_message"),

@@ -339,6 +339,10 @@ impl DuckEngine {
         let _ = watcher.join();
 
         match result {
+            // `INTERRUPT Error` is not one of the classes `errclass` keys on,
+            // so an interrupt stays `Engine` however it was raised — including
+            // from `prepare`, which under the old call-site classification came
+            // back as a *parse* error and was never normalized here at all.
             Err(EngineError::Engine(ref m)) if m.to_uppercase().contains("INTERRUPT") => {
                 Err(EngineError::Cancelled)
             }
@@ -381,7 +385,7 @@ impl QueryEngine for DuckEngine {
         // The read-only guard first, so a write submitted here is rejected
         // before the binder is handed a statement this surface does not accept
         // — and before it pays for provenance it is going to discard.
-        if !latiq_engine::is_read_only(sql) {
+        if latiq_engine::classify(sql) == latiq_engine::SqlShape::Write {
             return Err(EngineError::ReadOnlyViolation);
         }
         self.with_read(loc, |i| {
@@ -417,7 +421,7 @@ impl QueryEngine for DuckEngine {
         sink: &mut dyn ArrowSink,
     ) -> Result<QueryMeta, EngineError> {
         // Guard first, as in `read_query` — same reason.
-        if !latiq_engine::is_read_only(sql) {
+        if latiq_engine::classify(sql) == latiq_engine::SqlShape::Write {
             return Err(EngineError::ReadOnlyViolation);
         }
         self.with_read(loc, |i| {
@@ -567,7 +571,11 @@ impl QueryEngine for DuckEngine {
         let ran = guard
             .conn
             .execute_batch(query)
-            .map_err(|e| EngineError::Engine(format!("pull query: {e}")));
+            // The pull query is the CALLER's SQL, so it is classified like any
+            // other caller SQL. Wrapping it as `Engine` put a mistyped table
+            // name in a pull behind "Retry; if it persists, report to your
+            // operator", and dropped DuckDB's class prefix on the way.
+            .map_err(|e| crate::errclass::classify(&e));
         teardown_catalog(&guard.conn, &plan);
         ran?;
         // The pull's own target is a pond table, and it exists now. The source

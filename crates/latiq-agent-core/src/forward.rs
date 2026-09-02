@@ -26,9 +26,23 @@ use latiq_common::Identity;
 use latiq_engine::{ExplainResult, QueryResult};
 use std::collections::BTreeMap;
 
-/// Runs one op on the node that owns the pond. Every method takes the owner's
-/// endpoint, so the core never holds a connection or a peer identity — the
-/// implementation does.
+/// The node an op is being delegated to: who it is, and where to dial it.
+///
+/// Both halves travel together because a failure to reach the owner has to be
+/// reportable, and neither half alone reports it. The endpoint says what was
+/// dialled; the **node id** is what an operator needs to act on it (`latiq node
+/// list`), and it is the field the registry decides ownership by. Copy, so
+/// passing it costs the same as the `&str` it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Peer<'a> {
+    /// The owning node's registered id — an identity, never an address.
+    pub node_id: &'a str,
+    /// The address to dial it at (`node_endpoint` in the registry).
+    pub endpoint: &'a str,
+}
+
+/// Runs one op on the node that owns the pond. Every method takes the owning
+/// [`Peer`], so the core never holds a connection — the implementation does.
 #[async_trait::async_trait]
 pub trait Forwarder: Send + Sync {
     /// `timeout_ms` is what the CALLER asked for, relayed unresolved: the owner
@@ -38,7 +52,7 @@ pub trait Forwarder: Send + Sync {
     /// impose its own policy on the node that carries the risk.
     async fn read(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
@@ -49,7 +63,7 @@ pub trait Forwarder: Send + Sync {
     /// hop). Used by `read_arrow` when the pond is remote.
     async fn read_arrow(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
@@ -58,7 +72,7 @@ pub trait Forwarder: Send + Sync {
 
     async fn write(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
@@ -67,7 +81,7 @@ pub trait Forwarder: Send + Sync {
 
     async fn explain(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
@@ -75,7 +89,7 @@ pub trait Forwarder: Send + Sync {
 
     async fn describe(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
     ) -> Result<DescribeResult, AgentError>;
@@ -86,7 +100,7 @@ pub trait Forwarder: Send + Sync {
     /// of its own to answer with. `since` is inclusive, `before` exclusive.
     async fn get_lineage(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         limit: usize,
@@ -96,7 +110,7 @@ pub trait Forwarder: Send + Sync {
 
     async fn drop_pond(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         confirm: bool,
@@ -118,7 +132,7 @@ pub trait Forwarder: Send + Sync {
     /// paths stay as a fallback without the two fighting.
     async fn materialize_pond(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
     ) -> Result<(), AgentError>;
@@ -128,7 +142,7 @@ pub trait Forwarder: Send + Sync {
     /// the attach/detach on the owner — nothing about the catalog persists.
     async fn catalog_pull(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         catalog: &str,
@@ -139,7 +153,7 @@ pub trait Forwarder: Send + Sync {
     /// List an external catalog's tables on the owning node (transient attach).
     async fn catalog_describe(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         catalog: &str,

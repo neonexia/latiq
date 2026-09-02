@@ -1106,3 +1106,167 @@ mod eager_allocation {
         );
     }
 }
+
+/// The dead owner: the case a live cluster actually meets, driven by killing a
+/// node rather than by describing one.
+mod dead_owner {
+    use super::*;
+    use common::{add_greeter_node, add_node, start_control_plane_only};
+    use latiq_common::{ErrorEnvelope, ErrorKind};
+
+    fn envelope(s: &tonic::Status) -> ErrorEnvelope {
+        serde_json::from_slice(s.details())
+            .unwrap_or_else(|e| panic!("every error must carry its envelope ({e}): {s:?}"))
+    }
+
+    /// D2 — a crashed owner was reported as `internal` + "Retry; if it persists,
+    /// report to your operator", with `"tcp connect error"` as the whole
+    /// message.
+    ///
+    /// Three things were wrong and all three are asserted here: the kind (an
+    /// agent retried a node that was never coming back), the message (it named
+    /// neither the pond nor the node, so the operator had nothing to act on),
+    /// and — the reason this test exists at all — that `PondUnavailable` was
+    /// **unreachable in production**. It was raised only when the registry named
+    /// no node; a killed node keeps its id and its endpoint, so that branch
+    /// could not fire. The old test asserted the kind by building the empty
+    /// registry state directly, and passed the entire time the kind was dead.
+    ///
+    /// So this one kills a node that registered, served a real query, and then
+    /// stopped — and drives BOTH forward paths, which fail in different places:
+    ///
+    /// - the **warm** greeter has a cached channel to the owner, so its failure
+    ///   surfaces as a tonic `Unavailable` status (the bare "tcp connect error"
+    ///   in the audit);
+    /// - the **cold** greeter has never dialled it, so it fails inside
+    ///   `Endpoint::connect` instead.
+    ///
+    /// Both were `internal`. Either alone would leave half the fix untested.
+    #[tokio::test]
+    async fn error_contract_a_dead_owner_is_pond_unavailable_not_internal() {
+        let (control, _admin) = start_control_plane_only().await;
+        // One registered node: placement is `ORDER BY random()` over the pool,
+        // so a pool of one is the only way to know who owns the pond. The two
+        // greeters serve but never register, so they can forward and can never
+        // be picked.
+        let owner = add_node("owner", &control, None).await;
+        let warm = add_greeter_node("warm-greeter", &control).await;
+        let cold = add_greeter_node("cold-greeter", &control).await;
+
+        let mut w = client(&warm.data_endpoint).await;
+        w.allocate_pond(req(
+            AllocatePondRequest {
+                name: "stranded".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "alice",
+        ))
+        .await
+        .expect("allocation is placed on the one registered node");
+        w.write_query(req(
+            q("stranded", "CREATE TABLE t AS SELECT 1 AS v"),
+            "alice",
+        ))
+        .await
+        .expect("a forwarded write while the owner is alive");
+        // The warm greeter now holds an open channel to the owner — the state
+        // that produced the bare "tcp connect error".
+        assert_eq!(
+            served_by(
+                &w.read_query(req(q("stranded", "SELECT v FROM t"), "alice"))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .json
+            ),
+            owner.internal_endpoint,
+            "the fixture must really be forwarding, or nothing below is about a hop"
+        );
+
+        owner.kill().await;
+
+        // Every op an agent can reach the pond through, from a greeter with a
+        // cached channel and from one without.
+        let mut c = client(&cold.data_endpoint).await;
+        let mut failures = Vec::new();
+        for (path, status) in [
+            (
+                "warm read",
+                w.read_query(req(q("stranded", "SELECT v FROM t"), "alice"))
+                    .await
+                    .expect_err("the owner is dead"),
+            ),
+            (
+                "warm write",
+                w.write_query(req(q("stranded", "INSERT INTO t VALUES (2)"), "alice"))
+                    .await
+                    .expect_err("the owner is dead"),
+            ),
+            (
+                "warm describe",
+                w.describe_pond(req(
+                    DescribePondRequest {
+                        pond: "stranded".into(),
+                    },
+                    "alice",
+                ))
+                .await
+                .expect_err("the owner is dead"),
+            ),
+            (
+                "cold read",
+                c.read_query(req(q("stranded", "SELECT v FROM t"), "alice"))
+                    .await
+                    .expect_err("the owner is dead"),
+            ),
+            (
+                "cold explain",
+                c.explain_query(req(q("stranded", "SELECT v FROM t"), "alice"))
+                    .await
+                    .expect_err("the owner is dead"),
+            ),
+            (
+                "cold drop",
+                c.drop_pond(req(
+                    DropPondRequest {
+                        pond: "stranded".into(),
+                        confirm: true,
+                    },
+                    "alice",
+                ))
+                .await
+                .expect_err("the owner is dead"),
+            ),
+        ] {
+            let env = envelope(&status);
+            assert_eq!(
+                env.kind,
+                ErrorKind::PondUnavailable,
+                "{path}: a dead owner is not a crash of ours — {} / {}",
+                env.message,
+                env.suggest
+            );
+            assert!(
+                env.message.contains("stranded") && env.message.contains("owner"),
+                "{path}: the message must name the pond AND the node that owns it, \
+                 which is the only thing an operator can act on: {}",
+                env.message
+            );
+            assert!(
+                !env.suggest.to_lowercase().contains("retry"),
+                "{path}: nothing an agent retries brings a dead node back: {}",
+                env.suggest
+            );
+            assert_eq!(
+                env.see, "latiq://troubleshooting/pond-unavailable",
+                "{path}: and the page written for this kind must be reachable from it"
+            );
+            failures.push(path);
+        }
+        // Anti-vacuity: a loop that probed nothing would pass every assertion
+        // in it.
+        assert_eq!(failures.len(), 6, "probed {failures:?}");
+    }
+}

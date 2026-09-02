@@ -57,7 +57,12 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 - **Transaction control is Latiq's.** Don't send `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`: read_query rejects them, and in write_query they cut short the transaction Latiq attributes your write in (nothing rejects them there — it silently costs you the author). Several plain statements in one call are fine; they commit together as one snapshot.\n\
 - Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
 - Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` (`commit_extra_info` is where verified-vs-claimed shows up). List tables/columns with `SHOW TABLES` / `information_schema`.\n\
-- Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.",
+- Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.\n\n\
+## Values, types and constraints\n\n\
+An `invalid_value` error is about the DATA in your statement, not its syntax — the statement parsed and the names resolved.\n\
+- **Type conversion:** a literal or column is not convertible to the type it is used as (`Conversion Error: Could not convert string 'notanint' to INT32`). Quoted text is not coerced into a numeric column because it looks numeric. Check the target with `DESCRIBE <table>` and pass the right type, or CAST explicitly: `CAST('7' AS INTEGER)`.\n\
+- **Constraints:** the value is well-typed but breaks a rule on the table — primary key, unique, not null, check (`Constraint Error: Duplicate key …`). Read the conflicting row first (`SELECT * FROM t WHERE <key> = <value>`), then correct the value, UPDATE the existing row, or use `INSERT OR REPLACE` / `ON CONFLICT`.\n\n\
+Neither is fixed by retrying the same statement, and neither is a `parse_error`: if your statement had a syntax problem you would have been told `parse_error` with DuckDB's `Parser Error` text.",
     },
     Res {
         uri: "latiq://recipes/schema-design",
@@ -151,16 +156,67 @@ The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consume
 - It covers queries, not intent. The SQL shape is recorded with literals redacted, so the trail shows what ran, not the values it ran on.",
     },
     Res {
+        // `dataset_not_found`'s `see` has always pointed here, and until the
+        // guard below existed, nothing served it: an agent that followed the
+        // link got `resource_not_found` and spent a call learning nothing.
+        uri: "latiq://datasets",
+        name: "Datasets",
+        desc: "The curated public files this deployment can load into a pond",
+        body: "# Datasets\n\n\
+A **dataset** is a curated file this deployment already knows how to fetch — you name it, Latiq loads it into your pond. Nothing is queried live: `load_dataset` copies the data in, and from then on it is ordinary pond data.\n\n\
+```\nlist_datasets {}                        # everything registered here\nlist_datasets {query:'tpch'}            # filter by name/tag; '#sample' finds the small ones\nload_dataset {pond:'p', dataset:'tpch'} # -> a SCHEMA named after the dataset\nread_query {pond:'p', sql:'SELECT count(*) FROM tpch.orders'}\n```\n\n\
+**A dataset lands in its own schema**, so its tables are `<dataset>.<table>` — `tpch.orders`, not `orders`. `describe_pond` shows them after the load.\n\n\
+**`dataset_not_found` means the reference is not registered in THIS deployment.** The catalogue differs per deployment and is an operator's to extend, so:\n\
+- Call **list_datasets** and use a name from the answer — do not guess, and do not retry the same reference.\n\
+- If what you need is a URL rather than a registered dataset, read it directly instead: `write_query {sql:\"CREATE TABLE raw AS SELECT * FROM read_csv('https://…')\"}` (latiq://recipes/data-ingestion-m1).\n\
+- For an external database or lakehouse, that is a **catalog**, not a dataset: list_catalogs → describe_catalog → pull_catalog (latiq://recipes/external-data).",
+    },
+    Res {
         uri: "latiq://troubleshooting",
         name: "Troubleshooting index",
         desc: "Problem-keyed recovery guides",
         body: "# Troubleshooting\n\n\
 - latiq://troubleshooting/pond-not-found — the pond id/name doesn't resolve.\n\
 - latiq://troubleshooting/pond-unavailable — the pond exists but no node is serving it, or allocate_pond could not create one on the node it was assigned to.\n\
+- latiq://troubleshooting/catalog-error — a table/column/function in your SQL doesn't exist, or already does.\n\
+- latiq://troubleshooting/source-unavailable — a URL or path in your SQL could not be read.\n\
 - latiq://troubleshooting/large-results — results exceeded the inline cap.\n\
 - latiq://troubleshooting/timeouts — a query ran too long.\n\
 - latiq://troubleshooting/conflicts — concurrent writes conflicted.\n\
 - latiq://troubleshooting/read-only-violation — a write was sent to read_query.",
+    },
+    Res {
+        uri: "latiq://troubleshooting/catalog-error",
+        name: "Troubleshooting: catalog error",
+        desc: "A name in your SQL doesn't resolve — or already exists",
+        body: "# Catalog error\n\n\
+Your statement is valid SQL. A **name** in it does not match this pond: a table, column, schema or function that isn't there — or one that is there when you asked to create it.\n\n\
+## The name doesn't exist\n\
+`Catalog Error: Table with name nope does not exist!`, `Binder Error: Referenced column \"qty\" not found`.\n\
+1. **Look, don't guess:** `read_query {sql:'SHOW TABLES'}`, `read_query {sql:'DESCRIBE orders'}`, or **describe_pond** for the whole schema in one call.\n\
+2. Ponds are separate — a table in another pond is not visible here. `list_ponds` if you may be in the wrong one.\n\
+3. If it genuinely isn't there, create it with **write_query** (`CREATE TABLE …`, or `CREATE TABLE … AS SELECT …`), or bring the data in with load_dataset / pull_catalog (latiq://recipes/external-data).\n\n\
+## The name already exists\n\
+`Catalog Error: Table with name t already exists!` — from `CREATE TABLE t …`.\n\
+- **Do not retry the same statement.** It will fail identically forever; this is not a transient error.\n\
+- Choose: a different name, `CREATE TABLE IF NOT EXISTS t …` (keep what's there), `CREATE OR REPLACE TABLE t …` (discard what's there — destructive), or `INSERT INTO t …` if you meant to add rows to it.\n\
+- Another agent may have created it since you last looked. `DESCRIBE t` before you replace anything: ponds are shared, and CREATE OR REPLACE destroys someone else's table without asking.\n\n\
+## Functions\n\
+`Binder Error: No function matches the given name and argument types` — the function name or its argument types are wrong, not the SQL. See latiq://dialect.\n\n\
+This is never a syntax problem (that arrives as `parse_error`) and never something an operator can fix for you.",
+    },
+    Res {
+        uri: "latiq://troubleshooting/source-unavailable",
+        name: "Troubleshooting: source unavailable",
+        desc: "A URL or path in your SQL could not be read",
+        body: "# Source unavailable\n\n\
+The statement named a data source outside the pond — a URL, an object-store path, a file — and the engine could not read it: `IO Error: Could not connect to server …`, `HTTP Error: … (404)`.\n\n\
+**Nothing in Latiq is broken, and this is not the pond's storage.** The address is yours, in your SQL, so the fix is too:\n\
+1. **Check the address** — spelling, scheme, host, bucket, the file actually being there. `read_csv('http://127.0.0.1:9/none.csv')` fails for the obvious reason.\n\
+2. **Check it is reachable from the node**, not from you. Private hosts, localhost and VPN-only addresses are not; public http(s)/s3 sources are. A refused URI (blocked by policy rather than unreachable) arrives as `uri_not_allowed` instead.\n\
+3. **Credentials:** anonymous access only. For sources that need credentials use **pull_catalog** with `set:{…}` (used once, never stored) — see latiq://recipes/external-data.\n\
+4. **Retry once, not repeatedly.** A transient network fault is worth one retry; a second identical failure is the source, and repeating it will not change that.\n\n\
+Once the data is in the pond it can't fail this way again: `CREATE TABLE raw AS SELECT * FROM read_csv('<url>')` copies it in, and later queries read the pond.",
     },
     Res {
         uri: "latiq://troubleshooting/pond-not-found",
@@ -220,7 +276,8 @@ Multiple agents write through DuckLake's transactional model. Conflicting writes
         name: "Troubleshooting: read-only violation",
         desc: "A write was sent to read_query",
         body: "# Read-only violation\n\n\
-read_query only runs SELECT and read-only metadata statements. For INSERT/UPDATE/DELETE/DDL, use **write_query** — your writes there are attributed to your identity.",
+read_query only runs SELECT and read-only metadata statements. For INSERT/UPDATE/DELETE/DDL, use **write_query** — your writes there are attributed to your identity.\n\n\
+You get this error only for a statement that really is recognisable as a write (including a hidden one: `WITH … INSERT`, `EXPLAIN ANALYZE`, a second statement after a `;`, or `BEGIN`/`COMMIT`/`ROLLBACK`, which Latiq owns). A statement it cannot recognise at all is NOT reported here — it goes to the parser and comes back as `parse_error` — so if you see this kind, re-read your SQL for a write rather than assuming a typo.",
     },
 ];
 
@@ -320,4 +377,109 @@ See latiq://troubleshooting/conflicts.",
         PromptMessageRole::User,
         text,
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use latiq_common::ErrorKind;
+
+    /// Every kind an agent can receive must be able to explain itself.
+    ///
+    /// `see` is the deeper-learning half of the envelope, and a `see` that
+    /// 404s costs the agent a round trip to learn nothing. This is also the
+    /// guard on ADDING a kind: a new one whose `see` was invented but never
+    /// written fails here rather than in front of an agent.
+    #[test]
+    fn error_contract_every_error_kind_sees_a_resource_that_exists() {
+        // The closed taxonomy, listed so a new kind must be added here too.
+        const KINDS: &[ErrorKind] = &[
+            ErrorKind::PondNotFound,
+            ErrorKind::DatasetNotFound,
+            ErrorKind::NameConflict,
+            ErrorKind::CatalogError,
+            ErrorKind::ParseError,
+            ErrorKind::InvalidValue,
+            ErrorKind::MissingArgument,
+            ErrorKind::WriteToReservedSchema,
+            ErrorKind::ResultCapExceeded,
+            ErrorKind::ReadOnlyViolation,
+            ErrorKind::UriNotAllowed,
+            ErrorKind::QueryTimeout,
+            ErrorKind::QueryCancelled,
+            ErrorKind::Unauthenticated,
+            ErrorKind::PondUnavailable,
+            ErrorKind::SourceUnavailable,
+            ErrorKind::Storage,
+            ErrorKind::Internal,
+        ];
+        // Anti-vacuity: the list is the whole enum, so it cannot silently
+        // shrink to nothing (or to the kinds that happen to pass).
+        assert_eq!(
+            KINDS.len(),
+            18,
+            "a kind was added or removed — add it to KINDS, with a `see` that resolves"
+        );
+        for kind in KINDS {
+            let see = kind.default_see();
+            assert!(
+                read_resource(see).is_some(),
+                "{}'s see ({see}) is not a resource this server serves",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The two kinds added for the classification fix point at resources
+    /// written ABOUT them — not at the troubleshooting index, which would be a
+    /// dangling-by-another-name `see`: it resolves, and it teaches nothing.
+    #[test]
+    fn error_contract_the_new_kinds_have_their_own_page_not_the_index() {
+        for (kind, must_say) in [
+            (ErrorKind::CatalogError, ["SHOW TABLES", "already exists"]),
+            (
+                ErrorKind::SourceUnavailable,
+                ["reachable from the node", "Retry once"],
+            ),
+        ] {
+            let see = kind.default_see();
+            assert_ne!(
+                see,
+                "latiq://troubleshooting",
+                "{} must not point at the index",
+                kind.as_str()
+            );
+            let body = RESOURCES
+                .iter()
+                .find(|r| r.uri == see)
+                .unwrap_or_else(|| panic!("{see} is not served"))
+                .body;
+            for phrase in must_say {
+                assert!(
+                    body.contains(phrase),
+                    "{see} must actually cover this kind — missing {phrase:?}"
+                );
+            }
+        }
+    }
+
+    /// The index is how an agent browsing `latiq://troubleshooting` finds them;
+    /// a page nothing links to is a page nothing reads.
+    #[test]
+    fn error_contract_the_troubleshooting_index_lists_every_troubleshooting_page() {
+        let index = RESOURCES
+            .iter()
+            .find(|r| r.uri == "latiq://troubleshooting")
+            .expect("the index is served")
+            .body;
+        let pages: Vec<&str> = RESOURCES
+            .iter()
+            .map(|r| r.uri)
+            .filter(|u| u.starts_with("latiq://troubleshooting/"))
+            .collect();
+        assert!(pages.len() >= 7, "found only {pages:?}");
+        for page in pages {
+            assert!(index.contains(page), "the index does not link {page}");
+        }
+    }
 }

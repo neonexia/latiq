@@ -15,6 +15,7 @@
 //! latiq-engine-duckdb — DuckDB + DuckLake implementation of QueryEngine.
 pub mod attachers;
 pub mod duck_engine;
+pub mod errclass;
 pub mod exec;
 pub mod instance;
 pub use duck_engine::DuckEngine;
