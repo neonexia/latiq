@@ -30,7 +30,7 @@
 //! default anonymous) — the embedded and dev path.
 use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
 use crate::resources;
-use latiq_agent_core::{with_bearer, AgentError, AgentOps};
+use latiq_agent_core::{with_bearer, AgentError, AgentOps, QueryControls};
 use latiq_auth::metadata::{challenge_header, ProtectedResourceMetadata};
 use latiq_auth::Verifier;
 use latiq_common::Identity;
@@ -91,6 +91,10 @@ pub struct QueryArgs {
     pub pond: String,
     #[schemars(description = "SQL statement")]
     pub sql: String,
+    #[schemars(
+        description = "How long this statement may run, in milliseconds. Omit for the node's default. Asking for MORE than the node allows is not an error — it is clamped to the node's maximum and the query runs at that ceiling, so always read `_meta.timeout_ms` for what was actually applied. On expiry you get a `query_timeout` error naming both numbers. Ignored by explain_query, which does not execute."
+    )]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -158,6 +162,29 @@ pub struct LineageArgs {
         description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE. This is the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it to get the next older page. Pages are cut on a timestamp boundary, so this never repeats or skips an event — except for a FULL page whose events ALL share one `eventTime`, which is returned uncut, so a cursor from it skips the rest of that millisecond; raise `limit` if that happens."
     )]
     pub before: Option<String>,
+}
+
+/// This request's execution controls: the caller's `timeout_ms` and — the part
+/// that makes an agent's cancel real — **its MCP request cancellation**.
+///
+/// `RequestContext::ct` is rmcp's per-request token, and rmcp cancels it when a
+/// matching `notifications/cancelled` arrives (it keys a per-request token pool
+/// by request id in its serve loop). So request-id matching is already done for
+/// us: nothing here needs to track ids, and there is deliberately no registry of
+/// our own to drift out of sync with rmcp's.
+///
+/// It is a `tokio_util::sync::CancellationToken` — the SAME type as the core's
+/// `AbortToken` — so this is a hand-off, not an adapter, and no protocol type
+/// crosses into `latiq-agent-core` (invariant 5).
+///
+/// rmcp does NOT abort the handler future on cancel; it only fires the token. So
+/// the handler still runs to completion and still answers — but the query
+/// underneath is interrupted, and the answer is a `query_cancelled` envelope
+/// rather than rows the client no longer wants. A dropped connection is NOT a
+/// cancel source (see this crate's CLAUDE.md); the deadline is the backstop for
+/// an abandoned query.
+fn query_controls(a: &QueryArgs, ctx: &RequestContext<RoleServer>) -> QueryControls {
+    QueryControls::timeout(a.timeout_ms).with_cancel(ctx.ct.clone())
 }
 
 /// The HTTP header carrying the CLAIMED leaf id. Same name as the gRPC metadata
@@ -578,9 +605,14 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
+        let controls = query_controls(&a, &ctx);
         // Reads ride the Arrow internal hop, collected to the neutral result here.
         Ok(with_bearer(tok, async {
-            match self.ops.read_collected(&id, &a.pond, &a.sql).await {
+            match self
+                .ops
+                .read_collected_with(&id, &a.pond, &a.sql, controls)
+                .await
+            {
                 Ok(qr) => ok_query("read_query", qr),
                 Err(e) => err_envelope(e.envelope()),
             }
@@ -612,8 +644,13 @@ Do: add column COMMENTs so other agents understand your tables. See latiq://reci
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
+        let controls = query_controls(&a, &ctx);
         Ok(with_bearer(tok, async {
-            match self.ops.write_query(&id, &a.pond, &a.sql).await {
+            match self
+                .ops
+                .write_query_with(&id, &a.pond, &a.sql, controls)
+                .await
+            {
                 Ok(qr) => ok_query("write_query", qr),
                 Err(e) => err_envelope(e.envelope()),
             }

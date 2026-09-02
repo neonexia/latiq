@@ -254,6 +254,17 @@ fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamP
     }
 }
 
+/// One `QueryRequest`, built in one place so a new field cannot be forgotten on
+/// one of the four forwards. `None` becomes the proto3 zero the owner reads as
+/// "use your default".
+fn query_request(pond: &str, sql: &str, timeout_ms: Option<u64>) -> QueryRequest {
+    QueryRequest {
+        pond: pond.to_string(),
+        sql: sql.to_string(),
+        timeout_ms: timeout_ms.unwrap_or(0),
+    }
+}
+
 struct ArrowReadStreamParts {
     schema_rx: oneshot::Receiver<Result<Served, AgentError>>,
     batch_rx: mpsc::Receiver<Result<RecordBatch, AgentError>>,
@@ -267,15 +278,10 @@ impl Forwarder for GrpcForwarder {
         identity: &Identity,
         pond: &str,
         sql: &str,
+        timeout_ms: Option<u64>,
     ) -> Result<QueryResult, AgentError> {
         let mut c = self.client(endpoint).await?;
-        let req = with_identity(
-            QueryRequest {
-                pond: pond.to_string(),
-                sql: sql.to_string(),
-            },
-            identity,
-        );
+        let req = with_identity(query_request(pond, sql, timeout_ms), identity);
         let resp = c
             .read_query(req)
             .await
@@ -290,15 +296,10 @@ impl Forwarder for GrpcForwarder {
         identity: &Identity,
         pond: &str,
         sql: &str,
+        timeout_ms: Option<u64>,
     ) -> Result<ArrowReadStream, AgentError> {
         let mut c = self.stream_client(endpoint).await?;
-        let req = with_identity(
-            QueryRequest {
-                pond: pond.to_string(),
-                sql: sql.to_string(),
-            },
-            identity,
-        );
+        let req = with_identity(query_request(pond, sql, timeout_ms), identity);
         let streaming = c
             .read_arrow(req)
             .await
@@ -331,15 +332,10 @@ impl Forwarder for GrpcForwarder {
         identity: &Identity,
         pond: &str,
         sql: &str,
+        timeout_ms: Option<u64>,
     ) -> Result<QueryResult, AgentError> {
         let mut c = self.client(endpoint).await?;
-        let req = with_identity(
-            QueryRequest {
-                pond: pond.to_string(),
-                sql: sql.to_string(),
-            },
-            identity,
-        );
+        let req = with_identity(query_request(pond, sql, timeout_ms), identity);
         let resp = c
             .write_query(req)
             .await
@@ -356,13 +352,8 @@ impl Forwarder for GrpcForwarder {
         sql: &str,
     ) -> Result<ExplainResult, AgentError> {
         let mut c = self.client(endpoint).await?;
-        let req = with_identity(
-            QueryRequest {
-                pond: pond.to_string(),
-                sql: sql.to_string(),
-            },
-            identity,
-        );
+        // No timeout: explain does not execute the statement.
+        let req = with_identity(query_request(pond, sql, None), identity);
         let resp = c
             .explain_query(req)
             .await

@@ -36,6 +36,7 @@ fn q(pond: &str, sql: &str) -> QueryRequest {
     QueryRequest {
         pond: pond.into(),
         sql: sql.into(),
+        timeout_ms: 0,
     }
 }
 async fn client(ep: &str) -> DataClient<tonic::transport::Channel> {
@@ -103,6 +104,46 @@ async fn forwarding_read_happy() {
         .unwrap()
         .into_inner();
     assert_eq!(rows(&r.json)[0][0], 3);
+}
+
+#[tokio::test]
+async fn cancellation_forwarding_carries_the_callers_timeout_to_the_owner() {
+    // A gatewayed cluster is the shipped topology, so a request landing on a
+    // node that does not own the pond is the NORMAL case — and a `timeout_ms`
+    // dropped at that hop would be silently ignored for most real traffic.
+    //
+    // Proven through the WRITE path because a forwarded write relays the
+    // owner's JSON result, `_meta` and all: the number that comes back is the
+    // one the OWNER applied, which is exactly the claim.
+    let stack = start_stack_n(2).await;
+    let owner = allocate_and_locate(&stack, "fwdto").await;
+    let greeter = stack.other_than(&owner).data_endpoint.clone();
+    assert_ne!(greeter, owner, "the hop must be real");
+    let mut n = client(&greeter).await;
+
+    let r = n
+        .write_query(req(
+            QueryRequest {
+                pond: "fwdto".into(),
+                sql: "CREATE TABLE t AS SELECT 1 AS a".into(),
+                timeout_ms: 4_321,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let v: serde_json::Value = serde_json::from_str(&r.json).unwrap();
+    assert_eq!(
+        v["_meta"]["timeout_ms"], 4_321,
+        "the caller's ask must cross the hop and be applied by the node that \
+         actually ran the statement"
+    );
+    assert_eq!(
+        v["_meta"]["served_by"], owner,
+        "and it must really have been forwarded, or the assertion above is about \
+         the greeter serving its own empty pond"
+    );
 }
 
 #[tokio::test]

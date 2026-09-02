@@ -419,6 +419,9 @@ impl Latiq {
                 d.write_query(QueryRequest {
                     pond: pond.to_string(),
                     sql: sql.to_string(),
+                    // The node's default. The SDK does not surface a
+                    // per-statement timeout yet; 0 is "unset" on the wire.
+                    timeout_ms: 0,
                 })
                 .await
                 .map_err(|s| anyhow!("write: {}", s.message()))?;
@@ -429,6 +432,9 @@ impl Latiq {
                 .read_arrow(QueryRequest {
                     pond: pond.to_string(),
                     sql: sql.to_string(),
+                    // The node's default. The SDK does not surface a
+                    // per-statement timeout yet; 0 is "unset" on the wire.
+                    timeout_ms: 0,
                 })
                 .await
                 .map_err(|s| anyhow!("read: {}", s.message()))?
@@ -449,6 +455,9 @@ impl Latiq {
                 .explain_query(QueryRequest {
                     pond: pond.to_string(),
                     sql: sql.to_string(),
+                    // The node's default. The SDK does not surface a
+                    // per-statement timeout yet; 0 is "unset" on the wire.
+                    timeout_ms: 0,
                 })
                 .await
                 .map_err(|s| anyhow!("explain: {}", s.message()))?
@@ -725,6 +734,9 @@ impl LocalCluster {
             // often no network at all; lineage-enabled ponds still write their
             // own files, which is what `get_lineage` reads.
             lineage_backend_url: None,
+            // The shipped default/maximum; the embedded cluster exposes no
+            // knob for them.
+            timeouts: latiq_common::QueryTimeouts::default(),
         };
         rt.spawn(async move {
             let _ = run_pond_node(cfg).await;

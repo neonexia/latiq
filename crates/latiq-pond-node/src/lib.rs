@@ -28,6 +28,7 @@ pub use stream_service::StreamService;
 
 use latiq_agent_core::{AgentConfig, AgentOps};
 use latiq_auth::Verifier;
+use latiq_common::QueryTimeouts;
 use latiq_engine_duckdb::DuckEngine;
 use latiq_mcp::serve_mcp;
 use latiq_proto::v1::control_client::ControlClient;
@@ -79,6 +80,16 @@ pub struct PondNodeConfig {
     /// that produced them (dropping a pond destroys its local trail). A backend
     /// that is down, slow or dead can never fail, slow or block a query.
     pub lineage_backend_url: Option<String>,
+    /// How long a statement may run on this node: the default applied when a
+    /// caller names no `timeout_ms`, and the hard maximum every request is
+    /// clamped to.
+    ///
+    /// The maximum is the OPERATOR's protection, not the agent's: one DuckDB
+    /// instance per pond means one unbounded query pins that pond for every
+    /// other agent in it. A request above it is clamped rather than refused —
+    /// the query still runs, at the ceiling — and the response's
+    /// `_meta.timeout_ms` reports what was applied so the clamp is visible.
+    pub timeouts: QueryTimeouts,
 }
 
 /// Install the standard + optional DuckDB extensions into the local cache so a
@@ -125,6 +136,7 @@ pub async fn build_ops(
     control_endpoint: &str,
     data_dir: &std::path::Path,
     lineage_sink: Option<Arc<dyn latiq_lineage::EventSink>>,
+    timeouts: QueryTimeouts,
 ) -> anyhow::Result<Arc<AgentOps>> {
     let mut reg = ControlClient::connect(control_endpoint.to_string()).await?;
     reg.register_node(RegisterNodeRequest {
@@ -144,7 +156,16 @@ pub async fn build_ops(
     // of one thing. The endpoint comes along only as the address peers dial and
     // as this node's `served_by`; it is never compared (#89: two spellings of
     // one address made a node forward into itself, unboundedly).
-    let mut ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
+    let mut ops = AgentOps::new(
+        control,
+        storage,
+        engine,
+        AgentConfig {
+            timeouts,
+            ..AgentConfig::default()
+        },
+    )
+    .with_forwarding(
         node_id.to_string(),
         internal_endpoint.to_string(),
         Arc::new(GrpcForwarder::new()),
@@ -275,6 +296,7 @@ pub async fn run_pond_node_until(
         lineage_sink
             .clone()
             .map(|s| s as Arc<dyn latiq_lineage::EventSink>),
+        cfg.timeouts,
     )
     .await?;
 

@@ -1161,3 +1161,177 @@ async fn error_contract_allocate_on_an_unreachable_node_reads_as_not_created() {
     );
     c.close().await.unwrap();
 }
+
+/// Timeouts and real cancellation on the agent surface. Both stop a query by
+/// firing the same DuckDB interrupt, so the thing worth proving is that the
+/// agent can still tell them apart — a timeout is "ask for more time or ask for
+/// less data", a cancel is "you asked for this".
+mod timeouts {
+    use super::*;
+    use common::start_stack_with_timeouts;
+    use latiq_common::QueryTimeouts;
+    use std::time::Duration;
+
+    /// Cheap to submit, effectively unbounded to run: a generated range, so the
+    /// test needs no data loaded and no table size decides its flakiness.
+    const SLOW_SQL: &str = "SELECT count(*) FROM range(0, 100000000000) t(i) WHERE i % 999983 = 0";
+
+    fn query_args(pond: &str, sql: &str) -> Map<String, Value> {
+        let mut a = Map::new();
+        a.insert("pond".into(), Value::String(pond.into()));
+        a.insert("sql".into(), Value::String(sql.into()));
+        a
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_timeout_is_reported_as_query_timeout_to_the_agent() {
+        let s = start_stack_with_timeouts(QueryTimeouts::new(30_000, 30_000).unwrap()).await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-t".into()))
+            .await
+            .unwrap();
+        c.allocate_pond(Some("kinds")).await.unwrap();
+
+        let mut args = query_args("kinds", SLOW_SQL);
+        args.insert("timeout_ms".into(), Value::from(400u64));
+        let started = std::time::Instant::now();
+        let r = c.call_tool("read_query", args).await.unwrap();
+        assert!(r.is_error, "the deadline must fail the call: {}", r.value);
+        assert_eq!(
+            r.value["kind"], "query_timeout",
+            "our deadline fired — not a generic engine error, and not query_cancelled \
+             (nobody cancelled this): {}",
+            r.value
+        );
+        assert!(
+            r.value["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("400 ms"),
+            "the agent must be told what it actually got: {}",
+            r.value
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the deadline must CUT the query, not be reported after it finished on \
+             its own (took {:?})",
+            started.elapsed()
+        );
+
+        // A wedged pooled connection is the real damage; the next reader proves
+        // there is none.
+        let ok = c.query("kinds", "SELECT 41 + 1 AS v").await.unwrap();
+        assert!(!ok.is_error, "the pond must still answer: {}", ok.value);
+        assert_eq!(ok.value["rows"][0][0], 42);
+        c.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_notifications_cancelled_actually_stops_the_running_query() {
+        // Observed through the pond's WRITER, which is exclusive (one DuckDB
+        // instance per pond, one writer mutex). If the cancel does not reach the
+        // engine, the abandoned write holds that mutex for its full 30 s
+        // deadline and the second write below waits behind it.
+        //
+        // It has to be observed this way: a conforming MCP client resolves its
+        // own request the instant it sends `notifications/cancelled` and drops
+        // whatever the server answers, so the `query_cancelled` envelope is not
+        // visible from here. Its KIND is pinned in
+        // `latiq-agent-core/tests/agent_ops.rs::timeouts`; what this proves is
+        // the half that only the real transport can — that rmcp's per-request
+        // token reaches the running statement at all.
+        let s = start_stack_with_timeouts(QueryTimeouts::new(30_000, 30_000).unwrap()).await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-k".into()))
+            .await
+            .unwrap();
+        c.allocate_pond(Some("cancelme")).await.unwrap();
+
+        let err = c
+            .call_tool_then_cancel(
+                "write_query",
+                query_args(
+                    "cancelme",
+                    "CREATE TABLE t AS SELECT i FROM range(0, 100000000000) t(i) \
+                     WHERE i % 999983 = 0",
+                ),
+                Duration::from_millis(400),
+            )
+            .await
+            .expect_err("the client abandons its own request once it cancels");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "the notification must have gone out (this is the client's own \
+             bookkeeping, not the server's answer): {err}"
+        );
+
+        let started = std::time::Instant::now();
+        let ok = c
+            .write("cancelme", "CREATE TABLE fine AS SELECT 1 AS a")
+            .await
+            .unwrap();
+        let waited = started.elapsed();
+        assert!(!ok.is_error, "the pond's writer must survive: {}", ok.value);
+        assert!(
+            waited < Duration::from_secs(10),
+            "the cancelled write must have RELEASED the pond's writer; waiting {waited:?} \
+             means the notification never reached the query and it ran on to its \
+             30 s deadline"
+        );
+        c.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_the_clamp_is_visible_in_meta_on_the_agent_surface() {
+        let s = start_stack_with_timeouts(QueryTimeouts::new(1_000, 2_000).unwrap()).await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-c".into()))
+            .await
+            .unwrap();
+        c.allocate_pond(Some("clamp")).await.unwrap();
+
+        let mut args = query_args("clamp", "SELECT 1 AS v");
+        args.insert("timeout_ms".into(), Value::from(1_800_000u64));
+        let r = c.call_tool("read_query", args).await.unwrap();
+        assert!(!r.is_error, "an over-max ask runs, clamped: {}", r.value);
+        assert_eq!(
+            r.value["_meta"]["timeout_ms"], 2_000,
+            "the agent asked for 30 minutes and must be able to SEE it got 2 s, \
+             or it cannot understand why its next query dies early"
+        );
+
+        // A write reports it too, and an ask inside the ceiling is untouched.
+        let mut args = query_args("clamp", "CREATE TABLE t AS SELECT 1 AS a");
+        args.insert("timeout_ms".into(), Value::from(1_500u64));
+        let w = c.call_tool("write_query", args).await.unwrap();
+        assert!(!w.is_error, "{}", w.value);
+        assert_eq!(w.value["_meta"]["timeout_ms"], 1_500);
+        c.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_the_timeout_tool_argument_is_advertised_on_both_query_tools() {
+        // An argument the model cannot discover is an argument it will not use.
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-s".into()))
+            .await
+            .unwrap();
+        let tools = c.list_tools().await.unwrap();
+        let mut checked = 0;
+        for name in ["read_query", "write_query"] {
+            let t = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            let props = t.input_schema.get("properties").expect("a properties map");
+            let d = props["timeout_ms"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}.timeout_ms needs a description"));
+            assert!(
+                d.contains("clamped") && d.contains("_meta.timeout_ms"),
+                "the description must tell the model that an over-max ask is clamped \
+                 and where to read what was applied: {d}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both query tools must carry the argument");
+        c.close().await.unwrap();
+    }
+}

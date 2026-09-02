@@ -17,8 +17,11 @@
 //! not agents and speak gRPC, never MCP). A dev-dependency, never shipped.
 use anyhow::Result;
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, CallToolResult};
-use rmcp::service::RunningService;
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotification,
+    CancelledNotificationParam, ClientNotification, ClientRequest, ServerResult,
+};
+use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{RoleClient, ServiceExt};
@@ -125,6 +128,67 @@ impl LatiqClient {
 
     pub async fn explain(&self, pond: &str, sql: &str) -> Result<CallOutcome> {
         self.call("explain_query", query_args(pond, sql)).await
+    }
+
+    /// Call a tool and then, after `after`, cancel THAT call the way a real MCP
+    /// client does: a `notifications/cancelled` carrying the request's id.
+    ///
+    /// This is the only honest way to exercise the cancel path. Dropping the
+    /// connection is NOT a cancel source (rmcp never surfaces a disconnect to
+    /// the handler — see `latiq-mcp`'s CLAUDE.md), so a test that killed the
+    /// client would prove nothing about cancellation.
+    ///
+    /// **Normally returns `Err(ServiceError::Cancelled)`, and that is correct.**
+    /// rmcp resolves the caller's request the instant it sends the notification
+    /// and discards whatever the server eventually answers — which is what the
+    /// MCP spec asks of a client, since it has said it no longer wants the
+    /// result. So the server's `query_cancelled` envelope is NOT observable from
+    /// here, and a test that expects to read it is testing nothing; observe the
+    /// cancel's EFFECT on the server instead (see `crates/latiq/tests/mcp.rs`),
+    /// and pin the envelope's kind below the transport
+    /// (`latiq-agent-core/tests/agent_ops.rs`).
+    ///
+    /// `Ok` therefore means only one thing: the server answered before the
+    /// cancel went out — the call was too fast to cancel.
+    pub async fn call_tool_then_cancel(
+        &self,
+        name: &'static str,
+        args: Map<String, Value>,
+        after: std::time::Duration,
+    ) -> Result<CallOutcome> {
+        let mut params = CallToolRequestParams::default();
+        params.name = name.into();
+        params.arguments = Some(args);
+        let handle = self
+            .service
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::no_options(),
+            )
+            .await?;
+        // Taken BEFORE awaiting: `RequestHandle::cancel` consumes the handle and
+        // with it the response channel, and the response is the whole point.
+        let peer = handle.peer.clone();
+        let request_id = handle.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let _ = peer
+                .send_notification(ClientNotification::CancelledNotification(
+                    CancelledNotification::new(CancelledNotificationParam {
+                        request_id,
+                        reason: Some("agent no longer needs this result".into()),
+                    }),
+                ))
+                .await;
+        });
+        let res: CallToolResult = match handle.await_response().await? {
+            ServerResult::CallToolResult(r) => r,
+            other => anyhow::bail!("unexpected response to a tool call: {other:?}"),
+        };
+        Ok(CallOutcome {
+            value: res.structured_content.unwrap_or(Value::Null),
+            is_error: res.is_error.unwrap_or(false),
+        })
     }
 
     /// Call any tool by name with arbitrary args (agent-sim escape hatch for the

@@ -112,6 +112,7 @@ async fn policy_set_tier_applies_the_new_caps_including_the_uncapped_grant() {
                     QueryRequest {
                         pond: "retiered".into(),
                         sql: format!("SELECT current_setting('{name}')::VARCHAR AS v"),
+                        timeout_ms: 0,
                     },
                     "alice",
                 ))
@@ -794,6 +795,7 @@ mod catalogs {
                 QueryRequest {
                     pond: "work".into(),
                     sql: "SELECT count(*) AS n FROM holdings.holdings".into(),
+                    timeout_ms: 0,
                 },
                 "agent-x",
             ))
@@ -896,6 +898,7 @@ mod catalogs {
                 QueryRequest {
                     pond: "shop".into(),
                     sql: "SELECT count(*) AS n FROM cheap".into(),
+                    timeout_ms: 0,
                 },
                 "agent-x",
             ))
@@ -914,6 +917,7 @@ mod catalogs {
                 QueryRequest {
                     pond: "shop".into(),
                     sql: "SELECT count(*) FROM ext.widgets".into(),
+                    timeout_ms: 0,
                 },
                 "agent-x",
             ))
@@ -930,6 +934,7 @@ mod catalogs {
             QueryRequest {
                 pond: "shop".into(),
                 sql: "SELECT count(*) FROM cheap".into(),
+                timeout_ms: 0,
             },
             "agent-x",
         ))
@@ -1107,6 +1112,7 @@ mod catalogs_iceberg {
                 QueryRequest {
                     pond: "shop".into(),
                     sql: "SELECT count(*) AS n FROM cheap".into(),
+                    timeout_ms: 0,
                 },
                 "agent-x",
             ))

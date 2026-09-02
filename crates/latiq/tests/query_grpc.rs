@@ -42,6 +42,7 @@ fn q(pond: &str, sql: &str) -> QueryRequest {
     QueryRequest {
         pond: pond.into(),
         sql: sql.into(),
+        timeout_ms: 0,
     }
 }
 /// Decode the ErrorEnvelope from a tonic Status' details.
@@ -658,6 +659,7 @@ mod arrow_stream {
             QueryRequest {
                 pond: pond.into(),
                 sql: format!("CREATE TABLE t AS SELECT * FROM range({rows}) r(i)"),
+                timeout_ms: 0,
             },
             "a",
         ))
@@ -716,6 +718,7 @@ mod arrow_stream {
                 QueryRequest {
                     pond: "big".into(),
                     sql: "SELECT i FROM t".into(),
+                    timeout_ms: 0,
                 },
                 "a",
             ))
@@ -741,6 +744,7 @@ mod arrow_stream {
                 QueryRequest {
                     pond: "loc".into(),
                     sql: "SELECT i FROM t WHERE i < 0".into(),
+                    timeout_ms: 0,
                 },
                 "a",
             ))
@@ -923,5 +927,187 @@ mod lineage {
             "the Control surface must carry it too — the CLI's `pond create` goes \
              straight to the control plane, bypassing AgentOps"
         );
+    }
+}
+
+/// Query timeouts on the Data surface. A node whose policy is milliseconds
+/// rather than minutes, so the deadline can actually be observed inside a test's
+/// wall clock — the mechanism is the same at either scale.
+mod timeouts {
+    use super::*;
+    use common::start_stack_with_timeouts;
+    use latiq_common::{ErrorKind, QueryTimeouts};
+
+    /// Slow on purpose and cheap on purpose: a generated range, so nothing has
+    /// to be written first and no table's size decides whether the test is
+    /// flaky. It streams, so DuckDB's interrupt lands inside it.
+    const SLOW_SQL: &str = "SELECT count(*) FROM range(0, 100000000000) t(i) WHERE i % 999983 = 0";
+
+    fn timed(pond: &str, sql: &str, timeout_ms: u64) -> QueryRequest {
+        QueryRequest {
+            pond: pond.into(),
+            sql: sql.into(),
+            timeout_ms,
+        }
+    }
+
+    async fn pond(c: &mut DataClient<tonic::transport::Channel>, name: &str) {
+        c.allocate_pond(req(alloc(name), "a")).await.unwrap();
+    }
+
+    fn meta(json: &str) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v["_meta"].clone()
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_slow_read_times_out_and_names_both_numbers() {
+        // 400ms default, 2000ms ceiling: the query below cannot finish in either.
+        let s = start_stack_with_timeouts(QueryTimeouts::new(400, 2_000).unwrap()).await;
+        let mut c = client(&s.data_endpoint).await;
+        pond(&mut c, "slow").await;
+
+        let started = std::time::Instant::now();
+        let e = c
+            .read_query(req(q("slow", SLOW_SQL), "a"))
+            .await
+            .expect_err("a query that cannot finish in 400 ms must be cut");
+        let env = envelope(&e);
+        assert_eq!(
+            env.kind,
+            ErrorKind::QueryTimeout,
+            "not a generic engine error, and not query_cancelled: nobody cancelled this"
+        );
+        assert_eq!(
+            e.code(),
+            Code::DeadlineExceeded,
+            "the gRPC code a client branches on"
+        );
+        // Both numbers, because both decide the agent's next move: what it got,
+        // and how much more it is allowed to ask for.
+        assert!(
+            env.message.contains("400 ms"),
+            "the message must name the timeout that was applied: {}",
+            env.message
+        );
+        assert!(
+            env.message.contains("2000 ms"),
+            "the message must name the node's ceiling: {}",
+            env.message
+        );
+        assert!(
+            env.suggest.contains("timeout_ms") && env.suggest.contains("2000"),
+            "below the ceiling, retrying with a larger timeout_ms is a real lever: {}",
+            env.suggest
+        );
+        assert_eq!(env.see, "latiq://troubleshooting/timeouts");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the deadline must actually cut the query, not merely be reported after it \
+             finished on its own (took {:?})",
+            started.elapsed()
+        );
+
+        // The real damage a botched interrupt does is a wedged pooled
+        // connection. The next reader of the SAME pond must get a right answer.
+        let ok = c
+            .read_query(req(q("slow", "SELECT 41 + 1 AS v"), "a"))
+            .await
+            .expect("the pond's pooled connection must survive a timeout")
+            .into_inner();
+        let v: serde_json::Value = serde_json::from_str(&ok.json).unwrap();
+        assert_eq!(v["rows"][0][0], 42);
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_slow_write_times_out_too() {
+        let s = start_stack_with_timeouts(QueryTimeouts::new(400, 2_000).unwrap()).await;
+        let mut c = client(&s.data_endpoint).await;
+        pond(&mut c, "slowwrite").await;
+
+        let e = c
+            .write_query(req(
+                q(
+                    "slowwrite",
+                    "CREATE TABLE t AS SELECT i FROM range(0, 100000000000) t(i) WHERE i % 999983 = 0",
+                ),
+                "a",
+            ))
+            .await
+            .expect_err("the write path gets the same deadline as the read path");
+        assert_eq!(envelope(&e).kind, ErrorKind::QueryTimeout);
+        // A write cut mid-transaction is where a wedged connection would show:
+        // the ROLLBACK runs against a connection that was just interrupted.
+        let ok = c
+            .write_query(req(
+                q("slowwrite", "CREATE TABLE fine AS SELECT 1 AS a"),
+                "a",
+            ))
+            .await
+            .expect("the pond must still accept writes after a write timed out");
+        assert!(!ok.into_inner().json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_request_above_the_maximum_is_clamped_not_refused() {
+        let s = start_stack_with_timeouts(QueryTimeouts::new(400, 2_000).unwrap()).await;
+        let mut c = client(&s.data_endpoint).await;
+        pond(&mut c, "clamped").await;
+
+        // Half an hour, on a node that allows two seconds.
+        let r = c
+            .read_query(req(timed("clamped", "SELECT 1 AS v", 1_800_000), "a"))
+            .await
+            .expect("an over-max ask is CLAMPED, never refused — the query still runs")
+            .into_inner();
+        assert_eq!(
+            meta(&r.json)["timeout_ms"],
+            2_000,
+            "_meta must report the ceiling that was applied, or the clamp is silent \
+             and the agent is baffled when its query dies early"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_request_below_the_maximum_is_honoured_exactly() {
+        let s = start_stack_with_timeouts(QueryTimeouts::new(400, 2_000).unwrap()).await;
+        let mut c = client(&s.data_endpoint).await;
+        pond(&mut c, "honoured").await;
+
+        let r = c
+            .read_query(req(timed("honoured", "SELECT 1 AS v", 777), "a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            meta(&r.json)["timeout_ms"],
+            777,
+            "a request inside the ceiling is applied verbatim — neither clamped \
+             nor replaced by the node default"
+        );
+
+        // And with nothing asked for, the node's default is what applied.
+        let r = c
+            .read_query(req(q("honoured", "SELECT 1 AS v"), "a"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(meta(&r.json)["timeout_ms"], 400, "the node's default");
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_write_reports_the_effective_timeout_too() {
+        let s = start_stack_with_timeouts(QueryTimeouts::new(400, 2_000).unwrap()).await;
+        let mut c = client(&s.data_endpoint).await;
+        pond(&mut c, "wmeta").await;
+        let r = c
+            .write_query(req(
+                timed("wmeta", "CREATE TABLE t AS SELECT 1 AS a", 999),
+                "a",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(meta(&r.json)["timeout_ms"], 999);
     }
 }

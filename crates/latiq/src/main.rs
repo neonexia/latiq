@@ -339,6 +339,17 @@ struct NodeAddArgs {
     /// pond destroys its local trail. No credentials are sent.
     #[arg(long, env = "LATIQ_LINEAGE_BACKEND_URL")]
     lineage_backend_url: Option<String>,
+    /// How long a statement may run when the caller names no timeout_ms, in
+    /// milliseconds. Must be >0 and no larger than --query-timeout-max-ms.
+    #[arg(long, env = "LATIQ_QUERY_TIMEOUT_MS", default_value_t = latiq_common::DEFAULT_QUERY_TIMEOUT_MS)]
+    query_timeout_ms: u64,
+    /// The hard ceiling this node applies to ANY statement, in milliseconds.
+    /// This is the operator's protection: one DuckDB instance per pond means an
+    /// unbounded query pins that pond for every agent in it. A caller asking for
+    /// more is CLAMPED to this, never refused, and the response's
+    /// `_meta.timeout_ms` reports what was applied.
+    #[arg(long, env = "LATIQ_QUERY_TIMEOUT_MAX_MS", default_value_t = latiq_common::MAX_QUERY_TIMEOUT_MS)]
+    query_timeout_max_ms: u64,
 }
 
 #[derive(Subcommand)]
@@ -464,6 +475,17 @@ struct QueryArgs {
     /// Output format for read results.
     #[arg(short, long, value_enum, default_value_t = Format::Tabular)]
     format: Format,
+    /// How long the statement may run, in milliseconds. Omitted = the node's
+    /// default. A value above the node's maximum is CLAMPED, not refused: the
+    /// query runs at the ceiling, and `_meta.timeout_ms` reports what was
+    /// applied.
+    ///
+    /// Deliberately NOT read from an environment variable: `LATIQ_QUERY_TIMEOUT_MS`
+    /// is the NODE's default (`latiq node add`), and a per-statement ask that
+    /// silently picked it up would mean one variable configuring two unrelated
+    /// things on a host that runs both.
+    #[arg(long)]
+    timeout_ms: Option<u64>,
 }
 
 #[tokio::main]
@@ -1027,6 +1049,12 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
         a.auth_jwks_uri,
         a.auth_allow_insecure_jwks,
     )?;
+    // Validated ONCE here, before anything binds — same discipline as the
+    // verifier and --lineage-backend-url. A node whose timeout policy is
+    // nonsensical (a zero, or a default above its own ceiling) must fail to
+    // start, not discover it on some agent's first query.
+    let timeouts = latiq_common::QueryTimeouts::new(a.query_timeout_ms, a.query_timeout_max_ms)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let root = a.root.unwrap_or_else(default_root);
     std::fs::create_dir_all(&root)?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
@@ -1068,6 +1096,7 @@ async fn run_node_add(a: NodeAddArgs) -> Result<()> {
             // passes the variable through empty, and an empty string must mean
             // "no backend", never a URL the node fails to parse at startup.
             lineage_backend_url: non_blank(a.lineage_backend_url),
+            timeouts,
         },
         shutdown_signal(),
     )
@@ -1240,6 +1269,8 @@ async fn run_query(a: QueryArgs) -> Result<()> {
         QueryRequest {
             pond: a.pond.clone(),
             sql: a.sql.clone(),
+            // 0 is the wire's "unset" — the node applies its default.
+            timeout_ms: a.timeout_ms.unwrap_or(0),
         },
         &a.agent_id,
     );
