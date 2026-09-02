@@ -240,6 +240,80 @@ async fn pond_lifecycle_description_shown_in_list() {
 }
 
 #[tokio::test]
+async fn pond_lifecycle_forget_is_refused_for_a_pond_a_live_node_serves() {
+    // `pond forget` deletes a registry record and ORPHANS the data, so on a
+    // running stack — where the owning node is up and `pond drop` works — it
+    // has to refuse. This is the whole-surface half of the guard: the registry
+    // unit tests prove the decision, this proves an operator reaching the real
+    // Admin RPC gets it, with a code and guidance they can act on.
+    let s = start_stack().await;
+    let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+    data.allocate_pond(id_req(
+        AllocatePondRequest {
+            name: "live-one".into(),
+            policy_json: String::new(),
+            tier: String::new(),
+            lineage: false,
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+        .await
+        .unwrap();
+
+    // Without confirm: refused BEFORE anything is looked at, like drop's gate.
+    let unconfirmed = admin
+        .pond_forget(PondForgetRequest {
+            pond: "live-one".into(),
+            confirm: false,
+        })
+        .await
+        .expect_err("a destructive operator action must require confirm");
+    assert_eq!(unconfirmed.code(), tonic::Code::InvalidArgument);
+    assert!(
+        unconfirmed.message().contains("confirm=true"),
+        "the refusal must say how to proceed: {}",
+        unconfirmed.message()
+    );
+
+    // With confirm: still refused, now on the guard rail — and the message must
+    // send the operator to the verb that actually works here.
+    let err = admin
+        .pond_forget(PondForgetRequest {
+            pond: "live-one".into(),
+            confirm: true,
+        })
+        .await
+        .expect_err("a pond a live node still serves must not be forgotten");
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "not InvalidArgument: the request is fine, the cluster state is what refuses it"
+    );
+    let env: latiq_common::ErrorEnvelope = serde_json::from_slice(err.details()).expect("envelope");
+    assert!(
+        env.suggest.contains("pond drop"),
+        "must point at the verb that works: {}",
+        env.suggest
+    );
+
+    // And the pond is untouched — a refusal that had already deleted the row
+    // would be the worst possible outcome of this command.
+    let ponds = admin
+        .pond_list(PondListRequest {})
+        .await
+        .unwrap()
+        .into_inner()
+        .ponds;
+    assert!(
+        ponds.iter().any(|p| p.name == "live-one"),
+        "the refused pond must still be registered"
+    );
+}
+
+#[tokio::test]
 async fn node_list_shows_the_registered_node() {
     let s = start_stack().await;
     let mut admin = AdminClient::connect(s.admin_endpoint.clone())
@@ -472,7 +546,7 @@ async fn auth_admin_accepts_a_valid_token() {
 /// unattributed operator action, so the guard below enumerates the surface
 /// rather than sampling it: bump this and add a `probe!` line when the proto
 /// gains an RPC — the length assertion fails until you do.
-const ADMIN_RPC_COUNT: usize = 12;
+const ADMIN_RPC_COUNT: usize = 13;
 
 #[tokio::test]
 async fn auth_admin_every_rpc_rejects_a_missing_token() {
@@ -520,6 +594,7 @@ async fn auth_admin_every_rpc_rejects_a_missing_token() {
         probe!(policy_set, PolicySetRequest),
         probe!(pond_list, PondListRequest),
         probe!(pond_set_tier, PondSetTierRequest),
+        probe!(pond_forget, PondForgetRequest),
         probe!(dataset_add, DatasetAddRequest),
         probe!(dataset_remove, DatasetRemoveRequest),
         probe!(dataset_list, DatasetListRequest),

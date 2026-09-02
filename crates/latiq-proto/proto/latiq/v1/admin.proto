@@ -29,6 +29,24 @@ service Admin {
   // owning node resolves a pond's tier on every operation, so the new caps take
   // effect on that pond's next use, when its engine instance is re-opened.
   rpc PondSetTier(PondSetTierRequest) returns (PondSetTierResponse);
+  // Delete the REGISTRY RECORD of a pond that no registered node can serve.
+  //
+  // This is NOT `pond drop`. Drop is the agent/CLI data operation: it goes to
+  // the owning node, which deletes the pond's files. This one only removes the
+  // row, and it exists because a pond whose owning node is permanently gone can
+  // never be dropped — the drop has nowhere to go — leaving it stuck in the
+  // registry forever, unqueryable and undeletable.
+  //
+  // THE DATA IS NOT DELETED. If the departed node's disk still exists, this
+  // pond's files are still on it and are now orphaned: the registry no longer
+  // knows they belong to anything, and if that node ever comes back it will
+  // hold storage for a pond nothing knows about. Reclaiming that disk is a
+  // manual, out-of-band act.
+  //
+  // Refused while the owning node is registered, active and has an endpoint —
+  // then some node can still serve the pond and `pond drop` is the right tool.
+  // Requires confirm=true, like drop.
+  rpc PondForget(PondForgetRequest) returns (PondForgetResponse);
   // Operators curate the dataset catalog (add/remove); list/search is here too
   // so operators can browse it from the control plane.
   rpc DatasetAdd(DatasetAddRequest) returns (DatasetAddResponse);
@@ -63,6 +81,11 @@ message PondListResponse { repeated PondSummary ponds = 1; }
 // — we do NOT silently fall back to medium, which would resize the wrong way).
 message PondSetTierRequest { string pond = 1; string tier = 2; }
 message PondSetTierResponse { string pond = 1; string tier = 2; }
+// pond: name or id. confirm: required — this is destructive to the record.
+message PondForgetRequest { string pond = 1; bool confirm = 2; }
+// node_id: where any surviving data still is (nothing was deleted there).
+// node_state: why it was allowed — `down`, or `unregistered` (no node row).
+message PondForgetResponse { string pond_id = 1; string name = 2; string node_id = 3; string node_state = 4; }
 
 message NodeInfo {
   string node_id = 1; string mcp_endpoint = 2; string state = 3; uint32 pond_count = 4;

@@ -50,6 +50,167 @@ fn ops() -> AgentOps {
 }
 
 #[tokio::test]
+async fn pond_lifecycle_forget_turns_an_unservable_pond_into_a_missing_one() {
+    // The two halves of the stranded-pond story, over a REAL registry, because
+    // the point is that they compose: a pond nobody owns is refused rather than
+    // served (`pond_unavailable`), and the operator's escape hatch turns that
+    // into the ordinary `pond_not_found` instead of leaving it stuck forever.
+    // Neither half is worth much without the other — the guard alone would make
+    // such a pond permanently inert, since `drop_pond` forwards and has nowhere
+    // to go.
+    let registry = Registry::open(None).unwrap();
+    // A node that registered WITHOUT an internal endpoint: it can host nothing,
+    // so a pond placed on it has no address any peer could forward to — the
+    // same registry state as a node whose row is gone, reachable through the
+    // public API.
+    registry
+        .register_node("node-a", "http://127.0.0.1:8080/mcp", "", 100)
+        .unwrap();
+    registry
+        .create_pond(Some("stranded".into()), "x", "{}", "medium", &[], "", false)
+        .unwrap();
+    let ops = AgentOps::new(
+        Arc::new(RegistryControlPlane::new(registry.clone())),
+        Arc::new(TempFs::new()),
+        Arc::new(DuckEngine::new()),
+        AgentConfig::default(),
+    )
+    // Clustered: this node has an endpoint of its own and a way to forward, so
+    // "who owns this pond" is a question it can be wrong about.
+    .with_forwarding("http://127.0.0.1:9092".to_string(), Arc::new(NeverForwards));
+    let id = Identity::claimed(Some("a"));
+
+    let before = ops
+        .read_query(&id, "stranded", "SELECT 1")
+        .await
+        .expect_err("an unowned pond must not be served");
+    assert_eq!(
+        before.envelope().kind,
+        latiq_common::ErrorKind::PondUnavailable,
+        "{}",
+        before.envelope().message
+    );
+
+    let forgotten = registry.forget_pond("stranded").unwrap();
+    assert_eq!(forgotten.node_id, "node-a");
+
+    let after = ops
+        .read_query(&id, "stranded", "SELECT 1")
+        .await
+        .expect_err("and it is gone afterwards");
+    assert_eq!(
+        after.envelope().kind,
+        latiq_common::ErrorKind::PondNotFound,
+        "a forgotten pond must read as missing, not as unavailable — the \
+         record is genuinely gone and allocating a new one IS now the right \
+         advice: {}",
+        after.envelope().message
+    );
+    // The name is free again, which is the operator-visible point of forgetting.
+    ops.allocate_pond(&id, Some("stranded".into()), "{}", "medium", &[], false)
+        .await
+        .expect_err("this node cannot host it either, but the NAME was released");
+    assert!(
+        registry.list_ponds().unwrap().is_empty(),
+        "and the compensated allocation left nothing behind"
+    );
+}
+
+/// A `Forwarder` that fails loudly if anything reaches it. Used where the test
+/// is about the routing DECISION: a hop taken here would be a hop to an
+/// endpoint the registry never gave us.
+struct NeverForwards;
+
+#[async_trait::async_trait]
+impl latiq_agent_core::Forwarder for NeverForwards {
+    async fn read(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: &str,
+    ) -> Result<latiq_engine::QueryResult, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn read_arrow(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: &str,
+    ) -> Result<latiq_agent_core::ArrowReadStream, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn write(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: &str,
+    ) -> Result<latiq_engine::QueryResult, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn explain(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: &str,
+    ) -> Result<latiq_engine::ExplainResult, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn describe(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+    ) -> Result<latiq_agent_core::DescribeResult, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn get_lineage(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: usize,
+        _: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<latiq_agent_core::LineagePage, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn drop_pond(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: bool,
+    ) -> Result<(), latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn catalog_pull(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: std::collections::BTreeMap<String, String>,
+    ) -> Result<latiq_agent_core::PullResult, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+    async fn catalog_describe(
+        &self,
+        e: &str,
+        _: &Identity,
+        _: &str,
+        _: &str,
+        _: std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<(String, String)>, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e}")
+    }
+}
+
+#[tokio::test]
 async fn served_by_reports_in_process_when_the_node_advertises_no_endpoint() {
     // Single-node / embedded-SDK setups have no advertised endpoint to name.
     // The documented answer is the constant, never an empty string: "one node,

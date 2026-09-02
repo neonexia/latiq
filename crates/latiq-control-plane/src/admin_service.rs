@@ -352,6 +352,70 @@ impl Admin for AdminService {
         }))
     }
 
+    /// Remove the registry record of a pond no registered node can serve. See
+    /// the RPC's comment in `admin.proto` for the full contract; the two things
+    /// worth repeating here: it is NOT `drop_pond` (no data is deleted — any
+    /// files on the departed node are orphaned, not removed), and it is refused
+    /// while a live node still owns the pond.
+    async fn pond_forget(
+        &self,
+        req: Request<PondForgetRequest>,
+    ) -> Result<Response<PondForgetResponse>, Status> {
+        let started = Instant::now();
+        let identity = self.identity_of(&req, "pond_forget", started).await?;
+        let r = req.into_inner();
+        if r.pond.trim().is_empty() {
+            audit(
+                &identity,
+                "pond_forget",
+                None,
+                "rejected: pond is required",
+                ERROR,
+                started,
+            );
+            return Err(Status::invalid_argument("pond is required"));
+        }
+        // Same gate, same reason as `drop_pond`'s: destructive, irreversible,
+        // and recorded either way — "someone tried to forget this pond" is a
+        // line an operator wants on the trail.
+        if !r.confirm {
+            audit(
+                &identity,
+                "pond_forget",
+                Some(&r.pond),
+                "rejected: confirm is required",
+                ERROR,
+                started,
+            );
+            return Err(Status::invalid_argument(format!(
+                "pond_forget removes the registry record for pond '{}' (its data on the departed \
+                 node is NOT deleted, only orphaned); set confirm=true to proceed",
+                r.pond
+            )));
+        }
+        let res = self.registry.forget_pond(&r.pond).map_err(to_status);
+        // The node is named in the record on purpose: it is where the orphaned
+        // files are, and this line may be the only place that is written down.
+        audit(
+            &identity,
+            "pond_forget",
+            Some(&r.pond),
+            &match res.as_ref() {
+                Ok(f) => format!("forgot record; data orphaned on node={}", f.node_id),
+                Err(_) => "refused".to_string(),
+            },
+            outcome(&res),
+            started,
+        );
+        let f = res?;
+        Ok(Response::new(PondForgetResponse {
+            pond_id: f.pond_id,
+            name: f.name,
+            node_id: f.node_id,
+            node_state: f.node_state,
+        }))
+    }
+
     async fn dataset_add(
         &self,
         req: Request<DatasetAddRequest>,
