@@ -83,6 +83,9 @@ fn to_info(
         owner: row.owner_identity,
         created_at,
         policy_json,
+        // The registry's `ponds.node_id` — always set for a live row, and the
+        // one field ownership is decided on. An empty string is not an id.
+        node_id: Some(row.node_id).filter(|s| !s.is_empty()),
         node_endpoint,
         tier: row.tier,
         extensions: row.extensions,

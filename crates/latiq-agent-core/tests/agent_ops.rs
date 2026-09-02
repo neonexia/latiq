@@ -75,9 +75,14 @@ async fn pond_lifecycle_forget_turns_an_unservable_pond_into_a_missing_one() {
         Arc::new(DuckEngine::new()),
         AgentConfig::default(),
     )
-    // Clustered: this node has an endpoint of its own and a way to forward, so
-    // "who owns this pond" is a question it can be wrong about.
-    .with_forwarding("http://127.0.0.1:9092".to_string(), Arc::new(NeverForwards));
+    // Clustered, and NOT the node the pond was placed on ("node-a"): this node
+    // has an id, an endpoint and a way to forward, so "who owns this pond" is a
+    // question it can be wrong about.
+    .with_forwarding(
+        "node-b".to_string(),
+        "http://127.0.0.1:9092".to_string(),
+        Arc::new(NeverForwards),
+    );
     let id = Identity::claimed(Some("a"));
 
     let before = ops
@@ -651,9 +656,33 @@ mod forwarding {
     /// query it only relayed.
     const OWNER_SAYS: &str = "http://owner:9092";
 
-    /// Every pond resolves to a fixed owner endpoint (or none).
-    struct FixedOwner {
+    /// The registry's answer to "who owns this pond": the owning node's stable
+    /// **id** and, separately, its **address**. Held apart on purpose — #89 was
+    /// exactly the assumption that one can stand in for the other, so a fixture
+    /// that derived either from the other could not express the bug.
+    #[derive(Clone, Default)]
+    struct Owner {
+        node_id: Option<String>,
         endpoint: Option<String>,
+    }
+
+    /// A pond owned by node `id`, reachable at `endpoint`.
+    fn owned_by(id: &str, endpoint: &str) -> Owner {
+        Owner {
+            node_id: Some(id.to_string()),
+            endpoint: Some(endpoint.to_string()),
+        }
+    }
+
+    /// A pond the registry can name no owner for at all (the node's row is
+    /// gone) — `Placement::NoOwner`.
+    fn unowned() -> Owner {
+        Owner::default()
+    }
+
+    /// Every pond resolves to a fixed owner (or none).
+    struct FixedOwner {
+        owner: Owner,
         /// The pond's lineage opt-in, as the registry would report it.
         lineage: bool,
         /// Registry drops seen — `allocate_pond`'s compensation is invisible
@@ -691,7 +720,8 @@ mod forwarding {
                 owner: "owner".to_string(),
                 created_at: String::new(),
                 policy_json: "{}".to_string(),
-                node_endpoint: self.endpoint.clone(),
+                node_id: self.owner.node_id.clone(),
+                node_endpoint: self.owner.endpoint.clone(),
                 tier: "medium".to_string(),
                 extensions: vec![],
                 lineage: self.lineage,
@@ -824,6 +854,7 @@ mod forwarding {
                     owner: "owner".to_string(),
                     created_at: String::new(),
                     policy_json: "{}".to_string(),
+                    node_id: Some("owner-node".to_string()),
                     node_endpoint: Some(e.to_string()),
                     tier: "medium".to_string(),
                     extensions: vec![],
@@ -898,16 +929,16 @@ mod forwarding {
         }
     }
 
-    fn ops_with(owner: Option<&str>, self_ep: &str, fwd: Arc<RecordingForwarder>) -> AgentOps {
-        ops_with_lineage(owner, self_ep, fwd, false).0
+    fn ops_with(owner: Owner, me: (&str, &str), fwd: Arc<RecordingForwarder>) -> AgentOps {
+        ops_with_lineage(owner, me, fwd, false).0
     }
 
     /// A node with the same registry view but NO forwarding configured — the
     /// embedded SDK and single-node `dev.sh`, where there is one node, it owns
     /// everything, and `pip install latiq` has to keep working.
-    fn ops_embedded(owner: Option<&str>) -> (AgentOps, Arc<TempFs>) {
+    fn ops_embedded(owner: Owner) -> (AgentOps, Arc<TempFs>) {
         let control = Arc::new(FixedOwner {
-            endpoint: owner.map(|s| s.to_string()),
+            owner,
             lineage: false,
             drops: AtomicUsize::new(0),
         });
@@ -923,14 +954,16 @@ mod forwarding {
 
     /// As `ops_with`, with the pond's lineage opt-in chosen and the storage kept
     /// so a test can look for the events on disk.
+    /// `me` is this node's **(id, endpoint)** — two separate things, which is
+    /// the whole subject of these tests.
     fn ops_with_lineage(
-        owner: Option<&str>,
-        self_ep: &str,
+        owner: Owner,
+        me: (&str, &str),
         fwd: Arc<RecordingForwarder>,
         lineage: bool,
     ) -> (AgentOps, Arc<TempFs>) {
         let control = Arc::new(FixedOwner {
-            endpoint: owner.map(|s| s.to_string()),
+            owner,
             lineage,
             drops: AtomicUsize::new(0),
         });
@@ -941,7 +974,7 @@ mod forwarding {
             Arc::new(DuckEngine::new()),
             AgentConfig::default(),
         )
-        .with_forwarding(self_ep.to_string(), fwd);
+        .with_forwarding(me.0.to_string(), me.1.to_string(), fwd);
         (ops, storage)
     }
 
@@ -952,8 +985,8 @@ mod forwarding {
         // pond-local snapshot ids and only one of them real.
         let fwd = Arc::new(RecordingForwarder::default());
         let (greeter, greeter_storage) = ops_with_lineage(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
             true,
         );
@@ -986,8 +1019,12 @@ mod forwarding {
         // Anti-vacuity: the same pond, same SQL, owned by this node — the
         // events appear, so the silence above is the forward and not a pond
         // that never emits.
-        let (owner, owner_storage) =
-            ops_with_lineage(Some("http://me:9092"), "http://me:9092", fwd.clone(), true);
+        let (owner, owner_storage) = ops_with_lineage(
+            owned_by("me-node", "http://me:9092"),
+            ("me-node", "http://me:9092"),
+            fwd.clone(),
+            true,
+        );
         owner
             .write_query(
                 &Identity::claimed(Some("a")),
@@ -1011,7 +1048,11 @@ mod forwarding {
         // serving the pond itself and stamp its OWN name here, while every
         // other assertion in this file still passed.
         let fwd = Arc::new(RecordingForwarder::default());
-        let ops = ops_with(Some(OWNER_SAYS), "http://greeter:9092", fwd.clone());
+        let ops = ops_with(
+            owned_by("owner-node", OWNER_SAYS),
+            ("greeter-node", "http://greeter:9092"),
+            fwd.clone(),
+        );
         let id = Identity::claimed(Some("a"));
 
         let read = ops.read_query(&id, "pond-x", "SELECT 1").await.unwrap();
@@ -1049,7 +1090,11 @@ mod forwarding {
         // says so. Without this, `served_by` could be a constant and the
         // forwarded assertion would still pass.
         let fwd = Arc::new(RecordingForwarder::default());
-        let ops = ops_with(Some("http://me:9092"), "http://me:9092", fwd.clone());
+        let ops = ops_with(
+            owned_by("me-node", "http://me:9092"),
+            ("me-node", "http://me:9092"),
+            fwd.clone(),
+        );
         let id = Identity::claimed(Some("a"));
 
         let r = ops
@@ -1101,7 +1146,11 @@ mod forwarding {
             .build()
             .unwrap();
         let fwd = Arc::new(RecordingForwarder::default());
-        let ops = ops_with(Some(OWNER_SAYS), "http://greeter:9092", fwd.clone());
+        let ops = ops_with(
+            owned_by("owner-node", OWNER_SAYS),
+            ("greeter-node", "http://greeter:9092"),
+            fwd.clone(),
+        );
         let id = Identity::claimed(Some("a"));
 
         metrics::with_local_recorder(&recorder, || {
@@ -1134,7 +1183,11 @@ mod forwarding {
 
         // The same ops on a node that OWNS the pond must add nothing: the
         // counter measures hops, not requests.
-        let local = ops_with(Some("http://me:9092"), "http://me:9092", fwd);
+        let local = ops_with(
+            owned_by("me-node", "http://me:9092"),
+            ("me-node", "http://me:9092"),
+            fwd,
+        );
         metrics::with_local_recorder(&recorder, || {
             rt.block_on(async {
                 local
@@ -1158,8 +1211,8 @@ mod forwarding {
     async fn forwarding_read_delegates_to_owner() {
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
         let r = ops
@@ -1178,8 +1231,8 @@ mod forwarding {
     async fn forwarding_write_delegates_to_owner() {
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
         let r = ops
@@ -1194,11 +1247,148 @@ mod forwarding {
         assert_eq!(r.columns, vec!["forwarded_write".to_string()]);
     }
 
+    /// REGRESSION PIN — issue #89. Ownership used to be decided by comparing
+    /// this node's `self_endpoint` against the endpoint the registry stored for
+    /// the owning node. Two spellings of ONE address (the trailing slash below;
+    /// equally a hostname vs its IP, a case difference, or a node that was
+    /// re-addressed) made the node conclude it was not the owner, dial the
+    /// owner — itself — and re-enter this same decision, forwarding again with
+    /// no hop counter, no already-forwarded marker and no deadline to stop it.
+    ///
+    /// The endpoint was never the identity. `node_id` is: the same id the node
+    /// registers and heartbeats with, and the one the registry assigns ponds by.
+    ///
+    /// Do not delete this as redundant with `forwarding_skipped_when_self_owns`
+    /// — that one has the two spellings AGREEING, which is exactly the case the
+    /// bug did not affect.
+    #[tokio::test]
+    async fn forwarding_serves_locally_when_the_registrys_endpoint_spelling_drifted() {
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(
+            // One node, two spellings: the registry kept `…:9092/`, this
+            // process advertises `…:9092`. The id is the same because it IS
+            // the same node.
+            owned_by("me-node", "http://me:9092/"),
+            ("me-node", "http://me:9092"),
+            fwd.clone(),
+        );
+        let r = ops
+            .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
+            .await
+            .expect("a node must serve its own pond however its address is spelled");
+        // Not `is_ok`: the row can only come from this node's own DuckDB, so it
+        // is the proof the pond was served here and not relayed.
+        assert_eq!(r.rows[0][0], serde_json::json!(1));
+        assert_eq!(
+            fwd.reads.load(Ordering::SeqCst),
+            0,
+            "a node that dials itself is the unbounded recursion #89 is about"
+        );
+    }
+
+    /// The companion refusal: two DIFFERENT ids advertising ONE address is a
+    /// misconfiguration (a copy-pasted `--advertise-addr`), and forwarding to it
+    /// would dial ourselves — #89's recursion by another route. The endpoint is
+    /// still never an identity, so this can never make the node the owner; it
+    /// only stops it dialling itself, loudly, with the same refusal an unowned
+    /// pond gets.
+    #[tokio::test]
+    async fn forwarding_refuses_to_dial_its_own_address_for_another_nodes_pond() {
+        let fwd = Arc::new(RecordingForwarder::default());
+        let (ops, storage) = ops_with_lineage(
+            owned_by("other-node", "http://me:9092"),
+            ("me-node", "http://me:9092"),
+            fwd.clone(),
+            false,
+        );
+        let err = ops
+            .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
+            .await
+            .expect_err("must not dial its own address to reach another node");
+        assert_eq!(
+            err.envelope().kind,
+            latiq_common::ErrorKind::PondUnavailable,
+            "{}",
+            err.envelope().message
+        );
+        assert_eq!(
+            fwd.reads.load(Ordering::SeqCst),
+            0,
+            "and nothing was dialled"
+        );
+        assert!(
+            !latiq_storage::PondStorage::pond_exists(
+                storage.as_ref(),
+                latiq_common::PondId::parse(PID).unwrap()
+            ),
+            "nor may it take on a pond it does not own"
+        );
+    }
+
+    /// A registry that names no owning node — an in-process control plane that
+    /// does not fill the field, or a peer older than this change — is refused,
+    /// NOT silently fallen back to the endpoint comparison. The fallback would
+    /// re-open #89 on exactly the deployment that is hardest to reason about.
+    #[tokio::test]
+    async fn forwarding_refuses_a_pond_whose_owner_has_no_id_even_with_an_endpoint() {
+        let fwd = Arc::new(RecordingForwarder::default());
+        let (ops, storage) = ops_with_lineage(
+            Owner {
+                node_id: None,
+                // An endpoint IS present, and it is this node's own — under the
+                // old rule that read as "I own it" and the pond would have been
+                // served. Ownership is not inferable from an address.
+                endpoint: Some("http://me:9092".to_string()),
+            },
+            ("me-node", "http://me:9092"),
+            fwd.clone(),
+            false,
+        );
+        let err = ops
+            .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
+            .await
+            .expect_err("an owner that cannot be named must not be guessed at");
+        assert_eq!(
+            err.envelope().kind,
+            latiq_common::ErrorKind::PondUnavailable,
+            "{}",
+            err.envelope().message
+        );
+        assert_eq!(fwd.reads.load(Ordering::SeqCst), 0);
+        assert!(
+            !latiq_storage::PondStorage::pond_exists(
+                storage.as_ref(),
+                latiq_common::PondId::parse(PID).unwrap()
+            ),
+            "and no storage may be created for it"
+        );
+    }
+
+    /// The embedded/single-node path resolves `Local` BEFORE the ownership
+    /// question is asked — `pip install latiq` and `./dev.sh` have one node, it
+    /// owns everything, and the registry's owner column is not something they
+    /// can be wrong about. Here the registry names a DIFFERENT node entirely and
+    /// the pond is still served, because there is no forwarder to send it to.
+    #[tokio::test]
+    async fn forwarding_embedded_node_serves_a_pond_owned_by_another_node_id() {
+        let (ops, _storage) = ops_embedded(owned_by("somebody-else", "http://elsewhere:9092"));
+        let r = ops
+            .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
+            .await
+            .expect("the embedded path serves every pond");
+        assert_eq!(r.rows[0][0], serde_json::json!(1));
+    }
+
     #[tokio::test]
     async fn forwarding_skipped_when_self_owns() {
-        // self_endpoint == owner → no forward; the read runs locally (DuckDB).
+        // The owning node id is this node's own → no forward; the read runs
+        // locally (DuckDB).
         let fwd = Arc::new(RecordingForwarder::default());
-        let ops = ops_with(Some("http://me:9092"), "http://me:9092", fwd.clone());
+        let ops = ops_with(
+            owned_by("me-node", "http://me:9092"),
+            ("me-node", "http://me:9092"),
+            fwd.clone(),
+        );
         let r = ops
             .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
             .await
@@ -1215,8 +1405,8 @@ mod forwarding {
     async fn forwarding_catalog_pull_delegates_to_owner() {
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
         let r = ops
@@ -1239,8 +1429,8 @@ mod forwarding {
     async fn forwarding_catalog_describe_delegates_to_owner() {
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
         let tables = ops
@@ -1268,8 +1458,8 @@ mod forwarding {
         // there would answer an honest question with an empty page.
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
         let page = ops
@@ -1303,8 +1493,8 @@ mod forwarding {
         // error is pure latency.
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
-            Some("http://owner:9092"),
-            "http://greeter:9092",
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
         let err = ops
@@ -1332,7 +1522,8 @@ mod forwarding {
         // so one that keeps it is exactly what a sampled test misses.
         let id = Identity::claimed(Some("a"));
         let fwd = Arc::new(RecordingForwarder::default());
-        let (ops, storage) = ops_with_lineage(None, "http://me:9092", fwd.clone(), true);
+        let (ops, storage) =
+            ops_with_lineage(unowned(), ("me-node", "http://me:9092"), fwd.clone(), true);
         let no_params = || std::collections::BTreeMap::<String, String>::new();
 
         macro_rules! probe {
@@ -1423,7 +1614,7 @@ mod forwarding {
         // the refusal has to give the row back — otherwise the very change that
         // stops unowned ponds being served would be a way to create them.
         let control = Arc::new(FixedOwner {
-            endpoint: None,
+            owner: unowned(),
             lineage: false,
             drops: AtomicUsize::new(0),
         });
@@ -1435,6 +1626,7 @@ mod forwarding {
             AgentConfig::default(),
         )
         .with_forwarding(
+            "me".to_string(),
             "http://me:9092".to_string(),
             Arc::new(RecordingForwarder::default()),
         );
@@ -1478,7 +1670,7 @@ mod forwarding {
         // column is not a question it can be wrong about. The refusal above
         // must be about being clustered and unable to name the owner — never
         // about the endpoint being absent.
-        let (ops, _storage) = ops_embedded(None);
+        let (ops, _storage) = ops_embedded(unowned());
         let r = ops
             .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
             .await

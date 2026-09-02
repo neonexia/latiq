@@ -331,8 +331,10 @@ impl Latiq {
                 m.pond_id
             },
             name: m.name,
-            // PondInfoMsg carries node_endpoint, not node_id; node_id comes via list.
-            node_id: String::new(),
+            // PondInfoMsg now carries the owning node's id as well as its
+            // endpoint (#89), so describe agrees with list instead of leaving
+            // this blank.
+            node_id: m.node_id,
             tier: m.tier,
             description: m.description,
             lineage: m.lineage,

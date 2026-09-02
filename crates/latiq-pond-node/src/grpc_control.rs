@@ -68,6 +68,9 @@ fn to_info(m: PondInfoMsg) -> PondInfo {
         owner: m.owner,
         created_at: m.created_at,
         policy_json: m.policy_json,
+        // Empty wire string means "the control plane could not name the owning
+        // node" → None, which `placement` refuses rather than guessing at.
+        node_id: Some(m.node_id).filter(|s| !s.is_empty()),
         // Empty wire string means "no live owning node" → None.
         node_endpoint: Some(m.node_endpoint).filter(|s| !s.is_empty()),
         tier: m.tier,

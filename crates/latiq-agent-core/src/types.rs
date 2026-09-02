@@ -25,8 +25,19 @@ pub struct PondInfo {
     pub owner: String,
     pub created_at: String,
     pub policy_json: String,
+    /// Stable id of the node that owns this pond — the registry's
+    /// `ponds.node_id`, which is the id that node registered and heartbeats
+    /// with. **This is the identity a node decides local-vs-forward on**
+    /// (`AgentOps::placement`); the endpoint below is only how to reach it.
+    ///
+    /// `None` when the owner cannot be named at all, which is refused rather
+    /// than guessed — see `Placement::NoOwner`.
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// Internal endpoint of the node that owns this pond (`None` if the owning
-    /// node is gone). A node uses this to decide local-vs-forward.
+    /// node is gone). Purely an ADDRESS: what a node dials once it has already
+    /// decided, from `node_id`, that it is not the owner. It is not an
+    /// identity, and comparing it to one is issue #89.
     #[serde(default)]
     pub node_endpoint: Option<String>,
     /// Resource tier name (small/medium/large/x-large); the engine maps it to
