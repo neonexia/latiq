@@ -76,6 +76,55 @@ impl AgentError {
         )
     }
 
+    /// Allocation could not materialise the pond on the node the control plane
+    /// placed it on, so **there is no pond**.
+    ///
+    /// Same [`ErrorKind::PondUnavailable`] as the stranded-pond refusal, and for
+    /// the same underlying reason (the node that should hold this pond's files
+    /// cannot be reached), but with its own message and `suggest`: the kind's
+    /// default advice is `pond forget`, which is wrong here — the registry row
+    /// is normally already gone, and an agent's next move is to retry rather
+    /// than to fetch an operator.
+    ///
+    /// `compensated` is the whole difference between "retry freely" and "an
+    /// operator has work to do", so it is stated in the message rather than left
+    /// for the reader to assume. A retrying agent has to know whether the failed
+    /// attempt left a row behind holding its name.
+    pub fn allocation_not_materialized(
+        name: &str,
+        owner: &str,
+        cause: &AgentError,
+        compensated: bool,
+    ) -> Self {
+        let cause = &cause.envelope().message;
+        if compensated {
+            Self::new(
+                ErrorKind::PondUnavailable,
+                format!(
+                    "Pond '{name}' was NOT created: the node it was assigned to ({owner}) could \
+                     not materialise its storage ({cause}). The assignment has been rolled back, \
+                     so the name is free and nothing was left behind."
+                ),
+                "Retry allocate_pond — the failed attempt left nothing behind, so the same name is \
+                 free. If it keeps failing, that node is down: report it to your operator.",
+                ErrorKind::PondUnavailable.default_see(),
+            )
+        } else {
+            Self::new(
+                ErrorKind::PondUnavailable,
+                format!(
+                    "Pond '{name}' was NOT created: the node it was assigned to ({owner}) could \
+                     not materialise its storage ({cause}), AND the assignment could not be rolled \
+                     back — a registry row named '{name}' may still exist with no storage behind it."
+                ),
+                "Retry allocate_pond under a DIFFERENT name; the original may still be taken. Ask \
+                 an operator to remove the stranded record with `latiq pond forget <pond> \
+                 --confirm` (it deletes the registry row only, never data).",
+                ErrorKind::PondUnavailable.default_see(),
+            )
+        }
+    }
+
     pub fn name_conflict(name: &str) -> Self {
         Self::of_kind(
             ErrorKind::NameConflict,

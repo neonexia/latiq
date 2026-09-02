@@ -345,6 +345,14 @@ struct NodeAddArgs {
 #[command(after_help = SERVER_HELP)]
 enum PondCmd {
     /// Allocate a pond. The control plane picks a node; you don't pass an address.
+    ///
+    /// A registry-only assignment: this returns as soon as the control plane has
+    /// placed the pond, and the owning node creates its storage on first use.
+    /// The agent path (`allocate_pond` over MCP / Data gRPC) is eager instead —
+    /// it materializes the pond on its node before returning, so an agent is
+    /// never handed a pond that turns out to be on an unreachable node. The
+    /// difference is deliberate: the control plane is never in the data path, so
+    /// making THIS command eager would mean routing it through a pond node.
     Create {
         #[arg(short, long)]
         name: Option<String>,
@@ -1266,7 +1274,9 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 Err(msg) => return Err(anyhow!("{msg}")),
             };
             // Pure control-plane op: the registry assigns a (random) node; the
-            // node materializes storage lazily on first query.
+            // node materializes storage lazily on first query. Unlike the agent
+            // path (see the doc comment on `PondCmd::Create`), nothing is
+            // created up front — this command never reaches a pond node.
             let mut c = control_client().await?;
             let owner = agent_id.unwrap_or_else(|| "anonymous".into());
             match c

@@ -900,7 +900,7 @@ mod lineage {
         // renamed files, a changed `rpc` spelling — would pass while guarding
         // nothing. Pin that every declared RPC was seen, and that the flag it is
         // guarding really is on the wire at creation time.
-        assert_eq!(rpcs, 35, "every declared RPC must have been scanned");
+        assert_eq!(rpcs, 36, "every declared RPC must have been scanned");
         // The widened guard must still bite: a setter spelled any of the ways
         // above is refused. Without this the loosening could have been a
         // silent removal.

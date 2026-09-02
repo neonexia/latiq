@@ -94,6 +94,27 @@ pub trait Forwarder: Send + Sync {
         confirm: bool,
     ) -> Result<(), AgentError>;
 
+    /// Make the pond's storage exist on the owning node, and its engine open it.
+    ///
+    /// The node-to-node half of **eager allocation**: the control plane picks
+    /// the owner and writes the registry row, then the node that took the
+    /// allocate call reaches through here so the owner materialises the pond
+    /// before the caller is told it has one. An allocation that returns success
+    /// therefore means a pond that can accept data — and one that cannot be
+    /// materialised fails now, with the registry row given back, instead of
+    /// deferring the failure to the agent's first INSERT.
+    ///
+    /// **Idempotent by contract.** The op it drives is "ensure", not "create":
+    /// a pond that already exists is success, never a conflict. That is what
+    /// makes it safe to retry, and what lets the lazy `ensure_pond` on the query
+    /// paths stay as a fallback without the two fighting.
+    async fn materialize_pond(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+    ) -> Result<(), AgentError>;
+
     /// Transient pull from an external catalog on the owning node. The runtime
     /// `params` (incl. any credentials) ride the gRPC hop and are dropped after
     /// the attach/detach on the owner — nothing about the catalog persists.

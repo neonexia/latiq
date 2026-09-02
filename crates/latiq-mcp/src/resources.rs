@@ -156,7 +156,7 @@ The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consume
         desc: "Problem-keyed recovery guides",
         body: "# Troubleshooting\n\n\
 - latiq://troubleshooting/pond-not-found — the pond id/name doesn't resolve.\n\
-- latiq://troubleshooting/pond-unavailable — the pond exists but no node is serving it.\n\
+- latiq://troubleshooting/pond-unavailable — the pond exists but no node is serving it, or allocate_pond could not create one on the node it was assigned to.\n\
 - latiq://troubleshooting/large-results — results exceeded the inline cap.\n\
 - latiq://troubleshooting/timeouts — a query ran too long.\n\
 - latiq://troubleshooting/conflicts — concurrent writes conflicted.\n\
@@ -181,7 +181,12 @@ The pond is still in the registry — its name resolves and list_ponds shows it 
 - **Do not** allocate a replacement under the same intent and assume the data moved. It did not; the old pond's tables are on a node this deployment cannot see.\n\
 - An empty answer would have been a plausible lie, which is why you get an error instead.\n\
 - Ask an operator. They can bring the node back (`latiq node list`), or, if it is gone for good, remove the stale record with `latiq pond forget <pond> --confirm` — which deletes the registry row only, never the data on the departed node.\n\
-- Work in a different pond in the meantime: **list_ponds**, or **allocate_pond** for a fresh one.",
+- Work in a different pond in the meantime: **list_ponds**, or **allocate_pond** for a fresh one.\n\n\
+## The same error from allocate_pond\n\n\
+Allocation is eager: the control plane picks a node, and that node must create the pond's storage before you are told you have one. If it cannot be reached, **the pond was not created** — and the message says so, along with what happened to the assignment:\n\
+- **'the assignment has been rolled back'** — nothing was left behind and the name is free. Retry allocate_pond, the same name and all. If it keeps failing, that node is down and only an operator can bring it back; use a different pond in the meantime.\n\
+- **'may still exist'** — the rollback itself failed, so a registry row with that name may survive with no storage behind it. Retry under a DIFFERENT name, and tell an operator: `latiq pond forget <pond> --confirm` removes the stranded record.\n\n\
+You are not seeing a half-created pond either way. The eagerness is the point: the alternative is a pond id that works until your first write.",
     },
     Res {
         uri: "latiq://troubleshooting/large-results",

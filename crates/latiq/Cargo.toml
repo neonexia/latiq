@@ -40,6 +40,11 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 latiq-mcp = { path = "../latiq-mcp" }
 latiq-agent-core = { path = "../latiq-agent-core" }
+# The harness assembles one pond node by hand (`add_greeter_node`) out of the
+# same pieces `build_ops` uses, minus its RegisterNode call — the only way to
+# pin which node the control plane places a pond on.
+latiq-storage = { path = "../latiq-storage" }
+latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 latiq-client = { path = "../latiq-client" }
 # The SDK is the other client of the Data/Stream surface; its bearer-token path
 # is exercised against the same harness the gRPC surface tests use.

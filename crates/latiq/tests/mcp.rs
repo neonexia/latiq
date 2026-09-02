@@ -1105,3 +1105,54 @@ mod lineage {
         c.close().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn error_contract_allocate_on_an_unreachable_node_reads_as_not_created() {
+    // The agent-facing half of eager allocation. The Data-gRPC test
+    // (`tests/forwarding.rs::eager_allocation`) proves the mechanism; what this
+    // adds is the rendering an agent actually meets — and, above all, that the
+    // `see` it is sent to is a resource that EXISTS and covers this case. A
+    // dangling `see` costs the agent a round trip to discover nothing.
+    let (control, _admin) = common::start_control_plane_only().await;
+    let _ghost = common::register_ghost_node(&control, "gone").await;
+    let greeter = common::add_greeter_node("greeter", &control).await;
+    let c = LatiqClient::connect(&greeter.mcp_endpoint, Some("agent-x".into()))
+        .await
+        .unwrap();
+
+    let mut args = Map::new();
+    args.insert("name".into(), "unreachable".into());
+    let out = c.call_tool("allocate_pond", args).await.unwrap();
+    assert!(
+        out.is_error,
+        "a pond nobody could create must not be reported as allocated: {:?}",
+        out.value
+    );
+    assert!(
+        out.value.get("pond_id").is_none(),
+        "and must not hand back an id for a pond that does not exist: {:?}",
+        out.value
+    );
+    assert_eq!(out.value["kind"], "pond_unavailable");
+    let message = out.value["message"].as_str().unwrap();
+    assert!(
+        message.contains("was NOT created") && message.contains("rolled back"),
+        "the message must say plainly that there is no pond and nothing was left \
+         behind — 'storage error' reads as 'maybe it half-worked': {message}"
+    );
+    let suggest = out.value["suggest"].as_str().unwrap();
+    assert!(
+        suggest.contains("Retry allocate_pond"),
+        "and give the agent the one move it can make itself: {suggest}"
+    );
+
+    let see = out.value["see"].as_str().unwrap().to_string();
+    assert_eq!(see, "latiq://troubleshooting/pond-unavailable");
+    let body = c.read_resource_text(&see).await.unwrap();
+    assert!(
+        body.contains("The same error from allocate_pond"),
+        "the resource must cover the allocation case, not only the stranded-pond \
+         one it was written for: {body}"
+    );
+    c.close().await.unwrap();
+}

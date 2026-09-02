@@ -238,13 +238,14 @@ impl Data for DataService {
         &self,
         req: Request<AllocatePondRequest>,
     ) -> Result<Response<AllocatePondResponse>, Status> {
-        // The one handler with no `traced` scope, so neither the trace id nor
-        // the bearer token is ambient here. That is safe only because allocation
-        // NEVER forwards: `ops.allocate_pond` picks a node through the control
-        // plane and returns, without ever calling the forwarder. If it ever does
-        // forward, this handler must be wrapped like the rest — otherwise it
-        // would reach a peer with no token at all.
-        let (id, _tok) = self.identity(&req, "allocate_pond").await?;
+        // Wrapped in `traced` like every other handler, and it MUST be: since
+        // allocation became eager it reaches the owning node (MaterializePond)
+        // whenever the control plane places the pond elsewhere, and the
+        // forwarder replays the caller's token from this scope. Without it an
+        // authenticated deployment would allocate fine on the local node and
+        // fail with `Unauthenticated` the moment placement picked a peer.
+        let (id, tok) = self.identity(&req, "allocate_pond").await?;
+        let tid = trace_id_of(&req);
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -261,17 +262,41 @@ impl Data for DataService {
         } else {
             r.tier
         };
-        let res = self
-            .ops
-            // Lineage is chosen here and never again: the flag is stored on the
-            // pond row and there is no RPC to change it.
-            .allocate_pond(&id, name, &policy, &tier, &[], r.lineage)
-            .await
-            .map_err(to_status)?;
-        Ok(Response::new(AllocatePondResponse {
-            pond_id: res.pond_id,
-            pond_name: res.pond_name,
-        }))
+        let ops = self.ops.clone();
+        traced("allocate_pond", tid, tok, async move {
+            let res = ops
+                // Lineage is chosen here and never again: the flag is stored on
+                // the pond row and there is no RPC to change it.
+                .allocate_pond(&id, name, &policy, &tier, &[], r.lineage)
+                .await
+                .map_err(to_status)?;
+            Ok(Response::new(AllocatePondResponse {
+                pond_id: res.pond_id,
+                pond_name: res.pond_name,
+            }))
+        })
+        .await
+    }
+
+    /// Materialise the pond on the node that owns it — the node-to-node half of
+    /// eager allocation. Not a user-facing op: no CLI or SDK command reaches it,
+    /// and it is on the Data surface only because that is where node-to-node
+    /// traffic already flows (one channel, one verifier, one token replay).
+    async fn materialize_pond(
+        &self,
+        req: Request<MaterializePondRequest>,
+    ) -> Result<Response<MaterializePondResponse>, Status> {
+        let (id, tok) = self.identity(&req, "materialize_pond").await?;
+        let tid = trace_id_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("materialize_pond", tid, tok, async move {
+            ops.materialize_pond(&id, &r.pond)
+                .await
+                .map_err(to_status)?;
+            Ok(Response::new(MaterializePondResponse {}))
+        })
+        .await
     }
 
     async fn drop_pond(
