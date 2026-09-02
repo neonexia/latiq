@@ -186,6 +186,191 @@ async fn mcp_prompts_sops_are_available_and_parameterized() {
     c.close().await.unwrap();
 }
 
+/// The recipe's SQL is EXECUTED here, not proofread.
+///
+/// Regression pin. `latiq://recipes/schema-design` taught
+/// `CREATE TABLE events (id INTEGER, -- event primary key …)` and asserted
+/// "comments are visible via SHOW TABLES / information_schema.columns". DuckDB
+/// discards a lexical `--`: every comment came back NULL. The claim was
+/// repeated in `latiq://guidance`, `write_query`'s description and two prompts,
+/// and survived for months because nobody ran it. So this test reads the recipe
+/// off the live MCP surface, runs its own SQL block, and asserts the comments
+/// are actually readable afterwards — if the recipe reverts to a form that
+/// stores nothing, this fails.
+#[tokio::test]
+async fn mcp_resources_schema_design_recipe_sql_actually_stores_comments() {
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, Some("schema-author".into()))
+        .await
+        .unwrap();
+    c.allocate_pond(Some("recipe")).await.unwrap();
+
+    let body = c
+        .read_resource_text("latiq://recipes/schema-design")
+        .await
+        .unwrap();
+    let blocks = sql_blocks(&body);
+    assert_eq!(
+        blocks.len(),
+        2,
+        "the recipe should carry one authoring block and one read-back block; got {blocks:?}"
+    );
+
+    // 1. The pattern the recipe tells the agent to write, run verbatim.
+    let w = c.write("recipe", &blocks[0]).await.unwrap();
+    assert!(!w.is_error, "the recipe's own SQL must run: {:?}", w.value);
+
+    // 2. The read-back the recipe promises, also run verbatim. Statement one
+    //    is the column comments; statement two the table's.
+    let mut reads = blocks[1]
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cols = c.query("recipe", reads.next().unwrap()).await.unwrap();
+    assert!(!cols.is_error, "{:?}", cols.value);
+    let comments: Vec<(String, Value)> = cols.value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r[0].as_str().unwrap().to_string(), r[1].clone()))
+        .collect();
+    assert_eq!(
+        comments.len(),
+        3,
+        "the recipe creates three columns; got {comments:?}"
+    );
+    for (name, comment) in &comments {
+        assert!(
+            comment.as_str().is_some_and(|t| !t.is_empty()),
+            "column '{name}' has no stored comment ({comment:?}) — the recipe's pattern does not \
+             do what the recipe says it does"
+        );
+    }
+    // The exact text, so a comment attached to the wrong column is caught.
+    assert_eq!(
+        comments
+            .iter()
+            .find(|(n, _)| n == "id")
+            .map(|(_, c)| c.clone()),
+        Some(Value::String("event primary key".into()))
+    );
+    let table = c.query("recipe", reads.next().unwrap()).await.unwrap();
+    assert_eq!(
+        table.value["rows"][0][0], "One row per observed event.",
+        "the table COMMENT should be readable too: {:?}",
+        table.value
+    );
+    assert!(reads.next().is_none(), "unexpected extra read statement");
+
+    // 3. The prose also claims information_schema carries the same text.
+    let is_cols = c
+        .query(
+            "recipe",
+            "SELECT column_comment FROM information_schema.columns \
+             WHERE table_name='events' AND column_name='id'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        is_cols.value["rows"][0][0], "event primary key",
+        "the recipe says information_schema.columns.column_comment carries it: {:?}",
+        is_cols.value
+    );
+
+    // 4. And the negative the recipe warns about — the form it used to teach.
+    //    Without this, step 2 would pass just as well for a recipe that had
+    //    never been fixed but happened to be read back some other way.
+    c.write(
+        "recipe",
+        "CREATE TABLE lexical (\n  id INTEGER, -- event primary key\n  ts TIMESTAMP -- when\n)",
+    )
+    .await
+    .unwrap();
+    let dropped = c
+        .query(
+            "recipe",
+            "SELECT column_name, comment FROM duckdb_columns() WHERE table_name='lexical'",
+        )
+        .await
+        .unwrap();
+    for row in dropped.value["rows"].as_array().unwrap() {
+        assert_eq!(
+            row[1],
+            Value::Null,
+            "a `--` comment must NOT be stored — if DuckDB starts keeping it, the recipe's \
+             warning is now wrong and has to be rewritten: {:?}",
+            dropped.value
+        );
+    }
+    c.close().await.unwrap();
+}
+
+/// The ```sql fences of a served resource body, in order.
+fn sql_blocks(body: &str) -> Vec<String> {
+    body.split("```sql")
+        .skip(1)
+        .filter_map(|rest| rest.split("```").next())
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// A client builds `prompts/get` from the DECLARED argument list. While that
+/// list was `None` for all four prompts, every conforming client sent `{}` and
+/// every prompt rendered its placeholders — `discover_existing_pond` produced
+/// "Find an existing pond related to '' (intent: read)", an instruction shaped
+/// like a real one. The unit tests pin the rendering; this pins that the
+/// declarations survive the wire, and that the refusal reaches the client.
+#[tokio::test]
+async fn mcp_prompts_declare_their_arguments_over_the_wire() {
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, None).await.unwrap();
+
+    let prompts = c.list_prompts().await.unwrap();
+    assert_eq!(prompts.len(), 4, "got {prompts:?}");
+    for p in &prompts {
+        let declared = p
+            .arguments
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} declares no arguments", p.name));
+        assert!(
+            declared.iter().any(|a| a.required == Some(true)),
+            "{} declares no REQUIRED argument, so a client cannot know what to ask for",
+            p.name
+        );
+        assert!(
+            declared.iter().all(|a| a.description.is_some()),
+            "{}'s arguments must say what they are: {declared:?}",
+            p.name
+        );
+    }
+    // The one the audit observed, by name and by its required argument.
+    let discover = prompts
+        .iter()
+        .find(|p| p.name == "discover_existing_pond")
+        .unwrap();
+    let names: Vec<&str> = discover
+        .arguments
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
+    assert_eq!(names, ["search_term", "intent"], "declared: {names:?}");
+
+    // What a client that ignored the declaration used to get: a rendering.
+    // It must now be an error the client can report instead.
+    let err = c
+        .get_prompt_text("discover_existing_pond", Map::new())
+        .await
+        .expect_err("a prompt with no arguments must not render placeholders");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("search_term"),
+        "the refusal must name the missing argument; got: {msg}"
+    );
+    c.close().await.unwrap();
+}
+
 /// The uncapped tier is operator-only — an uncapped pond can starve every other
 /// pond on its node, so an *agent* must not be able to allocate itself one. The
 /// rule lives in the registry; this asserts the MCP surface actually carries it,
@@ -1515,7 +1700,7 @@ mod classification {
         assert_eq!(see, "latiq://troubleshooting/source-unavailable");
         let body = c.read_resource_text(&see).await.unwrap();
         assert!(
-            body.contains("reachable from the node"),
+            body.contains("reachable from the NODE"),
             "the page must be about this kind: {body}"
         );
 

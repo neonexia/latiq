@@ -247,6 +247,12 @@ impl LatiqClient {
             .collect())
     }
 
+    /// Prompts as advertised, including their DECLARED arguments — what a
+    /// conforming client reads to build a `prompts/get` call.
+    pub async fn list_prompts(&self) -> Result<Vec<rmcp::model::Prompt>> {
+        Ok(self.service.list_all_prompts().await?)
+    }
+
     /// Render a prompt (returns the concatenated message text).
     pub async fn get_prompt_text(&self, name: &str, args: Map<String, Value>) -> Result<String> {
         let mut params = rmcp::model::GetPromptRequestParams::default();

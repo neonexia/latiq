@@ -23,7 +23,8 @@ The **MCP-over-HTTP inbound adapter** (rmcp Streamable-HTTP) onto `AgentOps`. **
 This surface must make a frontier agent immediately effective:
 - **Tool annotations** (`read_only_hint`/`destructive_hint`/`idempotent_hint`) on every tool.
 - **Mini-tutorial tool descriptions** (what / when-vs-alternatives / concrete SQL / do-don't / `see`).
-- **Resources:** `latiq://guidance`, `latiq://dialect`, `latiq://recipes/*`, `latiq://troubleshooting/*`, `latiq://ponds`, `latiq://ponds/{id}/schema`.
+- **Resources:** `latiq://guidance`, `latiq://dialect`, `latiq://datasets`, `latiq://recipes/*`, `latiq://troubleshooting/*` (the index plus one page per kind that routes to it). **All static** — `RESOURCES` in `resources.rs` is the whole set, and `list_resources`/`read_resource` serve exactly it. There is deliberately **no `latiq://ponds` or `latiq://ponds/{id}/schema`**: this file listed them for months and neither was ever served, so an agent that believed the spec got `unknown resource`. Pond listing and schema are per-caller, need an identity, and are already **tools** (`list_ponds`, `describe_pond`) — don't re-serve them as resources.
+- **A resource that states engine behaviour must have a test that RUNS it.** `latiq://recipes/schema-design` taught `CREATE TABLE (id INTEGER, -- comment)` and claimed the comment was readable; DuckDB discards a lexical `--` and stores nothing, and the claim survived in four places (recipe, guidance, `write_query`'s description, two prompts) because it was only ever proofread. `crates/latiq/tests/mcp.rs::mcp_resources_schema_design_recipe_sql_actually_stores_comments` now executes the recipe's own SQL block, read out of the served body.
 - **Prompts:** the 4 SOPs (setup-multi-agent-pond, discover-existing-pond, design-collaborative-schema, recover-from-conflict).
 - Errors are next-action-oriented; `see` links must resolve to a real resource.
 
