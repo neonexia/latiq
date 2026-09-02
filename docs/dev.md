@@ -175,6 +175,7 @@ latiq pond create --name audited --lineage    # record OpenLineage provenance (f
 latiq pond list                               # discover ponds (control-plane registry)
 latiq pond describe demo                       # metadata (incl. tier) + table summary
 latiq pond drop demo --confirm                 # DESTRUCTIVE — requires --confirm
+latiq pond forget stranded --confirm           # operator recovery: drop the RECORD of a pond whose node is gone
 ```
 
 **Extensions** are baked into the deployment image. The **required standard** set is always loaded on every pond: `parquet`/`json` are statically linked into the binary, and `ducklake` (the catalog format) + `httpfs` (remote reads) load from the image — Latiq is built on these, so a node **ensures them at startup and refuses to serve if it can't load them**. The **optional** set (`spatial`, `fts`, `icu`, `inet`) is requested per pond and `LOAD`ed on open — never installed in the create path; a requested extension that isn't present fails fast. A node warms the optional cache once at startup (the dev stand-in for image-baking). Community/unsigned extensions are rejected.
@@ -199,6 +200,19 @@ effect on the pond's next query.
 pool). Readers past that wait briefly for a connection.
 
 `pond drop` without `--confirm` is refused with a structured error and leaves the pond intact.
+
+**A pond whose node is gone.** A pond is owned by exactly one node, and a node
+serves a pond only when the registry names it as the owner. If the owning node's
+registration is gone, every request for that pond is refused with
+`pond_unavailable` rather than served — a node with no claim to the pond would
+otherwise create an empty one of the same name and answer out of it. `pond drop`
+cannot help there either: it forwards to the owner, and there is none. `latiq
+pond forget <pond> --confirm` (Admin gRPC, the operator surface) removes the
+**registry record** so the name is free again. **It deletes no data:** whatever
+that pond had on the departed node's disk is still there, now orphaned, and
+reclaiming it is a manual job on that host. It is refused while the owning node
+is registered and active — then the pond is servable and `pond drop` is the verb
+that deletes the data properly.
 
 ### Run SQL — one `query` command
 

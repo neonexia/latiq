@@ -386,6 +386,29 @@ enum PondCmd {
         #[arg(long)]
         confirm: bool,
     },
+    /// Remove the registry record of a pond whose node is gone. NOT a drop —
+    /// NO DATA IS DELETED.
+    ///
+    /// `drop` is the normal way to remove a pond: it reaches the owning node,
+    /// which deletes the files. That is impossible once the owning node is
+    /// permanently gone, which leaves the pond stuck in the registry forever —
+    /// unqueryable (any node asked for it now refuses rather than inventing an
+    /// empty one) and undeletable. This forgets the record so the name is free
+    /// again.
+    ///
+    /// Whatever the departed node's disk holds for this pond stays exactly where
+    /// it is, now orphaned: nothing knows it belongs to a pond any more, and if
+    /// that node ever comes back it will still be sitting there. Reclaiming it
+    /// is a manual job on that host.
+    ///
+    /// Refused while the owning node is registered and active — use `drop`.
+    Forget {
+        /// Pond name or id.
+        pond: String,
+        /// Required. Removes the record; does not delete the data.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Change a pond's resource tier after creation (its memory + CPU caps).
     /// Takes effect on the pond's next query — in-flight queries finish under
     /// the old caps.
@@ -1323,6 +1346,38 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                                    "note": "applies on the pond's next query"})
             );
             Ok(())
+        }
+        PondCmd::Forget { pond, confirm } => {
+            // Admin gRPC (control plane): the operator surface, and the only one
+            // that still answers when the pond's node is gone — which is the
+            // only situation this command is for.
+            let mut c = admin_client().await?;
+            match c
+                .pond_forget(PondForgetRequest {
+                    pond: pond.clone(),
+                    confirm,
+                })
+                .await
+            {
+                Ok(r) => {
+                    let r = r.into_inner();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "forgotten", "pond": r.name, "pond_id": r.pond_id,
+                            "node_id": r.node_id, "node_state": r.node_state,
+                            // Said on every success, not only in --help: this is
+                            // the fact an operator has to carry away.
+                            "note": format!(
+                                "registry record removed. NO DATA WAS DELETED — any files for \
+                                 this pond on node '{}' are now orphaned there.",
+                                r.node_id),
+                        })
+                    );
+                    Ok(())
+                }
+                Err(st) => print_status(&st),
+            }
         }
         PondCmd::Drop { pond, confirm } => {
             let node = data_target(&pond).await?;

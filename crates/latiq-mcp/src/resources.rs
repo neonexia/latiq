@@ -156,6 +156,7 @@ The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consume
         desc: "Problem-keyed recovery guides",
         body: "# Troubleshooting\n\n\
 - latiq://troubleshooting/pond-not-found — the pond id/name doesn't resolve.\n\
+- latiq://troubleshooting/pond-unavailable — the pond exists but no node is serving it.\n\
 - latiq://troubleshooting/large-results — results exceeded the inline cap.\n\
 - latiq://troubleshooting/timeouts — a query ran too long.\n\
 - latiq://troubleshooting/conflicts — concurrent writes conflicted.\n\
@@ -170,6 +171,17 @@ The pond id or name doesn't exist in this deployment.\n\
 - Call **list_ponds** to see what exists (names + ids).\n\
 - Call **allocate_pond** to create a new one.\n\
 - Check spelling; pond refs accept either the UUID or the human name.",
+    },
+    Res {
+        uri: "latiq://troubleshooting/pond-unavailable",
+        name: "Troubleshooting: pond unavailable",
+        desc: "The pond exists but no node is serving it",
+        body: "# Pond unavailable\n\n\
+The pond is still in the registry — its name resolves and list_ponds shows it — but the node that owns it is no longer registered, so nothing can reach its files. This is NOT the same as a missing pond, and it is not something you can fix from here:\n\
+- **Do not** allocate a replacement under the same intent and assume the data moved. It did not; the old pond's tables are on a node this deployment cannot see.\n\
+- An empty answer would have been a plausible lie, which is why you get an error instead.\n\
+- Ask an operator. They can bring the node back (`latiq node list`), or, if it is gone for good, remove the stale record with `latiq pond forget <pond> --confirm` — which deletes the registry row only, never the data on the departed node.\n\
+- Work in a different pond in the meantime: **list_ponds**, or **allocate_pond** for a fresh one.",
     },
     Res {
         uri: "latiq://troubleshooting/large-results",

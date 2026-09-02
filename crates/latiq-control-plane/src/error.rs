@@ -35,6 +35,10 @@ pub enum ControlPlaneError {
     DatasetNotFound(String),
     #[error("catalog not found: {0}")]
     CatalogNotFound(String),
+    /// `forget_pond` on a pond a live node is still serving — the operator
+    /// wants `pond drop`, which deletes the data instead of orphaning it.
+    #[error("pond '{pond}' is still owned by active node {node_id}")]
+    PondStillOwned { pond: String, node_id: String },
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("storage error: {0}")]
@@ -81,6 +85,18 @@ impl ControlPlaneError {
                 "Call list_catalogs to see registered catalogs.",
                 "latiq://guidance",
             ),
+            // Not an argument the operator can correct — the pond and the verb
+            // are both fine, the CLUSTER is in a state this verb is not for.
+            ControlPlaneError::PondStillOwned { pond, node_id } => ErrorEnvelope::new(
+                ErrorKind::InvalidValue,
+                format!(
+                    "Pond '{pond}' is still owned by node '{node_id}', which is registered and \
+                     active — forgetting it would orphan data a live node is serving."
+                ),
+                "Use `latiq pond drop <pond> --confirm`, which deletes the pond AND its data via \
+                 the owning node. `pond forget` is only for a pond whose node is gone.",
+                "latiq://guidance",
+            ),
             ControlPlaneError::Invalid(m) => {
                 ErrorEnvelope::for_kind(ErrorKind::InvalidValue, m.clone())
             }
@@ -99,7 +115,9 @@ impl ControlPlaneError {
             | ControlPlaneError::DatasetNotFound(_)
             | ControlPlaneError::CatalogNotFound(_)
             | ControlPlaneError::NodeNotFound(_) => Code::NotFound,
-            ControlPlaneError::NoNodeAvailable(_) => Code::FailedPrecondition,
+            ControlPlaneError::NoNodeAvailable(_) | ControlPlaneError::PondStillOwned { .. } => {
+                Code::FailedPrecondition
+            }
             ControlPlaneError::Invalid(_) => Code::InvalidArgument,
             ControlPlaneError::Storage(_) => Code::Internal,
         }

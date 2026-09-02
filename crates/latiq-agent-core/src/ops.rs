@@ -52,6 +52,26 @@ use tracing::info;
 /// worse than none at all.
 const LINEAGE_RECIPE: &str = "latiq://recipes/lineage";
 
+/// Where a pond's work must run, as `AgentOps::placement` decides it.
+///
+/// The distinction this type exists to make: **`Local` is a positive statement
+/// of ownership**, never a default. Before it, "this node owns the pond" and
+/// "nobody knows who owns the pond" were both `None` and both served locally —
+/// so a node with no claim to a pond would create an empty one of its own and
+/// answer a query out of it, indistinguishably from a pond that really was
+/// empty.
+enum Placement<'a> {
+    /// Serve here: this node is the registered owner, or this process is not
+    /// clustered at all (no forwarder / no advertised endpoint — the embedded
+    /// SDK and single-node `dev.sh`), where every pond is by definition local.
+    Local,
+    /// Another node owns it; delegate over this forwarder to that endpoint.
+    Forward(&'a dyn Forwarder, &'a str),
+    /// The pond exists but the registry names no node serving it. Refuse —
+    /// `AgentError::pond_unavailable`.
+    NoOwner,
+}
+
 /// Node-wide limits on what an op may return inline. The cap is the reason a
 /// read has a bounded worst case at all, so raising it raises every surface's
 /// per-request memory ceiling at once.
@@ -332,18 +352,58 @@ impl AgentOps {
         }
     }
 
-    /// If this node isn't the pond's owner (and forwarding is configured), return
-    /// the delegate + owner endpoint to forward to. `None` → handle locally. A
-    /// pond with no live owner (`node_endpoint == None`) also runs locally, so the
-    /// local error path (e.g. storage/availability) surfaces normally.
-    fn forward_target<'a>(&'a self, info: &'a PondInfo) -> Option<(&'a dyn Forwarder, &'a str)> {
-        let fwd = self.forwarder.as_ref()?;
-        let me = self.self_endpoint.as_deref()?;
-        let owner = info.node_endpoint.as_deref()?;
-        if owner == me {
-            return None;
+    /// Where this pond's work belongs. Three states, and the whole point of the
+    /// enum is that the third one used to be indistinguishable from the first.
+    ///
+    /// A node may serve a pond only when it is **named** as the owner (or when
+    /// this process is not clustered at all — see [`Placement`]). "The registry
+    /// does not say who owns this" is NOT permission to serve it: the files are
+    /// on another host, and `ensure_pond` here would happily create an empty
+    /// pond of the same name and answer out of it.
+    fn placement<'a>(&'a self, info: &'a PondInfo) -> Placement<'a> {
+        // No forwarder / no advertised endpoint = single-node or the embedded
+        // SDK. There is one node, it owns everything, and there is nothing to
+        // forward to or to be wrong about. Checked FIRST so the embedded path
+        // never reaches the ownership question.
+        let (Some(fwd), Some(me)) = (self.forwarder.as_ref(), self.self_endpoint.as_deref()) else {
+            return Placement::Local;
+        };
+        // An empty endpoint is not an address: treat it exactly like a missing
+        // one rather than dialling "".
+        match info.node_endpoint.as_deref().filter(|e| !e.is_empty()) {
+            None => Placement::NoOwner,
+            Some(owner) if owner == me => Placement::Local,
+            Some(owner) => Placement::Forward(fwd.as_ref(), owner),
         }
-        Some((fwd.as_ref(), owner))
+    }
+
+    /// `placement`, with the `NoOwner` refusal already turned into an audited
+    /// error — so a call site is `if let Some((fwd, owner)) = self.route(..)? {
+    /// forward } else { serve locally }` and cannot silently grow a fall-through
+    /// for the unowned case.
+    ///
+    /// The refusal is recorded like every other rejection: an operator looking
+    /// for why an agent's pond went quiet needs it on the same trail.
+    async fn route<'a>(
+        &'a self,
+        identity: &Identity,
+        op: &'static str,
+        info: &'a PondInfo,
+    ) -> Result<Option<(&'a dyn Forwarder, &'a str)>, AgentError> {
+        match self.placement(info) {
+            Placement::Local => Ok(None),
+            Placement::Forward(fwd, owner) => Ok(Some((fwd, owner))),
+            Placement::NoOwner => Err(self
+                .audit_err(
+                    identity,
+                    op,
+                    Some(&info.pond_id),
+                    None,
+                    0,
+                    AgentError::pond_unavailable(&info.name),
+                )
+                .await),
+        }
     }
 
     /// What this node calls itself when it says "I ran this": its advertised
@@ -412,11 +472,22 @@ impl AgentOps {
         // (it would orphan files on the wrong node) — the owning node materializes
         // it lazily on first use (ensure_pond). Single-node: owner == self, so this
         // is skipped and the eager init below runs as before.
-        if self.forward_target(&info).is_some() {
-            return Ok(AllocateResult {
-                pond_id: info.pond_id,
-                pond_name: info.name,
-            });
+        match self.placement(&info) {
+            Placement::Forward(..) => {
+                return Ok(AllocateResult {
+                    pond_id: info.pond_id,
+                    pond_name: info.name,
+                })
+            }
+            // Placed on a node that vanished between the placement and this
+            // read. Nothing has been materialized anywhere yet, so the same
+            // compensation the failed-init path uses applies: give the registry
+            // row back rather than leave a pond that no node will ever serve.
+            Placement::NoOwner => {
+                let _ = self.control.drop_pond(&info.pond_id).await;
+                return Err(AgentError::pond_unavailable(&info.name));
+            }
+            Placement::Local => {}
         }
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
@@ -453,7 +524,7 @@ impl AgentOps {
         let info = self
             .pond_info_audited(identity, "describe_pond", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "describe_pond", &info).await? {
             info!(
                 op = "describe_pond",
                 pond = pond_ref,
@@ -551,7 +622,7 @@ impl AgentOps {
             .await?;
         // Owned by another node → forward the drop so the owner evicts its engine
         // instance and deletes the files it actually holds.
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "drop_pond", &info).await? {
             info!(
                 op = "drop_pond",
                 pond = pond_ref,
@@ -731,7 +802,7 @@ impl AgentOps {
         let info = self
             .pond_info_audited(identity, "catalog_pull", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "catalog_pull", &info).await? {
             info!(
                 op = "catalog_pull",
                 pond = pond_ref,
@@ -813,7 +884,7 @@ impl AgentOps {
         let info = self
             .pond_info_audited(identity, "catalog_describe", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "catalog_describe", &info).await? {
             info!(
                 op = "catalog_describe",
                 pond = pond_ref,
@@ -929,7 +1000,7 @@ impl AgentOps {
         let info = self
             .pond_info_audited(identity, "read_arrow", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "read_arrow", &info).await? {
             info!(
                 op = "read_arrow",
                 pond = pond_ref,
@@ -1090,7 +1161,7 @@ impl AgentOps {
         let info = self
             .pond_info_audited(identity, "read_query", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "read_query", &info).await? {
             info!(
                 op = "read_query",
                 pond = pond_ref,
@@ -1198,7 +1269,7 @@ impl AgentOps {
         // at this point we can't honestly say read vs write. Log a neutral "query".
         // Owned by another node → forward and relay. The owner audits + snapshots;
         // we just return its result, so attribution stays on the node that ran it.
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, op, &info).await? {
             info!(
                 op = "query",
                 pond = pond_ref,
@@ -1347,7 +1418,7 @@ impl AgentOps {
         let info = self
             .pond_info_audited(identity, "explain_query", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "explain_query", &info).await? {
             info!(
                 op = "explain_query",
                 pond = pond_ref,
@@ -1458,7 +1529,7 @@ impl AgentOps {
         // The events are FILES on the node that ran the queries, so the owner
         // is the only node that can answer — forwarded exactly like every other
         // pond-scoped op, token replay included.
-        if let Some((fwd, owner)) = self.forward_target(&info) {
+        if let Some((fwd, owner)) = self.route(identity, "get_lineage", &info).await? {
             info!(
                 op = "get_lineage",
                 pond = pond_ref,
@@ -1511,19 +1582,21 @@ impl AgentOps {
             ));
         }
         let pid = Self::parse_id(&info.pond_id)?;
-        // Reached only when the pond has no live owner to forward to (the
-        // forward decision above handles every other remote case), so this node
-        // is standing in for a node that is gone — and the files went with it.
+        // This node OWNS the pond by the time we get here (a pond with no
+        // registered owner was refused at the routing decision, and every other
+        // remote case was forwarded), so a location that will not resolve means
+        // the pond was never materialized on the node that holds it — nothing
+        // has run against it yet, and there is no trail to read.
         let loc = self.storage.pond_location(pid).map_err(|_| {
             AgentError::new(
                 ErrorKind::Storage,
                 format!(
-                    "Pond '{}' has no lineage on this node, and the node that recorded it is not \
-                     currently registered — its events are wherever that node's storage is.",
+                    "Pond '{}' has no lineage directory on the node that owns it — nothing has \
+                     been recorded for it yet.",
                     info.name
                 ),
-                "Retry once the pond's node is back; if it is gone for good, so is the trail. \
-                 describe_pond reports the pond's current owner.",
+                "Run a query against the pond first; its events appear once something has \
+                 happened in it.",
                 LINEAGE_RECIPE,
             )
         })?;

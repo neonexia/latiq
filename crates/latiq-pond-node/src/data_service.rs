@@ -182,6 +182,12 @@ pub(crate) fn to_status(e: AgentError) -> Status {
         // Reached when the OWNER of a forwarded pond refused the caller's token:
         // the code must stay actionable across the hop, not collapse to Internal.
         ErrorKind::Unauthenticated => Code::Unauthenticated,
+        // The pond is there and the request is well-formed; the CLUSTER is not
+        // in a state that can serve it. Not `NotFound` (the pond exists, and a
+        // client must not conclude it should allocate a replacement), not
+        // `Unavailable` (which invites a blind retry — only an operator can
+        // resolve this), and emphatically not the `InvalidArgument` catch-all.
+        ErrorKind::PondUnavailable => Code::FailedPrecondition,
         ErrorKind::Storage | ErrorKind::Internal => Code::Internal,
         // ParseError / InvalidValue / MissingArgument / ReadOnlyViolation /
         // WriteToReservedSchema / ResultCapExceeded / UriNotAllowed

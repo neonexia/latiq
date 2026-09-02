@@ -41,6 +41,19 @@ pub struct NodeRow {
     pub heartbeat_age_seconds: i64,
 }
 
+/// What [`Registry::forget_pond`] removed. Names the node whose storage now
+/// holds orphaned files, because that is the one fact the operator has to keep:
+/// the record is gone, the bytes are not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgottenPond {
+    pub pond_id: String,
+    pub name: String,
+    /// The node the pond was assigned to — where any surviving data still is.
+    pub node_id: String,
+    /// Why forgetting was allowed: `down`, or `unregistered` (no node row).
+    pub node_state: String,
+}
+
 /// A pond's row in the registry — its identity, its owning node, and the
 /// settings the node needs to open it. The registry is the only thing that
 /// knows which node holds a pond; the pond's data lives nowhere near here.
@@ -385,6 +398,72 @@ impl Registry {
         }
         let _ = c.execute_batch("CHECKPOINT");
         Ok(())
+    }
+
+    /// **Operator recovery, not a drop.** Delete the registry record of a pond
+    /// that no registered node can serve, so a pond whose host is permanently
+    /// gone stops being both unqueryable and undeletable.
+    ///
+    /// **The data is NOT deleted.** If the departed node's disk still exists,
+    /// this pond's files are still on it, now orphaned — the registry has
+    /// forgotten they belong to anything, and a node that came back would hold
+    /// storage for a pond nothing knows about. Say so wherever this is exposed.
+    ///
+    /// **Guard rail:** refused while the registry can still name a live host —
+    /// node row present, `active`, with an endpoint. That is exactly the
+    /// condition under which the ordinary `latiq pond drop` still works (it
+    /// reaches the owner, which deletes the files), so this cannot become a way
+    /// to abandon a live pond's data behind an operator's back. A node that is
+    /// `down`, unregistered, or registered without an internal endpoint is not
+    /// serving the pond by any path, and forgetting it is the operator's call.
+    ///
+    /// Both statements run under one held lock, so the guard cannot be read
+    /// against one registry state and the delete applied to another.
+    pub fn forget_pond(&self, pond_ref: &str) -> Result<ForgottenPond, ControlPlaneError> {
+        let c = self.lock();
+        // LEFT JOIN, so a pond whose node row is gone still resolves — that is
+        // the whole case this exists for. `''` state = no node row at all.
+        let (pond_id, name, node_id, state, endpoint) = c
+            .query_row(
+                "SELECT p.pond_id, p.name, p.node_id,
+                        coalesce(n.state, ''), coalesce(n.internal_endpoint, '')
+                 FROM ponds p LEFT JOIN nodes n ON n.node_id = p.node_id
+                 WHERE p.pond_id=? OR p.name=? LIMIT 1",
+                duckdb::params![pond_ref, pond_ref],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|_| ControlPlaneError::PondNotFound(pond_ref.to_string()))?;
+        if state == "active" && !endpoint.is_empty() {
+            return Err(ControlPlaneError::PondStillOwned {
+                pond: name,
+                node_id,
+            });
+        }
+        c.execute(
+            "DELETE FROM ponds WHERE pond_id=?",
+            duckdb::params![pond_id],
+        )?;
+        let _ = c.execute_batch("CHECKPOINT");
+        Ok(ForgottenPond {
+            pond_id,
+            name,
+            node_id,
+            // Reported so the operator's record says WHY it was allowed: the
+            // node was down, or was not registered at all.
+            node_state: if state.is_empty() {
+                "unregistered".to_string()
+            } else {
+                state
+            },
+        })
     }
 
     /// Forget a pond (by id or name). Registry-only — the owning node deletes
@@ -964,6 +1043,104 @@ mod tests {
         r.drop_pond(&p.pond_id).unwrap();
         assert!(matches!(
             r.get_pond_location("incident-1"),
+            Err(ControlPlaneError::PondNotFound(_))
+        ));
+    }
+
+    /// Create one pond on `node-a` and hand back its name.
+    fn pond_on_node_a(r: &Registry) -> String {
+        r.register_node("node-a", "http://n/mcp", "http://n:9092", 10)
+            .unwrap();
+        r.create_pond(Some("stranded".into()), "x", "{}", "medium", &[], "", false)
+            .unwrap()
+            .name
+    }
+
+    #[test]
+    fn forget_pond_is_refused_while_a_live_node_still_owns_it() {
+        // The guard rail that stops `forget` becoming a way to abandon a live
+        // pond's data: while the owner is registered and active, `drop_pond`
+        // still reaches it and deletes the files, so that is the right verb.
+        let r = reg();
+        let pond = pond_on_node_a(&r);
+        let err = r
+            .forget_pond(&pond)
+            .expect_err("a live owner must refuse the forget");
+        match &err {
+            ControlPlaneError::PondStillOwned { node_id, .. } => assert_eq!(node_id, "node-a"),
+            other => panic!("refused for the wrong reason: {other:?}"),
+        }
+        // And it really is refused, not merely reported as such.
+        assert_eq!(
+            r.list_ponds().unwrap().len(),
+            1,
+            "the pond must survive a refused forget"
+        );
+        // The suggestion has to name the verb that DOES work here, or the
+        // operator is stuck between two commands that both say no.
+        assert!(
+            err.envelope().suggest.contains("pond drop"),
+            "{}",
+            err.envelope().suggest
+        );
+    }
+
+    #[test]
+    fn forget_pond_removes_the_record_of_a_pond_whose_node_is_down() {
+        let r = reg();
+        let pond = pond_on_node_a(&r);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(r.reap_stale_nodes(1).unwrap(), 1, "node-a is down");
+
+        let f = r.forget_pond(&pond).expect("a down owner may be forgotten");
+        assert_eq!(f.name, "stranded");
+        assert_eq!(
+            f.node_id, "node-a",
+            "the record must name where the orphaned data is"
+        );
+        assert_eq!(f.node_state, "down", "and why it was allowed");
+        assert!(
+            r.list_ponds().unwrap().is_empty(),
+            "the registry must no longer list it"
+        );
+        // Second call: the record really is gone, and the answer is the ordinary
+        // not-found, not a second success.
+        assert!(matches!(
+            r.forget_pond(&pond),
+            Err(ControlPlaneError::PondNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn forget_pond_removes_the_record_of_a_pond_whose_node_row_is_gone() {
+        // The state `forget_pond` exists for and the one `pond_info`'s LEFT JOIN
+        // anticipates: the pond row outlives its node row entirely. No API
+        // deletes a node row today (the reaper only marks `down`), so the test
+        // reaches past the public surface to build it — which is exactly why the
+        // branch needs its own test rather than riding on the `down` one.
+        let r = reg();
+        let pond = pond_on_node_a(&r);
+        r.lock()
+            .execute("DELETE FROM nodes WHERE node_id='node-a'", [])
+            .unwrap();
+
+        let f = r
+            .forget_pond(&pond)
+            .expect("a pond with no node row at all may be forgotten");
+        assert_eq!(
+            f.node_state, "unregistered",
+            "an absent node row is reported as such, not as an empty string"
+        );
+        assert_eq!(f.node_id, "node-a");
+        assert!(r.list_ponds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_pond_reports_an_unknown_pond_as_not_found() {
+        let r = reg();
+        pond_on_node_a(&r);
+        assert!(matches!(
+            r.forget_pond("no-such-pond"),
             Err(ControlPlaneError::PondNotFound(_))
         ));
     }
