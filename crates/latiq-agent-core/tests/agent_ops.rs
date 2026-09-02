@@ -495,20 +495,27 @@ mod forwarding {
         endpoint: Option<String>,
         /// The pond's lineage opt-in, as the registry would report it.
         lineage: bool,
+        /// Registry drops seen — `allocate_pond`'s compensation is invisible
+        /// otherwise, and an allocation that refused a pond it had already
+        /// registered would leave exactly the stuck row this whole change is
+        /// about.
+        drops: AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl ControlPlane for FixedOwner {
         async fn create_pond(
             &self,
-            _: Option<String>,
+            name: Option<String>,
             _: &str,
             _: &str,
             _: &str,
             _: &[String],
             _: bool,
         ) -> Result<PondInfo, AgentError> {
-            unreachable!("not exercised")
+            // The registry row is created BEFORE the placement is inspected, as
+            // the real one is — which is what makes the compensation testable.
+            self.pond_info(name.as_deref().unwrap_or("pond-x")).await
         }
         async fn resolve_pond(&self, pond_ref: &str) -> Result<String, AgentError> {
             Ok(pond_ref.to_string())
@@ -531,6 +538,7 @@ mod forwarding {
             })
         }
         async fn drop_pond(&self, _: &str) -> Result<(), AgentError> {
+            self.drops.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn list_datasets(
@@ -733,6 +741,25 @@ mod forwarding {
         ops_with_lineage(owner, self_ep, fwd, false).0
     }
 
+    /// A node with the same registry view but NO forwarding configured — the
+    /// embedded SDK and single-node `dev.sh`, where there is one node, it owns
+    /// everything, and `pip install latiq` has to keep working.
+    fn ops_embedded(owner: Option<&str>) -> (AgentOps, Arc<TempFs>) {
+        let control = Arc::new(FixedOwner {
+            endpoint: owner.map(|s| s.to_string()),
+            lineage: false,
+            drops: AtomicUsize::new(0),
+        });
+        let storage = Arc::new(TempFs::new());
+        let ops = AgentOps::new(
+            control,
+            storage.clone(),
+            Arc::new(DuckEngine::new()),
+            AgentConfig::default(),
+        );
+        (ops, storage)
+    }
+
     /// As `ops_with`, with the pond's lineage opt-in chosen and the storage kept
     /// so a test can look for the events on disk.
     fn ops_with_lineage(
@@ -744,6 +771,7 @@ mod forwarding {
         let control = Arc::new(FixedOwner {
             endpoint: owner.map(|s| s.to_string()),
             lineage,
+            drops: AtomicUsize::new(0),
         });
         let storage = Arc::new(TempFs::new());
         let ops = AgentOps::new(
@@ -1131,16 +1159,169 @@ mod forwarding {
     }
 
     #[tokio::test]
-    async fn forwarding_skipped_when_no_live_owner() {
-        // node_endpoint == None (owning node gone) → run locally, surface real errors
-        // rather than forwarding to nowhere.
+    async fn forwarding_refuses_every_op_on_a_pond_with_no_registered_owner() {
+        // REPLACES `forwarding_skipped_when_no_live_owner`, which asserted the
+        // opposite and encoded the wrong invariant: a clustered node whose
+        // registry cannot name the pond's owner used to fall through and serve
+        // the request LOCALLY. `ensure_pond` then created an empty pond of the
+        // same name on a node with no claim to it, and the agent got a
+        // plausible, empty answer to a question about someone else's data.
+        //
+        // Every op is probed, not a sample: the fall-through was per call site,
+        // so one that keeps it is exactly what a sampled test misses.
+        let id = Identity::claimed(Some("a"));
         let fwd = Arc::new(RecordingForwarder::default());
-        let ops = ops_with(None, "http://me:9092", fwd.clone());
+        let (ops, storage) = ops_with_lineage(None, "http://me:9092", fwd.clone(), true);
+        let no_params = || std::collections::BTreeMap::<String, String>::new();
+
+        macro_rules! probe {
+            ($op:literal, $call:expr) => {{
+                let err = $call
+                    .await
+                    .err()
+                    .unwrap_or_else(|| panic!("{} must refuse an unowned pond", $op));
+                assert_eq!(
+                    err.envelope().kind,
+                    latiq_common::ErrorKind::PondUnavailable,
+                    "{} refused for the wrong reason: {}",
+                    $op,
+                    err.envelope().message
+                );
+                $op
+            }};
+        }
+
+        let probed = vec![
+            probe!("read_query", ops.read_query(&id, "pond-x", "SELECT 1")),
+            probe!(
+                "read_collected",
+                ops.read_collected(&id, "pond-x", "SELECT 1")
+            ),
+            probe!("read_arrow", ops.read_arrow(&id, "pond-x", "SELECT 1")),
+            probe!(
+                "write_query",
+                ops.write_query(&id, "pond-x", "CREATE TABLE t(i INT)")
+            ),
+            probe!(
+                "explain_query",
+                ops.explain_query(&id, "pond-x", "SELECT 1")
+            ),
+            probe!("describe_pond", ops.describe_pond(&id, "pond-x")),
+            probe!("drop_pond", ops.drop_pond(&id, "pond-x", true)),
+            probe!(
+                "get_lineage",
+                ops.get_lineage(&id, "pond-x", 10, None, None)
+            ),
+            probe!(
+                "catalog_pull",
+                ops.catalog_pull(
+                    &id,
+                    "pond-x",
+                    "lake",
+                    "CREATE TABLE t AS SELECT 1",
+                    no_params()
+                )
+            ),
+            probe!(
+                "catalog_describe",
+                ops.catalog_describe(&id, "pond-x", "lake", no_params())
+            ),
+        ];
+        // Anti-vacuity: a probe deleted (or a macro that stopped expanding)
+        // must fail here rather than shrink the surface being guarded.
+        assert_eq!(
+            probed.len(),
+            10,
+            "every pond-scoped op must be probed, not a sample: {probed:?}"
+        );
+
+        assert_eq!(
+            fwd.reads.load(Ordering::SeqCst)
+                + fwd.writes.load(Ordering::SeqCst)
+                + fwd.pulls.load(Ordering::SeqCst)
+                + fwd.describes.load(Ordering::SeqCst)
+                + fwd.lineages.load(Ordering::SeqCst),
+            0,
+            "there is no owner endpoint, so nothing may be dialled either"
+        );
+        // THE damage being prevented. Every refusal above could be produced by
+        // an error raised after the pond was materialized; this is the
+        // assertion that says the node never took the pond on.
+        assert!(
+            !latiq_storage::PondStorage::pond_exists(
+                storage.as_ref(),
+                latiq_common::PondId::parse(PID).unwrap()
+            ),
+            "a node that does not own the pond must not create storage for it"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_refuses_to_allocate_onto_a_node_that_vanished() {
+        // Allocation reaches the placement AFTER the registry row exists, so
+        // the refusal has to give the row back — otherwise the very change that
+        // stops unowned ponds being served would be a way to create them.
+        let control = Arc::new(FixedOwner {
+            endpoint: None,
+            lineage: false,
+            drops: AtomicUsize::new(0),
+        });
+        let storage = Arc::new(TempFs::new());
+        let ops = AgentOps::new(
+            control.clone(),
+            storage.clone(),
+            Arc::new(DuckEngine::new()),
+            AgentConfig::default(),
+        )
+        .with_forwarding(
+            "http://me:9092".to_string(),
+            Arc::new(RecordingForwarder::default()),
+        );
+
+        let err = ops
+            .allocate_pond(
+                &Identity::claimed(Some("a")),
+                None,
+                "{}",
+                "medium",
+                &[],
+                false,
+            )
+            .await
+            .expect_err("a pond placed on no node must not be reported as allocated");
+        assert_eq!(
+            err.envelope().kind,
+            latiq_common::ErrorKind::PondUnavailable,
+            "{}",
+            err.envelope().message
+        );
+        assert_eq!(
+            control.drops.load(Ordering::SeqCst),
+            1,
+            "the registry row must be compensated, not left stuck"
+        );
+        assert!(
+            !latiq_storage::PondStorage::pond_exists(
+                storage.as_ref(),
+                latiq_common::PondId::parse(PID).unwrap()
+            ),
+            "and no storage may be created for it here"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_embedded_node_serves_a_pond_with_no_owner_endpoint() {
+        // The other half of the guard, and the one that would break
+        // `pip install latiq`: with no forwarder and no advertised endpoint
+        // there IS one node, it owns everything, and the registry's owner
+        // column is not a question it can be wrong about. The refusal above
+        // must be about being clustered and unable to name the owner — never
+        // about the endpoint being absent.
+        let (ops, _storage) = ops_embedded(None);
         let r = ops
             .read_query(&Identity::claimed(Some("a")), "pond-x", "SELECT 1 AS one")
             .await
-            .unwrap();
-        assert_eq!(fwd.reads.load(Ordering::SeqCst), 0);
+            .expect("the embedded path serves every pond");
         assert_eq!(r.rows[0][0], serde_json::json!(1));
     }
 }

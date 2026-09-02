@@ -60,6 +60,22 @@ impl AgentError {
         )
     }
 
+    /// The pond resolves, but the registry names no node that is serving it —
+    /// see [`ErrorKind::PondUnavailable`]. Raised INSTEAD of falling through to
+    /// a local execution: the node that received the request does not hold this
+    /// pond's files, and serving it here would create an empty pond of the same
+    /// name and answer with plausible, empty results.
+    pub fn pond_unavailable(pond_ref: &str) -> Self {
+        Self::of_kind(
+            ErrorKind::PondUnavailable,
+            format!(
+                "Pond '{pond_ref}' exists, but the node that owns it is not registered with this \
+                 deployment — no node is currently serving it, and this node does not hold its \
+                 data."
+            ),
+        )
+    }
+
     pub fn name_conflict(name: &str) -> Self {
         Self::of_kind(
             ErrorKind::NameConflict,

@@ -46,6 +46,16 @@ pub enum ErrorKind {
     /// distinguishable from a crash all the way to the edge — including across a
     /// node-to-node forward, where the owner re-verifies on its own authority.
     Unauthenticated,
+    /// The pond EXISTS in the registry but no registered node is serving it —
+    /// its owning node is not in the registry, so nothing can reach its files.
+    /// Deliberately NOT `PondNotFound`: the record is there and the name still
+    /// resolves, so "allocate a new one" is the wrong advice, and a node that
+    /// answered such a request locally would silently create an empty pond of
+    /// its own and hand back plausible, empty results. Deliberately not
+    /// `Storage`/`Internal` either: nothing failed and nothing crashed, and
+    /// neither "retry" nor "report a bug" is the action that fixes it — an
+    /// operator has to bring the node back or forget the pond.
+    PondUnavailable,
     Storage,
     Internal,
 }
@@ -86,6 +96,7 @@ impl ErrorKind {
             ErrorKind::QueryTimeout => "query_timeout",
             ErrorKind::QueryCancelled => "query_cancelled",
             ErrorKind::Unauthenticated => "unauthenticated",
+            ErrorKind::PondUnavailable => "pond_unavailable",
             ErrorKind::Storage => "storage",
             ErrorKind::Internal => "internal",
         }
@@ -124,6 +135,13 @@ impl ErrorKind {
             ErrorKind::Unauthenticated => {
                 "Obtain a fresh access token for this deployment and retry with it."
             }
+            // Addressed to an OPERATOR, because no agent action fixes it: the
+            // pond's node has to come back, or the record has to go.
+            ErrorKind::PondUnavailable => {
+                "Ask an operator to bring the pond's node back (latiq node list shows which are \
+                 registered); if it is gone for good, `latiq pond forget <pond> --confirm` drops \
+                 the registry record — the data on that node is NOT deleted."
+            }
             ErrorKind::Storage | ErrorKind::Internal => {
                 "Retry; if it persists, report to your operator."
             }
@@ -140,6 +158,7 @@ impl ErrorKind {
             | ErrorKind::ParseError
             | ErrorKind::WriteToReservedSchema => "latiq://dialect",
             ErrorKind::QueryTimeout => "latiq://troubleshooting/timeouts",
+            ErrorKind::PondUnavailable => "latiq://troubleshooting/pond-unavailable",
             ErrorKind::NameConflict
             | ErrorKind::InvalidValue
             | ErrorKind::MissingArgument
@@ -227,6 +246,7 @@ mod tests {
             ErrorKind::QueryTimeout,
             ErrorKind::QueryCancelled,
             ErrorKind::Unauthenticated,
+            ErrorKind::PondUnavailable,
             ErrorKind::Storage,
             ErrorKind::Internal,
         ] {
@@ -251,6 +271,7 @@ mod tests {
             ErrorKind::QueryTimeout,
             ErrorKind::QueryCancelled,
             ErrorKind::Unauthenticated,
+            ErrorKind::PondUnavailable,
             ErrorKind::Storage,
             ErrorKind::Internal,
         ] {
