@@ -505,7 +505,7 @@ See latiq://guidance.",
         description = "Describe a pond: its metadata (name, owner, created_at) plus a summary of its tables. \
 Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying. \
 The response's `lineage` flag says whether this pond records provenance — check it before get_lineage, and before you rely on a pond to be explainable later (it cannot be switched on). \
-To discover tables/columns in detail, read_query `SHOW TABLES` or `SELECT * FROM information_schema.columns`.",
+To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table>`, or `SELECT column_name, comment FROM duckdb_columns() WHERE table_name='<table>'` for the authors' column comments.",
         annotations(
             title = "Describe pond",
             read_only_hint = true,
@@ -629,8 +629,8 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
 Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` — `commit_extra_info` carries the verified-vs-claimed evidence). \
 Latiq runs your statement inside its OWN transaction and records the author just before committing, so send plain statements — several are fine, but do NOT include BEGIN/COMMIT/ROLLBACK/START TRANSACTION. Your own COMMIT ends Latiq's transaction before the author is written, and the change lands in the pond's history with NO author. \
 Marked destructive because it CAN delete data; clients may require approval. \
-Load external public files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'` (public/anonymous only). \
-Do: add column COMMENTs so other agents understand your tables. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",
+Load external files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'`. Latiq attaches no credentials to those reads, so an authenticated source needs pull_catalog instead; and it does not allow-list the address either, so name only sources you were asked to use (issue #79). \
+Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements after the CREATE — a `--` comment inside the DDL is discarded by the parser and stores nothing. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",
         annotations(
             title = "Write query",
             read_only_hint = false,
@@ -965,8 +965,21 @@ suggest/see links to latiq:// resources. Prompts provide SOPs for common multi-a
         _ctx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
         let args = request.arguments.unwrap_or_default();
-        resources::get_prompt(&request.name, &args).ok_or_else(|| {
-            McpError::invalid_params(format!("unknown prompt: {}", request.name), None)
+        // A missing REQUIRED argument is refused, never defaulted: the prompt
+        // used to render its placeholder ("Find an existing pond related to
+        // ''"), which reads exactly like a real instruction. `prompts/list`
+        // declares which arguments are required, so this is answerable.
+        resources::get_prompt(&request.name, &args).map_err(|e| match e {
+            resources::PromptError::Unknown => {
+                McpError::invalid_params(format!("unknown prompt: {}", request.name), None)
+            }
+            resources::PromptError::MissingArgument { prompt, arg } => McpError::invalid_params(
+                format!(
+                    "prompt {prompt} requires the argument '{arg}' — it is declared as required \
+                     in prompts/list; pass it a non-empty value"
+                ),
+                None,
+            ),
         })
     }
 }

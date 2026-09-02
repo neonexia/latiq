@@ -175,7 +175,7 @@ impl ErrorKind {
             ErrorKind::SourceUnavailable => {
                 "Check the path or URL in the statement — spelling, host, bucket, and whether it \
                  needs credentials this deployment does not have. It must be reachable from the \
-                 node, and only public http(s)/s3 sources are. One retry is worth it if the \
+                 node, whose network is not yours. One retry is worth it if the \
                  failure could be a transient network fault; a second identical failure means the \
                  source, not the query. To work offline of it, load the data into the pond first \
                  (load_dataset / pull_catalog)."
@@ -203,13 +203,18 @@ impl ErrorKind {
             | ErrorKind::InvalidValue
             | ErrorKind::MissingArgument
             | ErrorKind::UriNotAllowed => "latiq://guidance",
-            // No dedicated resource: `latiq://troubleshooting` is a real served
-            // resource, and inventing a URI here would send a caller after one
-            // that does not exist.
-            ErrorKind::Unauthenticated
-            | ErrorKind::QueryCancelled
-            | ErrorKind::Storage
-            | ErrorKind::Internal => "latiq://troubleshooting",
+            // These four used to share `latiq://troubleshooting`, the INDEX.
+            // It resolved, so the guard was green — and it covered none of
+            // them, so an agent holding the two worst envelopes landed on a
+            // menu of other agents' problems. Each now points at a page that
+            // names its kind (pinned by
+            // `latiq-mcp::resources::error_contract_a_troubleshooting_see_names_its_own_kind`).
+            ErrorKind::Unauthenticated => "latiq://troubleshooting/unauthenticated",
+            // The timeouts page already contrasts the two, because "the node's
+            // deadline" vs "somebody asked me to stop" is the whole question an
+            // agent has when a query is killed.
+            ErrorKind::QueryCancelled => "latiq://troubleshooting/timeouts",
+            ErrorKind::Storage | ErrorKind::Internal => "latiq://troubleshooting/internal",
         }
     }
 }
