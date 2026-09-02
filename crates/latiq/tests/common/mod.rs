@@ -23,9 +23,11 @@ use latiq_control_plane::Registry;
 use latiq_mcp::serve_mcp_with_listener;
 use latiq_pond_node::{build_ops, DataService, StreamService};
 use latiq_proto::v1::admin_server::AdminServer;
+use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::control_server::ControlServer;
 use latiq_proto::v1::data_server::DataServer;
 use latiq_proto::v1::stream_server::StreamServer;
+use latiq_proto::v1::RegisterNodeRequest;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -47,6 +49,36 @@ pub struct NodeStack {
     pub mcp_endpoint: String,
     pub internal_endpoint: String,
     _tmp: tempfile::TempDir,
+}
+
+impl NodeStack {
+    /// This node's `LocalFs` root — the directory a pond materialised HERE
+    /// appears under, as `<root>/<pond-id>`. The one way a test can tell "the
+    /// owner created the pond" from "somebody said it did".
+    pub fn data_dir(&self) -> &std::path::Path {
+        self._tmp.path()
+    }
+
+    /// Whether this node holds storage for `pond_id` — `LocalFs::pond_exists`
+    /// read from the outside, so the assertion does not depend on the code path
+    /// under test to answer.
+    pub fn holds_pond(&self, pond_id: &str) -> bool {
+        self.data_dir().join(pond_id).exists()
+    }
+}
+
+/// A node the registry knows about that nothing is listening for: registered
+/// with a real, then closed, loopback port.
+///
+/// This is how a test pins WHICH node a pond is placed on. Placement is
+/// `ORDER BY random()` over active nodes, so the only deterministic cluster is
+/// one with a single node in the pool — and `revive` can then bring that node up
+/// at the very address the registry already published, which is "the node came
+/// back" without any second placement to be lucky about.
+pub struct GhostNode {
+    pub node_id: String,
+    pub internal_endpoint: String,
+    port: u16,
 }
 
 /// A control plane plus N pond nodes, all in-process over loopback.
@@ -199,12 +231,51 @@ async fn start_node_with_auth(
     control_endpoint: &str,
     auth: Option<latiq_auth::AuthConfig>,
 ) -> NodeStack {
+    start_node_inner(node_id, control_endpoint, auth, true, None).await
+}
+
+/// A pond node that serves normally but is left OUT of the control plane's
+/// placement pool (it never registers). Everything else about it — the same
+/// `AgentOps`, the same forwarder, the same surfaces — is what `build_ops`
+/// builds; the registration it skips only decides whether the control plane may
+/// place ponds on it.
+///
+/// It exists so a test can say which node owns a pond without racing
+/// `ORDER BY random()`: with exactly one registered node, every allocation this
+/// greeter takes is placed on that node, and every one of them must be
+/// materialised over the wire.
+pub async fn add_greeter_node(node_id: &str, control_endpoint: &str) -> NodeStack {
+    start_node_inner(node_id, control_endpoint, None, false, None).await
+}
+
+/// `add_greeter_node`, requiring a verified bearer token on its surfaces.
+pub async fn add_greeter_node_with_auth(
+    node_id: &str,
+    control_endpoint: &str,
+    auth: latiq_auth::AuthConfig,
+) -> NodeStack {
+    start_node_inner(node_id, control_endpoint, Some(auth), false, None).await
+}
+
+async fn start_node_inner(
+    node_id: &str,
+    control_endpoint: &str,
+    auth: Option<latiq_auth::AuthConfig>,
+    register: bool,
+    data_listener: Option<TcpListener>,
+) -> NodeStack {
     let verifier = auth.map(|cfg| {
         std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
     });
     let tmp = tempfile::tempdir().unwrap();
     let (mcp_l, mcp_port) = bind().await;
-    let (data_l, data_port) = bind().await;
+    let (data_l, data_port) = match data_listener {
+        Some(l) => {
+            let port = l.local_addr().unwrap().port();
+            (l, port)
+        }
+        None => bind().await,
+    };
     let mcp_endpoint = format!("http://127.0.0.1:{mcp_port}/mcp");
     let data_endpoint = format!("http://127.0.0.1:{data_port}");
     let internal_endpoint = data_endpoint.clone();
@@ -215,19 +286,43 @@ async fn start_node_with_auth(
     let metadata_url = verifier
         .as_ref()
         .map(|_| format!("http://127.0.0.1:{mcp_port}/.well-known/oauth-protected-resource"));
-    let ops = build_ops(
-        node_id,
-        &mcp_endpoint,
-        &internal_endpoint,
-        control_endpoint,
-        tmp.path(),
-        // No lineage backend in the harness: the sink is covered where it can
-        // be observed (`latiq-agent-core/tests/agent_ops.rs`), and a full-stack
-        // node posting to nowhere would prove nothing this does not.
-        None,
-    )
-    .await
-    .expect("build pond-node ops");
+    let ops = if register {
+        build_ops(
+            node_id,
+            &mcp_endpoint,
+            &internal_endpoint,
+            control_endpoint,
+            tmp.path(),
+            // No lineage backend in the harness: the sink is covered where it
+            // can be observed (`latiq-agent-core/tests/agent_ops.rs`), and a
+            // full-stack node posting to nowhere would prove nothing this does
+            // not.
+            None,
+        )
+        .await
+        .expect("build pond-node ops")
+    } else {
+        // `build_ops` minus its one RegisterNode call. Deliberately assembled
+        // from the same public pieces in the same order, so a node built here
+        // and one built there differ in the registration and nothing else.
+        std::sync::Arc::new(
+            latiq_agent_core::AgentOps::new(
+                std::sync::Arc::new(
+                    latiq_pond_node::GrpcControlPlane::connect(control_endpoint.to_string())
+                        .await
+                        .expect("connect control plane"),
+                ),
+                std::sync::Arc::new(latiq_storage::LocalFs::new(tmp.path())),
+                std::sync::Arc::new(latiq_engine_duckdb::DuckEngine::new()),
+                latiq_agent_core::AgentConfig::default(),
+            )
+            .with_forwarding(
+                node_id.to_string(),
+                internal_endpoint.clone(),
+                std::sync::Arc::new(latiq_pond_node::GrpcForwarder::new()),
+            ),
+        )
+    };
 
     let data_ops = ops.clone();
     tokio::spawn(async move {
@@ -259,6 +354,52 @@ async fn start_node_with_auth(
         mcp_endpoint,
         internal_endpoint,
         _tmp: tmp,
+    }
+}
+
+impl GhostNode {
+    /// Bring the ghost up for real, at the address the registry already
+    /// published for it and under the same node id — so the pond the registry
+    /// placed on it is now on a node that answers.
+    pub async fn revive(&self, control_endpoint: &str) -> NodeStack {
+        // The port was ours, closed, and is claimed again here: a `bind` that
+        // fails means someone else took it in between, which we want to hear
+        // about loudly rather than as a mystery connection error later.
+        let listener = TcpListener::bind(("127.0.0.1", self.port))
+            .await
+            .unwrap_or_else(|e| panic!("ghost port {} could not be reclaimed: {e}", self.port));
+        let node =
+            start_node_inner(&self.node_id, control_endpoint, None, true, Some(listener)).await;
+        assert_eq!(
+            node.internal_endpoint, self.internal_endpoint,
+            "the revived node must answer at the address the registry already has"
+        );
+        node
+    }
+}
+
+/// Register a node with the control plane that nothing is listening for. The
+/// port is bound to learn a free one and then released, so a peer dialling it
+/// gets a refusal now — and `GhostNode::revive` can take it back later.
+pub async fn register_ghost_node(control_endpoint: &str, node_id: &str) -> GhostNode {
+    let (listener, port) = bind().await;
+    drop(listener);
+    let internal_endpoint = format!("http://127.0.0.1:{port}");
+    let mut c = ControlClient::connect(control_endpoint.to_string())
+        .await
+        .unwrap();
+    c.register_node(RegisterNodeRequest {
+        node_id: node_id.to_string(),
+        mcp_endpoint: format!("http://127.0.0.1:{port}/mcp"),
+        internal_endpoint: internal_endpoint.clone(),
+        capacity: 100,
+    })
+    .await
+    .expect("register the ghost node");
+    GhostNode {
+        node_id: node_id.to_string(),
+        internal_endpoint,
+        port,
     }
 }
 

@@ -731,3 +731,215 @@ async fn forwarding_serves_locally_when_the_registrys_endpoint_spelling_drifted(
     // node serving an empty pond of its own would answer this differently.
     assert_eq!(rows(&r.json)[0][0], 7);
 }
+
+/// Eager, holistic allocation: an allocation only succeeds once the pond's
+/// storage exists on the node that owns it.
+///
+/// The fixture in all three tests is a **greeter that is not in the placement
+/// pool** plus exactly one registered node, so every pond these allocations
+/// create is placed on that one node and must cross the wire to be
+/// materialised. Anything less deterministic would leave the core claim decided
+/// by `ORDER BY random()`.
+mod eager_allocation {
+    use super::*;
+    use common::{add_greeter_node, add_node, register_ghost_node, start_control_plane_only};
+
+    // `Err` is tonic's `Status`, whose size the RPC surface fixes for us — the
+    // lint's suggestion (box it) would mean unboxing at every call site here.
+    #[allow(clippy::result_large_err)]
+    async fn allocate(endpoint: &str, name: &str) -> Result<String, tonic::Status> {
+        let mut c = client(endpoint).await;
+        c.allocate_pond(req(
+            AllocatePondRequest {
+                name: name.into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "alice",
+        ))
+        .await
+        .map(|r| r.into_inner().pond_id)
+    }
+
+    /// The structured `ErrorEnvelope` the Data surface puts in `Status::details`
+    /// — asserting on the code alone would not distinguish this failure from any
+    /// other `FailedPrecondition`.
+    fn envelope(s: &tonic::Status) -> latiq_common::ErrorEnvelope {
+        serde_json::from_slice(s.details())
+            .unwrap_or_else(|e| panic!("every Data error carries an envelope ({e}): {s:?}"))
+    }
+
+    async fn pond_names(control_endpoint: &str) -> Vec<String> {
+        let mut ctl = ControlClient::connect(control_endpoint.to_string())
+            .await
+            .unwrap();
+        ctl.list_ponds(ListPondsRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .ponds
+            .into_iter()
+            .map(|p| p.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pond_lifecycle_allocation_materializes_storage_on_the_owner() {
+        // THE claim. Before eager allocation this returned the same pond id with
+        // no directory on any node: the owner materialised it lazily, on a write
+        // that might arrive minutes later or never.
+        let (control, _admin) = start_control_plane_only().await;
+        let owner = add_node("owner", &control, None).await;
+        let greeter = add_greeter_node("greeter", &control).await;
+
+        let pond_id = allocate(&greeter.data_endpoint, "eager")
+            .await
+            .expect("allocation succeeds")
+            .to_string();
+
+        assert!(
+            owner.holds_pond(&pond_id),
+            "the owning node must hold the pond's storage the moment allocate returns"
+        );
+        assert!(
+            !greeter.holds_pond(&pond_id),
+            "and the node that merely took the call must hold nothing — a greeter with \
+             its own copy is the empty pond every forwarded read would fall into"
+        );
+    }
+
+    #[tokio::test]
+    async fn pond_lifecycle_allocation_rolls_back_when_the_owner_is_unreachable() {
+        // The compensation. The registry row is written BEFORE the owner is
+        // reached, so a failure at the owner has to give it back — otherwise
+        // failing fast would just be a new way to burn a name for ever.
+        let (control, _admin) = start_control_plane_only().await;
+        let ghost = register_ghost_node(&control, "gone").await;
+        let greeter = add_greeter_node("greeter", &control).await;
+
+        let status = allocate(&greeter.data_endpoint, "doomed")
+            .await
+            .expect_err("a pond nobody could create must not be reported as created");
+        let env = envelope(&status);
+        assert_eq!(
+            env.kind,
+            latiq_common::ErrorKind::PondUnavailable,
+            "{}",
+            env.message
+        );
+        assert!(
+            env.message.contains("was NOT created") && env.message.contains("rolled back"),
+            "an agent must be told the pond does not exist AND that nothing was left \
+             behind; a bare storage error reads as 'maybe it half-worked': {}",
+            env.message
+        );
+        assert!(
+            env.message.contains(&ghost.internal_endpoint),
+            "and which node could not be reached: {}",
+            env.message
+        );
+        // The compensation itself, read from the registry rather than inferred
+        // from the error text.
+        assert!(
+            !pond_names(&control).await.contains(&"doomed".to_string()),
+            "the registry row must be gone: {:?}",
+            pond_names(&control).await
+        );
+    }
+
+    #[tokio::test]
+    async fn pond_lifecycle_allocation_reuses_the_name_after_a_rolled_back_attempt() {
+        // What the rollback is FOR, and the assertion the registry check alone
+        // cannot make: the agent takes the error's advice (retry the same name)
+        // and it works, rather than meeting a NameConflict with a pond it cannot
+        // see in list_ponds.
+        let (control, _admin) = start_control_plane_only().await;
+        let ghost = register_ghost_node(&control, "gone").await;
+        let greeter = add_greeter_node("greeter", &control).await;
+
+        let status = allocate(&greeter.data_endpoint, "retry-me")
+            .await
+            .expect_err("the owner is down");
+        assert_eq!(
+            envelope(&status).kind,
+            latiq_common::ErrorKind::PondUnavailable
+        );
+
+        // The node comes back at the address the registry already published.
+        let owner = ghost.revive(&control).await;
+        let pond_id = allocate(&greeter.data_endpoint, "retry-me")
+            .await
+            .expect("the same name must be free again");
+        assert!(
+            owner.holds_pond(&pond_id),
+            "and the retry really materialised, on the node that is back"
+        );
+    }
+
+    #[tokio::test]
+    async fn pond_lifecycle_materialize_pond_rpc_is_idempotent() {
+        // The contract the allocating node relies on to be able to retry, and
+        // what lets the lazy ensure-on-first-use fallback coexist with this
+        // rather than race it into a conflict.
+        let stack = start_stack_n(1).await;
+        let owner = &stack.nodes[0];
+        let pond_id = allocate(&owner.data_endpoint, "twice").await.unwrap();
+        assert!(owner.holds_pond(&pond_id), "allocated locally, eagerly");
+
+        let mut c = client(&owner.data_endpoint).await;
+        for attempt in 1..=2 {
+            c.materialize_pond(req(
+                MaterializePondRequest {
+                    pond: pond_id.clone(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "materialising an existing pond is a success, not a conflict ({attempt}): {e}"
+                )
+            });
+        }
+        assert!(owner.holds_pond(&pond_id), "and the pond is still there");
+    }
+
+    #[tokio::test]
+    async fn auth_allocation_replays_the_callers_token_to_the_owner() {
+        // The hop eager allocation added is an AUTHENTICATED hop. The
+        // `allocate_pond` handler used to be the one handler outside `traced`,
+        // documented as safe precisely because allocation never forwarded; now
+        // it does, and without that scope the forwarder has no token to replay,
+        // so the owner refuses and every allocation placed on a peer fails with
+        // `Unauthenticated` — in authenticated deployments only, which is the
+        // worst place for a regression to hide.
+        let idp = latiq_auth::test_support::TestIdp::start().await;
+        let (control, _admin) = start_control_plane_only().await;
+        let owner = add_node("owner", &control, Some(idp.auth_config())).await;
+        let greeter =
+            common::add_greeter_node_with_auth("greeter", &control, idp.auth_config()).await;
+        let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
+
+        let mut c = client(&greeter.data_endpoint).await;
+        let pond_id = c
+            .allocate_pond(bearer_req(
+                AllocatePondRequest {
+                    name: "authed".into(),
+                    policy_json: String::new(),
+                    tier: String::new(),
+                    lineage: false,
+                },
+                "dave",
+                &token,
+            ))
+            .await
+            .expect("the caller's own token must cross the hop")
+            .into_inner()
+            .pond_id;
+        assert!(
+            owner.holds_pond(&pond_id),
+            "and the owner really materialised it under that token"
+        );
+    }
+}

@@ -24,6 +24,13 @@ package latiq.v1;
 service Data {
   rpc AllocatePond(AllocatePondRequest) returns (AllocatePondResponse);
   rpc DropPond(DropPondRequest) returns (DropPondResponse);
+  // NODE-TO-NODE ONLY — no CLI or SDK command maps to this. Allocation is eager:
+  // the control plane places the pond, then the node that took the AllocatePond
+  // call asks the OWNING node to materialise its storage through here, and rolls
+  // the assignment back if that fails. Idempotent by contract — a pond that is
+  // already materialised is a success, never a conflict — so it is safe to retry
+  // and harmless when it races the lazy ensure-on-first-use path.
+  rpc MaterializePond(MaterializePondRequest) returns (MaterializePondResponse);
   rpc DescribePond(DescribePondRequest) returns (JsonResponse);
   rpc ReadQuery(QueryRequest) returns (JsonResponse);
   rpc WriteQuery(QueryRequest) returns (JsonResponse);
@@ -72,6 +79,11 @@ message AllocatePondRequest { string name = 1; string policy_json = 2; string ti
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }
 message DropPondRequest { string pond = 1; bool confirm = 2; }
 message DropPondResponse { }
+// No `confirm` and no options: this creates nothing the registry has not
+// already decided on, and it can only ever make the pond exist where the
+// registry already says it lives.
+message MaterializePondRequest { string pond = 1; }
+message MaterializePondResponse { }
 message DescribePondRequest { string pond = 1; }
 message QueryRequest { string pond = 1; string sql = 2; }
 

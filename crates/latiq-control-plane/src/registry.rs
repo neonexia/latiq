@@ -239,8 +239,15 @@ impl Registry {
     /// Create a pond and place it on a node. This is the choke point every
     /// create path funnels through, so it is where placement (a uniformly random
     /// `active` node), name uniqueness, and the operator-only rule for the
-    /// uncapped tier are all decided. Registry-only: the pond's storage is
-    /// materialized lazily by the owning node on first use.
+    /// uncapped tier are all decided.
+    ///
+    /// **Registry-only, and it stays that way**: the control plane places the
+    /// pond, it never creates storage (invariant 3 — it is not in the data
+    /// path). Who materializes the pond depends on who called:
+    /// `AgentOps::allocate_pond` (agents, Data gRPC) does it eagerly, on the
+    /// owning node, before reporting success, and gives this row back if that
+    /// fails; the direct `CreatePondAssignment` path (`latiq pond create`, the
+    /// SDK) leaves the row alone and the owner materializes on first use.
     pub fn create_pond(
         &self,
         name: Option<String>,

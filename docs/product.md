@@ -78,6 +78,8 @@ An agent connected to Latiq can do the following, using only SQL and a handful o
 
 **Create a workspace.** "Give me a pond called `incident-2026-001` for analyzing this outage." Done in milliseconds. No tickets, no provisioning queue, no schema-up-front decisions.
 
+Allocation is **eager and holistic**: it returns only once the pond's storage really exists on the node the control plane placed it on, so a pond an agent was told it has is a pond that can accept data. On a multi-node deployment that costs a second hop — control plane, then the owning node — and it means allocation now *fails* when that node is unreachable, instead of succeeding and failing later at the agent's first write. The failure names the node and says the assignment was rolled back, so the agent knows the name is free and can simply retry. We would rather be slower and honest here than fast and wrong: the alternative hands an agent a pond id that nothing is behind.
+
 **Bring in curated data.** Operators pre-register two kinds of source. A **dataset** is a curated file or set of files (parquet/CSV) that `load_dataset` copies into the pond under its own schema. A **catalog** is an external database or lakehouse — Iceberg today — that the agent `pull`s from: a transient attach, one query, detach, with the result materialized into the pond. Agents pick from a described menu and never see a credential or a connection string.
 
 **Then work locally.** This is the important half. Latiq does not proxy live queries to external systems — a catalog is a tap you open, pull through, and close. Everything after that runs on the pond, on the node, next to the agent. Pushdown means the pull downloads only the columns and row groups the query touches, not the whole table.

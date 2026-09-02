@@ -415,6 +415,23 @@ impl Forwarder for GrpcForwarder {
         Ok(())
     }
 
+    async fn materialize_pond(
+        &self,
+        endpoint: &str,
+        identity: &Identity,
+        pond: &str,
+    ) -> Result<(), AgentError> {
+        let mut c = self.client(endpoint).await?;
+        let req = with_identity(
+            MaterializePondRequest {
+                pond: pond.to_string(),
+            },
+            identity,
+        );
+        c.materialize_pond(req).await.map_err(status_to_error)?;
+        Ok(())
+    }
+
     async fn get_lineage(
         &self,
         endpoint: &str,

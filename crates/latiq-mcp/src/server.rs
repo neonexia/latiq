@@ -433,6 +433,8 @@ Optionally pass a `name` (Latiq generates one if omitted). Returns `pond_id` + `
 Use this first when you have a task that needs its own data space; use list_ponds to find or join an existing one. \
 Then write_query to create tables and load data, and read_query to query. \
 DECIDE `lineage` NOW: provenance recording is set here and can never be turned on later — if this pond's work may have to explain where its data came from, pass `lineage: true`, because the only recovery is starting over in a new pond. \
+The pond's storage is created on its node BEFORE this returns, so success means a pond you can write to immediately — and on a clustered deployment that costs one extra hop and can fail if that node is down. \
+Such a failure says the pond was NOT created and the assignment was rolled back: the name is free, so retry. \
 See latiq://guidance.",
         annotations(
             title = "Allocate pond",
