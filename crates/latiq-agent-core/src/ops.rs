@@ -105,8 +105,21 @@ pub struct AgentOps {
     engine: Arc<dyn QueryEngine>,
     inflight: InFlightRegistry,
     config: AgentConfig,
+    /// This node's own stable id — the one it registered and heartbeats with,
+    /// and the one the registry assigns ponds by. `None` in
+    /// single-node/in-process setups, where forwarding never applies.
+    ///
+    /// **This, and never `self_endpoint`, is what ownership is decided on.**
+    /// Taken from the node's config, never derived from the endpoint: two
+    /// spellings of one address (a trailing slash, a hostname vs its IP, a node
+    /// that was re-addressed) made a node conclude it was not the owner and dial
+    /// itself, re-entering this same decision and forwarding again without
+    /// bound (#89).
+    self_node_id: Option<String>,
     /// This node's own internal endpoint (registered with the control plane).
     /// `None` in single-node/in-process setups, where forwarding never applies.
+    /// An ADDRESS, used for two things only: dialling is done with the *owner's*
+    /// endpoint, and this one names the node in `QueryMeta::served_by`.
     self_endpoint: Option<String>,
     /// Delegate for ponds owned by a different node. `None` = single-node: every
     /// pond is local, so the behavior is exactly as before forwarding existed.
@@ -150,6 +163,7 @@ impl AgentOps {
             engine,
             inflight: InFlightRegistry::new(),
             config,
+            self_node_id: None,
             self_endpoint: None,
             forwarder: None,
             lineage_writers: Arc::new(RwLock::new(HashMap::new())),
@@ -170,10 +184,22 @@ impl AgentOps {
         self
     }
 
-    /// Enable node-to-node forwarding: requests for ponds owned by a node other
-    /// than `self_endpoint` are delegated to `forwarder`. Without this, all ponds
-    /// are treated as local (single-node behavior).
-    pub fn with_forwarding(mut self, self_endpoint: String, forwarder: Arc<dyn Forwarder>) -> Self {
+    /// Enable node-to-node forwarding: requests for ponds owned by a node whose
+    /// id is not `self_node_id` are delegated to `forwarder`, dialled at the
+    /// owner's endpoint. Without this, all ponds are treated as local
+    /// (single-node behavior).
+    ///
+    /// The two arguments are NOT interchangeable and the order matters:
+    /// `self_node_id` is the id this node registered with (the identity it is
+    /// known by), `self_endpoint` is the address peers dial it at. Ownership is
+    /// decided on the first; only the second is ever dialled or advertised.
+    pub fn with_forwarding(
+        mut self,
+        self_node_id: String,
+        self_endpoint: String,
+        forwarder: Arc<dyn Forwarder>,
+    ) -> Self {
+        self.self_node_id = Some(self_node_id);
         self.self_endpoint = Some(self_endpoint);
         self.forwarder = Some(forwarder);
         self
@@ -250,7 +276,7 @@ impl AgentOps {
         let Some(writer) = self.lineage_writer(rec.info) else {
             return; // nothing to do, and never anything to fail
         };
-        if crate::lineage::record(&writer, self.node_id(), rec) {
+        if crate::lineage::record(&writer, self.serving_name(), rec) {
             tokio::task::spawn_blocking(move || writer.flush());
         }
     }
@@ -361,18 +387,54 @@ impl AgentOps {
     /// on another host, and `ensure_pond` here would happily create an empty
     /// pond of the same name and answer out of it.
     fn placement<'a>(&'a self, info: &'a PondInfo) -> Placement<'a> {
-        // No forwarder / no advertised endpoint = single-node or the embedded
+        // No forwarder / no identity of our own = single-node or the embedded
         // SDK. There is one node, it owns everything, and there is nothing to
         // forward to or to be wrong about. Checked FIRST so the embedded path
         // never reaches the ownership question.
-        let (Some(fwd), Some(me)) = (self.forwarder.as_ref(), self.self_endpoint.as_deref()) else {
+        let (Some(fwd), Some(me), Some(my_address)) = (
+            self.forwarder.as_ref(),
+            self.self_node_id.as_deref(),
+            self.self_endpoint.as_deref(),
+        ) else {
             return Placement::Local;
         };
-        // An empty endpoint is not an address: treat it exactly like a missing
-        // one rather than dialling "".
+        // OWNERSHIP IS AN IDENTITY COMPARISON, never an address one (#89). An
+        // empty id is not an id: a control plane that cannot name the owning
+        // node leaves the question unanswered, and an unanswered question is
+        // refused rather than resolved by falling back to the endpoint — that
+        // fallback is precisely the bug, and it would reappear on whichever
+        // deployment stopped filling the field.
+        let owner_id = match info.node_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => id,
+            None => return Placement::NoOwner,
+        };
+        if owner_id == me {
+            // Ours, whatever the registry has for our address — including
+            // nothing at all, since we do not need to dial ourselves.
+            return Placement::Local;
+        }
+        // Someone else's. NOW the endpoint matters, for the one thing it is
+        // for: dialling. An empty endpoint is not an address (the owning node's
+        // row is gone), so there is nobody to delegate to — the #88 refusal,
+        // unchanged.
         match info.node_endpoint.as_deref().filter(|e| !e.is_empty()) {
             None => Placement::NoOwner,
-            Some(owner) if owner == me => Placement::Local,
+            // Another node id advertising OUR address is a misconfiguration
+            // (a copy-pasted `--advertise-addr`), and dialling it would be
+            // dialling ourselves — #89's recursion by a second route. Refuse
+            // loudly instead. This is the only surviving comparison of two
+            // endpoints, and note what it is NOT: it can never make this node
+            // the owner, only stop it from calling itself.
+            Some(owner) if owner == my_address => {
+                tracing::warn!(
+                    pond = %info.pond_id,
+                    owner = %owner_id,
+                    me,
+                    address = %my_address,
+                    "refusing to forward: another node id advertises this node's own address"
+                );
+                Placement::NoOwner
+            }
             Some(owner) => Placement::Forward(fwd.as_ref(), owner),
         }
     }
@@ -411,7 +473,16 @@ impl AgentOps {
     /// embedded SDK). One definition for `QueryMeta::served_by` and the lineage
     /// event's `nodeId`, so an operator correlating the two never has to
     /// reconcile two spellings of the same node.
-    fn node_id(&self) -> &str {
+    ///
+    /// Deliberately still the ENDPOINT and not `self_node_id`, even though
+    /// ownership now routes on the id (#89): this is a shipped wire field whose
+    /// stated purpose (#87) is to hand an operator something they can dial and
+    /// grep, and the lineage facet's `nodeId` carries the same value for the
+    /// same reason. The two answer different questions — "who is the owner" is
+    /// an identity comparison, "where did this run" is an address — so the name
+    /// here is `serving_name`, not `node_id`, and the id never leaks into it by
+    /// accident.
+    fn serving_name(&self) -> &str {
         self.self_endpoint.as_deref().unwrap_or(IN_PROCESS_NODE)
     }
 
@@ -1133,7 +1204,7 @@ impl AgentOps {
             // it. Set here and not in the meta the blocking producer sends,
             // because the streaming adapter must announce it on its first chunk
             // — long before the last batch resolves that meta.
-            served_by: self.node_id().to_string(),
+            served_by: self.serving_name().to_string(),
         })
     }
 
@@ -1245,7 +1316,7 @@ impl AgentOps {
         meta.rows = n;
         // From the STREAM, not from this node: on a forwarded read the stream
         // was produced by the peer and carries the peer's name, which is the
-        // one the caller must see. Assigning `self.node_id()` here is exactly
+        // one the caller must see. Assigning `self.serving_name()` here is exactly
         // the bug the field exists to catch.
         meta.served_by = served_by;
         Ok(QueryResult {
@@ -1405,7 +1476,7 @@ impl AgentOps {
         // behind the field: the forwarded path returns the peer's result
         // untouched further up, so a relayed meta keeps the owner's name and
         // never acquires the greeter's.
-        qr.meta.served_by = self.node_id().to_string();
+        qr.meta.served_by = self.serving_name().to_string();
         Ok(qr)
     }
 

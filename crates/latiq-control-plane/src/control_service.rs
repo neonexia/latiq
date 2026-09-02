@@ -143,6 +143,10 @@ impl Control for ControlService {
                 owner: row.owner_identity,
                 created_at,
                 policy_json,
+                // The owner's identity (what a node routes on) alongside its
+                // address (what a node dials) — never one standing in for the
+                // other (#89).
+                node_id: row.node_id,
                 node_endpoint: endpoint.unwrap_or_default(),
                 tier: row.tier,
                 extensions: row.extensions,
@@ -168,6 +172,10 @@ impl Control for ControlService {
                 owner: row.owner_identity,
                 created_at,
                 policy_json,
+                // The owner's identity (what a node routes on) alongside its
+                // address (what a node dials) — never one standing in for the
+                // other (#89).
+                node_id: row.node_id,
                 node_endpoint: endpoint.unwrap_or_default(),
                 tier: row.tier,
                 extensions: row.extensions,

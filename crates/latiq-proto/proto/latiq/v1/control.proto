@@ -59,6 +59,12 @@ message PondInfoMsg {
   // Opt-in at creation, fixed for the pond's lifetime; false by default so the
   // default deployment pays nothing.
   bool lineage = 10;
+  // Stable id of the node that owns this pond (the registry's `ponds.node_id`,
+  // the id that node registered with). THE field a receiving node decides
+  // local-vs-forward on: `node_endpoint` above is only how to reach the owner
+  // once that decision is made. Comparing addresses instead let a node mistake
+  // itself for another node and forward into itself (#89).
+  string node_id = 11;
 }
 message ListPondsRequest { }
 message ListPondsResponse { repeated PondInfoMsg ponds = 1; }

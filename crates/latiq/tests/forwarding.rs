@@ -648,3 +648,86 @@ async fn forwarding_concurrent_tokens_stay_isolated_per_request() {
         t.await.unwrap();
     }
 }
+
+/// REGRESSION PIN — issue #89, end to end. A node decided whether it owned a
+/// pond by string-comparing its own advertised endpoint against the endpoint
+/// the registry stored for the owning node. When those two strings named the
+/// same node in different spellings, the node concluded it was not the owner,
+/// dialled the owner — itself — over gRPC, and re-entered the same decision,
+/// forwarding again with nothing to bound it.
+///
+/// Ownership is now decided on `node_id`, the stable id this node registered
+/// with, which is also how the registry assigns ponds. The drift is produced
+/// the way a real one is: the same node id re-registers under a differently
+/// spelled address (here a trailing slash; a hostname vs its IP or a
+/// re-addressed node do the same), which the registry's upsert accepts.
+///
+/// What the in-process pin in `latiq-agent-core` cannot prove and this does:
+/// that the id survives the registry → Control gRPC → `GrpcControlPlane` trip,
+/// and that the id a node registers with is the id it routes on.
+#[tokio::test]
+async fn forwarding_serves_locally_when_the_registrys_endpoint_spelling_drifted() {
+    let stack = start_stack_n(1).await;
+    let node = &stack.nodes[0];
+    let owner = allocate_and_locate(&stack, "drift").await;
+    assert_eq!(
+        owner, node.internal_endpoint,
+        "one node, so the pond must be placed on it"
+    );
+
+    let mut ctl = ControlClient::connect(stack.control_endpoint.clone())
+        .await
+        .unwrap();
+    ctl.register_node(RegisterNodeRequest {
+        node_id: node.node_id.clone(),
+        mcp_endpoint: node.mcp_endpoint.clone(),
+        internal_endpoint: format!("{}/", node.internal_endpoint),
+        capacity: 100,
+    })
+    .await
+    .unwrap();
+    // The drift is real, and the assertion below is not vacuous: the registry
+    // now hands out a spelling this node does not use for itself.
+    let drifted = ctl
+        .get_pond_location(GetPondLocationRequest {
+            pond_ref: "drift".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .node_endpoint;
+    assert_ne!(
+        drifted, node.internal_endpoint,
+        "the registry must now name this node by a different string"
+    );
+
+    // Bounded on purpose: the failure this pins is UNBOUNDED self-forwarding,
+    // which does not return an error — it recurses. A timeout is the only way
+    // the test fails cleanly when the mechanism breaks.
+    let deadline = std::time::Duration::from_secs(20);
+    let mut c = client(&node.data_endpoint).await;
+    let w = tokio::time::timeout(
+        deadline,
+        c.write_query(req(q("drift", "CREATE TABLE t AS SELECT 7 AS v"), "alice")),
+    )
+    .await
+    .expect("a node that forwards into itself never answers")
+    .unwrap()
+    .into_inner();
+    assert_eq!(
+        served_by(&w.json),
+        node.internal_endpoint,
+        "the node that holds the pond must serve it, not relay to itself"
+    );
+    let r = tokio::time::timeout(
+        deadline,
+        c.read_query(req(q("drift", "SELECT v FROM t"), "alice")),
+    )
+    .await
+    .expect("a node that forwards into itself never answers")
+    .unwrap()
+    .into_inner();
+    // The write landed in the one real pond, and the read found it there — a
+    // node serving an empty pond of its own would answer this differently.
+    assert_eq!(rows(&r.json)[0][0], 7);
+}

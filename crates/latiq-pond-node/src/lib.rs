@@ -139,9 +139,13 @@ pub async fn build_ops(
     let storage = Arc::new(LocalFs::new(data_dir));
     let engine = Arc::new(DuckEngine::new());
     // Forward requests for ponds this node doesn't own to the owning node. The
-    // node's own `internal_endpoint` is the identity it compares against, so a
-    // pond whose registry endpoint matches runs locally; everything else forwards.
+    // identity it compares against is `node_id` — the SAME id it just registered
+    // with above, so the registry's `ponds.node_id` and this value are two reads
+    // of one thing. The endpoint comes along only as the address peers dial and
+    // as this node's `served_by`; it is never compared (#89: two spellings of
+    // one address made a node forward into itself, unboundedly).
     let mut ops = AgentOps::new(control, storage, engine, AgentConfig::default()).with_forwarding(
+        node_id.to_string(),
         internal_endpoint.to_string(),
         Arc::new(GrpcForwarder::new()),
     );
