@@ -197,6 +197,16 @@ pub(crate) fn to_status(e: AgentError) -> Status {
     Status::with_details(code, env.message.clone(), details.into())
 }
 
+/// The wire's `timeout_ms` as execution controls. Proto3 cannot distinguish an
+/// unset `uint64` from a zero one, so `0` means "the node's default" — the
+/// alternative reading, an unbounded query, is exactly what the node's ceiling
+/// exists to prevent. There is no cancel source on this surface: gRPC has no
+/// mid-call cancel we can map onto one (dropping the call is what a client does
+/// instead), so the deadline is the only stop here.
+pub(crate) fn controls_of(timeout_ms: u64) -> latiq_agent_core::QueryControls {
+    latiq_agent_core::QueryControls::timeout(Some(timeout_ms))
+}
+
 fn json_resp(value: serde_json::Value) -> Response<JsonResponse> {
     Response::new(JsonResponse {
         json: value.to_string(),
@@ -342,7 +352,7 @@ impl Data for DataService {
         // Reads ride the Arrow internal hop, collected to JSON here at the edge.
         traced("read_query", tid, tok, async move {
             let qr = ops
-                .read_collected(&id, &r.pond, &r.sql)
+                .read_collected_with(&id, &r.pond, &r.sql, controls_of(r.timeout_ms))
                 .await
                 .map_err(to_status)?;
             Ok(json_resp(query_value(qr)))
@@ -360,7 +370,7 @@ impl Data for DataService {
         let ops = self.ops.clone();
         traced("write_query", tid, tok, async move {
             let qr = ops
-                .write_query(&id, &r.pond, &r.sql)
+                .write_query_with(&id, &r.pond, &r.sql, controls_of(r.timeout_ms))
                 .await
                 .map_err(to_status)?;
             Ok(json_resp(query_value(qr)))

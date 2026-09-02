@@ -293,6 +293,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         QueryRequest {
             pond: "never-existed".into(),
             sql: "CREATE TABLE t(i INTEGER)".into(),
+            timeout_ms: 0,
         },
         "agent-7",
         &token,
@@ -313,6 +314,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
             QueryRequest {
                 pond: "trail".into(),
                 sql: "SELECT * FROM range(50000)".into(),
+                timeout_ms: 0,
             },
             "agent-7",
             &token,
@@ -326,6 +328,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         QueryRequest {
             pond: "trail".into(),
             sql: "SELECT 1 AS one".into(),
+            timeout_ms: 0,
         },
         "agent-7",
         &token,
@@ -340,6 +343,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         QueryRequest {
             pond: "trail".into(),
             sql: "SELECT * FROM range(50000)".into(),
+            timeout_ms: 0,
         },
         "agent-7",
         &token,
@@ -392,6 +396,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
     anon.read_query(Request::new(QueryRequest {
         pond: "trail".into(),
         sql: "SELECT 1".into(),
+        timeout_ms: 0,
     }))
     .await
     .unwrap_err();
@@ -399,6 +404,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         QueryRequest {
             pond: "trail".into(),
             sql: "SELECT 1".into(),
+            timeout_ms: 0,
         },
         "intruder",
         "not-a-jwt",
@@ -412,6 +418,7 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         .read_arrow(Request::new(QueryRequest {
             pond: "trail".into(),
             sql: "SELECT 1".into(),
+            timeout_ms: 0,
         }))
         .await
         .unwrap_err();
@@ -628,6 +635,7 @@ async fn access_trail_trace_id_ties_a_forwarded_op_to_the_request_that_started_i
             QueryRequest {
                 pond: "traced".into(),
                 sql: "CREATE TABLE t(i INTEGER)".into(),
+                timeout_ms: 0,
             },
             "alice",
             FORWARDED,
@@ -643,6 +651,7 @@ async fn access_trail_trace_id_ties_a_forwarded_op_to_the_request_that_started_i
             QueryRequest {
                 pond: "traced".into(),
                 sql: "INSERT INTO t VALUES (1)".into(),
+                timeout_ms: 0,
             },
             "alice",
             DIRECT,

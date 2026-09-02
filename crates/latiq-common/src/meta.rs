@@ -127,6 +127,10 @@ impl DatasetRef {
     }
 }
 
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 /// The `_meta` envelope on every query response: cost, provenance and advice
 /// about the statement that just ran. It is also what the lineage emitter reads
 /// (`inputs`/`outputs`), so a field added here for a client is visible to
@@ -138,6 +142,21 @@ pub struct QueryMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
     pub duration_ms: u64,
+    /// The timeout that was actually IN EFFECT for this statement, in
+    /// milliseconds — the node's default when the caller asked for none, the
+    /// caller's `timeout_ms` when it fits, and the node's **maximum** when the
+    /// caller asked for more than the node allows.
+    ///
+    /// Reported on every local execution precisely so a clamp is never silent:
+    /// an agent that asks for 30 minutes on a node capped at 10 has to be able
+    /// to see that it got 10, or it is baffled when its query dies early. It is
+    /// the same number the timeout error quotes.
+    ///
+    /// `0` (and omitted from the wire) only where nothing executed anything —
+    /// a default-constructed meta, or a meta relayed from a peer whose stream
+    /// carried none. A node never applies a zero timeout.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub timeout_ms: u64,
     pub bytes_scanned: u64,
     /// Every dataset the statement touched, by name — the flat, human-facing
     /// summary the `_meta` envelope has always advertised. `inputs`/`outputs`

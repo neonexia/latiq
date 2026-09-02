@@ -251,7 +251,15 @@ async fn start_node_with_auth(
     control_endpoint: &str,
     auth: Option<latiq_auth::AuthConfig>,
 ) -> NodeStack {
-    start_node_inner(node_id, control_endpoint, auth, true, None).await
+    start_node_inner(
+        node_id,
+        control_endpoint,
+        auth,
+        true,
+        None,
+        latiq_common::QueryTimeouts::default(),
+    )
+    .await
 }
 
 /// A pond node that serves normally but is left OUT of the control plane's
@@ -265,7 +273,15 @@ async fn start_node_with_auth(
 /// greeter takes is placed on that node, and every one of them must be
 /// materialised over the wire.
 pub async fn add_greeter_node(node_id: &str, control_endpoint: &str) -> NodeStack {
-    start_node_inner(node_id, control_endpoint, None, false, None).await
+    start_node_inner(
+        node_id,
+        control_endpoint,
+        None,
+        false,
+        None,
+        latiq_common::QueryTimeouts::default(),
+    )
+    .await
 }
 
 /// `add_greeter_node`, requiring a verified bearer token on its surfaces.
@@ -274,7 +290,15 @@ pub async fn add_greeter_node_with_auth(
     control_endpoint: &str,
     auth: latiq_auth::AuthConfig,
 ) -> NodeStack {
-    start_node_inner(node_id, control_endpoint, Some(auth), false, None).await
+    start_node_inner(
+        node_id,
+        control_endpoint,
+        Some(auth),
+        false,
+        None,
+        latiq_common::QueryTimeouts::default(),
+    )
+    .await
 }
 
 async fn start_node_inner(
@@ -283,6 +307,7 @@ async fn start_node_inner(
     auth: Option<latiq_auth::AuthConfig>,
     register: bool,
     data_listener: Option<TcpListener>,
+    timeouts: latiq_common::QueryTimeouts,
 ) -> NodeStack {
     let verifier = auth.map(|cfg| {
         std::sync::Arc::new(latiq_auth::Verifier::new(cfg).expect("build test verifier"))
@@ -318,6 +343,7 @@ async fn start_node_inner(
             // full-stack node posting to nowhere would prove nothing this does
             // not.
             None,
+            timeouts,
         )
         .await
         .expect("build pond-node ops")
@@ -334,7 +360,10 @@ async fn start_node_inner(
                 ),
                 std::sync::Arc::new(latiq_storage::LocalFs::new(tmp.path())),
                 std::sync::Arc::new(latiq_engine_duckdb::DuckEngine::new()),
-                latiq_agent_core::AgentConfig::default(),
+                latiq_agent_core::AgentConfig {
+                    timeouts,
+                    ..latiq_agent_core::AgentConfig::default()
+                },
             )
             .with_forwarding(
                 node_id.to_string(),
@@ -388,8 +417,15 @@ impl GhostNode {
         let listener = TcpListener::bind(("127.0.0.1", self.port))
             .await
             .unwrap_or_else(|e| panic!("ghost port {} could not be reclaimed: {e}", self.port));
-        let node =
-            start_node_inner(&self.node_id, control_endpoint, None, true, Some(listener)).await;
+        let node = start_node_inner(
+            &self.node_id,
+            control_endpoint,
+            None,
+            true,
+            Some(listener),
+            latiq_common::QueryTimeouts::default(),
+        )
+        .await;
         assert_eq!(
             node.internal_endpoint, self.internal_endpoint,
             "the revived node must answer at the address the registry already has"
@@ -425,8 +461,19 @@ pub async fn register_ghost_node(control_endpoint: &str, node_id: &str) -> Ghost
 
 /// Start the full stack with a single pond node (the common case).
 pub async fn start_stack() -> TestStack {
+    start_stack_with_timeouts(latiq_common::QueryTimeouts::default()).await
+}
+
+/// `start_stack`, with the node's query-timeout policy set explicitly.
+///
+/// The timeout tests need a node whose default and maximum are milliseconds
+/// rather than minutes: the behaviour under test is "the deadline fires and is
+/// reported", and waiting 30 real seconds to see it would be the same test, only
+/// unrunnable. The clamp is a pure comparison, so a small ceiling proves it as
+/// well as a large one does.
+pub async fn start_stack_with_timeouts(timeouts: latiq_common::QueryTimeouts) -> TestStack {
     let (control_endpoint, admin_endpoint) = start_control_plane().await;
-    let node = start_node("node-test", &control_endpoint).await;
+    let node = start_node_inner("node-test", &control_endpoint, None, true, None, timeouts).await;
     TestStack {
         data_endpoint: node.data_endpoint.clone(),
         admin_endpoint,

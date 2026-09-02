@@ -31,12 +31,18 @@ use std::collections::BTreeMap;
 /// implementation does.
 #[async_trait::async_trait]
 pub trait Forwarder: Send + Sync {
+    /// `timeout_ms` is what the CALLER asked for, relayed unresolved: the owner
+    /// runs the statement, so the owner's default and the owner's ceiling are
+    /// the ones that apply, and the owner reports what it actually applied in
+    /// the meta it sends back. A greeter node that resolved it here would
+    /// impose its own policy on the node that carries the risk.
     async fn read(
         &self,
         endpoint: &str,
         identity: &Identity,
         pond: &str,
         sql: &str,
+        timeout_ms: Option<u64>,
     ) -> Result<QueryResult, AgentError>;
 
     /// Stream a read from the owning node as Arrow batches (the Arrow internal
@@ -47,6 +53,7 @@ pub trait Forwarder: Send + Sync {
         identity: &Identity,
         pond: &str,
         sql: &str,
+        timeout_ms: Option<u64>,
     ) -> Result<ArrowReadStream, AgentError>;
 
     async fn write(
@@ -55,6 +62,7 @@ pub trait Forwarder: Send + Sync {
         identity: &Identity,
         pond: &str,
         sql: &str,
+        timeout_ms: Option<u64>,
     ) -> Result<QueryResult, AgentError>;
 
     async fn explain(

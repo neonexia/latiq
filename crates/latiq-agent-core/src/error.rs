@@ -107,6 +107,42 @@ impl AgentError {
         )
     }
 
+    /// The node cut the query on its deadline. Names BOTH numbers — the timeout
+    /// that was actually in effect (which may be a clamped version of what the
+    /// caller asked for) and the node's ceiling — because those two are what
+    /// decide the agent's next move, and it can obtain neither any other way.
+    ///
+    /// The `suggest` covers the three levers, and drops the one that is not
+    /// available: at the ceiling there is no larger `timeout_ms` to retry with,
+    /// and telling an agent to ask for one would send it round a loop it cannot
+    /// win. That case is the tier's problem, not the timeout's.
+    pub fn query_timeout(effective_ms: u64, max_ms: u64) -> Self {
+        let at_ceiling = effective_ms >= max_ms;
+        let suggest = if at_ceiling {
+            "This ran at the node's maximum, so a larger timeout_ms is not available. Narrow the \
+             query — add a WHERE on a selective column, a LIMIT, or fewer columns — or aggregate \
+             server-side (GROUP BY/count/sum) instead of scanning. If the work is genuinely this \
+             large, it is too big for this pond's tier: ask an operator to re-tier the pond."
+                .to_string()
+        } else {
+            format!(
+                "Retry with a larger timeout_ms (this node allows up to {max_ms}), or narrow the \
+                 query — add a WHERE on a selective column, a LIMIT, or fewer columns — or \
+                 aggregate server-side (GROUP BY/count/sum). If it still times out at {max_ms} \
+                 ms, the query is too large for this pond's tier: ask an operator to re-tier it."
+            )
+        };
+        Self::new(
+            ErrorKind::QueryTimeout,
+            format!(
+                "Query stopped after {effective_ms} ms — the timeout in effect for this request. \
+                 This node allows up to {max_ms} ms."
+            ),
+            suggest,
+            ErrorKind::QueryTimeout.default_see(),
+        )
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::of_kind(ErrorKind::Internal, message)
     }

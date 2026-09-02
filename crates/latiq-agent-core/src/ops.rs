@@ -18,6 +18,7 @@
 use crate::access::{outcome, ERROR, OK};
 use crate::arrow::ArrowReadStream;
 use crate::control::ControlPlane;
+use crate::deadline::{Deadline, QueryControls};
 use crate::error::AgentError;
 use crate::forward::Forwarder;
 use crate::inflight::InFlightRegistry;
@@ -32,6 +33,7 @@ use latiq_common::ErrorKind;
 use latiq_common::Identity;
 use latiq_common::PondId;
 use latiq_common::QueryMeta;
+use latiq_common::QueryTimeouts;
 use latiq_common::{PondTier, ResourceLimits};
 use latiq_engine::{AbortToken, ArrowSink, ExplainResult, QueryEngine, QueryResult};
 use latiq_lineage::event::DurationMeaning;
@@ -80,12 +82,18 @@ pub struct AgentConfig {
     /// Rows a materialized (non-streaming) read may return before it fails with
     /// `result_cap_exceeded`. Streamed reads (`read_arrow`) are not capped.
     pub inline_row_cap: usize,
+    /// How long a statement may run on this node: the default applied when a
+    /// caller names no `timeout_ms`, and the maximum every request is clamped
+    /// to. The maximum is the OPERATOR's protection — one DuckDB instance per
+    /// pond means an unbounded query pins that pond for everyone.
+    pub timeouts: QueryTimeouts,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             inline_row_cap: 10_000,
+            timeouts: QueryTimeouts::default(),
         }
     }
 }
@@ -839,7 +847,22 @@ impl AgentOps {
         pond_ref: &str,
         sql: &str,
     ) -> Result<QueryResult, AgentError> {
-        let res = self.run_query(pond_ref, sql, identity, false).await?;
+        self.read_query_with(identity, pond_ref, sql, QueryControls::none())
+            .await
+    }
+
+    /// [`read_query`](Self::read_query) with the caller's execution controls —
+    /// its requested `timeout_ms` and its own cancellation source.
+    pub async fn read_query_with(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+        controls: QueryControls,
+    ) -> Result<QueryResult, AgentError> {
+        let res = self
+            .run_query(pond_ref, sql, identity, false, controls)
+            .await?;
         Ok(res)
     }
 
@@ -849,7 +872,21 @@ impl AgentOps {
         pond_ref: &str,
         sql: &str,
     ) -> Result<QueryResult, AgentError> {
-        let res = self.run_query(pond_ref, sql, identity, true).await?;
+        self.write_query_with(identity, pond_ref, sql, QueryControls::none())
+            .await
+    }
+
+    /// [`write_query`](Self::write_query) with the caller's execution controls.
+    pub async fn write_query_with(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+        controls: QueryControls,
+    ) -> Result<QueryResult, AgentError> {
+        let res = self
+            .run_query(pond_ref, sql, identity, true, controls)
+            .await?;
         Ok(res)
     }
 
@@ -1139,6 +1176,23 @@ impl AgentOps {
         pond_ref: &str,
         sql: &str,
     ) -> Result<ArrowReadStream, AgentError> {
+        self.read_arrow_with(identity, pond_ref, sql, QueryControls::none())
+            .await
+    }
+
+    /// [`read_arrow`](Self::read_arrow) with the caller's execution controls.
+    ///
+    /// The deadline covers the WHOLE stream, not just its establishment: a
+    /// consumer that stops reading holds a DuckLake snapshot pinned (see
+    /// `read_arrow_local`), so "the query finished" is the last batch, not the
+    /// first schema.
+    pub async fn read_arrow_with(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+        controls: QueryControls,
+    ) -> Result<ArrowReadStream, AgentError> {
         let info = self
             .pond_info_audited(identity, "read_arrow", pond_ref)
             .await?;
@@ -1150,12 +1204,15 @@ impl AgentOps {
                 "forwarding to owner node"
             );
             record_forward("read_arrow");
-            // The owner audits the read it actually ran, as everywhere else.
-            return fwd.read_arrow(owner, identity, pond_ref, sql).await;
+            // The owner audits the read it actually ran, as everywhere else —
+            // and enforces the timeout, under its own policy (see `run_query`).
+            return fwd
+                .read_arrow(owner, identity, pond_ref, sql, controls.timeout_ms)
+                .await;
         }
         info!(op = "read_arrow", pond = pond_ref, "processing locally");
         let started = Instant::now();
-        let res = self.read_arrow_local(&info, sql).await;
+        let res = self.read_arrow_local(&info, sql, controls).await;
         let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
@@ -1190,6 +1247,7 @@ impl AgentOps {
         &self,
         info: &PondInfo,
         sql: &str,
+        controls: QueryControls,
     ) -> Result<ArrowReadStream, AgentError> {
         record_query(&info.name, "read");
         metrics::gauge!("latiq_pond_inflight_queries", "pond" => info.name.clone()).increment(1.0);
@@ -1204,6 +1262,13 @@ impl AgentOps {
         loc.extensions = info.extensions.clone();
         loc.lineage = info.lineage;
         let (op_id, token) = self.inflight.register(Some(pond_id));
+        // The guard MOVES into the blocking producer below, so the deadline
+        // lives until the STREAM ends rather than until this call returns —
+        // which is the whole point here: a streamed read returns at the first
+        // schema and can then run for minutes. (Drop fires the abort token, so
+        // handing it to the caller's future instead would cut every read at its
+        // first batch.)
+        let deadline = Deadline::arm(&token, self.config.timeouts, &controls);
 
         let (schema_tx, schema_rx) = oneshot::channel::<Result<SchemaRef, AgentError>>();
         let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
@@ -1233,14 +1298,17 @@ impl AgentOps {
             };
             let res = engine.read_arrow(&loc, &sql2, token, &mut sink);
             match res {
-                Ok(meta) => {
+                Ok(mut meta) => {
+                    meta.timeout_ms = deadline.effective_ms();
                     // Sent before the sink (and so `batch_tx`) is dropped, so a
                     // caller that waits for the end of the stream never waits
                     // for the meta.
                     let _ = meta_tx.send(meta);
                 }
                 Err(e) => {
-                    let ae = AgentError::from(e);
+                    // Through the deadline: only it can tell our expiry from
+                    // somebody's cancel (see `run_query_local`).
+                    let ae = deadline.classify(e);
                     // Deliver the error on whichever channel is still open: the
                     // schema oneshot (no batches produced yet) or the batch
                     // stream.
@@ -1300,6 +1368,19 @@ impl AgentOps {
         pond_ref: &str,
         sql: &str,
     ) -> Result<QueryResult, AgentError> {
+        self.read_collected_with(identity, pond_ref, sql, QueryControls::none())
+            .await
+    }
+
+    /// [`read_collected`](Self::read_collected) with the caller's execution
+    /// controls — the entry point both agent-facing read surfaces use.
+    pub async fn read_collected_with(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        sql: &str,
+        controls: QueryControls,
+    ) -> Result<QueryResult, AgentError> {
         let info = self
             .pond_info_audited(identity, "read_query", pond_ref)
             .await?;
@@ -1312,12 +1393,14 @@ impl AgentOps {
             );
             record_forward("read_query");
             // The owner audits the read it ran; we only collect its stream.
-            let stream = fwd.read_arrow(owner, identity, pond_ref, sql).await?;
+            let stream = fwd
+                .read_arrow(owner, identity, pond_ref, sql, controls.timeout_ms)
+                .await?;
             return self.collect_stream(stream).await;
         }
         info!(op = "read_query", pond = pond_ref, "processing locally");
         let started = Instant::now();
-        let res = match self.read_arrow_local(&info, sql).await {
+        let res = match self.read_arrow_local(&info, sql, controls).await {
             Ok(stream) => self.collect_stream(stream).await,
             Err(e) => Err(e),
         };
@@ -1403,6 +1486,7 @@ impl AgentOps {
         sql: &str,
         identity: &Identity,
         write: bool,
+        controls: QueryControls,
     ) -> Result<QueryResult, AgentError> {
         let op = if write { "write_query" } else { "read_query" };
         let info = self.pond_info_audited(identity, op, pond_ref).await?;
@@ -1423,10 +1507,17 @@ impl AgentOps {
             // the RPC the caller invoked, which we do know — `op` is the whole
             // value of the label.
             record_forward(if write { "write_query" } else { "read_query" });
+            // The REQUESTED timeout crosses the hop, not our effective one: the
+            // owner runs the query, so the owner's default and the owner's
+            // ceiling are the ones that apply, and it reports what it applied in
+            // the meta it relays back. Resolving it here would let a greeter
+            // node's policy override the policy of the node actually at risk.
             return if write {
-                fwd.write(owner, identity, pond_ref, sql).await
+                fwd.write(owner, identity, pond_ref, sql, controls.timeout_ms)
+                    .await
             } else {
-                fwd.read(owner, identity, pond_ref, sql).await
+                fwd.read(owner, identity, pond_ref, sql, controls.timeout_ms)
+                    .await
             };
         }
         info!(op = "query", pond = pond_ref, "processing locally");
@@ -1435,7 +1526,7 @@ impl AgentOps {
         // the statement failed and so produced no meta of its own.
         let mut planned = None;
         let res = self
-            .run_query_local(&info, sql, identity, write, &mut planned)
+            .run_query_local(&info, sql, identity, write, controls, &mut planned)
             .await;
         let duration_ms = t0.elapsed().as_millis() as u64;
         self.audit(
@@ -1478,6 +1569,7 @@ impl AgentOps {
         sql: &str,
         identity: &Identity,
         write: bool,
+        controls: QueryControls,
         planned: &mut Option<QueryMeta>,
     ) -> Result<QueryResult, AgentError> {
         record_query(&info.name, if write { "write" } else { "read" });
@@ -1495,6 +1587,12 @@ impl AgentOps {
         loc.extensions = info.extensions.clone();
         loc.lineage = info.lineage;
         let (op_id, token) = self.inflight.register(Some(pond_id.clone()));
+        // Armed BEFORE the engine call and dropped after it. The guard owns the
+        // watcher task, so a query that finishes on time leaves nothing behind
+        // — and because Drop also fires the abort token, a caller that hangs up
+        // mid-await takes its detached engine call down with it rather than
+        // leaving one running with no deadline at all.
+        let deadline = Deadline::arm(&token, self.config.timeouts, &controls);
 
         let engine = self.engine.clone();
         let loc2 = loc.clone();
@@ -1528,7 +1626,11 @@ impl AgentOps {
         let mut qr = match result {
             Ok(qr) => qr,
             Err(e) => {
-                let ae = AgentError::from(e);
+                // Through the deadline, never `AgentError::from` directly: the
+                // engine reports our expiry and somebody's cancel as the SAME
+                // `Cancelled` (both are one `INTERRUPT`), and this is the only
+                // place that knows which of the two happened.
+                let ae = deadline.classify(e);
                 record_error(&info.name, &ae);
                 return Err(ae);
             }
@@ -1548,6 +1650,11 @@ impl AgentOps {
         // untouched further up, so a relayed meta keeps the owner's name and
         // never acquires the greeter's.
         qr.meta.served_by = self.serving_name().to_string();
+        // Stamped on the LOCAL path for the same reason as `served_by`: the node
+        // that RAN the statement is the one whose policy applied. Reporting it
+        // on every success is what makes a clamp visible — an agent that asked
+        // for 30 minutes on a node capped at 5 can see it got 5.
+        qr.meta.timeout_ms = deadline.effective_ms();
         Ok(qr)
     }
 

@@ -85,7 +85,12 @@ message DropPondResponse { }
 message MaterializePondRequest { string pond = 1; }
 message MaterializePondResponse { }
 message DescribePondRequest { string pond = 1; }
-message QueryRequest { string pond = 1; string sql = 2; }
+// `timeout_ms` is how long the caller is willing to let the statement run.
+// Unset (proto3 zero) means the node's default. A value ABOVE the node's
+// maximum is CLAMPED, never refused — the query runs at the ceiling — and the
+// response's `_meta.timeout_ms` reports what was actually applied, so a clamp
+// is never silent. Ignored by ExplainQuery, which does not execute.
+message QueryRequest { string pond = 1; string sql = 2; uint64 timeout_ms = 3; }
 
 // Carries a serialized JSON object: for queries `{columns, rows, statement,
 // status, _meta}`; for describe `{pond, schema}`.

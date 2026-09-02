@@ -92,9 +92,14 @@ impl StreamSvc for StreamService {
         // happens before we return — and so does any forward — so the trace id
         // must be ambient here; the batch encoding runs after, untraced.
         let read = crate::data_service::traced("read_arrow", tid, tok, async move {
-            ops.read_arrow(&id, &r.pond, &r.sql)
-                .await
-                .map_err(to_status)
+            ops.read_arrow_with(
+                &id,
+                &r.pond,
+                &r.sql,
+                crate::data_service::controls_of(r.timeout_ms),
+            )
+            .await
+            .map_err(to_status)
         })
         .await?;
         let (tx, rx) = mpsc::channel::<Result<ArrowChunk, Status>>(4);

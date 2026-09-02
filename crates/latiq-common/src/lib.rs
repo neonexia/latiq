@@ -21,6 +21,8 @@ pub mod error;
 pub use error::{ErrorEnvelope, ErrorKind, Location};
 pub mod meta;
 pub use meta::{DatasetField, DatasetRef, QueryMeta, Warning, WarningKind};
+pub mod timeout;
+pub use timeout::{QueryTimeouts, DEFAULT_QUERY_TIMEOUT_MS, MAX_QUERY_TIMEOUT_MS};
 pub mod tier;
 pub use tier::{PondTier, ResourceLimits};
 pub mod catalog;

@@ -200,7 +200,13 @@ Your read returned more rows than the inline cap (~10k). Narrow with WHERE/LIMIT
         name: "Troubleshooting: timeouts",
         desc: "Break up slow queries",
         body: "# Query timeout\n\n\
-The query exceeded the deployment's timeout. Call explain_query to find the heavy operation, add a WHERE on a selective column, reduce the scan, or pre-aggregate, then retry.",
+Your statement ran past the timeout in effect for it and was stopped. The error names two numbers: the timeout that was APPLIED, and the maximum this node allows.\n\n\
+**How the timeout is decided.** `read_query` and `write_query` take an optional `timeout_ms`. Omit it and the node's default applies. Ask for more than the node's maximum and you are CLAMPED to that maximum — the query still runs, it is never refused — so read `_meta.timeout_ms` on every successful result to see what was actually in effect.\n\n\
+**Three levers, in order of cost:**\n\
+1. **Retry with a larger `timeout_ms`**, up to the node's maximum. Cheapest when the work is genuinely large and you simply under-asked.\n\
+2. **Narrow the query** — a WHERE on a selective column, a LIMIT, fewer columns, or aggregate server-side (GROUP BY/count/sum) instead of scanning. Call explain_query first to find the heavy operation.\n\
+3. **If it already timed out AT the maximum**, a larger `timeout_ms` is not available: the work is too large for this pond's tier. Ask an operator to re-tier the pond.\n\n\
+`query_timeout` and `query_cancelled` are different: the first is the node's deadline, the second is somebody asking for the query to stop. Only the first is fixed by asking for more time.",
     },
     Res {
         uri: "latiq://troubleshooting/conflicts",

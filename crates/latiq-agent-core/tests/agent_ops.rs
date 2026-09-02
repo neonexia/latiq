@@ -133,6 +133,7 @@ impl latiq_agent_core::Forwarder for NeverForwards {
         _: &Identity,
         _: &str,
         _: &str,
+        _: Option<u64>,
     ) -> Result<latiq_engine::QueryResult, latiq_agent_core::AgentError> {
         panic!("nothing may be forwarded; dialled {e}")
     }
@@ -142,6 +143,7 @@ impl latiq_agent_core::Forwarder for NeverForwards {
         _: &Identity,
         _: &str,
         _: &str,
+        _: Option<u64>,
     ) -> Result<latiq_agent_core::ArrowReadStream, latiq_agent_core::AgentError> {
         panic!("nothing may be forwarded; dialled {e}")
     }
@@ -151,6 +153,7 @@ impl latiq_agent_core::Forwarder for NeverForwards {
         _: &Identity,
         _: &str,
         _: &str,
+        _: Option<u64>,
     ) -> Result<latiq_engine::QueryResult, latiq_agent_core::AgentError> {
         panic!("nothing may be forwarded; dialled {e}")
     }
@@ -783,6 +786,10 @@ mod forwarding {
         last_endpoint: Mutex<String>,
         last_pond: Mutex<String>,
         last_sql: Mutex<String>,
+        /// What the greeter node relayed as the caller's requested timeout. It
+        /// must be the CALLER's ask, unresolved — the owner runs the query, so
+        /// the owner's default and ceiling are the ones that apply.
+        last_timeout_ms: Mutex<Option<u64>>,
     }
 
     impl RecordingForwarder {
@@ -812,9 +819,11 @@ mod forwarding {
             _: &Identity,
             p: &str,
             s: &str,
+            timeout_ms: Option<u64>,
         ) -> Result<QueryResult, AgentError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.note(e, p, s);
+            *self.last_timeout_ms.lock().unwrap() = timeout_ms;
             Ok(sentinel("forwarded_read"))
         }
         async fn write(
@@ -823,9 +832,11 @@ mod forwarding {
             _: &Identity,
             p: &str,
             s: &str,
+            timeout_ms: Option<u64>,
         ) -> Result<QueryResult, AgentError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             self.note(e, p, s);
+            *self.last_timeout_ms.lock().unwrap() = timeout_ms;
             Ok(sentinel("forwarded_write"))
         }
         async fn read_arrow(
@@ -834,9 +845,11 @@ mod forwarding {
             _: &Identity,
             p: &str,
             s: &str,
+            timeout_ms: Option<u64>,
         ) -> Result<ArrowReadStream, AgentError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.note(e, p, s);
+            *self.last_timeout_ms.lock().unwrap() = timeout_ms;
             Ok(ArrowReadStream::new(
                 std::sync::Arc::new(arrow::datatypes::Schema::empty()),
                 Box::pin(tokio_stream::iter(Vec::new())),
@@ -1258,6 +1271,53 @@ mod forwarding {
         assert_eq!(*fwd.last_sql.lock().unwrap(), "SELECT 1");
         // The sentinel proves the result came from the forwarder, not a local run.
         assert_eq!(r.columns, vec!["forwarded_read".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_forwarding_relays_the_callers_requested_timeout_unresolved() {
+        // The OWNER runs the statement, so the owner's default and the owner's
+        // ceiling are the ones that must apply — and the owner reports what it
+        // applied in the meta it sends back. A greeter that resolved the
+        // timeout here would impose its own policy on the node carrying the
+        // risk, and a greeter that dropped it would silently ignore the caller.
+        let fwd = Arc::new(RecordingForwarder::default());
+        let ops = ops_with(
+            owned_by("owner-node", "http://owner:9092"),
+            ("greeter-node", "http://greeter:9092"),
+            fwd.clone(),
+        );
+        let id = Identity::claimed(Some("a"));
+
+        // Deliberately ABOVE this greeter's own maximum: the value on the wire
+        // must still be the caller's ask, not the greeter's clamp of it.
+        ops.read_query_with(
+            &id,
+            "pond-x",
+            "SELECT 1",
+            latiq_agent_core::QueryControls::timeout(Some(1_800_000)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *fwd.last_timeout_ms.lock().unwrap(),
+            Some(1_800_000),
+            "the caller's ask crosses the hop unresolved"
+        );
+
+        ops.write_query_with(
+            &id,
+            "pond-x",
+            "INSERT INTO t VALUES (1)",
+            latiq_agent_core::QueryControls::timeout(Some(1_234)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*fwd.last_timeout_ms.lock().unwrap(), Some(1_234));
+
+        // And a caller that asked for nothing relays nothing, so the owner
+        // applies ITS default rather than a number this node invented.
+        ops.read_query(&id, "pond-x", "SELECT 1").await.unwrap();
+        assert_eq!(*fwd.last_timeout_ms.lock().unwrap(), None);
     }
 
     #[tokio::test]
@@ -3391,6 +3451,152 @@ mod lineage {
         assert_eq!(
             posted, stored,
             "and post it verbatim, exactly as `submit` would have"
+        );
+    }
+}
+
+/// Query timeouts and cancellation over the REAL engine, at the layer where the
+/// resulting `ErrorKind` is directly observable.
+///
+/// The MCP surface cannot answer this question: a conforming MCP client
+/// resolves its own request the moment it sends `notifications/cancelled` and
+/// discards the server's eventual response (rmcp does exactly that), so the
+/// envelope a cancel produces is not observable from a client. The transport
+/// wiring is proven full-stack in `crates/latiq/tests/mcp.rs`; the meaning of
+/// the two outcomes is proven here.
+mod timeouts {
+    use super::*;
+    use latiq_agent_core::QueryControls;
+    use latiq_common::{ErrorKind, QueryTimeouts};
+    use latiq_engine::AbortToken;
+    use std::time::Duration;
+
+    /// Cheap to submit, effectively unbounded to run — and it streams, so the
+    /// interrupt lands inside it. No table to build, so no data size decides
+    /// whether this test is flaky.
+    const SLOW_SQL: &str = "SELECT count(*) FROM range(0, 100000000000) t(i) WHERE i % 999983 = 0";
+
+    fn ops_with(timeouts: QueryTimeouts) -> AgentOps {
+        let registry = Registry::open(None).unwrap();
+        registry
+            .register_node(
+                "node-a",
+                "http://127.0.0.1:8080/mcp",
+                "http://127.0.0.1:9092",
+                100,
+            )
+            .unwrap();
+        AgentOps::new(
+            Arc::new(RegistryControlPlane::new(registry)),
+            Arc::new(TempFs::new()),
+            Arc::new(DuckEngine::new()),
+            AgentConfig {
+                timeouts,
+                ..AgentConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_deadline_and_a_caller_cancel_produce_different_kinds() {
+        // A long default so nothing expires by accident; each half arranges its
+        // own stop.
+        let ops = ops_with(QueryTimeouts::new(60_000, 60_000).unwrap());
+        let id = Identity::claimed(Some("agent-x"));
+        let pond = ops
+            .allocate_pond(&id, Some("kinds".into()), "{}", "medium", &[], false)
+            .await
+            .unwrap();
+
+        // (1) The deadline fires. The engine reports this as the same
+        // `INTERRUPT` a cancel produces, so anything less than a timeout kind
+        // here means the two were confused.
+        let e = ops
+            .read_collected_with(
+                &id,
+                &pond.pond_id,
+                SLOW_SQL,
+                QueryControls::timeout(Some(400)),
+            )
+            .await
+            .expect_err("400 ms is not enough for 1e11 rows");
+        let env = e.envelope();
+        assert_eq!(env.kind, ErrorKind::QueryTimeout, "{}", env.message);
+        assert!(
+            env.message.contains("400 ms") && env.message.contains("60000 ms"),
+            "the applied timeout AND the ceiling: {}",
+            env.message
+        );
+
+        // (2) The caller cancels. Same interrupt underneath, different meaning.
+        let ct = AbortToken::new();
+        let cancel = ct.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            cancel.cancel();
+        });
+        let e = ops
+            .read_collected_with(
+                &id,
+                &pond.pond_id,
+                SLOW_SQL,
+                QueryControls::none().with_cancel(ct),
+            )
+            .await
+            .expect_err("a cancelled query does not return rows");
+        assert_eq!(
+            e.envelope().kind,
+            ErrorKind::QueryCancelled,
+            "nobody's deadline fired — reporting a timeout here would send the agent \
+             chasing a bigger timeout_ms for a query it stopped itself: {}",
+            e.envelope().message
+        );
+
+        // Neither stop wedged the pond: a wedged pooled connection is the real
+        // damage an interrupt can do, and it is invisible until the next query.
+        let ok = ops
+            .read_collected(&id, &pond.pond_id, "SELECT 41 + 1 AS v")
+            .await
+            .expect("the pond must still be readable after a timeout and a cancel");
+        assert_eq!(ok.rows[0][0], serde_json::json!(42));
+    }
+
+    #[tokio::test]
+    async fn cancellation_a_cancelled_write_leaves_the_pond_writable() {
+        // The write path is where an interrupt is most dangerous: it is cut
+        // inside Latiq's own transaction, and the ROLLBACK runs on a connection
+        // that was just interrupted.
+        let ops = ops_with(QueryTimeouts::new(60_000, 60_000).unwrap());
+        let id = Identity::claimed(Some("agent-w"));
+        let pond = ops
+            .allocate_pond(&id, Some("cw".into()), "{}", "medium", &[], false)
+            .await
+            .unwrap();
+
+        let ct = AbortToken::new();
+        let cancel = ct.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            cancel.cancel();
+        });
+        let e = ops
+            .write_query_with(
+                &id,
+                &pond.pond_id,
+                "CREATE TABLE t AS SELECT i FROM range(0, 100000000000) t(i) WHERE i % 999983 = 0",
+                QueryControls::none().with_cancel(ct),
+            )
+            .await
+            .expect_err("the write was cancelled");
+        assert_eq!(e.envelope().kind, ErrorKind::QueryCancelled);
+
+        let ok = ops
+            .write_query(&id, &pond.pond_id, "CREATE TABLE fine AS SELECT 1 AS a")
+            .await
+            .expect("the pond's writer must survive a cancelled write");
+        assert_eq!(
+            ok.meta.timeout_ms, 60_000,
+            "every local execution reports the timeout that was in effect"
         );
     }
 }
