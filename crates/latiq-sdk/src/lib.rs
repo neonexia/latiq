@@ -268,6 +268,11 @@ impl Latiq {
 
     /// Allocate a pond and return a handle. `description` is agent-discovery text.
     ///
+    /// **Eager**: this returns only once the pond's storage exists on the node
+    /// the control plane placed it on. If that node is unreachable the call
+    /// fails, the assignment is rolled back, and the same name is free to try
+    /// again — you never get a handle to a pond that does not exist.
+    ///
     /// `lineage` records OpenLineage provenance for every query (written as JSONL
     /// into the pond's own `lineage/` directory on its node; agents read it with
     /// the `get_lineage` MCP tool). The choice is made here and is **fixed for the

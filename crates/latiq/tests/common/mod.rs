@@ -117,6 +117,24 @@ async fn wait_connectable(endpoint: &str) {
     panic!("endpoint never became connectable: {endpoint}");
 }
 
+/// The Control service exactly as `serve_control_plane` builds it: WITH the
+/// outbound materializer, and replaying the caller's bearer token iff this
+/// control plane is authenticated.
+///
+/// The harness must not diverge from the real wiring here. A control plane
+/// without a materializer silently reverts every create path to lazy
+/// allocation, and the whole eager-allocation suite would go green while
+/// proving nothing.
+fn control_service(registry: Registry, replay_bearer: bool) -> ControlService {
+    ControlService::new(
+        registry,
+        Some(std::sync::Arc::new(
+            latiq_control_plane::node_client::GrpcNodeMaterializer::new(),
+        )),
+    )
+    .replaying_bearer(replay_bearer)
+}
+
 /// Start the control plane (Control + Admin gRPC) and return its endpoints.
 async fn start_control_plane() -> (String, String) {
     start_control_plane_with_auth(None).await
@@ -141,9 +159,10 @@ pub async fn start_control_plane_with_auth(
         .map(|_| format!("http://127.0.0.1:{admin_port}/.well-known/oauth-protected-resource"));
 
     let r1 = registry.clone();
+    let replay = verifier.is_some();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(ControlServer::new(ControlService::new(r1)))
+            .add_service(ControlServer::new(control_service(r1, replay)))
             .serve_with_incoming(TcpListenerStream::new(control_l))
             .await
             .unwrap();
@@ -180,9 +199,10 @@ pub async fn start_control_plane_one_port(auth: Option<latiq_auth::AuthConfig>) 
         .map(|_| format!("http://127.0.0.1:{port}/.well-known/oauth-protected-resource"));
 
     let r1 = registry.clone();
+    let replay = verifier.is_some();
     tokio::spawn(async move {
         Server::builder()
-            .add_service(ControlServer::new(ControlService::new(r1)))
+            .add_service(ControlServer::new(control_service(r1, replay)))
             .add_service(AdminServer::new(
                 AdminService::new(registry)
                     .with_verifier(verifier)
@@ -420,7 +440,13 @@ pub async fn start_stack() -> TestStack {
 /// require a verified bearer token. `start_stack` stays auth-free so every
 /// pre-existing test keeps exercising the relaxed path.
 pub async fn start_stack_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
-    let (control_endpoint, admin_endpoint) = start_control_plane().await;
+    // The control plane is authenticated too, because a real one is: it is what
+    // calls the node's `MaterializePond` to create a pond, and only an
+    // authenticated control plane replays the caller's token on that hop. A
+    // relaxed control plane here would make every allocation on this stack fail
+    // at the node with `Unauthenticated`.
+    let (control_endpoint, admin_endpoint) =
+        start_control_plane_with_auth(Some(auth.clone())).await;
     let node = start_node_with_auth("node-test", &control_endpoint, Some(auth)).await;
     TestStack {
         data_endpoint: node.data_endpoint.clone(),
@@ -454,7 +480,9 @@ pub async fn start_stack_one_port_with_auth(auth: latiq_auth::AuthConfig) -> Tes
 /// `n` pond nodes, all requiring the same verified bearer token — the shape a
 /// real cluster has, and what makes the forward hop's own auth testable.
 pub async fn start_stack_n_with_auth(n: usize, auth: latiq_auth::AuthConfig) -> MultiStack {
-    let (control_endpoint, admin_endpoint) = start_control_plane().await;
+    // Authenticated control plane: see `start_stack_with_auth`.
+    let (control_endpoint, admin_endpoint) =
+        start_control_plane_with_auth(Some(auth.clone())).await;
     let mut nodes = Vec::with_capacity(n);
     for i in 0..n {
         nodes.push(

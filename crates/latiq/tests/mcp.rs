@@ -471,7 +471,10 @@ async fn auth_mcp_unauthenticated_node_does_not_replay_a_client_token() {
     // token, so if the greeter had forwarded the (perfectly valid) header this
     // write would succeed. It must not.
     let idp = latiq_auth::test_support::TestIdp::start().await;
-    let (control, _admin) = common::start_control_plane_only().await;
+    // The control plane is authenticated because the cluster is: it materialises
+    // the pond on the owner when `allocate_pond` below runs, and only an
+    // authenticated control plane replays the caller's token on that hop.
+    let (control, _admin) = common::start_control_plane_with_auth(Some(idp.auth_config())).await;
     let owner = common::add_node("owner", &control, Some(idp.auth_config())).await;
     let token = idp.mint("svc-dave", "latiq", &idp.issuer, 300);
 
@@ -568,7 +571,9 @@ async fn mcp_cross_node_write_forwards_the_bearer_on_an_auth_enabled_cluster() {
     // opposite (the hop failing closed with "a bearer token is required")
     // because MCP had no verifier and scoped no token; it now pins the fix.
     let idp = latiq_auth::test_support::TestIdp::start().await;
-    let (control, _admin) = common::start_control_plane_only().await;
+    // Authenticated control plane: it is what materialises the pond on the owner
+    // (and the only thing that replays the caller's token on that hop).
+    let (control, _admin) = common::start_control_plane_with_auth(Some(idp.auth_config())).await;
 
     // Owner first, alone, so it certainly owns `mcpfwd` (placement is random).
     let owner = common::add_node("owner", &control, Some(idp.auth_config())).await;

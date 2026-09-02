@@ -14,21 +14,112 @@
 
 //! Control gRPC service (pond-nodes call this).
 use crate::error::{to_status, ControlPlaneError};
+use crate::node_client::{CallerAuth, NodeMaterializer};
 use crate::registry::Registry;
 use latiq_proto::v1::control_server::Control;
 use latiq_proto::v1::*;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 /// The internal node-facing surface: registration, heartbeats, and the routing
 /// and registry lookups a node needs to serve a pond. Not an external surface —
 /// no CLI, SDK or agent calls this.
+///
+/// It is also where **every** pond in the system is created — `AgentOps::
+/// allocate_pond` (agents over MCP, clients over Data gRPC) and the direct
+/// `CreatePondAssignment` calls from `latiq pond create` and the SDK all land on
+/// `create_pond_assignment`. That is why materialisation lives here: one
+/// implementation of "a create that returns success means a pond that can accept
+/// data", rather than four that drift.
 pub struct ControlService {
     pub registry: Registry,
+    /// How this control plane reaches a pond node to materialise a pond it just
+    /// placed. `None` = the pre-eager behaviour (write the row, let the owner's
+    /// lazy `ensure_pond` catch up), which is a **test-only** configuration:
+    /// every production entry point (`serve_control_plane`, `serve_control`)
+    /// passes one.
+    materializer: Option<Arc<dyn NodeMaterializer>>,
+    /// Replay the caller's `authorization` header onto the node hop.
+    ///
+    /// Gated exactly like the node-to-node forwarder's: only a control plane
+    /// that was configured with an issuer replays a bearer token. An
+    /// unauthenticated control plane must not capture whatever `authorization`
+    /// header a client happens to send (one meant for an upstream gateway, say)
+    /// and present it on an internal channel.
+    replay_bearer: bool,
 }
 
 impl ControlService {
-    pub fn new(registry: Registry) -> Self {
-        Self { registry }
+    /// `materializer` is a required argument rather than a builder step on
+    /// purpose: forgetting to wire it does not fail, it silently reverts every
+    /// create path to lazy allocation, which is invisible until a pond is
+    /// created on a node that is down. A caller has to write `None` and mean it.
+    pub fn new(registry: Registry, materializer: Option<Arc<dyn NodeMaterializer>>) -> Self {
+        Self {
+            registry,
+            materializer,
+            replay_bearer: false,
+        }
+    }
+
+    /// Whether this control plane replays the caller's bearer token on the node
+    /// hop — true iff it was configured with an issuer.
+    pub fn replaying_bearer(mut self, yes: bool) -> Self {
+        self.replay_bearer = yes;
+        self
+    }
+
+    /// The identity the node hop carries. Both halves are the caller's own; the
+    /// control plane asserts nothing of its own here.
+    fn caller_auth<T>(&self, req: &Request<T>, owner_identity: &str) -> CallerAuth {
+        let md = req.metadata();
+        let header = |k: &str| md.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+        CallerAuth {
+            // The header when the caller sent one (agents, the Data surface, a
+            // node forwarding on someone's behalf); otherwise the identity the
+            // create names as the pond's owner, which is the same string the
+            // CLI/SDK put in `--agent-id`.
+            agent_id: header("latiq-agent-id")
+                .or_else(|| Some(owner_identity.to_string()).filter(|s| !s.is_empty())),
+            bearer: if self.replay_bearer {
+                header("authorization")
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Give the registry row back after the owner could not materialise the
+    /// pond, and turn that into the error the caller sees.
+    ///
+    /// Compensation can itself fail — the row was deleted underneath us, or the
+    /// registry is unwell — which leaves an ORPHAN: a pond name that resolves
+    /// with no storage anywhere. That state is what `latiq pond forget` exists
+    /// for, so it is said out loud in both directions: an `error!` an operator
+    /// can grep for with the pond id in it, and a different `suggest` for the
+    /// caller, who must not be told to retry a name that may still be taken.
+    fn compensate(&self, pond_id: &str, name: &str, owner: &str, cause: String) -> Status {
+        let compensated = match self.registry.drop_pond(pond_id) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(
+                    pond = %pond_id,
+                    name = %name,
+                    owner = %owner,
+                    cause = %cause,
+                    error = %e,
+                    "ORPHANED REGISTRY ROW: this pond could not be materialised and its \
+                     assignment could not be rolled back; remove it with `latiq pond forget`"
+                );
+                false
+            }
+        };
+        to_status(ControlPlaneError::AllocationNotMaterialized {
+            name: name.to_string(),
+            owner: owner.to_string(),
+            cause,
+            compensated,
+        })
     }
 }
 
@@ -61,10 +152,26 @@ impl Control for ControlService {
         Ok(Response::new(HeartbeatResponse {}))
     }
 
+    /// Create a pond: **place it, then make it real, then give the placement
+    /// back if it could not be made real.**
+    ///
+    /// The one create path in the system, and the one place eager allocation is
+    /// implemented. The control plane does not touch storage — it has no access
+    /// to a node's filesystem — it calls the owning node's idempotent
+    /// `Data.MaterializePond` and waits. That is the explicit, narrow exception
+    /// to invariant 3 (root `CLAUDE.md`): the control plane drives pond
+    /// LIFECYCLE, and is still never in the query path.
+    ///
+    /// It has to be here rather than in `AgentOps` because `AgentOps` is not on
+    /// every create path: `latiq pond create` and the SDK's `create_pond` call
+    /// this RPC directly, and while materialisation lived in the node they
+    /// stayed lazy — the two paths humans use were the two that could still
+    /// report "created" for a pond on an unreachable node.
     async fn create_pond_assignment(
         &self,
         req: Request<CreatePondAssignmentRequest>,
     ) -> Result<Response<CreatePondAssignmentResponse>, Status> {
+        let caller = self.caller_auth(&req, &req.get_ref().owner_identity);
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -76,6 +183,9 @@ impl Control for ControlService {
         } else {
             r.tier.as_str()
         };
+        // Placement first: the registry picks the owner and reserves the name,
+        // and only then is there something to materialise. Everything after this
+        // point owns the row and must not return an error without giving it back.
         let pond = self
             .registry
             .create_pond(
@@ -88,10 +198,25 @@ impl Control for ControlService {
                 r.lineage,
             )
             .map_err(to_status)?;
-        let (_pid, endpoint) = self
-            .registry
-            .get_pond_location(&pond.pond_id)
-            .map_err(to_status)?;
+        let endpoint = match self.registry.get_pond_location(&pond.pond_id) {
+            Ok((_pid, endpoint)) => endpoint,
+            // The owning node's row vanished between the placement and this
+            // read. Nothing exists anywhere, so the row goes back rather than
+            // becoming a pond name no node will ever serve.
+            Err(e) => {
+                return Err(self.compensate(
+                    &pond.pond_id,
+                    &pond.name,
+                    &pond.node_id,
+                    format!("the registry can no longer say where it was placed: {e}"),
+                ))
+            }
+        };
+        if let Some(m) = &self.materializer {
+            if let Err(cause) = m.materialize(&endpoint, &pond.pond_id, &caller).await {
+                return Err(self.compensate(&pond.pond_id, &pond.name, &endpoint, cause));
+            }
+        }
         Ok(Response::new(CreatePondAssignmentResponse {
             pond_id: pond.pond_id,
             assigned_node_endpoint: endpoint,

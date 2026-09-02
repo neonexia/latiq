@@ -1242,10 +1242,14 @@ mod cli_auth {
 /// The SDK against an auth-enabled stack: the client half of identity v0.
 ///
 /// The Rust SDK is what the Python SDK wraps, so proving the token reaches the
-/// Data/Stream surface from here covers both. The stack's pond node requires a
-/// verified bearer token; its control plane does not (pond CREATION is a pure
-/// control-plane op), which is exactly the asymmetry that makes "the query is
-/// the thing that needs the token" visible.
+/// Data/Stream surface from here covers both.
+///
+/// CHANGED with centralised pond creation: this used to assert that
+/// `create_pond` succeeds WITHOUT a token, because "pond CREATION is a pure
+/// control-plane op". It no longer is — the control plane materialises the pond
+/// on the owning node before reporting it created, and that node requires a
+/// token like every other caller. The invariant the test is really about is
+/// unchanged and now covers one more call: **no token, nothing works**.
 mod sdk_auth {
     use crate::common::{start_stack_one_port_with_auth, start_stack_with_auth};
     use arrow::array::Array;
@@ -1264,23 +1268,34 @@ mod sdk_auth {
         let token = idp.mint("svc-sdk", "latiq", &idp.issuer, 300);
         let (control, gateway) = (s.control_endpoint.clone(), s.data_endpoint.clone());
 
-        // ── no token ────────────────────────────────────────────────────
-        // The pond is allocated through the (unauthenticated) control plane, so the
-        // first thing that touches the node is the query — and it is refused.
+        // ── no token: even CREATE is refused now ────────────────────────
+        // Creation reaches the pond node (the control plane materialises the
+        // pond there before reporting it created), so the token is needed from
+        // the very first call, not only from the first query.
         let (c, g) = (control.clone(), gateway.clone());
         let err = blocking(move || {
             let db = Latiq::connect_with(&c, None, Some(&g)).unwrap();
-            db.create_pond(Some("sdkauth"), "medium", "", false)
-                .unwrap();
-            db.query("sdkauth", "SELECT 1 AS n")
-                .unwrap_err()
-                .to_string()
+            match db.create_pond(Some("sdkauth"), "medium", "", false) {
+                Ok(_) => panic!("creating a pond with no token must be refused"),
+                Err(e) => e.to_string(),
+            }
         })
         .await;
         assert!(
             err.to_lowercase().contains("token"),
-            "an SDK call with no token must be refused: {err}"
+            "creating a pond with no token must be refused at the node the control \
+             plane materialises it on: {err}"
         );
+        // …and it was refused by NOT CREATING it: the name is still free, which
+        // is the compensation working end to end through the SDK.
+        let (c, g, t) = (control.clone(), gateway.clone(), token.clone());
+        blocking(move || {
+            let db = Latiq::connect_with_token(&c, None, Some(&g), Some(&t)).unwrap();
+            db.create_pond(Some("sdkauth"), "medium", "", false)
+                .map(|p| p.id().to_string())
+                .expect("the rolled-back attempt must leave the name free")
+        })
+        .await;
 
         // ── explicit token ──────────────────────────────────────────────
         let (c, g, t) = (control.clone(), gateway.clone(), token.clone());

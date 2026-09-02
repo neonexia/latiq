@@ -33,6 +33,20 @@ fn embedded_handle_lifecycle_and_arrow_query() {
     assert_eq!(work.name(), "work");
     assert!(!work.id().is_empty());
     assert_eq!(work.description(), "round-trip test");
+    // …and it is EAGER: the pond's storage is on disk the moment `create_pond`
+    // returns, not on the first query. The embedded stack is a real control
+    // plane plus a real node over loopback, so this is the same mechanism a
+    // cluster uses — the control plane materialises the pond on the node it
+    // placed it on. This is the `pip install latiq` half of that guarantee; the
+    // clustered half is `crates/latiq/tests/forwarding.rs::eager_allocation`.
+    assert!(
+        dir.path().join("ponds").join(work.id()).exists(),
+        "the embedded node must hold the pond's storage before the first query: {:?}",
+        std::fs::read_dir(dir.path().join("ponds")).map(|d| d
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>())
+    );
     // list_ponds is a map keyed by name.
     assert!(db.list_ponds().unwrap().contains_key("work"));
 
