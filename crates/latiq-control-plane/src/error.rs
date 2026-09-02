@@ -39,6 +39,17 @@ pub enum ControlPlaneError {
     /// wants `pond drop`, which deletes the data instead of orphaning it.
     #[error("pond '{pond}' is still owned by active node {node_id}")]
     PondStillOwned { pond: String, node_id: String },
+    /// A pond was placed on a node that could not materialise its storage, so
+    /// **there is no pond**. `compensated` says whether the registry row was
+    /// successfully given back — the whole difference between "retry freely" and
+    /// "an operator has work to do".
+    #[error("pond '{name}' could not be materialized on {owner}: {cause}")]
+    AllocationNotMaterialized {
+        name: String,
+        owner: String,
+        cause: String,
+        compensated: bool,
+    },
     #[error("invalid request: {0}")]
     Invalid(String),
     #[error("storage error: {0}")]
@@ -97,6 +108,51 @@ impl ControlPlaneError {
                  the owning node. `pond forget` is only for a pond whose node is gone.",
                 "latiq://guidance",
             ),
+            // Same `PondUnavailable` kind as the stranded-pond refusal, and for
+            // the same underlying reason (the node that should hold this pond's
+            // files cannot be reached) — but with its own message and `suggest`,
+            // because the kind's default advice is `pond forget`, which is wrong
+            // here: the registry row is normally already gone and the caller's
+            // next move is to retry, not to fetch an operator.
+            //
+            // `compensated` is stated in the MESSAGE rather than left for the
+            // reader to infer, because a retrying caller has to know whether the
+            // failed attempt left a row behind holding its name.
+            ControlPlaneError::AllocationNotMaterialized {
+                name,
+                owner,
+                cause,
+                compensated: true,
+            } => ErrorEnvelope::new(
+                ErrorKind::PondUnavailable,
+                format!(
+                    "Pond '{name}' was NOT created: the node it was assigned to ({owner}) could \
+                     not materialise its storage ({cause}). The assignment has been rolled back, \
+                     so the name is free and nothing was left behind."
+                ),
+                "Retry allocate_pond (or `latiq pond create`) — the failed attempt left nothing \
+                 behind, so the same name is free. If it keeps failing, that node is down: report \
+                 it to your operator.",
+                ErrorKind::PondUnavailable.default_see(),
+            ),
+            ControlPlaneError::AllocationNotMaterialized {
+                name,
+                owner,
+                cause,
+                compensated: false,
+            } => ErrorEnvelope::new(
+                ErrorKind::PondUnavailable,
+                format!(
+                    "Pond '{name}' was NOT created: the node it was assigned to ({owner}) could \
+                     not materialise its storage ({cause}), AND the assignment could not be \
+                     rolled back — a registry row named '{name}' may still exist with no storage \
+                     behind it."
+                ),
+                "Retry under a DIFFERENT name; the original may still be taken. Ask an operator \
+                 to remove the stranded record with `latiq pond forget <pond> --confirm` (it \
+                 deletes the registry row only, never data).",
+                ErrorKind::PondUnavailable.default_see(),
+            ),
             ControlPlaneError::Invalid(m) => {
                 ErrorEnvelope::for_kind(ErrorKind::InvalidValue, m.clone())
             }
@@ -115,9 +171,12 @@ impl ControlPlaneError {
             | ControlPlaneError::DatasetNotFound(_)
             | ControlPlaneError::CatalogNotFound(_)
             | ControlPlaneError::NodeNotFound(_) => Code::NotFound,
-            ControlPlaneError::NoNodeAvailable(_) | ControlPlaneError::PondStillOwned { .. } => {
-                Code::FailedPrecondition
-            }
+            // The request was well-formed and the placement was fine; the
+            // CLUSTER could not carry it out. Same code the Data surface gives
+            // `PondUnavailable`, so a client branches on one thing across both.
+            ControlPlaneError::NoNodeAvailable(_)
+            | ControlPlaneError::PondStillOwned { .. }
+            | ControlPlaneError::AllocationNotMaterialized { .. } => Code::FailedPrecondition,
             ControlPlaneError::Invalid(_) => Code::InvalidArgument,
             ControlPlaneError::Storage(_) => Code::Internal,
         }

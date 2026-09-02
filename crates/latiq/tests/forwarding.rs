@@ -435,7 +435,13 @@ async fn hop_pair(
     greeter_auth: Option<latiq_auth::AuthConfig>,
     alloc_token: Option<&str>,
 ) -> HopPair {
-    let (control, _admin) = common::start_control_plane_only().await;
+    // The control plane is authenticated whenever the cluster is: it is what
+    // calls the owner's `MaterializePond` when the pond below is allocated, and
+    // only an authenticated control plane replays the caller's token on that
+    // hop. A relaxed one here would fail the allocation and every test using
+    // this fixture would fail for a reason that has nothing to do with the hop
+    // it is about.
+    let (control, _admin) = common::start_control_plane_with_auth(owner_auth.clone()).await;
     let owner = common::add_node("owner", &control, owner_auth).await;
     let mut oc = client(&owner.data_endpoint).await;
     let msg = AllocatePondRequest {
@@ -905,17 +911,133 @@ mod eager_allocation {
         assert!(owner.holds_pond(&pond_id), "and the pond is still there");
     }
 
+    /// `Control::CreatePondAssignment` verbatim — the call `latiq pond create`
+    /// (`crates/latiq/src/main.rs`) and the SDK's `create_pond`
+    /// (`crates/latiq-sdk/src/lib.rs`) make, with no `AgentOps` anywhere in the
+    /// path. These two are the reason this change exists: eager allocation
+    /// shipped in the NODE, so the two create paths humans actually use went
+    /// straight to the control plane and stayed lazy.
+    // `Err` is tonic's `Status`, whose size the RPC surface fixes for us — the
+    // lint's suggestion (box it) would mean unboxing at every call site here.
+    #[allow(clippy::result_large_err)]
+    async fn create_pond_assignment(
+        control_endpoint: &str,
+        name: &str,
+    ) -> Result<String, tonic::Status> {
+        let mut ctl = ControlClient::connect(control_endpoint.to_string())
+            .await
+            .unwrap();
+        ctl.create_pond_assignment(CreatePondAssignmentRequest {
+            name: name.into(),
+            owner_identity: "alice".into(),
+            policy_json: "{}".into(),
+            tier: "medium".into(),
+            extensions: vec![],
+            description: String::new(),
+            lineage: false,
+        })
+        .await
+        .map(|r| r.into_inner().pond_id)
+    }
+
+    #[tokio::test]
+    async fn pond_lifecycle_cli_and_sdk_create_is_eager_on_a_single_node_stack() {
+        // Two claims in one, both of which used to be false.
+        //
+        // (1) `latiq pond create` / SDK `create_pond` is now EAGER: the pond's
+        //     storage is on the node when the call returns, not on some later
+        //     query. Nothing about `AgentOps` is involved.
+        // (2) A single-node stack — `./dev.sh`, `pip install latiq` — still
+        //     works, which is the configuration everything else here is not.
+        let stack = start_stack_n(1).await;
+        let node = &stack.nodes[0];
+
+        let pond_id = create_pond_assignment(&stack.control_endpoint, "clicreate")
+            .await
+            .expect("create succeeds");
+        assert!(
+            node.holds_pond(&pond_id),
+            "the node must hold the pond's storage the moment `pond create` returns"
+        );
+
+        // And it is a real pond, not just a directory: the first query is an
+        // ordinary query rather than the thing that discovers the pond.
+        let mut c = client(&node.data_endpoint).await;
+        c.write_query(req(
+            q("clicreate", "CREATE TABLE t AS SELECT 1 AS v"),
+            "alice",
+        ))
+        .await
+        .expect("the pond accepts data immediately");
+    }
+
+    #[tokio::test]
+    async fn pond_lifecycle_cli_and_sdk_create_fails_and_frees_the_name_when_the_owner_is_down() {
+        // The failure the CLI/SDK path could not previously report: it returned
+        // a pond id for a node nobody could reach. It must now fail, must say
+        // the pond was not created, and must leave the name free — proven by
+        // reusing it, not by trusting the message.
+        let (control, _admin) = start_control_plane_only().await;
+        let ghost = register_ghost_node(&control, "gone").await;
+
+        let status = create_pond_assignment(&control, "clidoomed")
+            .await
+            .expect_err("a pond nobody could create must not be reported as created");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let env = envelope(&status);
+        assert_eq!(
+            env.kind,
+            latiq_common::ErrorKind::PondUnavailable,
+            "{}",
+            env.message
+        );
+        assert!(
+            env.message.contains("was NOT created") && env.message.contains("rolled back"),
+            "{}",
+            env.message
+        );
+        assert!(
+            env.message.contains(&ghost.internal_endpoint),
+            "and which node could not be reached: {}",
+            env.message
+        );
+        assert!(
+            !pond_names(&control)
+                .await
+                .contains(&"clidoomed".to_string()),
+            "the registry row must be gone: {:?}",
+            pond_names(&control).await
+        );
+
+        // The node comes back at the address the registry already published, and
+        // the SAME name is usable — the assertion the registry check alone
+        // cannot make.
+        let owner = ghost.revive(&control).await;
+        let pond_id = create_pond_assignment(&control, "clidoomed")
+            .await
+            .expect("the same name must be free again");
+        assert!(
+            owner.holds_pond(&pond_id),
+            "and the retry really materialised, on the node that is back"
+        );
+    }
+
     #[tokio::test]
     async fn auth_allocation_replays_the_callers_token_to_the_owner() {
-        // The hop eager allocation added is an AUTHENTICATED hop. The
-        // `allocate_pond` handler used to be the one handler outside `traced`,
-        // documented as safe precisely because allocation never forwarded; now
-        // it does, and without that scope the forwarder has no token to replay,
-        // so the owner refuses and every allocation placed on a peer fails with
-        // `Unauthenticated` — in authenticated deployments only, which is the
-        // worst place for a regression to hide.
+        // The hop eager allocation added is an AUTHENTICATED hop, and it is now
+        // TWO hops: greeter → control plane → owner. The caller's own token has
+        // to survive both, because the owner verifies it on its own authority
+        // before it will materialise anything.
+        //
+        // Two links break this independently and only under auth — the worst
+        // place for a regression to hide. `GrpcControlPlane::create_pond` must
+        // put the ambient bearer on the Control call (it is the only Control RPC
+        // that does), and the control plane must replay it onto the node hop.
+        // Drop either and every allocation in an authenticated deployment fails
+        // with `Unauthenticated` while the unauthenticated one stays green.
         let idp = latiq_auth::test_support::TestIdp::start().await;
-        let (control, _admin) = start_control_plane_only().await;
+        let (control, _admin) =
+            common::start_control_plane_with_auth(Some(idp.auth_config())).await;
         let owner = add_node("owner", &control, Some(idp.auth_config())).await;
         let greeter =
             common::add_greeter_node_with_auth("greeter", &control, idp.auth_config()).await;

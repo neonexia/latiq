@@ -111,14 +111,13 @@ async fn pond_lifecycle_forget_turns_an_unservable_pond_into_a_missing_one() {
          advice: {}",
         after.envelope().message
     );
-    // The name is free again, which is the operator-visible point of forgetting.
-    ops.allocate_pond(&id, Some("stranded".into()), "{}", "medium", &[], false)
-        .await
-        .expect_err("this node cannot host it either, but the NAME was released");
-    assert!(
-        registry.list_ponds().unwrap().is_empty(),
-        "and the compensated allocation left nothing behind"
-    );
+    // The name is free again, which is the operator-visible point of forgetting:
+    // the row is gone, so the registry accepts it once more. (Whether the pond
+    // can then be MATERIALISED is the control plane's business and is proven
+    // there — `forget` releases the name, which is all it claims to do.)
+    registry
+        .create_pond(Some("stranded".into()), "x", "{}", "medium", &[], "", false)
+        .expect("forgetting must release the name for reuse");
 }
 
 /// A `Forwarder` that fails loudly if anything reaches it. Used where the test
@@ -700,14 +699,13 @@ mod forwarding {
         owner: Owner,
         /// The pond's lineage opt-in, as the registry would report it.
         lineage: bool,
-        /// Make the compensating `drop_pond` fail — the control plane went away
-        /// between writing the row and giving it back. The one path that leaves
-        /// an orphaned registry row, so the one the error text has to change for.
-        drop_fails: bool,
-        /// Registry drops seen — `allocate_pond`'s compensation is invisible
-        /// otherwise, and an allocation that refused a pond it had already
-        /// registered would leave exactly the stuck row this whole change is
-        /// about.
+        /// Creates seen. The anti-vacuity counterpart to the materialise
+        /// counters: "allocate materialised nothing" is only worth asserting if
+        /// allocate did something.
+        creates: AtomicUsize,
+        /// Registry drops seen — `drop_pond` is the compensating move, and a
+        /// path that refused a pond it had already registered without dropping
+        /// the row would leave a stuck name.
         drops: AtomicUsize,
     }
 
@@ -722,8 +720,7 @@ mod forwarding {
             _: &[String],
             _: bool,
         ) -> Result<PondInfo, AgentError> {
-            // The registry row is created BEFORE the placement is inspected, as
-            // the real one is — which is what makes the compensation testable.
+            self.creates.fetch_add(1, Ordering::SeqCst);
             self.pond_info(name.as_deref().unwrap_or("pond-x")).await
         }
         async fn resolve_pond(&self, pond_ref: &str) -> Result<String, AgentError> {
@@ -749,9 +746,6 @@ mod forwarding {
         }
         async fn drop_pond(&self, _: &str) -> Result<(), AgentError> {
             self.drops.fetch_add(1, Ordering::SeqCst);
-            if self.drop_fails {
-                return Err(AgentError::internal("registry unreachable"));
-            }
             Ok(())
         }
         async fn list_datasets(
@@ -977,7 +971,7 @@ mod forwarding {
         let control = Arc::new(FixedOwner {
             owner,
             lineage: false,
-            drop_fails: false,
+            creates: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
         });
         let storage = Arc::new(TempFs::new());
@@ -1003,7 +997,7 @@ mod forwarding {
         let control = Arc::new(FixedOwner {
             owner,
             lineage,
-            drop_fails: false,
+            creates: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
         });
         let storage = Arc::new(TempFs::new());
@@ -1647,67 +1641,11 @@ mod forwarding {
         );
     }
 
-    #[tokio::test]
-    async fn forwarding_refuses_to_allocate_onto_a_node_that_vanished() {
-        // Allocation reaches the placement AFTER the registry row exists, so
-        // the refusal has to give the row back — otherwise the very change that
-        // stops unowned ponds being served would be a way to create them.
-        let control = Arc::new(FixedOwner {
-            owner: unowned(),
-            lineage: false,
-            drop_fails: false,
-            drops: AtomicUsize::new(0),
-        });
-        let storage = Arc::new(TempFs::new());
-        let ops = AgentOps::new(
-            control.clone(),
-            storage.clone(),
-            Arc::new(DuckEngine::new()),
-            AgentConfig::default(),
-        )
-        .with_forwarding(
-            "me".to_string(),
-            "http://me:9092".to_string(),
-            Arc::new(RecordingForwarder::default()),
-        );
-
-        let err = ops
-            .allocate_pond(
-                &Identity::claimed(Some("a")),
-                None,
-                "{}",
-                "medium",
-                &[],
-                false,
-            )
-            .await
-            .expect_err("a pond placed on no node must not be reported as allocated");
-        assert_eq!(
-            err.envelope().kind,
-            latiq_common::ErrorKind::PondUnavailable,
-            "{}",
-            err.envelope().message
-        );
-        assert_eq!(
-            control.drops.load(Ordering::SeqCst),
-            1,
-            "the registry row must be compensated, not left stuck"
-        );
-        assert!(
-            !latiq_storage::PondStorage::pond_exists(
-                storage.as_ref(),
-                latiq_common::PondId::parse(PID).unwrap()
-            ),
-            "and no storage may be created for it here"
-        );
-    }
-
     /// A node whose registry places every pond on `owner`, with a forwarder we
-    /// can make fail and a control plane whose compensating drop we can too.
+    /// can make fail.
     fn allocating_ops(
         owner: Owner,
         materialize_fails: bool,
-        drop_fails: bool,
     ) -> (
         AgentOps,
         Arc<FixedOwner>,
@@ -1717,7 +1655,7 @@ mod forwarding {
         let control = Arc::new(FixedOwner {
             owner,
             lineage: false,
-            drop_fails,
+            creates: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
         });
         let fwd = Arc::new(RecordingForwarder {
@@ -1743,131 +1681,71 @@ mod forwarding {
         latiq_common::PondId::parse(PID).unwrap()
     }
 
+    /// RELOCATED with centralised pond creation. `AgentOps::allocate_pond` used
+    /// to materialise the pond itself — locally when this node owned it, over
+    /// `Forwarder::materialize_pond` when it did not — and to compensate the
+    /// registry row when that failed. All three tests that pinned it
+    /// (`..._materializes_on_the_owner_before_returning`,
+    /// `..._compensates_when_the_owner_cannot_materialize`,
+    /// `..._reports_the_orphan_when_compensation_also_fails`) plus
+    /// `forwarding_refuses_to_allocate_onto_a_node_that_vanished` now live in
+    /// `latiq-control-plane/tests/grpc_integration.rs::materialize`, because
+    /// that is where the mechanism went: the control plane places the pond, so
+    /// the control plane materialises it and rolls the placement back.
+    ///
+    /// Nothing was dropped — the guarantees are the same and are asserted
+    /// against a control plane that really can fail — and the full-stack proofs
+    /// in `crates/latiq/tests/forwarding.rs::eager_allocation` were untouched
+    /// and still pass. What is pinned HERE is the other half of that move: that
+    /// `allocate_pond` does not do it a SECOND time.
     #[tokio::test]
-    async fn pond_lifecycle_allocation_materializes_on_the_owner_before_returning() {
-        // THE claim of eager allocation. Before it, a pond placed on another
-        // node was reported as created while nothing existed anywhere, and the
-        // agent's first INSERT was what discovered whether that node was even
-        // reachable. Nothing else in this file would notice the difference:
-        // allocation returned `Ok` either way.
-        let (ops, _control, fwd, storage) =
-            allocating_ops(owned_by("owner-node", "http://owner:9092"), false, false);
-        let r = ops
-            .allocate_pond(
-                &Identity::claimed(Some("a")),
-                Some("eager".into()),
-                "{}",
-                "medium",
-                &[],
-                false,
-            )
-            .await
-            .expect("the owner materialised it");
-        assert_eq!(r.pond_name, "eager");
-        assert_eq!(
-            fwd.materializes.load(Ordering::SeqCst),
-            1,
-            "the owner must be asked to materialise, exactly once"
-        );
-        // Dialled at the OWNER's endpoint, and asked about THIS pond — an
-        // allocation that reached the right node about the wrong pond would
-        // leave the caller's pond just as unmaterialised.
-        assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
-        assert_eq!(*fwd.last_pond.lock().unwrap(), PID);
-        // And the storage is the OWNER's to create: a greeter that made its own
-        // copy would give every forwarded read an empty pond to fall into.
-        assert!(
-            !latiq_storage::PondStorage::pond_exists(storage.as_ref(), pid()),
-            "the node that only placed the pond must hold no storage for it"
-        );
-    }
-
-    #[tokio::test]
-    async fn pond_lifecycle_allocation_compensates_when_the_owner_cannot_materialize() {
-        // The test this change most needs to get right: the registry row exists
-        // BEFORE the owner is reached, so a failure there must give it back.
-        // Without the compensation, eager allocation would trade a pond that
-        // fails on first write for a name that is taken for ever.
-        let (ops, control, fwd, storage) =
-            allocating_ops(owned_by("owner-node", "http://owner:9092"), true, false);
-        let err = ops
-            .allocate_pond(
-                &Identity::claimed(Some("a")),
-                Some("doomed".into()),
-                "{}",
-                "medium",
-                &[],
-                false,
-            )
-            .await
-            .expect_err("an unreachable owner must not be reported as an allocation");
-        assert_eq!(fwd.materializes.load(Ordering::SeqCst), 1, "it did try");
-        assert_eq!(
-            err.envelope().kind,
-            latiq_common::ErrorKind::PondUnavailable,
-            "{}",
-            err.envelope().message
-        );
-        assert_eq!(
-            control.drops.load(Ordering::SeqCst),
-            1,
-            "the registry row must be given back, not left stuck"
-        );
-        // The message is the agent's only evidence about what state it is in.
-        // "storage error" would read as "maybe it half-worked"; these two facts
-        // are what make the next move obvious.
-        let msg = &err.envelope().message;
-        assert!(
-            msg.contains("was NOT created") && msg.contains("rolled back"),
-            "the message must say the pond does not exist and nothing was left behind: {msg}"
-        );
-        assert!(
-            err.envelope().suggest.contains("Retry allocate_pond"),
-            "an agent whose attempt was fully compensated should just retry: {}",
-            err.envelope().suggest
-        );
-        assert!(
-            !latiq_storage::PondStorage::pond_exists(storage.as_ref(), pid()),
-            "and no storage anywhere on this node"
-        );
-    }
-
-    #[tokio::test]
-    async fn pond_lifecycle_allocation_reports_the_orphan_when_compensation_also_fails() {
-        // Row written, storage failed, rollback failed: a name that resolves to
-        // a pond with no storage. Telling this caller to "retry with the same
-        // name" would send it into a NameConflict it cannot explain, so the
-        // guidance changes — and an operator has to hear about it (the `error!`
-        // in `compensate_allocation`, which names the pond id).
-        let (ops, control, _fwd, _storage) =
-            allocating_ops(owned_by("owner-node", "http://owner:9092"), true, true);
-        let err = ops
-            .allocate_pond(
-                &Identity::claimed(Some("a")),
-                Some("stranded".into()),
-                "{}",
-                "medium",
-                &[],
-                false,
-            )
-            .await
-            .expect_err("still a failure");
-        assert_eq!(
-            control.drops.load(Ordering::SeqCst),
-            1,
-            "compensation was attempted"
-        );
-        let env = err.envelope();
-        assert!(
-            env.message.contains("may still exist"),
-            "the caller must be told the row survived: {}",
-            env.message
-        );
-        assert!(
-            env.suggest.contains("DIFFERENT name") && env.suggest.contains("pond forget"),
-            "and given the operator escape hatch rather than a retry that will conflict: {}",
-            env.suggest
-        );
+    async fn pond_lifecycle_allocation_does_not_materialize_a_second_time() {
+        // The redundancy this change removes. With the control plane
+        // materialising as part of placing, a node that also materialised would
+        // make one extra RPC per allocation when the pond is placed elsewhere —
+        // and something worse when it is placed HERE is not the risk, so both
+        // placements are checked: a remote one must dial nobody, and a local one
+        // must not create storage on the strength of an allocate call alone
+        // (`materialize_pond` is the op that does that, and it is the control
+        // plane that calls it).
+        for (case, owner) in [
+            (
+                "placed on a peer",
+                owned_by("owner-node", "http://owner:9092"),
+            ),
+            ("placed on this node", owned_by("me-node", "http://me:9092")),
+        ] {
+            let (ops, control, fwd, storage) = allocating_ops(owner, false);
+            let r = ops
+                .allocate_pond(
+                    &Identity::claimed(Some("a")),
+                    Some("once".into()),
+                    "{}",
+                    "medium",
+                    &[],
+                    false,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {}", e.envelope().message));
+            assert_eq!(r.pond_name, "once", "{case}");
+            assert_eq!(
+                fwd.materializes.load(Ordering::SeqCst),
+                0,
+                "{case}: the control plane already materialised this pond; dialling \
+                 the owner again is a second RPC for no new state"
+            );
+            assert!(
+                !latiq_storage::PondStorage::pond_exists(storage.as_ref(), pid()),
+                "{case}: allocate must not create storage of its own"
+            );
+            // Anti-vacuity: the allocation really happened, so the two zeroes
+            // above are "did not repeat the work", not "did no work at all".
+            assert_eq!(
+                control.creates.load(Ordering::SeqCst),
+                1,
+                "{case}: the pond must still have been created through the control plane"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1876,7 +1754,7 @@ mod forwarding {
         // the one that lets the lazy `ensure_pond` stay on the query paths
         // without the two racing into a conflict.
         let (ops, _control, _fwd, storage) =
-            allocating_ops(owned_by("me-node", "http://me:9092"), false, false);
+            allocating_ops(owned_by("me-node", "http://me:9092"), false);
         let id = Identity::claimed(Some("a"));
         ops.materialize_pond(&id, "pond-x").await.expect("first");
         assert!(latiq_storage::PondStorage::pond_exists(
@@ -1892,29 +1770,21 @@ mod forwarding {
         ));
     }
 
-    #[tokio::test]
-    async fn pond_lifecycle_embedded_allocation_materializes_with_no_forwarder() {
-        // `pip install latiq` and `./dev.sh`: one node, no forwarder, no
-        // advertised endpoint, and therefore no network hop to add. Eager
-        // allocation must be exactly what it always was here — the pond on disk
-        // when allocate returns.
-        let (ops, storage) = ops_embedded(unowned());
-        ops.allocate_pond(
-            &Identity::claimed(Some("a")),
-            Some("solo".into()),
-            "{}",
-            "medium",
-            &[],
-            false,
-        )
-        .await
-        .expect("the embedded path allocates without any peer");
-        assert!(
-            latiq_storage::PondStorage::pond_exists(storage.as_ref(), pid()),
-            "the one node owns everything, so it materialises locally"
-        );
-    }
-
+    /// RELOCATED. This asserted that the embedded/single-node path
+    /// (`pip install latiq`, `./dev.sh`) has the pond on disk when
+    /// `allocate_pond` returns — but it asserted it against
+    /// `RegistryControlPlane`, an in-process registry nothing outside these
+    /// tests runs. The embedded stack does not use it: `LocalCluster` starts a
+    /// real control plane and a real node over loopback gRPC, so its allocation
+    /// is eager for exactly the reason a cluster's is — the control plane
+    /// materialises it. The guarantee is pinned where it is now true, over the
+    /// real wiring, in `crates/latiq/tests/forwarding.rs::eager_allocation` on a
+    /// single-node stack, through BOTH `AllocatePond` and the direct
+    /// `CreatePondAssignment` the CLI and SDK use.
+    ///
+    /// What stays here is the claim it was paired with, below: an embedded node
+    /// with no forwarder and no advertised endpoint owns every pond and serves
+    /// it.
     #[tokio::test]
     async fn forwarding_embedded_node_serves_a_pond_with_no_owner_endpoint() {
         // The other half of the guard, and the one that would break

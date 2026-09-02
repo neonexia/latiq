@@ -492,19 +492,17 @@ impl AgentOps {
 
     /// Make this pond's storage exist HERE and open its engine instance.
     ///
-    /// `fresh` picks `create_pond` over the idempotent `ensure_pond`. Allocation
-    /// passes `true`: the id it just minted must not already be on disk, and a
-    /// collision there is a bug worth failing on rather than absorbing. Every
-    /// other caller passes `false`, because "already materialised" is the normal
-    /// case for them and not an error.
-    async fn materialize_here(&self, info: &PondInfo, fresh: bool) -> Result<(), AgentError> {
+    /// Always `ensure_pond`, never `create_pond`: this is only ever reached
+    /// through `materialize_pond`, whose contract is idempotent, and the control
+    /// plane may call it more than once for the same pond (a retried create, a
+    /// create racing the lazy `ensure_pond` on a query path). "Already there" is
+    /// success.
+    async fn materialize_here(&self, info: &PondInfo) -> Result<(), AgentError> {
         let pid = Self::parse_id(&info.pond_id)?;
-        let storage = if fresh {
-            self.storage.create_pond(pid, info.lineage)
-        } else {
-            self.storage.ensure_pond(pid, info.lineage)
-        };
-        let mut loc = storage.map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+        let mut loc = self
+            .storage
+            .ensure_pond(pid, info.lineage)
+            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
@@ -518,13 +516,19 @@ impl AgentOps {
             .map_err(AgentError::from)
     }
 
-    /// Ensure the pond is materialised on the node that owns it — the
-    /// node-to-node op behind **eager allocation** (see [`Forwarder::materialize_pond`]).
+    /// Ensure the pond is materialised on the node that owns it — the inbound
+    /// half of **eager allocation**.
+    ///
+    /// Its caller is the **control plane**: `Control::CreatePondAssignment`
+    /// places the pond and then calls this on the owning node before it reports
+    /// the pond created (root `CLAUDE.md` invariant 3's lifecycle exception).
+    /// `Forwarder::materialize_pond` is the outbound half, used when this call
+    /// lands — through a gateway — on a node that does not own the pond.
     ///
     /// Internal by audience, not by mechanism: it is reached over the Data gRPC
-    /// like every other forwarded op, and there is deliberately NO CLI or SDK
-    /// command for it (invariants 1 and 2 — this is a node talking to a node,
-    /// not a user asking for anything).
+    /// like every other op, and there is deliberately NO CLI or SDK command for
+    /// it (invariants 1 and 2 — this is infrastructure talking to a node, not a
+    /// user asking for anything).
     ///
     /// **Idempotent**: a pond whose storage already exists is a success. That is
     /// what makes it safe for the allocating node to retry, and what makes it
@@ -558,7 +562,7 @@ impl AgentOps {
             "processing locally"
         );
         let started = Instant::now();
-        let res = self.materialize_here(&info, false).await;
+        let res = self.materialize_here(&info).await;
         self.audit(
             identity,
             "materialize_pond",
@@ -571,49 +575,18 @@ impl AgentOps {
         res
     }
 
-    /// Give the registry row back after allocation failed to materialise the
-    /// pond, and turn that into the error the caller sees.
-    ///
-    /// Compensation can itself fail (the control plane went away between the two
-    /// calls), which leaves an orphaned row: a pond name that resolves with no
-    /// storage anywhere. That state is what `latiq pond forget` exists for, so it
-    /// is said out loud in BOTH directions — an `error!` an operator can grep for
-    /// with the pond id in it, and a different `suggest` for the caller, who must
-    /// not be told to retry the same name when it may still be taken.
-    async fn compensate_allocation(
-        &self,
-        info: &PondInfo,
-        owner: &str,
-        cause: AgentError,
-    ) -> AgentError {
-        let compensated = match self.control.drop_pond(&info.pond_id).await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!(
-                    pond = %info.pond_id,
-                    name = %info.name,
-                    owner,
-                    cause = %cause,
-                    error = %e,
-                    "ORPHANED REGISTRY ROW: allocation could not materialise this pond and could \
-                     not roll back its assignment; remove it with `latiq pond forget`"
-                );
-                false
-            }
-        };
-        AgentError::allocation_not_materialized(&info.name, owner, &cause, compensated)
-    }
-
     /// Allocate a pond, recording the attempt either way. Allocation is the one
     /// op with no pond to name on failure (there is not one yet), so a failed
     /// record carries `pond=-`.
     ///
-    /// **Allocation is eager and holistic**: it returns only once the pond's
-    /// storage exists on the node that owns it, which for a placement on another
-    /// node means a second network hop (control plane, then owner). That is the
-    /// deliberate cost — a pond reported as created can accept data, rather than
-    /// failing at the agent's first write against a node that was never
-    /// reachable.
+    /// **Allocation is eager and holistic** — but this method is not where that
+    /// happens. `ControlPlane::create_pond` returns only once the pond's storage
+    /// exists on the node the control plane placed it on, because the control
+    /// plane materialises it (and rolls the placement back if it cannot). So
+    /// there is nothing to do here beyond asking, and deliberately so: a node
+    /// that also materialised would make a second, redundant call for every
+    /// allocation, and `latiq pond create` and the SDK — which never come
+    /// through `AgentOps` at all — would still be lazy.
     pub async fn allocate_pond(
         &self,
         identity: &Identity,
@@ -659,50 +632,13 @@ impl AgentOps {
                 lineage,
             )
             .await?;
-        // The control plane may place the pond on a different node than the one
-        // that received this call. Storage still has to exist BEFORE we report
-        // success, so reach through to the owner and have it materialise the
-        // pond there. Creating it here instead would orphan files on a node with
-        // no claim to the pond; leaving it to the owner's lazy `ensure_pond`
-        // would hand back a pond id whose first write is the thing that finds
-        // out the node is unreachable.
-        match self.placement(&info) {
-            Placement::Forward(fwd, owner) => {
-                record_forward("allocate_pond");
-                if let Err(e) = fwd.materialize_pond(owner, identity, &info.pond_id).await {
-                    return Err(self.compensate_allocation(&info, owner, e).await);
-                }
-                return Ok(AllocateResult {
-                    pond_id: info.pond_id,
-                    pond_name: info.name,
-                });
-            }
-            // Placed on a node that vanished between the placement and this
-            // read. Nothing has been materialized anywhere yet, so the same
-            // compensation the unreachable-owner path uses applies: give the
-            // registry row back rather than leave a pond no node will serve.
-            //
-            // It reports through the SAME error as an owner we could not reach,
-            // not `pond_unavailable`, whose message says the pond exists — here
-            // it does not, and that is the fact the caller has to act on.
-            Placement::NoOwner => {
-                let cause = AgentError::of_kind(
-                    ErrorKind::PondUnavailable,
-                    "the registry names no node serving it",
-                );
-                let owner = info.node_id.as_deref().unwrap_or("unknown");
-                return Err(self.compensate_allocation(&info, owner, cause).await);
-            }
-            Placement::Local => {}
-        }
-        if let Err(e) = self.materialize_here(&info, true).await {
-            // Compensate: roll back registry + storage.
-            let _ = self.control.drop_pond(&info.pond_id).await;
-            if let Ok(pid) = Self::parse_id(&info.pond_id) {
-                let _ = self.storage.drop_pond(pid);
-            }
-            return Err(e);
-        }
+        // Nothing else. The control plane placed the pond AND materialised it on
+        // the owner before answering; if it could not, it gave the registry row
+        // back and this `?` already returned that error. Materialising again
+        // here would be a second call to the same node for the same pond, and
+        // materialising *locally* would be worse — this node may not own it, and
+        // a greeter with its own copy is the empty pond every forwarded read
+        // falls into.
         Ok(AllocateResult {
             pond_id: info.pond_id,
             pond_name: info.name,
@@ -2003,12 +1939,12 @@ fn record_query_duration(pond: &str, op: &'static str, elapsed: std::time::Durat
 /// the genuinely streaming RPC and left `read_query` looking like it never
 /// crossed a node.
 ///
-/// Called at the forward decision and nowhere else — including allocation,
-/// which since eager allocation really does dial the owner (as
-/// `allocate_pond`, the op the caller asked for, not as `materialize_pond`,
-/// the op it rides). A node that cannot reach its peers now shows up here on
-/// the allocate path too, which is exactly where the new latency and the new
-/// failure mode both live.
+/// Called at the forward decision and nowhere else. Allocation has no counter:
+/// this node does not dial anyone to allocate — it asks the control plane, and
+/// the control plane is what reaches the owner. The only allocation-related
+/// forward that can happen here is `materialize_pond`, when the control plane's
+/// call lands (through a gateway) on a node that does not own the pond, and it
+/// is counted under that name because that is the op being relayed.
 fn record_forward(op: &'static str) {
     metrics::counter!("latiq_forwarded_total", "op" => op).increment(1);
 }

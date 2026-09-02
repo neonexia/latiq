@@ -18,6 +18,7 @@ pub mod control_service;
 pub mod dataset_convert;
 pub mod error;
 pub mod migrations;
+pub mod node_client;
 pub mod registry;
 pub use error::ControlPlaneError;
 pub use registry::Registry;
@@ -121,15 +122,18 @@ pub async fn serve_control_plane(
     registry: Registry,
     auth: Option<latiq_auth::AuthConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Whether this deployment is authenticated at all — read before `auth` is
+    // consumed. It decides one thing beyond the Admin verifier: whether the
+    // Control surface replays a caller's bearer token onto the node hop it makes
+    // to materialise a pond (see `ControlService::replaying_bearer`).
+    let authenticated = auth.is_some();
     // Built ONCE, before anything binds, so a bad config fails startup loudly.
     let verifier = build_verifier(auth)?;
     let metadata_url = verifier
         .as_ref()
         .map(|_| protected_resource_url(&addr.to_string()));
     spawn_node_reaper(registry.clone());
-    let control = latiq_proto::v1::control_server::ControlServer::new(
-        control_service::ControlService::new(registry.clone()),
-    );
+    let control = control_server(registry.clone(), authenticated);
     let admin = latiq_proto::v1::admin_server::AdminServer::new(
         admin_service::AdminService::new(registry)
             .with_verifier(verifier)
@@ -143,14 +147,36 @@ pub async fn serve_control_plane(
     Ok(())
 }
 
+/// The ONE place a served Control surface is built.
+///
+/// It exists so there is one place, not two, that has to remember the outbound
+/// materializer: a `ControlService` without one silently reverts every create
+/// path in the system to lazy allocation, and nothing fails until somebody
+/// creates a pond on a node that is down. `control_service_is_always_served_with_a_materializer`
+/// below pins that this is the only construction in the file.
+fn control_server(
+    registry: Registry,
+    authenticated: bool,
+) -> latiq_proto::v1::control_server::ControlServer<control_service::ControlService> {
+    latiq_proto::v1::control_server::ControlServer::new(
+        control_service::ControlService::new(
+            registry,
+            // One materializer per server, so the channel cache is shared
+            // across every create this control plane handles.
+            Some(std::sync::Arc::new(node_client::GrpcNodeMaterializer::new())),
+        )
+        .replaying_bearer(authenticated),
+    )
+}
+
 /// Serve the Control gRPC surface on `addr` until the server is shut down.
 pub async fn serve_control(
     addr: SocketAddr,
     registry: Registry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = latiq_proto::v1::control_server::ControlServer::new(
-        control_service::ControlService::new(registry),
-    );
+    // Control on its own is never the authenticated deployment's shape (that is
+    // `serve_control_plane`, one port for Control + Admin), so no bearer replay.
+    let svc = control_server(registry, false);
     Server::builder().add_service(svc).serve(addr).await?;
     Ok(())
 }
@@ -172,4 +198,54 @@ pub async fn serve_admin(
     );
     Server::builder().add_service(svc).serve(addr).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod wiring {
+    /// The full-stack harness builds its own `ControlService`, so nothing else in
+    /// the suite would notice if the SERVED one lost its materializer — the one
+    /// wiring that ships. A `ControlService::new` anywhere in this file other
+    /// than inside `control_server` is that regression, and it fails silently:
+    /// every create path reverts to lazy allocation and no test goes red.
+    ///
+    /// Greps only the non-test half of the file, or this module's own string
+    /// literals would satisfy the guard they exist to enforce.
+    #[test]
+    fn control_service_is_always_served_with_a_materializer() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a non-test half");
+
+        // Exactly one, not "at most one": a zero here would mean the Control
+        // surface stopped being built at all and the guard guarded nothing.
+        assert_eq!(
+            body.matches("ControlService::new(").count(),
+            1,
+            "the served Control surface must be built in exactly one place \
+             (`control_server`), so the materializer cannot be forgotten in the other"
+        );
+        let ctor = &body[body.find("ControlService::new(").expect("just counted one")..];
+        assert!(
+            ctor.contains("GrpcNodeMaterializer::new()"),
+            "…and that one construction must pass the outbound materializer; \
+             without it every create path silently reverts to lazy allocation"
+        );
+
+        // Both public entry points go through it.
+        for f in ["serve_control_plane", "serve_control"] {
+            let start = body.find(&format!("pub async fn {f}(")).unwrap_or_else(|| {
+                panic!("{f} must exist; a renamed entry point escapes this guard")
+            });
+            let end = body[start..]
+                .find("\n}\n")
+                .map(|i| start + i)
+                .unwrap_or(body.len());
+            assert!(
+                body[start..end].contains("control_server("),
+                "{f} must serve Control through `control_server`"
+            );
+        }
+    }
 }

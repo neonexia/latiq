@@ -346,13 +346,16 @@ struct NodeAddArgs {
 enum PondCmd {
     /// Allocate a pond. The control plane picks a node; you don't pass an address.
     ///
-    /// A registry-only assignment: this returns as soon as the control plane has
-    /// placed the pond, and the owning node creates its storage on first use.
-    /// The agent path (`allocate_pond` over MCP / Data gRPC) is eager instead —
-    /// it materializes the pond on its node before returning, so an agent is
-    /// never handed a pond that turns out to be on an unreachable node. The
-    /// difference is deliberate: the control plane is never in the data path, so
-    /// making THIS command eager would mean routing it through a pond node.
+    /// EAGER: this returns only once the pond's storage exists on the node the
+    /// control plane placed it on. If that node cannot be reached the command
+    /// fails, the assignment is rolled back, and the name is free again — you
+    /// are never handed a pond id for a pond that does not exist. The cost is
+    /// one extra hop (control plane, then owner) and the DuckDB attach that used
+    /// to be paid on the first query.
+    ///
+    /// Same behaviour as the agent path (`allocate_pond` over MCP / Data gRPC),
+    /// because it is the same implementation: the control plane materialises,
+    /// so every create path is eager through one mechanism.
     Create {
         #[arg(short, long)]
         name: Option<String>,
@@ -1273,10 +1276,11 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
                 Ok(e) => e,
                 Err(msg) => return Err(anyhow!("{msg}")),
             };
-            // Pure control-plane op: the registry assigns a (random) node; the
-            // node materializes storage lazily on first query. Unlike the agent
-            // path (see the doc comment on `PondCmd::Create`), nothing is
-            // created up front — this command never reaches a pond node.
+            // The control plane assigns a (random) node AND has that node
+            // materialize the pond before it answers, so an `Ok` here means a
+            // pond that can accept data (see the doc comment on
+            // `PondCmd::Create`). This command still never talks to a pond node
+            // itself — the control plane does the reaching.
             let mut c = control_client().await?;
             let owner = agent_id.unwrap_or_else(|| "anonymous".into());
             match c

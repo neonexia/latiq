@@ -41,6 +41,33 @@ impl GrpcControlPlane {
     }
 }
 
+/// Tag a Control request with the caller's claimed leaf, their verbatim bearer
+/// token, and the ambient trace id — the same three things the node-to-node
+/// forwarder sends, for the same reason: the control plane relays this call on
+/// to a pond node, which verifies the token itself.
+///
+/// Mirrors `forward_client::with_identity` deliberately, including what it does
+/// NOT do — there is no "already verified" header. A claim the next hop trusts
+/// without checking is trust laundering.
+fn with_caller<T>(msg: T, agent_id: &str) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(msg);
+    if let Ok(v) = tonic::metadata::MetadataValue::try_from(agent_id) {
+        req.metadata_mut().insert("latiq-agent-id", v);
+    }
+    if let Some(token) = latiq_agent_core::current_bearer() {
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(format!("Bearer {token}").as_str())
+        {
+            req.metadata_mut().insert("authorization", v);
+        }
+    }
+    if let Some(tid) = latiq_agent_core::current_trace_id() {
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(tid.as_str()) {
+            req.metadata_mut().insert("latiq-trace-id", v);
+        }
+    }
+    req
+}
+
 fn status_err(s: tonic::Status) -> AgentError {
     // Prefer the structured ErrorEnvelope the control plane attaches to the
     // Status details (control_service/admin_service to_status) — it carries the
@@ -123,19 +150,34 @@ impl ControlPlane for GrpcControlPlane {
         lineage: bool,
     ) -> Result<PondInfo, AgentError> {
         let mut c = self.client.clone();
+        // The ONE Control call that has to carry the caller's identity, because
+        // it is the one the control plane acts on: `CreatePondAssignment` now
+        // materialises the pond by calling the owning node's Data surface, and
+        // that node verifies a token like any other caller. Without this the
+        // hop arrives anonymous and every allocation in an authenticated
+        // deployment fails at the owner — the same trap `allocate_pond`'s
+        // missing `traced` scope was.
+        //
+        // The token is replayed VERBATIM (`current_bearer` is set only when this
+        // node has a verifier), never an assertion that we already verified it:
+        // the owner re-verifies on its own authority. Every other Control RPC is
+        // a metadata read the control plane answers itself.
         let created = c
-            .create_pond_assignment(CreatePondAssignmentRequest {
-                name: name.unwrap_or_default(),
-                owner_identity: owner.to_string(),
-                policy_json: policy_json.to_string(),
-                tier: tier.to_string(),
-                extensions: extensions.to_vec(),
-                // The ControlPlane trait's create_pond doesn't carry a description
-                // (MCP/agent allocate defaults empty); the CLI/SDK set it via the
-                // Control gRPC create_pond_assignment directly.
-                description: String::new(),
-                lineage,
-            })
+            .create_pond_assignment(with_caller(
+                CreatePondAssignmentRequest {
+                    name: name.unwrap_or_default(),
+                    owner_identity: owner.to_string(),
+                    policy_json: policy_json.to_string(),
+                    tier: tier.to_string(),
+                    extensions: extensions.to_vec(),
+                    // The ControlPlane trait's create_pond doesn't carry a description
+                    // (MCP/agent allocate defaults empty); the CLI/SDK set it via the
+                    // Control gRPC create_pond_assignment directly.
+                    description: String::new(),
+                    lineage,
+                },
+                owner,
+            ))
             .await
             .map_err(status_err)?
             .into_inner();
