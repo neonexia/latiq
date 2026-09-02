@@ -25,7 +25,7 @@
 //! `tests/access_trail.rs` stays a separate binary on purpose: it installs a
 //! process-global `tracing` subscriber, and `tracing` caches callsite interest
 //! process-wide, so it cannot share a binary with tests that install none.
-use latiq_agent_core::{AgentConfig, AgentOps, RegistryControlPlane};
+use latiq_agent_core::{AgentConfig, AgentOps, Peer, RegistryControlPlane};
 use latiq_common::Identity;
 use latiq_control_plane::Registry;
 use latiq_engine_duckdb::DuckEngine;
@@ -129,99 +129,99 @@ struct NeverForwards;
 impl latiq_agent_core::Forwarder for NeverForwards {
     async fn read(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
         _: Option<u64>,
     ) -> Result<latiq_engine::QueryResult, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn read_arrow(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
         _: Option<u64>,
     ) -> Result<latiq_agent_core::ArrowReadStream, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn write(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
         _: Option<u64>,
     ) -> Result<latiq_engine::QueryResult, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn explain(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
     ) -> Result<latiq_engine::ExplainResult, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn describe(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
     ) -> Result<latiq_agent_core::DescribeResult, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn materialize_pond(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
     ) -> Result<(), latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn get_lineage(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: usize,
         _: Option<&str>,
         _: Option<&str>,
     ) -> Result<latiq_agent_core::LineagePage, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn drop_pond(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: bool,
     ) -> Result<(), latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn catalog_pull(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
         _: &str,
         _: std::collections::BTreeMap<String, String>,
     ) -> Result<latiq_agent_core::PullResult, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
     async fn catalog_describe(
         &self,
-        e: &str,
+        e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
         _: std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, String)>, latiq_agent_core::AgentError> {
-        panic!("nothing may be forwarded; dialled {e}")
+        panic!("nothing may be forwarded; dialled {e:?}")
     }
 }
 
@@ -656,7 +656,7 @@ mod m7 {
 mod forwarding {
     use latiq_agent_core::{
         AgentConfig, AgentError, AgentOps, ArrowReadStream, ControlPlane, DescribeResult,
-        Forwarder, PondInfo,
+        Forwarder, Peer, PondInfo,
     };
     use latiq_common::{Identity, QueryMeta};
     use latiq_engine::{ExplainResult, QueryResult, SchemaSummary};
@@ -815,40 +815,40 @@ mod forwarding {
     impl Forwarder for RecordingForwarder {
         async fn read(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             s: &str,
             timeout_ms: Option<u64>,
         ) -> Result<QueryResult, AgentError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            self.note(e, p, s);
+            self.note(e.endpoint, p, s);
             *self.last_timeout_ms.lock().unwrap() = timeout_ms;
             Ok(sentinel("forwarded_read"))
         }
         async fn write(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             s: &str,
             timeout_ms: Option<u64>,
         ) -> Result<QueryResult, AgentError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
-            self.note(e, p, s);
+            self.note(e.endpoint, p, s);
             *self.last_timeout_ms.lock().unwrap() = timeout_ms;
             Ok(sentinel("forwarded_write"))
         }
         async fn read_arrow(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             s: &str,
             timeout_ms: Option<u64>,
         ) -> Result<ArrowReadStream, AgentError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            self.note(e, p, s);
+            self.note(e.endpoint, p, s);
             *self.last_timeout_ms.lock().unwrap() = timeout_ms;
             Ok(ArrowReadStream::new(
                 std::sync::Arc::new(arrow::datatypes::Schema::empty()),
@@ -858,12 +858,12 @@ mod forwarding {
         }
         async fn explain(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             s: &str,
         ) -> Result<ExplainResult, AgentError> {
-            self.note(e, p, s);
+            self.note(e.endpoint, p, s);
             Ok(ExplainResult {
                 estimated_rows: 0,
                 estimated_bytes: 0,
@@ -876,11 +876,11 @@ mod forwarding {
         }
         async fn describe(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
         ) -> Result<DescribeResult, AgentError> {
-            self.note(e, p, "");
+            self.note(e.endpoint, p, "");
             Ok(DescribeResult {
                 pond: PondInfo {
                     pond_id: PID.to_string(),
@@ -889,7 +889,7 @@ mod forwarding {
                     created_at: String::new(),
                     policy_json: "{}".to_string(),
                     node_id: Some("owner-node".to_string()),
-                    node_endpoint: Some(e.to_string()),
+                    node_endpoint: Some(e.endpoint.to_string()),
                     tier: "medium".to_string(),
                     extensions: vec![],
                     lineage: false,
@@ -900,27 +900,33 @@ mod forwarding {
         }
         async fn drop_pond(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             _: bool,
         ) -> Result<(), AgentError> {
-            self.note(e, p, "");
+            self.note(e.endpoint, p, "");
             Ok(())
         }
-        async fn materialize_pond(&self, e: &str, _: &Identity, p: &str) -> Result<(), AgentError> {
+        async fn materialize_pond(
+            &self,
+            e: Peer<'_>,
+            _: &Identity,
+            p: &str,
+        ) -> Result<(), AgentError> {
             self.materializes.fetch_add(1, Ordering::SeqCst);
-            self.note(e, p, "");
+            self.note(e.endpoint, p, "");
             if self.materialize_fails {
                 return Err(AgentError::internal(format!(
-                    "forward connect {e}: refused"
+                    "forward connect {}: refused",
+                    e.endpoint
                 )));
             }
             Ok(())
         }
         async fn catalog_pull(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             catalog: &str,
@@ -928,7 +934,7 @@ mod forwarding {
             _params: std::collections::BTreeMap<String, String>,
         ) -> Result<latiq_agent_core::PullResult, AgentError> {
             self.pulls.fetch_add(1, Ordering::SeqCst);
-            self.note(e, p, q);
+            self.note(e.endpoint, p, q);
             Ok(latiq_agent_core::PullResult {
                 catalog: catalog.to_string(),
                 query: q.to_string(),
@@ -936,7 +942,7 @@ mod forwarding {
         }
         async fn get_lineage(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             limit: usize,
@@ -948,7 +954,7 @@ mod forwarding {
             // so a test can prove they crossed the hop rather than being
             // silently dropped — a forward that lost `before` would page for
             // ever without it.
-            self.note(e, p, &format!("{limit}|{since:?}|{before:?}"));
+            self.note(e.endpoint, p, &format!("{limit}|{since:?}|{before:?}"));
             Ok(latiq_agent_core::LineagePage {
                 pond_id: PID.to_string(),
                 pond_name: p.to_string(),
@@ -961,14 +967,14 @@ mod forwarding {
         }
         async fn catalog_describe(
             &self,
-            e: &str,
+            e: Peer<'_>,
             _: &Identity,
             p: &str,
             _catalog: &str,
             _params: std::collections::BTreeMap<String, String>,
         ) -> Result<Vec<(String, String)>, AgentError> {
             self.describes.fetch_add(1, Ordering::SeqCst);
-            self.note(e, p, "");
+            self.note(e.endpoint, p, "");
             Ok(vec![("main".to_string(), "forwarded_table".to_string())])
         }
     }

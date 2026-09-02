@@ -1034,3 +1034,108 @@ mod lineage {
         assert!(reported.starts_with('v'), "got {reported:?}");
     }
 }
+
+/// The classification pin: DuckDB's error CLASS names, asserted against the real
+/// engine.
+///
+/// Every agent-facing kind for a failed statement is derived from the class
+/// prefix DuckDB puts at the head of its message (`Catalog Error: …`). Those
+/// prefixes carry no stability guarantee, and a DuckDB upgrade that renamed one
+/// would not break anything loudly — it would silently drop that whole class
+/// back to `internal` + "Retry; if it persists, report to your operator", which
+/// is exactly the failure this suite exists to prevent. Same shape, and the same
+/// reason, as `lineage_plan_key_names_still_match_this_duckdb_version`.
+///
+/// This is NOT a test of DuckDB's messages: it asserts OUR classification of
+/// them, one statement per class, through the public engine.
+#[test]
+fn error_contract_duckdb_error_classes_are_unchanged() {
+    use latiq_engine::EngineError;
+
+    let fs = TempFs::new();
+    let eng = DuckEngine::new();
+    let id = PondId::new();
+    let loc = fs.create_pond(id, false).unwrap();
+    eng.init_pond(&loc).unwrap();
+    let agent = Identity::claimed(Some("agent-class"));
+    let write = |sql: &str| eng.write_query(&loc, sql, &agent, AbortToken::new());
+    write("CREATE TABLE t(id INTEGER NOT NULL, name VARCHAR)").unwrap();
+    write("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    // (statement, the DuckDB class it must still raise, the variant we must
+    // derive from it). The variant is what decides the agent-facing kind, so a
+    // renamed class shows up here as a `Engine` and names itself in the panic.
+    struct Case {
+        sql: &'static str,
+        class: &'static str,
+        want: &'static str,
+    }
+    let cases = [
+        Case {
+            sql: "SELEKT 1",
+            class: latiq_engine_duckdb::errclass::PARSER,
+            want: "Parse",
+        },
+        Case {
+            // The single most common failure an agent meets in normal work.
+            sql: "INSERT INTO nope VALUES (1)",
+            class: latiq_engine_duckdb::errclass::CATALOG,
+            want: "Catalog",
+        },
+        Case {
+            // Rejected at EXECUTION, where the old scheme called it `internal`.
+            sql: "CREATE TABLE t(id INTEGER)",
+            class: latiq_engine_duckdb::errclass::CATALOG,
+            want: "Catalog",
+        },
+        Case {
+            sql: "CREATE TABLE information_schema.x(i INTEGER)",
+            class: latiq_engine_duckdb::errclass::BINDER,
+            want: "Catalog",
+        },
+        Case {
+            sql: "INSERT INTO t VALUES ('notanint', 'x')",
+            class: latiq_engine_duckdb::errclass::CONVERSION,
+            want: "Conversion",
+        },
+        Case {
+            // NOT NULL, not PRIMARY KEY: DuckLake does not support PK/UNIQUE
+            // constraints at all ("Not implemented Error"), so NOT NULL is the
+            // constraint an agent can actually hit inside a pond.
+            sql: "INSERT INTO t VALUES (NULL, 'x')",
+            class: latiq_engine_duckdb::errclass::CONSTRAINT,
+            want: "Constraint",
+        },
+        Case {
+            // Port 9 (discard) refuses instantly: an unreachable source, with
+            // no network round trip and no flakiness.
+            sql: "CREATE TABLE c AS SELECT * FROM read_csv('http://127.0.0.1:9/none.csv')",
+            class: latiq_engine_duckdb::errclass::IO,
+            want: "SourceIo",
+        },
+    ];
+
+    for Case { sql, class, want } in cases {
+        let err = write(sql).expect_err(sql);
+        let (got, msg) = match &err {
+            EngineError::Parse(m) => ("Parse", m),
+            EngineError::Catalog(m) => ("Catalog", m),
+            EngineError::Conversion(m) => ("Conversion", m),
+            EngineError::Constraint(m) => ("Constraint", m),
+            EngineError::SourceIo(m) => ("SourceIo", m),
+            EngineError::Engine(m) => ("Engine", m),
+            other => panic!("unexpected variant for `{sql}`: {other:?}"),
+        };
+        assert_eq!(
+            got, want,
+            "`{sql}` no longer classifies as {want}. DuckDB said: {msg}\n\
+             If the class prefix `{class}` was renamed, everything in that class \
+             has just fallen back to `internal` + \"retry\" — fix errclass.rs."
+        );
+        assert!(
+            msg.starts_with(class),
+            "`{sql}` must still lead with `{class}`, and the caller must see \
+             DuckDB's own words; got: {msg}"
+        );
+    }
+}

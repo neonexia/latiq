@@ -26,7 +26,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
 use latiq_agent_core::{
-    AgentError, ArrowReadStream, DescribeResult, Forwarder, LineagePage, PullResult,
+    AgentError, ArrowReadStream, DescribeResult, Forwarder, LineagePage, Peer, PullResult,
 };
 use latiq_common::{ErrorEnvelope, ErrorKind, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
@@ -57,27 +57,31 @@ impl GrpcForwarder {
         Self::default()
     }
 
-    async fn client(&self, endpoint: &str) -> Result<DataClient<Channel>, AgentError> {
+    async fn client(&self, peer: Peer<'_>, pond: &str) -> Result<DataClient<Channel>, AgentError> {
         let mut map = self.clients.lock().await;
-        if let Some(c) = map.get(endpoint) {
+        if let Some(c) = map.get(peer.endpoint) {
             return Ok(c.clone());
         }
-        let c = DataClient::connect(endpoint.to_string())
+        let c = DataClient::connect(peer.endpoint.to_string())
             .await
-            .map_err(|e| AgentError::internal(format!("forward connect {endpoint}: {e}")))?;
-        map.insert(endpoint.to_string(), c.clone());
+            .map_err(|e| unreachable_owner(peer, pond, &e.to_string()))?;
+        map.insert(peer.endpoint.to_string(), c.clone());
         Ok(c)
     }
 
-    async fn stream_client(&self, endpoint: &str) -> Result<StreamClient<Channel>, AgentError> {
+    async fn stream_client(
+        &self,
+        peer: Peer<'_>,
+        pond: &str,
+    ) -> Result<StreamClient<Channel>, AgentError> {
         let mut map = self.stream_clients.lock().await;
-        if let Some(c) = map.get(endpoint) {
+        if let Some(c) = map.get(peer.endpoint) {
             return Ok(c.clone());
         }
-        let c = StreamClient::connect(endpoint.to_string())
+        let c = StreamClient::connect(peer.endpoint.to_string())
             .await
-            .map_err(|e| AgentError::internal(format!("forward connect {endpoint}: {e}")))?;
-        map.insert(endpoint.to_string(), c.clone());
+            .map_err(|e| unreachable_owner(peer, pond, &e.to_string()))?;
+        map.insert(peer.endpoint.to_string(), c.clone());
         Ok(c)
     }
 }
@@ -114,7 +118,7 @@ fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
 /// Rebuild a structured `AgentError` from the peer's `Status`. The Data service
 /// puts the JSON `ErrorEnvelope` in `details`, so prefer it (kind/suggest/see
 /// survive the hop); fall back to code-based mapping.
-fn status_to_error(s: Status) -> AgentError {
+fn status_to_error(peer: Peer<'_>, pond: &str, s: Status) -> AgentError {
     if !s.details().is_empty() {
         if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(s.details()) {
             return AgentError::new(env.kind, env.message, env.suggest, env.see);
@@ -131,8 +135,44 @@ fn status_to_error(s: Status) -> AgentError {
         Code::Unauthenticated => {
             AgentError::of_kind(ErrorKind::Unauthenticated, s.message().to_string())
         }
+        // The owner did not answer. This is the crashed-node case, and it is
+        // NOT `internal`: it arrived here as `Internal: "tcp connect error"` +
+        // "Retry; if it persists, report to your operator", which told the
+        // agent to keep asking a dead node and named no node for the operator
+        // to look at. tonic raises `Unavailable` for a transport that could not
+        // be established or was lost — including on a CACHED channel, which is
+        // why this arm exists as well as the connect one: once a peer has been
+        // dialled successfully, every later failure comes through here.
+        //
+        // The owner never sends `Unavailable` itself (`to_status` maps
+        // `PondUnavailable` to `FailedPrecondition`, and any envelope it did
+        // send is decoded above), so an `Unavailable` with no details is always
+        // the hop, never the peer's opinion.
+        Code::Unavailable => unreachable_owner(peer, pond, s.message()),
         _ => AgentError::internal(s.message().to_string()),
     }
+}
+
+/// The owning node could not be reached — the pond is real, its data is on that
+/// node, and nothing here can serve it.
+///
+/// `PondUnavailable` was previously raised ONLY when the registry named no node
+/// at all, which is the rare case; a crashed-but-still-registered node kept both
+/// its id and its endpoint, so the placement said "forward", the dial failed,
+/// and the kind (with its whole `latiq://troubleshooting/pond-unavailable`
+/// page) was unreachable in production. The message names the pond AND the node
+/// because the fix is an operator's and it starts with knowing which node died.
+fn unreachable_owner(peer: Peer<'_>, pond: &str, detail: &str) -> AgentError {
+    AgentError::of_kind(
+        ErrorKind::PondUnavailable,
+        format!(
+            "Pond '{pond}' is owned by node '{}', which is not answering at {} ({}). The pond's \
+             data is on that node; no other node can serve it.",
+            peer.node_id,
+            peer.endpoint,
+            detail.trim()
+        ),
+    )
 }
 
 fn parse_json(json: &str) -> Result<serde_json::Value, AgentError> {
@@ -172,7 +212,19 @@ fn deliver_schema(
 /// The peer's `served_by` rides the same oneshot as the schema, because the
 /// caller needs both at the same moment — when it builds the stream it hands
 /// back — and the peer puts both on its first chunk.
-fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamParts {
+fn decode_arrow_stream(
+    peer: Peer<'_>,
+    pond: &str,
+    mut streaming: Streaming<ArrowChunk>,
+) -> ArrowReadStreamParts {
+    // Owned copies: the decode task outlives this call, and a mid-stream
+    // failure must still be able to name the pond and the node that dropped it
+    // rather than degrading to `internal` once the borrow is gone.
+    let (owner_id, owner_endpoint, pond_name) = (
+        peer.node_id.to_string(),
+        peer.endpoint.to_string(),
+        pond.to_string(),
+    );
     let (schema_tx, schema_rx) = oneshot::channel::<Result<Served, AgentError>>();
     let (batch_tx, batch_rx) = mpsc::channel::<Result<RecordBatch, AgentError>>(4);
 
@@ -233,7 +285,14 @@ fn decode_arrow_stream(mut streaming: Streaming<ArrowChunk>) -> ArrowReadStreamP
                     return;
                 }
                 Err(status) => {
-                    let ae = status_to_error(status);
+                    let ae = status_to_error(
+                        Peer {
+                            node_id: &owner_id,
+                            endpoint: &owner_endpoint,
+                        },
+                        &pond_name,
+                        status,
+                    );
                     match schema_tx.take() {
                         Some(s) => {
                             let _ = s.send(Err(ae));
@@ -274,38 +333,38 @@ struct ArrowReadStreamParts {
 impl Forwarder for GrpcForwarder {
     async fn read(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
         timeout_ms: Option<u64>,
     ) -> Result<QueryResult, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(query_request(pond, sql, timeout_ms), identity);
         let resp = c
             .read_query(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         query_result_from_json(&parse_json(&resp.json)?)
     }
 
     async fn read_arrow(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
         timeout_ms: Option<u64>,
     ) -> Result<ArrowReadStream, AgentError> {
-        let mut c = self.stream_client(endpoint).await?;
+        let mut c = self.stream_client(peer, pond).await?;
         let req = with_identity(query_request(pond, sql, timeout_ms), identity);
         let streaming = c
             .read_arrow(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
-        let parts = decode_arrow_stream(streaming);
+        let parts = decode_arrow_stream(peer, pond, streaming);
         // The schema (and any pre-stream error) resolves before we hand back the
         // stream, mirroring the local path.
         let served = parts
@@ -328,36 +387,36 @@ impl Forwarder for GrpcForwarder {
 
     async fn write(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
         timeout_ms: Option<u64>,
     ) -> Result<QueryResult, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(query_request(pond, sql, timeout_ms), identity);
         let resp = c
             .write_query(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         query_result_from_json(&parse_json(&resp.json)?)
     }
 
     async fn explain(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         sql: &str,
     ) -> Result<ExplainResult, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         // No timeout: explain does not execute the statement.
         let req = with_identity(query_request(pond, sql, None), identity);
         let resp = c
             .explain_query(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         // ExplainResult is encoded by the Data service as plain serde JSON, so the
         // serde inverse re-hydrates it exactly.
@@ -367,11 +426,11 @@ impl Forwarder for GrpcForwarder {
 
     async fn describe(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
     ) -> Result<DescribeResult, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(
             DescribePondRequest {
                 pond: pond.to_string(),
@@ -381,7 +440,7 @@ impl Forwarder for GrpcForwarder {
         let resp = c
             .describe_pond(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         serde_json::from_value(parse_json(&resp.json)?)
             .map_err(|e| AgentError::internal(format!("forward decode describe: {e}")))
@@ -389,12 +448,12 @@ impl Forwarder for GrpcForwarder {
 
     async fn drop_pond(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         confirm: bool,
     ) -> Result<(), AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(
             DropPondRequest {
                 pond: pond.to_string(),
@@ -402,37 +461,41 @@ impl Forwarder for GrpcForwarder {
             },
             identity,
         );
-        c.drop_pond(req).await.map_err(status_to_error)?;
+        c.drop_pond(req)
+            .await
+            .map_err(|s| status_to_error(peer, pond, s))?;
         Ok(())
     }
 
     async fn materialize_pond(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
     ) -> Result<(), AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(
             MaterializePondRequest {
                 pond: pond.to_string(),
             },
             identity,
         );
-        c.materialize_pond(req).await.map_err(status_to_error)?;
+        c.materialize_pond(req)
+            .await
+            .map_err(|s| status_to_error(peer, pond, s))?;
         Ok(())
     }
 
     async fn get_lineage(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         limit: usize,
         since: Option<&str>,
         before: Option<&str>,
     ) -> Result<LineagePage, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(
             GetLineageRequest {
                 pond: pond.to_string(),
@@ -449,7 +512,7 @@ impl Forwarder for GrpcForwarder {
         let resp = c
             .get_lineage(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         serde_json::from_value(parse_json(&resp.json)?)
             .map_err(|e| AgentError::internal(format!("forward decode get_lineage: {e}")))
@@ -457,14 +520,14 @@ impl Forwarder for GrpcForwarder {
 
     async fn catalog_pull(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         catalog: &str,
         query: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<PullResult, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(
             CatalogPullRequest {
                 pond: pond.to_string(),
@@ -477,7 +540,7 @@ impl Forwarder for GrpcForwarder {
         let resp = c
             .catalog_pull(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         serde_json::from_value(parse_json(&resp.json)?)
             .map_err(|e| AgentError::internal(format!("forward decode catalog_pull: {e}")))
@@ -485,13 +548,13 @@ impl Forwarder for GrpcForwarder {
 
     async fn catalog_describe(
         &self,
-        endpoint: &str,
+        peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
         catalog: &str,
         params: std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, String)>, AgentError> {
-        let mut c = self.client(endpoint).await?;
+        let mut c = self.client(peer, pond).await?;
         let req = with_identity(
             CatalogDescribeRequest {
                 pond: pond.to_string(),
@@ -503,7 +566,7 @@ impl Forwarder for GrpcForwarder {
         let resp = c
             .catalog_describe(req)
             .await
-            .map_err(status_to_error)?
+            .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         // The Data service encodes describe as {catalog, tables:[{schema,table}]}.
         // Re-hydrate the (schema, table) pairs the core returns.

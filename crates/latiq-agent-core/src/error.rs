@@ -156,6 +156,13 @@ impl std::fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// The engine's classification → the agent-facing kind.
+///
+/// One rule governs every arm: the kind and its `suggest` must name a next move
+/// the CALLER can make, and must not name one it cannot. `internal` + "Retry; if
+/// it persists, report to your operator" is the answer for a failure of ours —
+/// it was being given for a duplicate table name, a mistyped column and an
+/// unreachable URL, none of which retrying or an operator can fix.
 impl From<EngineError> for AgentError {
     fn from(e: EngineError) -> Self {
         match e {
@@ -169,10 +176,120 @@ impl From<EngineError> for AgentError {
             EngineError::Timeout => {
                 AgentError::of_kind(ErrorKind::QueryTimeout, "The query exceeded the timeout.")
             }
-            EngineError::Parse(m) => {
-                AgentError::of_kind(ErrorKind::ParseError, format!("SQL parse error: {m}"))
-            }
+            // The message is passed through as the engine gave it. It used to be
+            // prefixed with "SQL parse error:", which was a false statement for
+            // every catalog, conversion and I/O failure that ended up in this
+            // arm — and is redundant for the one that belongs here, since the
+            // engine's own message already begins "Parser Error:".
+            EngineError::Parse(m) => AgentError::of_kind(ErrorKind::ParseError, m),
+            EngineError::Catalog(m) => AgentError::of_kind(ErrorKind::CatalogError, m),
+            // Kind: the value is invalid. Suggest: bespoke, because the two
+            // ways a value can be rejected have different fixes — a wrong TYPE
+            // is fixed in the statement, a constraint violation is about the
+            // rows already in the table.
+            EngineError::Conversion(m) => AgentError::new(
+                ErrorKind::InvalidValue,
+                m,
+                "A value does not match the type it is being used as. Check the column types \
+                 (read_query \"DESCRIBE <table>\" or describe_pond), then supply a value of that \
+                 type or CAST it explicitly — e.g. CAST('7' AS INTEGER). Quoted text is never \
+                 coerced into a numeric column just because it looks numeric.",
+                "latiq://dialect",
+            ),
+            EngineError::Constraint(m) => AgentError::new(
+                ErrorKind::InvalidValue,
+                m,
+                "The value is the right type but breaks a rule on the table (primary key, unique, \
+                 not null, or check). Read the conflicting rows first — read_query \"SELECT * FROM \
+                 <table> WHERE <key> = <value>\" — then either correct the value, UPDATE the \
+                 existing row instead of inserting, or use INSERT OR REPLACE / ON CONFLICT.",
+                "latiq://dialect",
+            ),
+            EngineError::SourceIo(m) => AgentError::of_kind(ErrorKind::SourceUnavailable, m),
             EngineError::Engine(m) => AgentError::internal(format!("engine error: {m}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mapping table, at the cheapest layer that can prove it.
+    ///
+    /// The full-stack tests prove an agent really receives these kinds; this
+    /// proves the mapping itself is total and that no caller-fixable engine
+    /// failure lands on `internal` — the one bucket whose advice ("retry, then
+    /// wake a human") is wrong for everything the caller could fix.
+    #[test]
+    fn error_contract_every_engine_error_maps_to_a_kind_the_caller_can_act_on() {
+        let cases = [
+            (
+                EngineError::Parse("Parser Error: x".into()),
+                ErrorKind::ParseError,
+            ),
+            (
+                EngineError::Catalog("Catalog Error: x".into()),
+                ErrorKind::CatalogError,
+            ),
+            (
+                EngineError::Conversion("Conversion Error: x".into()),
+                ErrorKind::InvalidValue,
+            ),
+            (
+                EngineError::Constraint("Constraint Error: x".into()),
+                ErrorKind::InvalidValue,
+            ),
+            (
+                EngineError::SourceIo("IO Error: x".into()),
+                ErrorKind::SourceUnavailable,
+            ),
+            (EngineError::ReadOnlyViolation, ErrorKind::ReadOnlyViolation),
+            (EngineError::Cancelled, ErrorKind::QueryCancelled),
+            (EngineError::Timeout, ErrorKind::QueryTimeout),
+        ];
+        // Anti-vacuity: the list is every variant except `Engine`, which is the
+        // deliberate `internal` one. A new variant added without a mapping
+        // decision fails here.
+        assert_eq!(cases.len(), 8, "an EngineError variant is unaccounted for");
+        for (engine_err, want) in cases {
+            let label = format!("{engine_err:?}");
+            let env = AgentError::from(engine_err).into_envelope();
+            assert_eq!(env.kind, want, "{label}");
+            assert!(
+                !env.suggest.contains("report to your operator"),
+                "{label}: this is the caller's to fix, so the advice must not be \
+                 to wake an operator: {}",
+                env.suggest
+            );
+            assert!(env.see.starts_with("latiq://"), "{label}: {}", env.see);
+        }
+        // And the catch-all still is one: a failure we have NOT classified must
+        // keep saying so rather than borrowing someone else's advice.
+        let internal = AgentError::from(EngineError::Engine("connection reset".into()));
+        assert_eq!(internal.envelope().kind, ErrorKind::Internal);
+    }
+
+    /// The message an agent reads must not assert something untrue about the
+    /// failure. Every one of these used to be prefixed "SQL parse error:".
+    #[test]
+    fn error_contract_a_message_is_not_relabelled_on_its_way_out() {
+        for e in [
+            EngineError::Parse("Parser Error: syntax error at or near \"SELEKT\"".into()),
+            EngineError::Catalog("Catalog Error: Table with name nope does not exist!".into()),
+            EngineError::SourceIo("IO Error: Could not connect to server".into()),
+        ] {
+            let expected = match &e {
+                EngineError::Parse(m) | EngineError::Catalog(m) | EngineError::SourceIo(m) => {
+                    m.clone()
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                AgentError::from(e).envelope().message,
+                expected,
+                "the engine's own words, unprefixed"
+            );
         }
     }
 }

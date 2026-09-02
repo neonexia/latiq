@@ -32,6 +32,16 @@ pub enum ErrorKind {
     PondNotFound,
     DatasetNotFound,
     NameConflict,
+    /// The statement is valid SQL and a name in it does not resolve against the
+    /// pond — or already exists there. Deliberately NOT `ParseError`: nothing is
+    /// wrong with the syntax, so "check the SQL against the dialect" sends the
+    /// agent to read a grammar when what it needs is `SHOW TABLES`. And
+    /// deliberately not `Internal`: `CREATE TABLE t` on an existing `t` used to
+    /// arrive as "Retry; if it persists, report to your operator", which is
+    /// advice to repeat a statement that cannot ever succeed and then to wake a
+    /// human about it. Also not `NameConflict`, which is about POND names and
+    /// tells the caller to pick a different pond name.
+    CatalogError,
     ParseError,
     InvalidValue,
     MissingArgument,
@@ -56,6 +66,13 @@ pub enum ErrorKind {
     /// neither "retry" nor "report a bug" is the action that fixes it — an
     /// operator has to bring the node back or forget the pond.
     PondUnavailable,
+    /// A data source named IN THE STATEMENT could not be read or written — a
+    /// URL, an object-store path, a file. The failure is outside the pond and
+    /// usually outside this deployment, so neither `Storage` nor `Internal`
+    /// fits: nothing of ours broke, and "report to your operator" is the wrong
+    /// move for a mistyped URL. The action is the caller's: fix the address or
+    /// the credentials, or accept that the source is down.
+    SourceUnavailable,
     Storage,
     Internal,
 }
@@ -86,6 +103,7 @@ impl ErrorKind {
             ErrorKind::PondNotFound => "pond_not_found",
             ErrorKind::DatasetNotFound => "dataset_not_found",
             ErrorKind::NameConflict => "name_conflict",
+            ErrorKind::CatalogError => "catalog_error",
             ErrorKind::ParseError => "parse_error",
             ErrorKind::InvalidValue => "invalid_value",
             ErrorKind::MissingArgument => "missing_argument",
@@ -97,6 +115,7 @@ impl ErrorKind {
             ErrorKind::QueryCancelled => "query_cancelled",
             ErrorKind::Unauthenticated => "unauthenticated",
             ErrorKind::PondUnavailable => "pond_unavailable",
+            ErrorKind::SourceUnavailable => "source_unavailable",
             ErrorKind::Storage => "storage",
             ErrorKind::Internal => "internal",
         }
@@ -116,6 +135,15 @@ impl ErrorKind {
                 "Choose a different name, or omit name to let Latiq generate one."
             }
             ErrorKind::ParseError => "Check the SQL syntax against the supported dialect.",
+            // The one an agent hits most in ordinary work (`INSERT INTO nope`),
+            // so it names the exact call that answers it — first, and by name.
+            ErrorKind::CatalogError => {
+                "Look up what the pond actually has before retrying: describe_pond, or read_query \
+                 \"SHOW TABLES\" / \"DESCRIBE <table>\" / \"SELECT * FROM \
+                 information_schema.columns\". Then use a name that exists — or create it with \
+                 write_query first. If the name already exists, pick another or use CREATE OR \
+                 REPLACE / CREATE TABLE IF NOT EXISTS."
+            }
             ErrorKind::InvalidValue => "Fix the value and retry.",
             ErrorKind::MissingArgument => "Provide the required argument and retry.",
             ErrorKind::WriteToReservedSchema => {
@@ -142,6 +170,16 @@ impl ErrorKind {
                  registered); if it is gone for good, `latiq pond forget <pond> --confirm` drops \
                  the registry record — the data on that node is NOT deleted."
             }
+            // Addressed to the CALLER: the address in the statement is the
+            // caller's, and an operator cannot fix a typo in it.
+            ErrorKind::SourceUnavailable => {
+                "Check the path or URL in the statement — spelling, host, bucket, and whether it \
+                 needs credentials this deployment does not have. It must be reachable from the \
+                 node, and only public http(s)/s3 sources are. One retry is worth it if the \
+                 failure could be a transient network fault; a second identical failure means the \
+                 source, not the query. To work offline of it, load the data into the pond first \
+                 (load_dataset / pull_catalog)."
+            }
             ErrorKind::Storage | ErrorKind::Internal => {
                 "Retry; if it persists, report to your operator."
             }
@@ -158,6 +196,8 @@ impl ErrorKind {
             | ErrorKind::ParseError
             | ErrorKind::WriteToReservedSchema => "latiq://dialect",
             ErrorKind::QueryTimeout => "latiq://troubleshooting/timeouts",
+            ErrorKind::CatalogError => "latiq://troubleshooting/catalog-error",
+            ErrorKind::SourceUnavailable => "latiq://troubleshooting/source-unavailable",
             ErrorKind::PondUnavailable => "latiq://troubleshooting/pond-unavailable",
             ErrorKind::NameConflict
             | ErrorKind::InvalidValue
@@ -237,6 +277,7 @@ mod tests {
             ErrorKind::DatasetNotFound,
             ErrorKind::NameConflict,
             ErrorKind::ParseError,
+            ErrorKind::CatalogError,
             ErrorKind::InvalidValue,
             ErrorKind::MissingArgument,
             ErrorKind::WriteToReservedSchema,
@@ -247,6 +288,7 @@ mod tests {
             ErrorKind::QueryCancelled,
             ErrorKind::Unauthenticated,
             ErrorKind::PondUnavailable,
+            ErrorKind::SourceUnavailable,
             ErrorKind::Storage,
             ErrorKind::Internal,
         ] {
@@ -262,6 +304,7 @@ mod tests {
             ErrorKind::DatasetNotFound,
             ErrorKind::NameConflict,
             ErrorKind::ParseError,
+            ErrorKind::CatalogError,
             ErrorKind::InvalidValue,
             ErrorKind::MissingArgument,
             ErrorKind::WriteToReservedSchema,
@@ -272,6 +315,7 @@ mod tests {
             ErrorKind::QueryCancelled,
             ErrorKind::Unauthenticated,
             ErrorKind::PondUnavailable,
+            ErrorKind::SourceUnavailable,
             ErrorKind::Storage,
             ErrorKind::Internal,
         ] {

@@ -20,7 +20,7 @@ use crate::arrow::ArrowReadStream;
 use crate::control::ControlPlane;
 use crate::deadline::{Deadline, QueryControls};
 use crate::error::AgentError;
-use crate::forward::Forwarder;
+use crate::forward::{Forwarder, Peer};
 use crate::inflight::InFlightRegistry;
 use crate::lineage::{QueryRecord, IN_PROCESS_NODE};
 use crate::types::{
@@ -67,8 +67,8 @@ enum Placement<'a> {
     /// clustered at all (no forwarder / no advertised endpoint — the embedded
     /// SDK and single-node `dev.sh`), where every pond is by definition local.
     Local,
-    /// Another node owns it; delegate over this forwarder to that endpoint.
-    Forward(&'a dyn Forwarder, &'a str),
+    /// Another node owns it; delegate over this forwarder to that peer.
+    Forward(&'a dyn Forwarder, Peer<'a>),
     /// The pond exists but the registry names no node serving it. Refuse —
     /// `AgentError::pond_unavailable`.
     NoOwner,
@@ -443,7 +443,13 @@ impl AgentOps {
                 );
                 Placement::NoOwner
             }
-            Some(owner) => Placement::Forward(fwd.as_ref(), owner),
+            Some(endpoint) => Placement::Forward(
+                fwd.as_ref(),
+                Peer {
+                    node_id: owner_id,
+                    endpoint,
+                },
+            ),
         }
     }
 
@@ -459,7 +465,7 @@ impl AgentOps {
         identity: &Identity,
         op: &'static str,
         info: &'a PondInfo,
-    ) -> Result<Option<(&'a dyn Forwarder, &'a str)>, AgentError> {
+    ) -> Result<Option<(&'a dyn Forwarder, Peer<'a>)>, AgentError> {
         match self.placement(info) {
             Placement::Local => Ok(None),
             Placement::Forward(fwd, owner) => Ok(Some((fwd, owner))),
@@ -558,7 +564,8 @@ impl AgentOps {
             info!(
                 op = "materialize_pond",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("materialize_pond");
@@ -665,7 +672,8 @@ impl AgentOps {
             info!(
                 op = "describe_pond",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("describe_pond");
@@ -776,7 +784,8 @@ impl AgentOps {
             info!(
                 op = "drop_pond",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("drop_pond");
@@ -985,7 +994,8 @@ impl AgentOps {
             info!(
                 op = "catalog_pull",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("catalog_pull");
@@ -1067,7 +1077,8 @@ impl AgentOps {
             info!(
                 op = "catalog_describe",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("catalog_describe");
@@ -1200,7 +1211,8 @@ impl AgentOps {
             info!(
                 op = "read_arrow",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("read_arrow");
@@ -1388,7 +1400,8 @@ impl AgentOps {
             info!(
                 op = "read_query",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("read_query");
@@ -1499,7 +1512,8 @@ impl AgentOps {
             info!(
                 op = "query",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             // The neutral `query` above is about the SQL (we cannot say read vs
@@ -1671,7 +1685,8 @@ impl AgentOps {
             info!(
                 op = "explain_query",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("explain_query");
@@ -1782,7 +1797,8 @@ impl AgentOps {
             info!(
                 op = "get_lineage",
                 pond = pond_ref,
-                owner,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
             record_forward("get_lineage");

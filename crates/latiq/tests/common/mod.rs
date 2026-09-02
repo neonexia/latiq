@@ -38,7 +38,12 @@ pub struct TestStack {
     pub admin_endpoint: String,
     pub control_endpoint: String,
     pub mcp_endpoint: String,
-    _tmp: tempfile::TempDir,
+    /// The whole node, not just its data directory. Keeping only the TempDir
+    /// used to be enough; it stopped being enough when `NodeStack` grew the
+    /// shutdown sender that `kill` fires — dropping the node dropped that
+    /// sender, the server saw its shutdown future resolve, and the node
+    /// stopped serving the moment the stack was built.
+    _node: NodeStack,
 }
 
 /// One pond node in a multi-node stack. `internal_endpoint == data_endpoint` —
@@ -48,6 +53,14 @@ pub struct NodeStack {
     pub data_endpoint: String,
     pub mcp_endpoint: String,
     pub internal_endpoint: String,
+    /// The node's serving tasks, kept so a test can KILL it — see
+    /// [`NodeStack::kill`].
+    servers: Vec<tokio::task::JoinHandle<()>>,
+    /// Stops the Data/Stream server. Aborting its task is NOT enough: tonic
+    /// spawns each connection on its own task, so a peer that already holds a
+    /// channel keeps being served by a node whose acceptor is gone — which is
+    /// how a "killed" node went on answering forwarded queries.
+    shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -64,6 +77,37 @@ impl NodeStack {
     /// under test to answer.
     pub fn holds_pond(&self, pond_id: &str) -> bool {
         self.data_dir().join(pond_id).exists()
+    }
+
+    /// Kill the node the way a `SIGKILL` does: its listeners stop answering,
+    /// while the registry keeps its row — same node id, same endpoint, still
+    /// "active" — because nothing told the control plane anything.
+    ///
+    /// This exists because the alternative (registering a node that never
+    /// listened, or blanking the registry row) is a state a live deployment
+    /// only reaches by accident. The dead-owner path is reached by a node that
+    /// registered, served, and then stopped, and it was the path that returned
+    /// `internal` + "retry" while a test on the fabricated state asserted the
+    /// right kind and passed.
+    ///
+    /// Returns once the data port actually refuses connections, so a test that
+    /// dials next cannot race the shutdown.
+    pub async fn kill(&self) {
+        if let Some(tx) = self.shutdown.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        for task in &self.servers {
+            task.abort();
+        }
+        for _ in 0..200 {
+            if let Ok(ep) = Endpoint::from_shared(self.data_endpoint.clone()) {
+                if ep.connect().await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("killed node still answers at {}", self.data_endpoint);
     }
 }
 
@@ -374,7 +418,8 @@ async fn start_node_inner(
     };
 
     let data_ops = ops.clone();
-    tokio::spawn(async move {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let data_task = tokio::spawn(async move {
         Server::builder()
             .add_service(DataServer::new(
                 DataService::new(data_ops.clone())
@@ -386,11 +431,13 @@ async fn start_node_inner(
                     .with_verifier(verifier)
                     .with_metadata_url(metadata_url.as_deref()),
             ))
-            .serve_with_incoming(TcpListenerStream::new(data_l))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(data_l), async {
+                let _ = stop_rx.await;
+            })
             .await
             .unwrap();
     });
-    tokio::spawn(async move {
+    let mcp_task = tokio::spawn(async move {
         serve_mcp_with_listener(mcp_l, ops, mcp_verifier, None)
             .await
             .unwrap();
@@ -402,6 +449,8 @@ async fn start_node_inner(
         data_endpoint,
         mcp_endpoint,
         internal_endpoint,
+        servers: vec![data_task, mcp_task],
+        shutdown: std::sync::Mutex::new(Some(stop_tx)),
         _tmp: tmp,
     }
 }
@@ -479,7 +528,7 @@ pub async fn start_stack_with_timeouts(timeouts: latiq_common::QueryTimeouts) ->
         admin_endpoint,
         control_endpoint,
         mcp_endpoint: node.mcp_endpoint.clone(),
-        _tmp: node._tmp,
+        _node: node,
     }
 }
 
@@ -500,7 +549,7 @@ pub async fn start_stack_with_auth(auth: latiq_auth::AuthConfig) -> TestStack {
         admin_endpoint,
         control_endpoint,
         mcp_endpoint: node.mcp_endpoint.clone(),
-        _tmp: node._tmp,
+        _node: node,
     }
 }
 
@@ -520,7 +569,7 @@ pub async fn start_stack_one_port_with_auth(auth: latiq_auth::AuthConfig) -> Tes
         admin_endpoint: endpoint.clone(),
         control_endpoint: endpoint,
         mcp_endpoint: node.mcp_endpoint.clone(),
-        _tmp: node._tmp,
+        _node: node,
     }
 }
 

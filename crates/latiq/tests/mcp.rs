@@ -1335,3 +1335,194 @@ mod timeouts {
         c.close().await.unwrap();
     }
 }
+
+/// Error classification as an AGENT meets it. Every assertion here is the same
+/// question: from this envelope alone, can the agent decide its next call
+/// without a human?
+///
+/// The kinds these pin were all `internal` + "Retry; if it persists, report to
+/// your operator", or `parse_error` + "Check the SQL syntax", or
+/// `read_only_violation` — three answers that between them sent an agent to
+/// retry a statement that can never succeed, to read a grammar for a name that
+/// does not exist, and to call write_query with a typo.
+mod classification {
+    use super::*;
+
+    /// One pond with one table, plus a client. Every case below is a single
+    /// tool call against it, so they share the fixture rather than a stack
+    /// each.
+    async fn pond_with_a_table() -> (common::TestStack, LatiqClient) {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-e".into()))
+            .await
+            .unwrap();
+        let a = c.allocate_pond(Some("errs")).await.unwrap();
+        assert!(!a.is_error, "allocate: {:?}", a.value);
+        let out = call(
+            &c,
+            "write_query",
+            "CREATE TABLE t(id INTEGER, name VARCHAR)",
+        )
+        .await;
+        assert!(!out.is_error, "fixture: {:?}", out.value);
+        (s, c)
+    }
+
+    async fn call(c: &LatiqClient, tool: &'static str, sql: &str) -> latiq_client::CallOutcome {
+        let mut a = Map::new();
+        a.insert("pond".into(), Value::String("errs".into()));
+        a.insert("sql".into(), Value::String(sql.into()));
+        c.call_tool(tool, a).await.unwrap()
+    }
+
+    fn field(out: &latiq_client::CallOutcome, key: &str) -> String {
+        out.value[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("no {key} in {:?}", out.value))
+            .to_string()
+    }
+
+    /// D1 + D7: a name that doesn't resolve — the commonest failure in ordinary
+    /// agent work — and its mirror image, a name that already does.
+    ///
+    /// `INSERT INTO nope` was `parse_error` ("Check the SQL syntax against the
+    /// supported dialect") because DuckDB binds INSERT at prepare time;
+    /// `CREATE TABLE t` on an existing `t` was `internal` ("Retry…report to
+    /// your operator") because DuckDB defers that check to execution. Same
+    /// mistake, same fix, two different answers decided by binder phasing.
+    #[tokio::test]
+    async fn error_contract_a_name_that_does_not_resolve_is_a_catalog_error() {
+        let (_s, c) = pond_with_a_table().await;
+        for (sql, tool) in [
+            ("INSERT INTO nope VALUES (1)", "write_query"),
+            ("SELECT * FROM nope", "read_query"),
+            ("SELECT nosuchcol FROM t", "read_query"),
+            ("CREATE TABLE t(id INTEGER)", "write_query"),
+            (
+                "CREATE TABLE information_schema.x(i INTEGER)",
+                "write_query",
+            ),
+        ] {
+            let out = call(&c, tool, sql).await;
+            assert!(out.is_error, "{sql} must fail");
+            assert_eq!(out.value["kind"], "catalog_error", "{sql}: {:?}", out.value);
+            let suggest = field(&out, "suggest");
+            // The next call, named. Not a dialect reference, and not "retry".
+            assert!(
+                suggest.contains("describe_pond") && suggest.contains("SHOW TABLES"),
+                "{sql}: the suggest must name the call that answers this: {suggest}"
+            );
+            assert!(
+                !suggest.contains("report to your operator"),
+                "{sql}: no operator can fix a name in the caller's SQL: {suggest}"
+            );
+            let message = field(&out, "message");
+            assert!(
+                !message.starts_with("SQL parse error") && !message.starts_with("engine error"),
+                "{sql}: the message must not mislabel what happened: {message}"
+            );
+        }
+        // The `see` is a page about THIS kind, and it exists.
+        let out = call(&c, "write_query", "INSERT INTO nope VALUES (1)").await;
+        let see = field(&out, "see");
+        assert_eq!(see, "latiq://troubleshooting/catalog-error");
+        let body = c.read_resource_text(&see).await.unwrap();
+        assert!(
+            body.contains("SHOW TABLES") && body.contains("already exists"),
+            "the page must cover both halves of the kind: {body}"
+        );
+        c.close().await.unwrap();
+    }
+
+    /// D4: a typo in read_query was reported as a write.
+    ///
+    /// `SELEKT * FROM t` does not start with a read keyword, so the read guard
+    /// called it a write: "read_query received a statement that is not
+    /// read-only… Use write_query for INSERT/UPDATE/DELETE/DDL". The agent
+    /// obeys, calls write_query, and only then learns it made a typo — two
+    /// calls and a false belief to fix one character.
+    #[tokio::test]
+    async fn error_contract_a_typo_in_read_query_is_a_parse_error_not_a_write() {
+        let (_s, c) = pond_with_a_table().await;
+        for sql in ["SELEKT * FROM t", "@@@@", "", "   ", "SELECT * FRM t"] {
+            let out = call(&c, "read_query", sql).await;
+            assert!(out.is_error, "{sql:?} must fail");
+            assert_eq!(
+                out.value["kind"], "parse_error",
+                "{sql:?} is a typo, not a write: {:?}",
+                out.value
+            );
+        }
+        // The control: read_query must still refuse a REAL write, or the fix
+        // above would have been a hole in the read guard rather than a
+        // correction to it.
+        for sql in [
+            "INSERT INTO t VALUES (1, 'a')",
+            "DROP TABLE t",
+            "WITH x AS (SELECT 1) INSERT INTO t SELECT 1, 'a'",
+            "SELECT 1;DROP TABLE t",
+            "SET memory_limit='1GB'",
+        ] {
+            let out = call(&c, "read_query", sql).await;
+            assert_eq!(
+                out.value["kind"], "read_only_violation",
+                "{sql} is a write and must still be refused as one: {:?}",
+                out.value
+            );
+        }
+        c.close().await.unwrap();
+    }
+
+    /// D7: a value DuckDB could not convert, and a source it could not reach,
+    /// were both `parse_error` — "Check the SQL syntax against the supported
+    /// dialect", for SQL whose syntax was fine.
+    #[tokio::test]
+    async fn error_contract_a_rejected_value_and_an_unreachable_source_are_told_apart() {
+        let (_s, c) = pond_with_a_table().await;
+
+        let bad_value = call(&c, "write_query", "INSERT INTO t VALUES ('notanint','x')").await;
+        assert_eq!(
+            bad_value.value["kind"], "invalid_value",
+            "a value the engine could not convert is not a syntax error: {:?}",
+            bad_value.value
+        );
+        let suggest = field(&bad_value, "suggest");
+        assert!(
+            suggest.contains("CAST") && suggest.contains("DESCRIBE"),
+            "the suggest must name how to fix a value: {suggest}"
+        );
+
+        // Port 9 (discard) refuses immediately — an unreachable source with no
+        // network wait and nothing to be flaky about.
+        let unreachable = call(
+            &c,
+            "read_query",
+            "SELECT * FROM read_csv('http://127.0.0.1:9/none.csv')",
+        )
+        .await;
+        assert_eq!(
+            unreachable.value["kind"], "source_unavailable",
+            "an address the caller supplied is not our failure and not a syntax \
+             error: {:?}",
+            unreachable.value
+        );
+        let suggest = field(&unreachable, "suggest");
+        assert!(
+            !suggest.contains("report to your operator"),
+            "an operator cannot fix a URL in the caller's SQL: {suggest}"
+        );
+        let see = field(&unreachable, "see");
+        assert_eq!(see, "latiq://troubleshooting/source-unavailable");
+        let body = c.read_resource_text(&see).await.unwrap();
+        assert!(
+            body.contains("reachable from the node"),
+            "the page must be about this kind: {body}"
+        );
+
+        // And a genuine syntax error is still a parse error — the kinds above
+        // are distinctions, not a wholesale relabelling.
+        let syntax = call(&c, "write_query", "INSERT INTO t VALUES (").await;
+        assert_eq!(syntax.value["kind"], "parse_error", "{:?}", syntax.value);
+        c.close().await.unwrap();
+    }
+}
