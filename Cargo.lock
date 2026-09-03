@@ -1915,6 +1915,7 @@ dependencies = [
  "latiq-storage",
  "metrics",
  "metrics-exporter-prometheus",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",
@@ -1962,6 +1963,7 @@ dependencies = [
 name = "latiq-common"
 version = "0.1.0"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
  "uuid",
@@ -1995,6 +1997,7 @@ dependencies = [
  "arrow",
  "latiq-common",
  "latiq-storage",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

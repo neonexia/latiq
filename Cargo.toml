@@ -73,7 +73,13 @@ url = "2"
 # `rustls-tls` feature to `rustls` (it now also pulls the platform verifier
 # for root certs); `rustls-tls` no longer exists.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-schemars = "0.8"
+# The types every surface serializes derive `JsonSchema` here so the MCP
+# `outputSchema` is GENERATED from the struct we really send (it cannot drift).
+# It must be the SAME crate version rmcp re-exports as `rmcp::schemars` — a
+# mismatch is a trait-mismatch at the `with_output_schema` call site, i.e. a
+# build failure rather than a silent divergence, which is why this is pinned to
+# rmcp 1.7's schemars line rather than left open.
+schemars = "1.2"
 # Observability. metrics-exporter-prometheus without default features drops its
 # hyper http-listener (we serve /metrics ourselves via axum) — no tonic skew.
 metrics = "0.24"

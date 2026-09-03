@@ -14,11 +14,12 @@
 
 //! Neutral, protocol-agnostic result/info types produced by AgentOps.
 use latiq_engine::SchemaSummary;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A pond's registry record, as every surface sees it. Purely metadata — the
 /// registry's view of a pond, never its contents.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PondInfo {
     pub pond_id: String,
     pub name: String,
@@ -62,14 +63,14 @@ pub struct PondInfo {
 
 /// What `allocate_pond` hands back. Both identifiers, because the caller asked
 /// for a name (or none) and every later call may use either.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AllocateResult {
     pub pond_id: String,
     pub pond_name: String,
 }
 
 /// One file table in a dataset.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DatasetTableInfo {
     pub table_name: String,
     pub source_uri: String,
@@ -77,7 +78,7 @@ pub struct DatasetTableInfo {
 }
 
 /// A dataset: simple file tables in the built-in `latiq` catalog.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DatasetInfo {
     pub name: String,
     pub description: String,
@@ -88,7 +89,7 @@ pub struct DatasetInfo {
 }
 
 /// An external catalog (iceberg/…): a type + locator params (no credentials).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CatalogInfo {
     pub name: String,
     pub r#type: String,
@@ -100,7 +101,7 @@ pub struct CatalogInfo {
 }
 
 /// Result of loading a dataset into a pond.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LoadDatasetResult {
     pub dataset: String,
     /// The schema the dataset's tables were created under (named after the
@@ -111,7 +112,7 @@ pub struct LoadDatasetResult {
 }
 
 /// Result of a transient pull from an external catalog (the query ran in-pond).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PullResult {
     pub catalog: String,
     pub query: String,
@@ -121,7 +122,7 @@ pub struct PullResult {
 /// returns. The events are the recorded JSON **verbatim** (see
 /// `latiq_lineage::reader`), so a consumer can replay them into an OpenLineage
 /// backend unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LineagePage {
     pub pond_id: String,
     pub pond_name: String,
@@ -157,7 +158,7 @@ pub struct LineagePage {
 /// A pond's orientation for an agent: its registry record plus its live table
 /// schema. The two halves come from different planes — the registry and the
 /// engine — which is why describe runs on the owning node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DescribeResult {
     pub pond: PondInfo,
     pub schema: SchemaSummary,

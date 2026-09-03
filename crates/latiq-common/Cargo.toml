@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 uuid = { workspace = true }
+# Describes the shapes this kernel serializes (`QueryMeta`, the error envelope's
+# neighbours) so the MCP surface's declared `outputSchema` is derived from them
+# rather than restated. A serde-adjacent description crate, not a transport —
+# invariant 5 is untouched.
+schemars = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

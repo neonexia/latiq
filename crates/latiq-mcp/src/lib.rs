@@ -15,6 +15,8 @@
 //! latiq-mcp — MCP-over-HTTP surface adapter (rmcp) onto latiq-agent-core.
 pub mod encode;
 pub mod resources;
+pub mod response;
+pub mod schema;
 pub mod server;
 
 pub use server::{

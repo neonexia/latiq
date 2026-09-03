@@ -2173,3 +2173,282 @@ mod honest_answers {
         c.close().await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+/// **The declared output contract.** Every tool publishes an `outputSchema`, and
+/// the point of publishing one is that a client may rely on it — so this drives
+/// each tool to a REAL success response over the real transport and validates
+/// that response against the schema the server itself advertised in
+/// `tools/list`. rmcp deliberately does not validate responses against
+/// `outputSchema` ("since rust is a strong type language…", `model.rs`), so if
+/// we do not, nobody does and the declaration is a document rather than a
+/// contract.
+///
+/// A submodule, not a new binary (tests/CLAUDE.md rule 5).
+// ---------------------------------------------------------------------------
+mod output_schema {
+    use crate::common::start_stack;
+    use latiq_client::LatiqClient;
+    use latiq_proto::v1::admin_client::AdminClient;
+    use latiq_proto::v1::{CatalogAddRequest, CatalogMsg};
+    use serde_json::{Map, Value};
+    use std::collections::HashMap;
+
+    /// Every tool this surface advertises. Pinned as a list so a NEW tool fails
+    /// this test rather than slipping in undeclared and unvalidated: the count
+    /// assertion below is the anti-vacuity guard (tests/CLAUDE.md rule 3).
+    const TOOLS: &[&str] = &[
+        "allocate_pond",
+        "describe_pond",
+        "list_ponds",
+        "drop_pond",
+        "read_query",
+        "write_query",
+        "explain_query",
+        "list_datasets",
+        "load_dataset",
+        "list_catalogs",
+        "describe_catalog",
+        "pull_catalog",
+        "get_lineage",
+    ];
+
+    /// A local DuckLake catalog with one table — file metadata + local data, no
+    /// network and no docker, so `describe_catalog`/`pull_catalog` reach a real
+    /// SUCCESS response in this suite rather than only an error one. Same seed
+    /// the Data-surface catalog test uses (`admin.rs::catalogs`).
+    fn seed_ducklake(dir: &std::path::Path) -> (String, String) {
+        let meta = dir.join("meta.duckdb");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake;
+             ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
+             CREATE TABLE ext.widgets AS
+               SELECT * FROM (VALUES (1,'gear',9.99),(2,'bolt',0.99)) t(id,name,price);",
+            meta.display(),
+            data.display(),
+        ))
+        .unwrap();
+        (meta.display().to_string(), data.display().to_string())
+    }
+
+    fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn output_schema_every_tool_declares_one_and_its_real_response_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (metadata_path, data_path) = seed_ducklake(tmp.path());
+        let s = start_stack().await;
+        AdminClient::connect(s.admin_endpoint.clone())
+            .await
+            .unwrap()
+            .catalog_add(CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "ext".into(),
+                    r#type: "ducklake".into(),
+                    params: HashMap::from([
+                        ("metadata_path".into(), metadata_path),
+                        ("data_path".into(), data_path),
+                    ]),
+                    description: "local ducklake".into(),
+                    tags: vec!["test".into()],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            })
+            .await
+            .unwrap();
+
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
+            .await
+            .unwrap();
+
+        // What the server ADVERTISES — the schemas a client would compile.
+        let tools = c.list_tools().await.unwrap();
+        let mut declared: HashMap<String, Value> = HashMap::new();
+        for t in &tools {
+            let schema = t.output_schema.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "tool `{}` declares no outputSchema; every result of ours is \
+                     structured, so an undeclared one is a promise we are not making",
+                    t.name
+                )
+            });
+            declared.insert(t.name.to_string(), Value::Object((**schema).clone()));
+        }
+        let mut names: Vec<&str> = TOOLS.to_vec();
+        names.sort();
+        let mut advertised: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        advertised.sort();
+        assert_eq!(
+            advertised, names,
+            "the advertised tool set must match the list this test drives — a new \
+             tool has to gain a declared+validated response, not slip past"
+        );
+
+        // Drive every tool to a real SUCCESS response, in dependency order.
+        let mut observed: Vec<(&str, Value)> = Vec::new();
+        let mut record = |name: &'static str, out: latiq_client::CallOutcome| {
+            assert!(!out.is_error, "{name} must succeed here: {:#}", out.value);
+            observed.push((name, out.value));
+        };
+
+        record(
+            "allocate_pond",
+            c.call_tool(
+                "allocate_pond",
+                args(&[("name", "sch".into()), ("lineage", true.into())]),
+            )
+            .await
+            .unwrap(),
+        );
+        record(
+            "write_query",
+            c.write("sch", "CREATE TABLE t AS SELECT 1 AS id, 'a' AS nm")
+                .await
+                .unwrap(),
+        );
+        record(
+            "read_query",
+            c.query("sch", "SELECT * FROM t").await.unwrap(),
+        );
+        record(
+            "explain_query",
+            c.explain("sch", "SELECT * FROM t").await.unwrap(),
+        );
+        record("describe_pond", c.describe_pond("sch").await.unwrap());
+        record("list_ponds", c.list_ponds().await.unwrap());
+        record(
+            "list_datasets",
+            c.call_tool("list_datasets", Map::new()).await.unwrap(),
+        );
+        record(
+            "load_dataset",
+            c.call_tool(
+                "load_dataset",
+                args(&[("pond", "sch".into()), ("dataset", "holdings".into())]),
+            )
+            .await
+            .unwrap(),
+        );
+        record(
+            "list_catalogs",
+            c.call_tool("list_catalogs", Map::new()).await.unwrap(),
+        );
+        record(
+            "describe_catalog",
+            c.call_tool(
+                "describe_catalog",
+                args(&[("pond", "sch".into()), ("catalog", "ext".into())]),
+            )
+            .await
+            .unwrap(),
+        );
+        record(
+            "pull_catalog",
+            c.call_tool(
+                "pull_catalog",
+                args(&[
+                    ("pond", "sch".into()),
+                    ("catalog", "ext".into()),
+                    (
+                        "query",
+                        "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
+                            .into(),
+                    ),
+                ]),
+            )
+            .await
+            .unwrap(),
+        );
+        record(
+            "get_lineage",
+            c.call_tool("get_lineage", args(&[("pond", "sch".into())]))
+                .await
+                .unwrap(),
+        );
+        // Destructive, so last.
+        record("drop_pond", c.drop_pond("sch").await.unwrap());
+
+        // The whole point: the real response satisfies the declared schema.
+        for (name, value) in &observed {
+            let schema = declared
+                .get(*name)
+                .unwrap_or_else(|| panic!("no declared schema for {name}"));
+            let validator = jsonschema::validator_for(schema)
+                .unwrap_or_else(|e| panic!("{name}'s declared outputSchema must compile: {e}"));
+            if let Err(e) = validator.validate(value) {
+                panic!(
+                    "{name}'s real response does not satisfy its DECLARED outputSchema \
+                     at `{}`: {e}\nresponse: {value:#}\nschema: {schema:#}",
+                    e.instance_path()
+                );
+            }
+        }
+        assert_eq!(
+            observed.len(),
+            TOOLS.len(),
+            "every tool must contribute a real response — a tool validated against \
+             nothing is a tool nobody checked"
+        );
+        c.close().await.unwrap();
+    }
+
+    /// **Errors are deliberately OUTSIDE the declared schema.** A failed tool
+    /// call answers with `isError: true` and the `ErrorEnvelope` in
+    /// `structuredContent` — not the success shape — and both reference MCP
+    /// clients skip output-schema validation entirely on an error result (the
+    /// TypeScript SDK guards both branches with `&& !result.isError`; the Python
+    /// SDK with `if ... and not result.is_error`). So the schemas describe the
+    /// success shape only, and the envelope stays one shape across all 13 tools
+    /// instead of thirteen `anyOf`s that would have to be edited in lockstep.
+    ///
+    /// This test pins that decision from both ends: the envelope really is what
+    /// comes back, and it really would NOT satisfy the success schema — which is
+    /// exactly why the schema must not be read as covering it.
+    #[tokio::test]
+    async fn output_schema_errors_answer_with_the_envelope_outside_the_success_shape() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
+            .await
+            .unwrap();
+        let tools = c.list_tools().await.unwrap();
+        let schema = Value::Object(
+            (**tools
+                .iter()
+                .find(|t| t.name == "read_query")
+                .unwrap()
+                .output_schema
+                .as_ref()
+                .expect("read_query declares an outputSchema"))
+            .clone(),
+        );
+
+        let out = c.query("no-such-pond", "SELECT 1").await.unwrap();
+        assert!(
+            out.is_error,
+            "an unknown pond is a tool error: {:#}",
+            out.value
+        );
+        assert_eq!(
+            out.value["kind"], "pond_not_found",
+            "the envelope, keyed by the field agents route on: {:#}",
+            out.value
+        );
+
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(
+            validator.validate(&out.value).is_err(),
+            "the envelope is NOT the success shape — if it validated, the schema \
+             would be too loose to promise anything about a successful read"
+        );
+        c.close().await.unwrap();
+    }
+}

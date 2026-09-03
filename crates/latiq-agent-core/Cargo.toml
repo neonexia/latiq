@@ -19,6 +19,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 arrow = { workspace = true }
+# The neutral result types in `types.rs` are declared verbatim as MCP output
+# schemas; see latiq-common's note. Protocol-neutral: no transport type is
+# involved, and the MCP adapter is still the only thing that publishes them.
+schemars = { workspace = true }
 
 [dev-dependencies]
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }

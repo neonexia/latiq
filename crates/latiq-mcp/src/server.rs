@@ -28,8 +28,13 @@
 //! front of the router (so `initialize` and the discovery methods are covered
 //! too, not just tool calls). Without one, identity stays relaxed (claimed,
 //! default anonymous) — the embedded and dev path.
-use crate::encode::{err_envelope, ok_explain, ok_query, ok_value};
+use crate::encode::{err_envelope, ok, ok_explain, ok_query};
 use crate::resources;
+use crate::response::{
+    CatalogTableRef, DescribeCatalogResponse, DropPondResponse, ListCatalogsResponse,
+    ListDatasetsResponse, ListPondsResponse, QueryResponse,
+};
+use crate::schema::output_schema;
 use latiq_agent_core::{with_bearer, AgentError, AgentOps, QueryControls};
 use latiq_auth::metadata::{challenge_header, ProtectedResourceMetadata};
 use latiq_auth::Verifier;
@@ -524,6 +529,7 @@ impl LatiqServer {
     /// Allocate a new pond. Optionally name it; Latiq generates a name if omitted.
     /// Returns the pond_id and pond_name. Use list_ponds to discover existing ponds.
     #[tool(
+        output_schema = output_schema::<latiq_agent_core::AllocateResult>(),
         description = "Allocate a new pond — a private DuckLake workspace you can write to and query with SQL. \
 Optionally pass a `name` (Latiq generates one if omitted). Returns `pond_id` + `pond_name`. \
 Use this first when you have a task that needs its own data space; use list_ponds to find or join an existing one. \
@@ -582,7 +588,7 @@ See latiq://guidance.",
                 .allocate_pond(&id, a.name, "{}", tier, &exts, a.lineage.unwrap_or(false))
                 .await
             {
-                Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
+                Ok(r) => ok(&r),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -591,6 +597,7 @@ See latiq://guidance.",
 
     /// Describe a pond: its metadata + a summary of its tables. Pass pond id or name.
     #[tool(
+        output_schema = output_schema::<latiq_agent_core::DescribeResult>(),
         description = "Describe a pond: its metadata (name, owner, created_at, tier) plus every table with its COLUMNS (name + type, in declaration order), a row-count estimate and the table's stored comment. \
 Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying — it is one call for the whole pond, where SHOW TABLES + DESCRIBE is one per table. \
 The response's `lineage` flag says whether this pond records provenance — check it before get_lineage, and before you rely on a pond to be explainable later (it cannot be switched on). \
@@ -610,7 +617,7 @@ To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table
         let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.describe_pond(&id, &a.pond).await {
-                Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
+                Ok(r) => ok(&r),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -619,6 +626,7 @@ To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table
 
     /// List all ponds in the deployment.
     #[tool(
+        output_schema = output_schema::<ListPondsResponse>(),
         description = "List all ponds in the deployment (id, name, owner). \
 Use this to discover existing work before allocating a new pond — multiple agents often collaborate in one pond. \
 Follow with describe_pond on a candidate to inspect its tables.",
@@ -636,7 +644,7 @@ Follow with describe_pond on a candidate to inspect its tables.",
         let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.list_ponds(&id).await {
-                Ok(ponds) => ok_value(serde_json::json!({ "ponds": ponds })),
+                Ok(ponds) => ok(&ListPondsResponse { ponds }),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -645,6 +653,7 @@ Follow with describe_pond on a candidate to inspect its tables.",
 
     /// Drop a pond and reclaim its storage. Destructive.
     #[tool(
+        output_schema = output_schema::<DropPondResponse>(),
         description = "Drop a pond and reclaim its storage. DESTRUCTIVE and not reversible — all tables and data in the pond are removed, and its lineage trail goes with them (the deployment's access log is preserved). Read what you still need from get_lineage BEFORE dropping. \
 Only drop a pond when its work is finished. Do NOT drop a pond other agents may still be using; check list_ponds first.",
         annotations(
@@ -666,7 +675,10 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
                 .drop_pond(&id, &a.pond, a.confirm.unwrap_or(false))
                 .await
             {
-                Ok(()) => ok_value(serde_json::json!({ "status": "dropped", "pond": a.pond })),
+                Ok(()) => ok(&DropPondResponse {
+                    status: "dropped".into(),
+                    pond: a.pond.clone(),
+                }),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -676,6 +688,7 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
     /// Run a read-only SQL query (SELECT / read-only metadata) against a pond.
     /// For writes/DDL use write_query. Results are bounded by the inline cap.
     #[tool(
+        output_schema = output_schema::<QueryResponse>(),
         description = "Run a read-only SQL query (SELECT, or read-only metadata like SHOW/DESCRIBE) against a pond. \
 For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here, as is transaction control (BEGIN/COMMIT/ROLLBACK): Latiq manages the transaction. \
 Latiq prefers ANSI SQL; DuckDB extensions are tolerated. Discover tables with `SHOW TABLES` (or `information_schema.tables`/`information_schema.columns`) first. \
@@ -717,6 +730,7 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     /// inside the transaction it owns — caller SQL must not do its own
     /// BEGIN/COMMIT/ROLLBACK.
     #[tool(
+        output_schema = output_schema::<QueryResponse>(),
         description = "Run a write or DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE TABLE AS SELECT) against a pond. \
 Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` — `commit_extra_info` carries the verified-vs-claimed evidence). \
 Latiq runs your statement inside its OWN transaction and records the author just before committing, so send plain statements — several are fine, but do NOT include BEGIN/COMMIT/ROLLBACK/START TRANSACTION. Your own COMMIT ends Latiq's transaction before the author is written, and the change lands in the pond's history with NO author. \
@@ -756,6 +770,7 @@ Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements 
     /// Estimate a query's cost without running it. Call before read/write_query to
     /// reason about scan size; refine, then run.
     #[tool(
+        output_schema = output_schema::<latiq_engine::ExplainResult>(),
         description = "Plan a query WITHOUT running it, and get the planner's cost estimates. \
 Returns `estimated_rows` (how many rows the query would RETURN — compare it against the ~10k inline cap), \
 `scan_operations` (one entry per table read: `table`, `scan_type` full_scan/filtered_scan, `estimated_rows_scanned`, `source`), \
@@ -789,6 +804,7 @@ Read-only and side-effect-free.",
 
     /// Discover curated datasets (simple public files) you can copy into a pond.
     #[tool(
+        output_schema = output_schema::<ListDatasetsResponse>(),
         description = "Browse the catalog of curated DATASETS — simple public files (parquet/CSV) an operator registered. \
 Returns each dataset's `name`, `tables`, `tags`, and `description`. \
 Use this BEFORE load_dataset to find what's available; pass `query` to filter (`#tag`, a `name*` glob, or a substring). \
@@ -816,7 +832,7 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
                 .list_datasets(a.query.as_deref().unwrap_or(""))
                 .await
             {
-                Ok(datasets) => ok_value(serde_json::json!({ "datasets": datasets })),
+                Ok(datasets) => ok(&ListDatasetsResponse { datasets }),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -825,6 +841,7 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
 
     /// Copy a dataset's tables into a pond, under a schema named after the dataset. Pick a name from list_datasets.
     #[tool(
+        output_schema = output_schema::<latiq_agent_core::LoadDatasetResult>(),
         description = "Copy a DATASET's tables into a pond — materialized into the pond's DuckLake under a SCHEMA named after the dataset. \
 Pass `dataset` (a name from list_datasets) and the target `pond`. The response returns `schema` and schema-qualified `tables`; \
 query them as `<dataset>.<table>` with read_query (e.g. `SELECT * FROM tpch.lineitem`). \
@@ -844,7 +861,7 @@ This is a WRITE (it creates a schema + tables, attributed to you). For an extern
         let (id, tok) = self.identity(&ctx)?;
         Ok(with_bearer(tok, async {
             match self.ops.load_dataset(&id, &a.pond, &a.dataset).await {
-                Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
+                Ok(r) => ok(&r),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -853,6 +870,7 @@ This is a WRITE (it creates a schema + tables, attributed to you). For an extern
 
     /// Discover registered external catalogs (iceberg/…) you can pull data from.
     #[tool(
+        output_schema = output_schema::<ListCatalogsResponse>(),
         description = "Browse registered external CATALOGS — databases/lakehouses (iceberg today) an operator registered. \
 Returns each catalog's `name`, `type`, `tags`, and `description`. \
 You don't know a catalog's tables until you look: call describe_catalog next. Then pull_catalog to copy a subset into a pond. \
@@ -878,7 +896,7 @@ Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sour
                 .list_catalogs(a.query.as_deref().unwrap_or(""))
                 .await
             {
-                Ok(catalogs) => ok_value(serde_json::json!({ "catalogs": catalogs })),
+                Ok(catalogs) => ok(&ListCatalogsResponse { catalogs }),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -887,6 +905,7 @@ Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sour
 
     /// List an external catalog's tables (transient attach on a pond). Pass creds via `set`.
     #[tool(
+        output_schema = output_schema::<DescribeCatalogResponse>(),
         description = "List an external catalog's tables/columns — Latiq transiently attaches it on `pond`, reads its metadata, and detaches. \
 Returns `{catalog, tables:[{schema, table}]}`. Use this to learn what to SELECT before pull_catalog. \
 Credentials and config go in `set` (e.g. {\"token\":\"<bearer>\"}); they're used for this call only and never stored. \
@@ -911,15 +930,13 @@ If a credential is missing the attach fails with a clear error — read it and r
                 .catalog_describe(&id, &a.pond, &a.catalog, set)
                 .await
             {
-                Ok(tables) => {
-                    let rows: Vec<_> = tables
+                Ok(tables) => ok(&DescribeCatalogResponse {
+                    catalog: a.catalog.clone(),
+                    tables: tables
                         .into_iter()
-                        .map(
-                            |(schema, table)| serde_json::json!({"schema": schema, "table": table}),
-                        )
-                        .collect();
-                    ok_value(serde_json::json!({ "catalog": a.catalog, "tables": rows }))
-                }
+                        .map(|(schema, table)| CatalogTableRef { schema, table })
+                        .collect(),
+                }),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -928,6 +945,7 @@ If a credential is missing the attach fails with a clear error — read it and r
 
     /// Pull a subset of an external catalog into a pond: transient attach → your query → detach.
     #[tool(
+        output_schema = output_schema::<latiq_agent_core::PullResult>(),
         description = "Pull data from an external catalog INTO a pond in one shot: Latiq attaches the catalog (with your creds), runs your `query`, then detaches. \
 External catalogs are never queried live — you pull what you need into the pond, then work there. \
 Write `query` as a CREATE TABLE that names the catalog, e.g. `CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region='us'` — DuckDB downloads only the columns/rows you select. \
@@ -952,7 +970,7 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
                 .catalog_pull(&id, &a.pond, &a.catalog, &a.query, set)
                 .await
             {
-                Ok(r) => ok_value(serde_json::to_value(r).unwrap_or_default()),
+                Ok(r) => ok(&r),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
@@ -961,6 +979,7 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
 
     /// Read the pond's OpenLineage trail — canonical events, newest first.
     #[tool(
+        output_schema = output_schema::<latiq_agent_core::LineagePage>(),
         description = "Read a pond's PROVENANCE — the OpenLineage events Latiq recorded for every query on it, NEWEST FIRST. \
 Use it to answer 'where did this table come from?', 'who wrote it, and was that identity verified?', 'what did that run read?'. \
 Only ponds allocated with `lineage: true` record anything; asking a pond that does not returns an error saying so — that is deliberately \
@@ -996,7 +1015,7 @@ A record, not proof: these are files in the pond, reachable by anything that can
                 .get_lineage(&id, &a.pond, limit, a.since.as_deref(), a.before.as_deref())
                 .await
             {
-                Ok(page) => ok_value(serde_json::to_value(page).unwrap_or_default()),
+                Ok(page) => ok(&page),
                 Err(e) => err_envelope(e.envelope()),
             }
         })
