@@ -3649,6 +3649,18 @@ mod timeouts {
         // The write path is where an interrupt is most dangerous: it is cut
         // inside Latiq's own transaction, and the ROLLBACK runs on a connection
         // that was just interrupted.
+        //
+        // Regression: this is the test that caught the lost-interrupt bug in
+        // nightly 33789446152 — the write below COMMITTED, reporting
+        // `duration_ms: 2694228` against `timeout_ms: 60000`, because the
+        // engine's watcher fired its one interrupt in a gap where DuckDB had no
+        // running statement to take it. Fixed in `latiq-engine-duckdb`'s
+        // `abort::AbortWatcher` (re-fire) and `Pond::lock_writer` (the queue
+        // wait), and pinned deterministically by that crate's
+        // `cancellation_*` unit tests. Keep the 400 ms here: it deliberately
+        // lands the cancel while the statement is running, which is the ONE
+        // ordering the old code got right, so a regression to one-shot firing
+        // shows up as this test flaking rather than as nothing at all.
         let ops = ops_with(QueryTimeouts::new(60_000, 60_000).unwrap());
         let id = Identity::claimed(Some("agent-w"));
         let pond = ops

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 //! latiq-engine-duckdb — DuckDB + DuckLake implementation of QueryEngine.
+mod abort;
 pub mod attachers;
 pub mod duck_engine;
 pub mod errclass;
