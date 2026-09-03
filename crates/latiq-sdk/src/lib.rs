@@ -100,7 +100,9 @@ impl Pond<'_> {
     pub fn describe(&self) -> Result<serde_json::Value> {
         self.latiq.describe_pond(&self.info.name)
     }
-    /// Explain a query plan (no execution).
+    /// Plan a query without executing it: `estimated_rows`, one
+    /// `scan_operations` entry per table read, derived `warnings`/`suggestions`,
+    /// and `raw_plan`. Every number is the optimiser ESTIMATING.
     pub fn explain(&self, sql: &str) -> Result<serde_json::Value> {
         self.latiq.explain(&self.info.name, sql)
     }
@@ -447,7 +449,12 @@ impl Latiq {
         })
     }
 
-    /// Explain a query plan against `pond` (no execution). Returns the plan JSON.
+    /// Plan a query against `pond` without executing it. Returns the plan
+    /// JSON: `estimated_rows` (the result size the optimiser expects), one
+    /// `scan_operations` entry per table read (`table`, `scan_type`,
+    /// `estimated_rows_scanned`, `source`), derived `warnings`/`suggestions`,
+    /// and `raw_plan`. These are ESTIMATES — nothing runs, and there is no time
+    /// or byte figure because the plan predicts neither.
     pub fn explain(&self, pond: &str, sql: &str) -> Result<serde_json::Value> {
         self.rt.block_on(async {
             let mut d = self.data().await?;

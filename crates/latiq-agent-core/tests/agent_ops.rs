@@ -865,13 +865,8 @@ mod forwarding {
         ) -> Result<ExplainResult, AgentError> {
             self.note(e.endpoint, p, s);
             Ok(ExplainResult {
-                estimated_rows: 0,
-                estimated_bytes: 0,
-                estimated_duration_ms: 0,
-                scan_operations: vec![],
-                warnings: vec![],
-                suggestions: vec![],
                 raw_plan: "forwarded".to_string(),
+                ..Default::default()
             })
         }
         async fn describe(

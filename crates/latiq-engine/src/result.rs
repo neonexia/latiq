@@ -25,7 +25,9 @@ pub struct QueryResult {
 }
 
 /// One table access in an explained plan — the part of a plan an agent can act
-/// on (a `full_scan` is a hint to add a filter).
+/// on (a `full_scan` is a hint to add a filter). File readers (`read_parquet`)
+/// are absent on purpose: the plan JSON carries no path for them, so they are
+/// visible in `raw_plan` only rather than under an invented name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanOp {
     pub table: String,
@@ -37,11 +39,19 @@ pub struct ScanOp {
 }
 
 /// Result of explain_query — estimates + guidance + raw plan.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Every number here is the **optimiser's estimate**, not a measurement: the
+/// statement was planned and discarded, never run. Estimates are routinely wrong
+/// on multi-way joins. Treat them as an order of magnitude.
+///
+/// There is deliberately no `estimated_bytes` and no `estimated_duration_ms`:
+/// the plan carries no byte estimate and predicts no time, and a field that is
+/// always `0` reads as "this query is free", which is worse than its absence.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExplainResult {
+    /// The root operator's estimated row count — the size of the RESULT, the
+    /// number to compare against the inline result cap.
     pub estimated_rows: u64,
-    pub estimated_bytes: u64,
-    pub estimated_duration_ms: u64,
     #[serde(default)]
     pub scan_operations: Vec<ScanOp>,
     #[serde(default)]

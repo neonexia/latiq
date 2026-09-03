@@ -103,6 +103,71 @@ async fn mcp_tools_full_agent_loop() {
 }
 
 #[tokio::test]
+async fn explain_reaches_the_agent_with_real_estimates() {
+    // The whole stack for explain: engine parse -> AgentOps -> ok_explain's
+    // structured content. Six of this response's seven fields used to be
+    // hard-coded empty, so what this proves is that an AGENT — not a unit test
+    // holding an ExplainResult — actually receives numbers.
+    let s = start_stack().await;
+    let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-explain".into()))
+        .await
+        .unwrap();
+    c.allocate_pond(Some("plans")).await.unwrap();
+    c.write("plans", "CREATE TABLE big(id INTEGER)")
+        .await
+        .unwrap();
+    // Over the engine's full-scan threshold, so the derived advice fires too.
+    c.write("plans", "INSERT INTO big SELECT i FROM range(200000) s(i)")
+        .await
+        .unwrap();
+
+    let e = c.explain("plans", "SELECT * FROM big").await.unwrap();
+    assert!(!e.is_error, "{:?}", e.value);
+    assert_eq!(
+        e.value["estimated_rows"], 200_000,
+        "the agent must see the planner's row estimate, not a stub 0: {:?}",
+        e.value
+    );
+    let scan = &e.value["scan_operations"][0];
+    assert_eq!(scan["table"], "big");
+    assert_eq!(scan["scan_type"], "full_scan");
+    assert_eq!(scan["source"], "pond");
+    assert_eq!(scan["estimated_rows_scanned"], 200_000);
+    let advice = format!("{} {}", e.value["warnings"], e.value["suggestions"]);
+    assert!(
+        advice.contains("big") && advice.contains("WHERE"),
+        "the warning and suggestion must name the table and a concrete fix: {advice}"
+    );
+    // The fields we deleted must be GONE, not present-and-zero: a `0` next to
+    // real numbers reads as "this query costs no time and no bytes".
+    assert!(
+        e.value.get("estimated_bytes").is_none() && e.value.get("estimated_duration_ms").is_none(),
+        "explain must not report estimates DuckDB does not produce: {:?}",
+        e.value
+    );
+    assert!(
+        e.value["raw_plan"].as_str().unwrap_or("").contains("big"),
+        "raw_plan stays the escape hatch: {:?}",
+        e.value["raw_plan"]
+    );
+
+    // Anti-vacuity for the advice: the same table WITH a predicate goes quiet,
+    // so `warnings` is not simply always populated.
+    let f = c
+        .explain("plans", "SELECT * FROM big WHERE id = 7")
+        .await
+        .unwrap();
+    assert_eq!(f.value["scan_operations"][0]["scan_type"], "filtered_scan");
+    assert_eq!(
+        f.value["warnings"],
+        serde_json::json!([]),
+        "a filtered scan earns no warning: {:?}",
+        f.value
+    );
+    c.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn mcp_annotations_mark_destructive_and_readonly_tools() {
     let s = start_stack().await;
     let c = LatiqClient::connect(&s.mcp_endpoint, None).await.unwrap();
@@ -1517,6 +1582,32 @@ mod timeouts {
             checked += 1;
         }
         assert_eq!(checked, 2, "both query tools must carry the argument");
+
+        // …and explain_query must NOT. It shared `QueryArgs` and so advertised a
+        // `timeout_ms` its own description admitted was ignored — a dead
+        // argument the model must spend a decision on and can never benefit
+        // from. explain executes nothing, so there is no deadline to set.
+        let explain = tools
+            .iter()
+            .find(|t| t.name == "explain_query")
+            .expect("missing tool explain_query");
+        let props = explain
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("a properties map");
+        assert!(
+            !props.contains_key("timeout_ms"),
+            "explain_query must not advertise an argument it ignores: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        // Anti-vacuity: the arguments it DOES take are still advertised, so this
+        // is not passing because the schema went empty.
+        assert!(
+            props.contains_key("pond") && props.contains_key("sql"),
+            "explain_query still needs pond + sql: {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
         c.close().await.unwrap();
     }
 }
