@@ -26,8 +26,11 @@
 //! catalog file. Only the connection count varies — never the instance count.
 //!
 //! Cancellation uses the spike-confirmed `Connection::interrupt_handle()`: a
-//! watcher thread interrupts the running statement when the `AbortToken` is
-//! cancelled, and exits when the operation completes.
+//! watcher thread (`crate::abort`) interrupts the running statement while the
+//! `AbortToken` is cancelled, and is joined when the operation completes. The
+//! wait *before* a statement — for this pond's writer mutex — is covered too
+//! (`Pond::lock_writer`), because an interrupt has nothing to act on there.
+use crate::abort::AbortWatcher;
 use crate::exec::{
     annotate_schemas, in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow,
     run_write,
@@ -40,7 +43,6 @@ use latiq_engine::{
 };
 use latiq_storage::PondLocation;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -139,6 +141,11 @@ struct Pond {
     reads: ReadPool,
 }
 
+/// How often a writer queued behind another write re-checks its abort. At least
+/// as prompt as a cancel is inside a running statement (`abort::POLL`), and paid
+/// only by a writer that would have blocked anyway.
+const WRITER_WAIT_POLL: Duration = Duration::from_millis(5);
+
 /// A bounded, lazily-grown pool of read connections to one pond's database.
 /// Bounded because unbounded growth would mean one DuckDB connection per
 /// in-flight agent request; when every connection is busy a reader waits, which
@@ -231,6 +238,34 @@ impl Pond {
         })
     }
 
+    /// Take the pond's writer, giving up if the caller's abort fires while we
+    /// are still queued behind another write.
+    ///
+    /// `Mutex::lock` has no deadline, so a plain `lock()` here put the whole
+    /// queueing time outside every bound the node has: by the time the mutex
+    /// freed, the abort had already been fired and discarded (DuckDB drops an
+    /// interrupt that arrives between statements), and the statement ran its full
+    /// length under an expired deadline. The uncontended fast path is still a
+    /// single `try_lock`; only a writer that would have blocked pays the poll.
+    fn lock_writer(
+        &self,
+        abort: &AbortToken,
+    ) -> Result<std::sync::MutexGuard<'_, PondInstance>, EngineError> {
+        loop {
+            match self.writer.try_lock() {
+                Ok(g) => return Ok(g),
+                // Same recovery as `lock_recover`: a panicking writer must not
+                // brick the pond.
+                Err(std::sync::TryLockError::Poisoned(e)) => return Ok(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if abort.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            std::thread::sleep(WRITER_WAIT_POLL);
+        }
+    }
+
     /// Check out a read connection, growing the pool up to `max`, else waiting
     /// for one to come back.
     fn checkout_read(&self) -> Result<ReadGuard<'_>, EngineError> {
@@ -312,31 +347,27 @@ impl DuckEngine {
         out
     }
 
-    /// Run a blocking engine operation with an interrupt watcher bound to `abort`.
-    /// An `INTERRUPT` error is normalized to `Cancelled`.
+    /// Run a blocking engine operation with an interrupt watcher bound to
+    /// `abort`. An `INTERRUPT` error is normalized to `Cancelled`.
+    ///
+    /// The watcher is joined before this returns, so any statement a caller
+    /// issues *after* it — the write path's recovery `ROLLBACK` — is guaranteed
+    /// not to be interrupted by this operation's abort.
     fn run_with_abort<T>(
         inst: &PondInstance,
         abort: &AbortToken,
         f: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
     ) -> Result<T, EngineError> {
-        let handle = inst.conn.interrupt_handle();
-        let abort = abort.clone();
-        let done = Arc::new(AtomicBool::new(false));
-        let done_w = done.clone();
-        let watcher = std::thread::spawn(move || loop {
-            if abort.is_cancelled() {
-                handle.interrupt();
-                break;
-            }
-            if done_w.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        });
+        // Deliberately no `is_cancelled()` short-circuit here. It would be dead
+        // weight: an already-cancelled token is answered by the watcher itself,
+        // which keeps firing until the first statement of the operation takes the
+        // interrupt (`cancellation_a_write_cancelled_before_it_starts_never_runs`
+        // passes with or without such a check, and fails without the re-firing).
+        // One mechanism, one thing to keep true.
+        let mut watcher = AbortWatcher::arm(inst, abort);
 
         let result = f(inst);
-        done.store(true, Ordering::Relaxed);
-        let _ = watcher.join();
+        watcher.disarm();
 
         match result {
             // `INTERRUPT Error` is not one of the classes `errclass` keys on,
@@ -457,7 +488,12 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
         let pond = self.pond(loc)?;
-        let guard = lock_recover(&pond.writer);
+        // Abortably: the wait for this mutex is as long as the write ahead of us,
+        // and it used to be a stretch of the query's life that NO timeout
+        // covered — the deadline fired against a connection running nothing, the
+        // interrupt was discarded, and the statement then started and ran its
+        // full length regardless.
+        let guard = pond.lock_writer(&abort)?;
         // One abort watcher over the extraction AND the write. The extraction
         // holds the pond's writer mutex — deliberately, because it must happen
         // before the write (a `DROP TABLE t` no longer binds once it has run,
@@ -466,7 +502,7 @@ impl QueryEngine for DuckEngine {
         // another write land in between and change what it resolves against.
         // The cost is that a slow bind delays other writers to this pond; being
         // abortable is what keeps that bounded.
-        Self::run_with_abort(&guard, &abort, |i| {
+        let out = Self::run_with_abort(&guard, &abort, |i| {
             let mut datasets = plan_datasets(loc, i, sql);
             let mut res = run_write(i, sql, identity, &loc.catalog_name)?;
             // AFTER the statement: a `CREATE TABLE … AS`'s target has no
@@ -477,7 +513,23 @@ impl QueryEngine for DuckEngine {
             annotate(loc, i, &mut datasets);
             apply_datasets(&mut res.meta, datasets);
             Ok(res)
-        })
+        });
+        if out.is_err() {
+            // `run_write` already tried to roll back, but it tried from *inside*
+            // the abort watcher: a cancelled write's rollback is itself a
+            // statement, and the watcher re-fires for as long as the token stays
+            // cancelled, so that attempt can be interrupted too. This one cannot
+            // be — `run_with_abort` joined the watcher before returning — and it
+            // is the pond's writer connection, the one connection that is kept
+            // rather than discarded, so a transaction left open here fails every
+            // later write to this pond. Harmlessly refused ("no transaction is
+            // active") when the rollback already succeeded — which is the usual
+            // case, and why no test can provoke this line: whether the watcher's
+            // 10 ms tick lands on a sub-millisecond ROLLBACK is a race, and the
+            // race is exactly what this removes. Defence, deliberately unpinned.
+            let _ = guard.conn.execute_batch("ROLLBACK");
+        }
+        out
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
@@ -784,6 +836,218 @@ mod tests {
             .read_query(&loc, "SELECT 1 AS x", AbortToken::new())
             .unwrap();
         assert_eq!(ok.rows[0][0], serde_json::json!(1));
+    }
+
+    /// A statement long enough that nothing but an interrupt ends it.
+    const SLOW: &str = "SELECT count(*) FROM range(100000000000) t1, range(1000) t2";
+
+    /// Run `f` on its own thread and fail if it has not finished within `limit`.
+    ///
+    /// Every cancellation test below asserts that something *stops*; the
+    /// regression they guard is an unbounded wait, which without this would hang
+    /// the suite rather than fail it. The runaway thread is deliberately leaked:
+    /// the panic has already failed the test, and the statement it is stuck in is
+    /// the very thing we could not stop.
+    fn within<T: Send + 'static>(
+        limit: Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("{what} did not finish within {limit:?}"))
+    }
+
+    // Regression (nightly 33789446152): a write with a 60 s deadline ran 2694 s
+    // and COMMITTED. DuckDB clears its interrupt flag when a statement begins, so
+    // an `interrupt()` fired while nothing is executing is silently discarded —
+    // and the old watcher fired exactly once and then exited, leaving the
+    // statement that started next with no bound of any kind. These three pin the
+    // three windows in which that shot used to be wasted.
+
+    #[test]
+    fn cancellation_a_write_cancelled_before_it_starts_never_runs() {
+        // Window 1: the token is already cancelled on entry — the shape of a
+        // request that spent its whole deadline queued for a blocking-pool slot
+        // before the engine ever saw it. Nothing is executing yet, so the abort
+        // can only be honoured by an interrupt that is still being fired when the
+        // first statement starts. One shot here is one shot into the void, and
+        // the write then runs to completion with its cancel already spent.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let eng = DuckEngine::new();
+        eng.init_pond(&loc).unwrap();
+        let id = Identity::claimed(Some("a"));
+
+        let abort = AbortToken::new();
+        abort.cancel();
+        let (l, e2, i2) = (loc.clone(), DuckEngine::new(), id.clone());
+        let res = within(
+            Duration::from_secs(20),
+            "a pre-cancelled write",
+            move || e2.write_query(&l, &format!("CREATE TABLE t AS {SLOW}"), &i2, abort),
+        );
+        assert!(
+            matches!(res, Err(EngineError::Cancelled)),
+            "expected Cancelled, got {res:?}"
+        );
+        // And it must not merely have *reported* a cancel: the statement must not
+        // have run. A committed table here is the 2694 s write.
+        //
+        // Asserted against a control table written afterwards, so the check
+        // cannot pass just because nothing at all is listed.
+        eng.write_query(
+            &loc,
+            "CREATE TABLE control AS SELECT 1 AS a",
+            &id,
+            AbortToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            table_names(&eng, &loc),
+            vec!["control".to_string()],
+            "the cancelled statement must not have executed"
+        );
+    }
+
+    #[test]
+    fn cancellation_an_abort_between_statements_still_stops_the_next_one() {
+        // Window 2: the abort lands mid-operation but while no DuckDB statement
+        // is executing (between our BEGIN, the caller's statement, the
+        // attribution CALL). DuckDB has nothing to interrupt at that instant, so
+        // the watcher must keep firing rather than spend its one shot.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+
+        let abort = AbortToken::new();
+        let a2 = abort.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            a2.cancel();
+        });
+        let res = within(
+            Duration::from_secs(20),
+            "a statement started after its abort",
+            move || {
+                DuckEngine::run_with_abort(&inst, &abort, |i| {
+                    // The cancel lands in here, with nothing running.
+                    std::thread::sleep(Duration::from_millis(400));
+                    crate::exec::run_read(i, SLOW)
+                })
+            },
+        );
+        assert!(
+            matches!(res, Err(EngineError::Cancelled)),
+            "an interrupt fired while nothing was executing must be re-fired at the \
+             statement that starts next, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn cancellation_a_write_queued_behind_another_writer_gives_up() {
+        // Window 3: the whole wait for the pond's writer mutex used to sit
+        // outside the watcher, so a queued write kept its full runtime *after*
+        // its deadline had already passed — no backstop at all.
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let eng = Arc::new(DuckEngine::new());
+        eng.init_pond(&loc).unwrap();
+        let id = Identity::claimed(Some("a"));
+
+        // Holder: takes the writer mutex and keeps it.
+        let holder_abort = AbortToken::new();
+        let (h_eng, h_loc, h_id, h_abort) =
+            (eng.clone(), loc.clone(), id.clone(), holder_abort.clone());
+        let holder = std::thread::spawn(move || {
+            h_eng.write_query(
+                &h_loc,
+                &format!("CREATE TABLE held AS {SLOW}"),
+                &h_id,
+                h_abort,
+            )
+        });
+        // Wait for the mutex to actually be held, rather than sleeping a guess:
+        // on a loaded runner a fixed sleep can expire first, and then the
+        // "queued" write is not queued at all and this test proves nothing.
+        let pond = {
+            let map = eng.ponds.lock().unwrap();
+            map.values().next().expect("the pond is open").clone()
+        };
+        let t = Instant::now();
+        while pond.writer.try_lock().is_ok() {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "the holder never took the writer mutex"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let queued = AbortToken::new();
+        let q2 = queued.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            q2.cancel();
+        });
+        let (q_eng, q_loc, q_id) = (eng.clone(), loc.clone(), id.clone());
+        let res = within(Duration::from_secs(20), "a queued write", move || {
+            q_eng.write_query(
+                &q_loc,
+                "CREATE TABLE queued AS SELECT 1 AS a",
+                &q_id,
+                queued,
+            )
+        });
+        assert!(
+            matches!(res, Err(EngineError::Cancelled)),
+            "a write still waiting for the writer mutex when its abort fires must \
+             give up, not run once the mutex frees, got {res:?}"
+        );
+        // And it gave up instead of running: `Cancelled` alone would also be what
+        // a write that ran and was then interrupted returns.
+        assert!(
+            pond.writer.try_lock().is_err(),
+            "the holder still owns the writer, so the queued write cannot have run"
+        );
+
+        holder_abort.cancel();
+        let held = holder.join().unwrap();
+        assert!(
+            matches!(held, Err(EngineError::Cancelled)),
+            "the holder was cancelled too, got {held:?}"
+        );
+        // And the pond's writer survived both — a `ROLLBACK` refused on the one
+        // connection this pond keeps would fail every later write.
+        eng.write_query(
+            &loc,
+            "CREATE TABLE fine AS SELECT 1 AS a",
+            &id,
+            AbortToken::new(),
+        )
+        .expect("the writer must still work after two cancelled writes");
+        assert_eq!(
+            table_names(&eng, &loc),
+            vec!["fine".to_string()],
+            "neither cancelled write may have committed"
+        );
+    }
+
+    /// The pond's committed tables, sorted. Read through the engine's own
+    /// introspection so an empty answer means an empty pond, not a query that
+    /// does not see DuckLake tables.
+    fn table_names(eng: &DuckEngine, loc: &PondLocation) -> Vec<String> {
+        let mut names: Vec<String> = eng
+            .describe_schema(loc)
+            .unwrap()
+            .tables
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        names.sort();
+        names
     }
 
     fn instance_count(eng: &DuckEngine) -> usize {

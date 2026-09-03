@@ -142,6 +142,13 @@ pub struct QueryMeta {
     pub rows_affected: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
+    /// How long the statement spent **executing on the engine**, in
+    /// milliseconds. Measured by the engine, so it starts once the pond's writer
+    /// (or a read connection) has been acquired and excludes any time queued
+    /// behind another statement — it is the cost of the work, not the latency
+    /// the caller saw. The `latiq::access` trail records the wall clock instead,
+    /// which is why the two can differ on a busy pond. Compare it against
+    /// [`Self::timeout_ms`] with that in mind: the deadline bounds execution.
     pub duration_ms: u64,
     /// The timeout that was actually IN EFFECT for this statement, in
     /// milliseconds — the node's default when the caller asked for none, the
