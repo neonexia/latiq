@@ -263,11 +263,31 @@ impl Registry {
         // at each caller because the registry is the one choke point every create
         // path funnels through — the agent/SDK path (AgentOps::allocate_pond) and
         // the CLI's direct Control::CreatePondAssignment alike.
-        if latiq_common::PondTier::parse(tier) == Some(latiq_common::PondTier::None) {
+        //
+        // An UNKNOWN tier is refused for the same reason, one step earlier: it
+        // used to fall through to `PondTier::parse(..).unwrap_or_default()` on
+        // the node, so `tier: "gigantic"` ran at medium and `describe_pond`
+        // reported `gigantic` for the pond's whole life. The two refusals stay
+        // separate messages — "that tier is not yours" and "no such tier" are
+        // different problems with different fixes.
+        let parsed =
+            latiq_common::PondTier::parse_for_create(tier).map_err(ControlPlaneError::Invalid)?;
+        if parsed == latiq_common::PondTier::None {
             return Err(ControlPlaneError::Invalid(
                 "tier 'none' (uncapped) is operator-only: set it after creation with `latiq pond set-tier <pond> --tier none`"
                     .into(),
             ));
+        }
+        // Stored CANONICAL, never as typed: the row is what `describe_pond`
+        // reports and what the node re-parses on every operation, so `XLARGE`
+        // must come back out as `x-large`.
+        let tier = parsed.as_str();
+        // The name is the pond's SQL catalog identifier, so its legal set is
+        // enforced here — the choke point every create path funnels through.
+        // A caller that supplied nothing gets the generated id, which is itself
+        // a legal name (see `latiq_common::pond_name`).
+        if let Some(n) = name.as_deref() {
+            latiq_common::pond_name::validate(n).map_err(ControlPlaneError::Invalid)?;
         }
         let pond_id = PondId::new().to_string();
         let name = name.unwrap_or_else(|| pond_id.clone());
@@ -391,8 +411,11 @@ impl Registry {
     /// intended.
     pub fn set_pond_tier(&self, pond_ref: &str, tier: &str) -> Result<(), ControlPlaneError> {
         let parsed = latiq_common::PondTier::parse(tier).ok_or_else(|| {
+            // Built from the shared list, not typed out: this message used to
+            // omit `none` — the one tier only this function can grant.
             ControlPlaneError::Invalid(format!(
-                "unknown tier '{tier}' (expected x-small, small, medium, large, or x-large)"
+                "unknown tier '{tier}' (expected {})",
+                latiq_common::tier::ALL.join(", ")
             ))
         })?;
         let c = self.lock();
@@ -835,6 +858,115 @@ mod tests {
             r.set_pond_tier("nope", "small").unwrap_err(),
             ControlPlaneError::PondNotFound(_)
         ));
+    }
+
+    /// The rejection message listed five of the six tiers this function accepts:
+    /// `none` — the ONE tier only an operator can grant, and so the one an
+    /// operator is most likely to be reaching for here — was missing from it.
+    #[test]
+    fn set_pond_tier_rejection_names_every_tier_it_accepts_including_none() {
+        let r = reg();
+        r.register_node("n1", "http://m", "http://i", 10).unwrap();
+        r.create_pond(Some("p".into()), "agent-x", "{}", "medium", &[], "", false)
+            .unwrap();
+        let ControlPlaneError::Invalid(msg) = r.set_pond_tier("p", "enormous").unwrap_err() else {
+            panic!("an unknown tier must be an Invalid value");
+        };
+        for t in latiq_common::tier::ALL {
+            assert!(msg.contains(t), "the message must offer '{t}', got: {msg}");
+        }
+        // ...and every one it names must actually be accepted, or it is advice
+        // that fails when taken.
+        for t in latiq_common::tier::ALL {
+            r.set_pond_tier("p", t)
+                .unwrap_or_else(|e| panic!("'{t}' is offered but refused: {e:?}"));
+            assert_eq!(r.pond_info("p").unwrap().0.tier, *t);
+        }
+    }
+
+    /// An unknown tier used to be accepted here and then read on the node with
+    /// `unwrap_or_default()`: the pond ran at medium while the registry — and
+    /// so `describe_pond`, forever — reported the tier the caller mistyped.
+    #[test]
+    fn create_pond_rejects_an_unknown_tier_rather_than_running_at_the_default() {
+        let r = reg();
+        r.register_node("n1", "http://m", "http://i", 10).unwrap();
+        for bad in ["gigantic", "larg"] {
+            let err = r
+                .create_pond(Some("t".into()), "agent-x", "{}", bad, &[], "", false)
+                .unwrap_err();
+            let ControlPlaneError::Invalid(msg) = &err else {
+                panic!("'{bad}' must be an Invalid value, got {err:?}");
+            };
+            assert!(msg.contains(bad), "must name the offender: {msg}");
+            for t in latiq_common::tier::CREATABLE {
+                assert!(msg.contains(t), "must offer '{t}', got: {msg}");
+            }
+        }
+        // The name was never taken: the refusal happened before placement.
+        r.create_pond(Some("t".into()), "agent-x", "{}", "large", &[], "", false)
+            .expect("a known tier still creates");
+    }
+
+    /// A tier is stored canonically, because the row is what `describe_pond`
+    /// reports: an accepted alias that came back out as typed would be a second
+    /// way for the reported tier to differ from the applied one.
+    #[test]
+    fn create_pond_stores_the_canonical_tier_name() {
+        let r = reg();
+        r.register_node("n1", "http://m", "http://i", 10).unwrap();
+        let row = r
+            .create_pond(
+                Some("p".into()),
+                "agent-x",
+                "{}",
+                " XLARGE ",
+                &[],
+                "",
+                false,
+            )
+            .unwrap();
+        assert_eq!(row.tier, "x-large", "the row the caller is handed");
+        assert_eq!(
+            r.pond_info("p").unwrap().0.tier,
+            "x-large",
+            "and the row every later read sees"
+        );
+        // An empty tier is the proto3 "unset" and still means the default.
+        r.create_pond(Some("q".into()), "agent-x", "{}", "", &[], "", false)
+            .unwrap();
+        assert_eq!(r.pond_info("q").unwrap().0.tier, "medium");
+    }
+
+    /// The name becomes the pond's SQL catalog identifier, so the choke point
+    /// every create path funnels through is where its legal set is enforced.
+    /// `a b/c` used to become a real pond.
+    #[test]
+    fn create_pond_rejects_an_illegal_name() {
+        let r = reg();
+        r.register_node("n1", "http://m", "http://i", 10).unwrap();
+        for bad in ["a b/c", "", &"x".repeat(65)] {
+            let err = r
+                .create_pond(Some(bad.into()), "agent-x", "{}", "medium", &[], "", false)
+                .unwrap_err();
+            let ControlPlaneError::Invalid(msg) = &err else {
+                panic!("name '{bad}' must be an Invalid value, got {err:?}");
+            };
+            assert!(
+                msg.contains(latiq_common::pond_name::RULE),
+                "must state what a name may be, got: {msg}"
+            );
+        }
+        // The generated default has to survive its own rule.
+        let row = r
+            .create_pond(None, "agent-x", "{}", "medium", &[], "", false)
+            .expect("an omitted name still generates one");
+        assert_eq!(
+            latiq_common::pond_name::validate(&row.name),
+            Ok(()),
+            "the generated name '{}' must itself be legal",
+            row.name
+        );
     }
 
     #[test]

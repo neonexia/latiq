@@ -47,7 +47,10 @@ message PondInfoMsg {
   // Internal endpoint of the node that owns this pond (empty if the node is
   // gone). Lets a node that receives a request resolve the owner and forward.
   string node_endpoint = 6;
-  // Resource tier (small/medium/large/x-large); empty → medium.
+  // Resource tier (x-small/small/medium/large/x-large); empty → medium.
+  // An unknown name is REJECTED, never run at the default — the tier is
+  // reported back by pond describe, so a tolerated typo would be a durable
+  // lie about what the pond is.
   string tier = 7;
   // Optional DuckDB extensions the pond loads on open (LOADed from the image).
   repeated string extensions = 8;

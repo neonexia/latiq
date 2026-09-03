@@ -50,13 +50,27 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// Every argument struct on this surface is `deny_unknown_fields`.
+///
+/// A misspelled argument used to be dropped in silence: `timout_ms` had no
+/// effect, no error, and no way for the model to learn it had mistyped — the
+/// query simply ran under a policy it thought it had changed. Serde's rejection
+/// names the offending key AND lists the accepted ones, which is exactly the
+/// correction an agent needs, and it costs nothing for a conforming client: MCP
+/// `arguments` is the object the model produced, and no client of ours adds
+/// fields to it (protocol-level extras like `_meta` live beside `arguments` in
+/// `params`, never inside it).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct AllocateArgs {
-    #[schemars(description = "Optional pond name; Latiq generates one if omitted")]
+    #[schemars(
+        description = "Optional pond name; Latiq generates one (a uuid) if omitted. It becomes the pond's SQL catalog name, so it must be 1-64 characters of letters, digits, `_` or `-` — anything else is rejected rather than mangled. An empty string is NOT 'generate one for me': omit the field for that."
+    )]
     pub name: Option<String>,
     #[schemars(
-        description = "Resource tier: x-small | small | medium | large | x-large (default medium). Caps the pond's memory + CPU."
+        description = "Resource tier (default medium). Caps the pond's memory + CPU. An unrecognised tier is REJECTED, not quietly run at the default.",
+        extend("enum" = ["x-small", "small", "medium", "large", "x-large"])
     )]
     pub tier: Option<String>,
     #[schemars(
@@ -70,6 +84,7 @@ pub struct AllocateArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct PondRefArgs {
     #[schemars(description = "Pond id or name")]
@@ -77,14 +92,22 @@ pub struct PondRefArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct DropArgs {
     #[schemars(description = "Pond id or name")]
     pub pond: String,
+    /// The most consequential argument on the only irreversible tool, and it had
+    /// NO description at all — an agent could only learn what it was for by
+    /// being refused once.
+    #[schemars(
+        description = "Must be `true` for the drop to happen. There is no undo: the pond's tables, history and lineage are deleted, and re-allocating the same name gives you an empty pond, not this one. Omitted or `false` is refused with an error and NOTHING is deleted — that refusal is the safety net, so do not set `true` speculatively. Set it only when you have confirmed this pond is finished with; other agents may be working in it (list_ponds shows who owns it)."
+    )]
     pub confirm: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct QueryArgs {
     #[schemars(description = "Pond id or name")]
@@ -92,7 +115,7 @@ pub struct QueryArgs {
     #[schemars(description = "SQL statement")]
     pub sql: String,
     #[schemars(
-        description = "How long this statement may run, in milliseconds. Omit for the node's default. Asking for MORE than the node allows is not an error — it is clamped to the node's maximum and the query runs at that ceiling, so always read `_meta.timeout_ms` for what was actually applied. On expiry you get a `query_timeout` error naming both numbers."
+        description = "How long this statement may run, in milliseconds. Omit for the node's default. Must be at least 1 — `0` is rejected, not read as 'no timeout' and not read as 'use the default'; omit the field for the default. Asking for MORE than the node allows is not an error — it is clamped to the node's maximum and the query runs at that ceiling, so always read `_meta.timeout_ms` for what was actually applied. On expiry you get a `query_timeout` error naming both numbers."
     )]
     pub timeout_ms: Option<u64>,
 }
@@ -105,6 +128,7 @@ pub struct QueryArgs {
 /// set; if planning itself ever needs bounding, that is a node-side concern, not
 /// a knob the agent should be offered.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ExplainArgs {
     #[schemars(description = "Pond id or name")]
@@ -114,6 +138,7 @@ pub struct ExplainArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct SearchArgs {
     #[schemars(
@@ -123,6 +148,7 @@ pub struct SearchArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct LoadDatasetArgs {
     #[schemars(description = "Pond id or name to load into")]
@@ -132,6 +158,7 @@ pub struct LoadDatasetArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CatalogDescribeArgs {
     #[schemars(description = "Pond id or name (the catalog is attached on it transiently)")]
@@ -145,6 +172,7 @@ pub struct CatalogDescribeArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct CatalogPullArgs {
     #[schemars(description = "Pond id or name to pull into")]
@@ -162,12 +190,13 @@ pub struct CatalogPullArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct LineageArgs {
     #[schemars(description = "Pond id or name")]
     pub pond: String,
     #[schemars(
-        description = "How many events to return, newest first (default 50, max 500). Two events are recorded per operation. Must be at least 1 — `0` is rejected, not read as 'no limit'."
+        description = "How many events to return, newest first (default 50). Two events are recorded per operation. Must be at least 1 — `0` is rejected, not read as 'no limit'. Above the maximum of 500 it is CLAMPED rather than refused, and the response's `limit_applied` reports the value actually used — read it before concluding a pond has only that many events."
     )]
     pub limit: Option<u32>,
     #[schemars(
@@ -201,6 +230,30 @@ pub struct LineageArgs {
 /// an abandoned query.
 fn query_controls(a: &QueryArgs, ctx: &RequestContext<RoleServer>) -> QueryControls {
     QueryControls::timeout(a.timeout_ms).with_cancel(ctx.ct.clone())
+}
+
+/// **The zero rule for this surface.** An explicit `0` from a JSON caller is a
+/// value the caller chose, so it is refused; it is never re-read as "unset".
+///
+/// The two adjacent tools disagreed about exactly this: `get_lineage`'s
+/// `limit: 0` was rejected with a message that says so in as many words, while
+/// `read_query`'s `timeout_ms: 0` silently ran at the node default and reported
+/// 30000 back as though it had been asked for. The gRPC surface still reads a
+/// zero as unset and must — proto3 cannot express an absent number — but that is
+/// a limitation of that wire, normalised at that boundary, and it has no
+/// business reaching a surface where the caller could say what it meant.
+fn reject_zero(field: &str, value: Option<u64>) -> Option<CallToolResult> {
+    (value == Some(0)).then(|| {
+        err_envelope(
+            AgentError::new(
+                latiq_common::ErrorKind::InvalidValue,
+                format!("`{field}` must be at least 1."),
+                format!("Omit `{field}` to use the node's default; `0` is not 'unlimited'."),
+                "latiq://guidance",
+            )
+            .envelope(),
+        )
+    })
 }
 
 /// The HTTP header carrying the CLAIMED leaf id. Same name as the gRPC metadata
@@ -493,6 +546,26 @@ See latiq://guidance.",
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
         let tier = a.tier.as_deref().unwrap_or("medium");
+        // The registry refuses an unknown tier or an illegal name too — it is
+        // the choke point every create path shares, and it is what makes the
+        // guarantee durable. Checked here as well because THIS surface can see
+        // what the caller actually typed: an empty `name` is a deliberate empty
+        // string to a JSON caller and "unset" by the time it has crossed
+        // proto3, and only one of those two should become a generated uuid.
+        if let Some(name) = a.name.as_deref() {
+            if let Err(msg) = latiq_common::pond_name::validate(name) {
+                return Ok(err_envelope(
+                    AgentError::new(
+                        latiq_common::ErrorKind::InvalidValue,
+                        msg,
+                        "Retry with a name of letters, digits, `_` or `-`, or omit `name` and \
+                         use the one Latiq generates.",
+                        "latiq://guidance",
+                    )
+                    .envelope(),
+                ));
+            }
+        }
         // Validate requested extensions against the signed/official allowlist
         // before allocating, so a bad name returns a clear, actionable error.
         let exts = match latiq_common::extensions::validate(&a.extensions.unwrap_or_default()) {
@@ -518,8 +591,8 @@ See latiq://guidance.",
 
     /// Describe a pond: its metadata + a summary of its tables. Pass pond id or name.
     #[tool(
-        description = "Describe a pond: its metadata (name, owner, created_at) plus a summary of its tables. \
-Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying. \
+        description = "Describe a pond: its metadata (name, owner, created_at, tier) plus every table with its COLUMNS (name + type, in declaration order), a row-count estimate and the table's stored comment. \
+Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying — it is one call for the whole pond, where SHOW TABLES + DESCRIBE is one per table. \
 The response's `lineage` flag says whether this pond records provenance — check it before get_lineage, and before you rely on a pond to be explainable later (it cannot be switched on). \
 To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table>`, or `SELECT column_name, comment FROM duckdb_columns() WHERE table_name='<table>'` for the authors' column comments.",
         annotations(
@@ -621,6 +694,9 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
+        if let Some(refusal) = reject_zero("timeout_ms", a.timeout_ms) {
+            return Ok(refusal);
+        }
         let controls = query_controls(&a, &ctx);
         // Reads ride the Arrow internal hop, collected to the neutral result here.
         Ok(with_bearer(tok, async {
@@ -660,6 +736,9 @@ Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements 
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
+        if let Some(refusal) = reject_zero("timeout_ms", a.timeout_ms) {
+            return Ok(refusal);
+        }
         let controls = query_controls(&a, &ctx);
         Ok(with_bearer(tok, async {
             match self

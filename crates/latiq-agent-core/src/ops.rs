@@ -1460,8 +1460,12 @@ impl AgentOps {
         while let Some(b) = batches.next().await {
             append_batch_rows(&b?, &columns, &mut rows)?;
             if rows.len() > self.config.inline_row_cap {
-                return Err(AgentError::result_cap_exceeded(
-                    rows.len(),
+                // `rows.len()` here is an ARROW BATCH BOUNDARY, not the result's
+                // size — the stream is abandoned at this point and the rest was
+                // never counted. Reporting it named a number that was wrong for
+                // every result bigger than one batch past the cap, and wrong in
+                // the most misleading direction: it always looked *just* over.
+                return Err(AgentError::result_cap_exceeded_unknown(
                     self.config.inline_row_cap,
                 ));
             }
@@ -1650,6 +1654,10 @@ impl AgentOps {
             }
         };
         if !write && qr.rows.len() > self.config.inline_row_cap {
+            // The EXACT count, and this is the one path entitled to say it: the
+            // engine materialized the whole result before we looked, so
+            // `rows.len()` is the result's size and not a point we gave up at.
+            // The streaming collector says `more than {cap}` instead.
             let ae = AgentError::result_cap_exceeded(qr.rows.len(), self.config.inline_row_cap);
             record_error(&info.name, &ae);
             return Err(ae);
@@ -1783,13 +1791,23 @@ impl AgentOps {
                     AgentError::new(
                         ErrorKind::InvalidValue,
                         "`limit` must be at least 1.".to_string(),
-                        "Omit `limit` for the default page, or pass a positive count \
-                         (capped at 500).",
+                        format!(
+                            "Omit `limit` for the default page, or pass a positive count \
+                             (clamped to {}, and the page reports the value applied as \
+                             `limit_applied`).",
+                            latiq_lineage::MAX_LIMIT
+                        ),
                         LINEAGE_RECIPE,
                     ),
                 )
                 .await);
         }
+        // Clamped HERE, once, and before the forward: the page reports the
+        // applied value (`limit_applied`), so the owner must be asked for the
+        // number the caller will be told about. Clamping rather than refusing is
+        // deliberate — the cap protects the caller's own context — but a clamp
+        // nobody can see is the failure this whole class of bug is about.
+        let limit = limit.min(latiq_lineage::MAX_LIMIT);
         // The events are FILES on the node that ran the queries, so the owner
         // is the only node that can answer — forwarded exactly like every other
         // pond-scoped op, token replay included.
@@ -1907,6 +1925,7 @@ impl AgentOps {
             pond_name: info.name.clone(),
             lineage_dir: loc.lineage_dir,
             events: page.events,
+            limit_applied: limit,
             truncated: page.truncated,
             malformed_lines: page.malformed_lines,
             unreadable_files: page.unreadable_files,
@@ -1989,9 +2008,17 @@ impl AgentOps {
     }
 }
 
-/// Map a pond's tier name to its resource caps (unknown/empty → medium). `None`
-/// means "apply nothing" — either the `none` tier, or a tier with no caps — and
-/// the engine leaves its own defaults in force.
+/// Map a pond's tier name to its resource caps. `None` means "apply nothing" —
+/// either the `none` tier, or a tier with no caps — and the engine leaves its
+/// own defaults in force.
+///
+/// The `unwrap_or_default()` is a floor for a row we cannot re-ask about, NOT a
+/// validation policy: an unknown tier is refused at creation
+/// (`Registry::create_pond`) and at re-tiering (`Registry::set_pond_tier`), so
+/// nothing can write one any more. It survives for a row that predates that, and
+/// running such a pond at medium is the safe reading — the alternative is a pond
+/// that cannot be queried at all. What it must never do again is decide the tier
+/// for a name the caller just typed; that is why the check moved to the registry.
 fn tier_limits(tier: &str) -> Option<ResourceLimits> {
     PondTier::parse(tier).unwrap_or_default().limits()
 }

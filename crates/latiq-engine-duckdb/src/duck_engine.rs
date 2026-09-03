@@ -523,23 +523,55 @@ impl QueryEngine for DuckEngine {
         // duckdb_tables() here is fine; a DataFusion adapter would use its own.)
         // Scope to this pond's catalog (its name); escape `'` for the literal.
         let cat = loc.catalog_name.replace('\'', "''");
-        let res = self.with_read(loc, |i| {
-            run_read(
+        // TWO catalog queries, not one per table: the columns come back for the
+        // whole catalog in one scan and are grouped here. `columns` used to be
+        // hard-coded `vec![]`, so every table in every pond described itself as
+        // having no columns — which an agent reads as a fact about the table,
+        // not as a field we did not fill in. Describing a pond is this tool's
+        // entire job, so a second bounded catalog read is the right price; what
+        // stays forbidden is a `count(*)` (see `TableInfo::row_count_estimate`).
+        let (res, cols) = self.with_read(loc, |i| {
+            let tables = run_read(
                 i,
                 &format!(
                     "SELECT table_name AS name, estimated_size AS row_count, comment \
                      FROM duckdb_tables() WHERE database_name = '{cat}'"
                 ),
-            )
+            )?;
+            // Ordered by `column_index` so the columns read in the order they
+            // were declared — the order the author chose and the order an
+            // `INSERT` without a column list expects.
+            let cols = run_read(
+                i,
+                &format!(
+                    "SELECT table_name, column_name, data_type FROM duckdb_columns() \
+                     WHERE database_name = '{cat}' ORDER BY table_name, column_index"
+                ),
+            )?;
+            Ok((tables, cols))
         })?;
+        let text = |r: &[serde_json::Value], i: usize| {
+            r.get(i).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        };
+        let mut by_table: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for r in &cols.rows {
+            by_table
+                .entry(text(r, 0))
+                .or_default()
+                .push((text(r, 1), text(r, 2)));
+        }
         let tables = res
             .rows
             .iter()
-            .map(|r| TableInfo {
-                name: r.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                columns: vec![],
-                row_count_estimate: r.get(1).and_then(|v| v.as_u64()).unwrap_or(0),
-                comment: r.get(2).and_then(|v| v.as_str()).map(|s| s.to_string()),
+            .map(|r| {
+                let name = text(r, 0);
+                TableInfo {
+                    columns: by_table.remove(&name).unwrap_or_default(),
+                    name,
+                    row_count_estimate: r.get(1).and_then(|v| v.as_u64()).unwrap_or(0),
+                    comment: r.get(2).and_then(|v| v.as_str()).map(|s| s.to_string()),
+                }
             })
             .collect();
         Ok(SchemaSummary { tables })

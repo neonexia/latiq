@@ -60,6 +60,18 @@ pub enum PondTier {
     XLarge,
 }
 
+/// Every tier name, canonical spelling, smallest to largest — `none` last
+/// because it is not on the ladder. The ONE list every "expected …" message and
+/// every schema `enum` is built from, so a tier that is added cannot be added to
+/// the parser and forgotten in the error text (`set_pond_tier` once listed five
+/// of the six it accepted).
+pub const ALL: &[&str] = &["x-small", "small", "medium", "large", "x-large", "none"];
+
+/// The tiers a caller may ask for at CREATE time. `none` is excluded because it
+/// is an operator grant (see [`PondTier::None`]) — asking for it is refused with
+/// its own message, which says how to obtain it.
+pub const CREATABLE: &[&str] = &["x-small", "small", "medium", "large", "x-large"];
+
 impl PondTier {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -85,6 +97,31 @@ impl PondTier {
             "x-large" | "xlarge" => Some(PondTier::XLarge),
             _ => None,
         }
+    }
+
+    /// Resolve the tier a CREATE path was asked for.
+    ///
+    /// Three outcomes, and the middle one is why this exists: an empty name is
+    /// "the caller said nothing" (proto3 cannot express an absent string) and
+    /// takes the default; a KNOWN name is honoured; an unknown name is an
+    /// **error naming the whole set**, never a silent fall back to the default.
+    /// It was the fall back that let `tier: "gigantic"` create a medium pond
+    /// that then reported `"tier": "gigantic"` from `describe_pond` forever.
+    ///
+    /// `none` parses here and is deliberately NOT rejected here — it is refused
+    /// one layer up with a message that says how an operator grants it, so
+    /// "that tier is not yours" stays distinguishable from "no such tier".
+    pub fn parse_for_create(s: &str) -> Result<Self, String> {
+        if s.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        Self::parse(s).ok_or_else(|| {
+            format!(
+                "unknown tier '{}'. Allowed at creation: {}.",
+                s.trim(),
+                CREATABLE.join(", ")
+            )
+        })
     }
 
     /// Resource caps for this tier, or `None` for [`PondTier::None`] — which the
@@ -142,6 +179,49 @@ mod tests {
         assert_eq!(PondTier::parse("xlarge"), Some(PondTier::XLarge));
         assert_eq!(PondTier::parse("x-small"), Some(PondTier::XSmall));
         assert_eq!(PondTier::parse("huge"), None);
+    }
+
+    /// The create path must never turn a typo into a pond: `larg` is not
+    /// `large`, and the pond that used to result behaved as medium while
+    /// `describe_pond` reported `larg` for the rest of its life.
+    #[test]
+    fn parse_for_create_rejects_an_unknown_tier_and_names_the_allowed_set() {
+        for bad in ["gigantic", "larg", "smal", "unlimited"] {
+            let err = PondTier::parse_for_create(bad)
+                .expect_err("an unknown tier must not resolve to a default");
+            assert!(err.contains(bad), "must name the offender, got: {err}");
+            for t in CREATABLE {
+                assert!(err.contains(t), "must name '{t}', got: {err}");
+            }
+        }
+    }
+
+    /// Empty is the proto3 "unset" only. Everything else is a real answer.
+    #[test]
+    fn parse_for_create_takes_the_default_only_for_an_empty_name() {
+        assert_eq!(PondTier::parse_for_create(""), Ok(PondTier::Medium));
+        assert_eq!(PondTier::parse_for_create("   "), Ok(PondTier::Medium));
+        assert_eq!(PondTier::parse_for_create(" LARGE "), Ok(PondTier::Large));
+        // `none` parses; refusing it is the caller's job, so the two failures
+        // ("not yours" vs "no such tier") can carry different messages.
+        assert_eq!(PondTier::parse_for_create("none"), Ok(PondTier::None));
+    }
+
+    /// The name lists exist so no message can drift out of sync with the parser.
+    /// Anti-vacuity: the counts are pinned, so a tier added to the enum without
+    /// being added here fails this test rather than silently going unlisted.
+    #[test]
+    fn the_name_lists_match_what_the_parser_accepts() {
+        assert_eq!(ALL.len(), 6, "every tier must be listed");
+        assert_eq!(CREATABLE.len(), 5, "every tier but `none` is creatable");
+        for name in ALL {
+            let t = PondTier::parse(name).unwrap_or_else(|| panic!("'{name}' must parse"));
+            assert_eq!(t.as_str(), *name, "'{name}' must be the canonical spelling");
+        }
+        assert!(!CREATABLE.contains(&"none"), "`none` is an operator grant");
+        for name in CREATABLE {
+            assert!(ALL.contains(name), "'{name}' missing from ALL");
+        }
     }
 
     /// Every rung must be strictly bigger than the one below it in **both**

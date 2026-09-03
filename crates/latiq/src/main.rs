@@ -1299,6 +1299,14 @@ async fn run_pond_cmd(cmd: PondCmd) -> Result<()> {
             description,
             lineage,
         } => {
+            // Same for the pond name, and for the same reason. It matters extra
+            // here because `--name ""` is indistinguishable from an omitted
+            // `--name` once it has crossed proto3 (empty string = unset), so the
+            // control plane would generate a uuid for it — the caller's explicit
+            // (if useless) answer silently replaced by ours.
+            if let Some(n) = name.as_deref() {
+                latiq_common::pond_name::validate(n).map_err(|m| anyhow!("{m}"))?;
+            }
             // Validate the requested extensions against the allowlist before we
             // call the control plane, so a typo/community name fails locally.
             let exts = match latiq_common::extensions::validate(

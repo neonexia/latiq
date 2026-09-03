@@ -132,6 +132,14 @@ pub struct LineagePage {
     /// its own context.
     pub lineage_dir: String,
     pub events: Vec<serde_json::Value>,
+    /// The `limit` that was actually applied. A caller's `limit` is CLAMPED to
+    /// `latiq_lineage::MAX_LIMIT` rather than refused, and this is what keeps
+    /// that clamp from being silent: `limit: 99999` used to come back as a
+    /// 500-event page with nothing in it saying so, which is indistinguishable
+    /// from a pond that has exactly 500 events. Same discipline as
+    /// `QueryMeta::timeout_ms`, which reports the node's timeout clamp.
+    #[serde(default)]
+    pub limit_applied: usize,
     /// Older events matched than this page could carry. Read the next page by
     /// passing the oldest `eventTime` in `events` as the next call's `before`
     /// (exclusive) — the page is cut on a timestamp boundary, so that walks the

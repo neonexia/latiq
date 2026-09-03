@@ -46,6 +46,9 @@ latiq-agent-core = { path = "../latiq-agent-core" }
 latiq-storage = { path = "../latiq-storage" }
 latiq-engine-duckdb = { path = "../latiq-engine-duckdb" }
 latiq-client = { path = "../latiq-client" }
+# The lineage page's own MAX_LIMIT, so the clamp test asserts the server's
+# number rather than a copy of it that could drift.
+latiq-lineage = { path = "../latiq-lineage" }
 # The SDK is the other client of the Data/Stream surface; its bearer-token path
 # is exercised against the same harness the gRPC surface tests use.
 latiq-sdk = { path = "../latiq-sdk" }

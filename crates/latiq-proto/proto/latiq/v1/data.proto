@@ -75,6 +75,9 @@ message CatalogDescribeRequest {
 // read. Events are OpenLineage JSONL files in the pond's own `lineage/`
 // directory, read back through the `get_lineage` MCP tool — there is no SQL
 // view over them (docs/lineage.md, "Cut: the SQL catalog over the events").
+// name: empty → Latiq generates one (proto3 cannot express an absent string);
+// otherwise 1-64 chars of [A-Za-z0-9_-], since it becomes the pond's SQL catalog
+// name. tier: empty → medium; an unknown tier is rejected, not defaulted.
 message AllocatePondRequest { string name = 1; string policy_json = 2; string tier = 3; bool lineage = 4; }
 message AllocatePondResponse { string pond_id = 1; string pond_name = 2; }
 message DropPondRequest { string pond = 1; bool confirm = 2; }

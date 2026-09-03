@@ -475,6 +475,87 @@ async fn lazy_materialize_pond_assigned_without_eager_storage() {
     assert_eq!(r.rows[0][0], serde_json::json!(2));
 }
 
+/// Regression pin (observed live): the streaming collector reported the Arrow
+/// batch boundary it abandoned the stream at as though it were the result's row
+/// count, so `range(20000)` and `range(1000000)` both came back as
+/// "Result has 10240 rows, over the inline cap of 10000" — a plausible number,
+/// two per cent over the cap, that sends an agent round a narrowing loop it
+/// cannot win.
+///
+/// The property, asserted without depending on DuckDB's vector size: two
+/// results of WILDLY different size must produce the SAME message, because a
+/// message that varies with where collection happened to stop is a message
+/// carrying a number nobody can use. The old code fails this — the two sizes
+/// stop on different boundaries — as well as the `more than` assertion.
+#[tokio::test]
+async fn result_encoding_cap_exceeded_mid_stream_reports_a_bound_not_a_batch_boundary() {
+    const CAP: usize = 3_000;
+    let registry = Registry::open(None).unwrap();
+    registry
+        .register_node(
+            "node-a",
+            "http://127.0.0.1:8080/mcp",
+            "http://127.0.0.1:9092",
+            100,
+        )
+        .unwrap();
+    let ops = AgentOps::new(
+        Arc::new(RegistryControlPlane::new(registry)),
+        Arc::new(TempFs::new()),
+        Arc::new(DuckEngine::new()),
+        AgentConfig {
+            inline_row_cap: CAP,
+            ..AgentConfig::default()
+        },
+    );
+    let id = Identity::claimed(Some("agent-x"));
+    ops.allocate_pond(&id, Some("big".into()), "{}", "medium", &[], false)
+        .await
+        .unwrap();
+
+    // `read_collected` is the streaming path — it is what MCP's `read_query`
+    // calls, which is where this was seen.
+    let msg = |n: u64| {
+        let ops = &ops;
+        let id = &id;
+        async move {
+            let err = ops
+                .read_collected(id, "big", &format!("SELECT * FROM range({n})"))
+                .await
+                .unwrap_err();
+            let e = err.envelope();
+            assert_eq!(e.kind, latiq_common::ErrorKind::ResultCapExceeded);
+            e.message.clone()
+        }
+    };
+    let just_over = msg(CAP as u64 + 1_000).await;
+    let enormous = msg(1_000_000).await;
+
+    assert_eq!(
+        just_over, enormous,
+        "a result 250x larger must not be described by the same *number*; \
+         since the collector cannot know either size, both must read the same"
+    );
+    assert!(
+        just_over.contains(&format!("more than {CAP}")),
+        "the only true thing the collector knows is the bound: {just_over}"
+    );
+    for invented in ["4000", "4096", "1000000"] {
+        assert!(
+            !just_over.contains(invented),
+            "'{invented}' is a count nobody measured: {just_over}"
+        );
+    }
+
+    // Anti-vacuity, and the other half of the policy: a result UNDER the cap
+    // still comes back, so this is not "every read now fails".
+    let ok = ops
+        .read_collected(&id, "big", &format!("SELECT * FROM range({CAP})"))
+        .await
+        .expect("a result at the cap is still served");
+    assert_eq!(ok.rows.len(), CAP);
+}
+
 #[tokio::test]
 async fn read_query_rejects_writes_with_structured_error() {
     let ops = ops();
@@ -958,6 +1039,7 @@ mod forwarding {
                 truncated: false,
                 malformed_lines: 0,
                 unreadable_files: 0,
+                limit_applied: limit,
             })
         }
         async fn catalog_describe(

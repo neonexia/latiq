@@ -77,7 +77,7 @@ message CatalogListResponse { repeated CatalogMsg catalogs = 1; }
 message PondSummary { string pond_id = 1; string name = 2; string owner = 3; string created_at = 4; string node_id = 5; string tier = 6; string description = 7; bool lineage = 8; }
 message PondListRequest { }
 message PondListResponse { repeated PondSummary ponds = 1; }
-// pond: name or id. tier: x-small|small|medium|large|x-large (rejected if unknown
+// pond: name or id. tier: x-small|small|medium|large|x-large|none (rejected if unknown
 // — we do NOT silently fall back to medium, which would resize the wrong way).
 message PondSetTierRequest { string pond = 1; string tier = 2; }
 message PondSetTierResponse { string pond = 1; string tier = 2; }

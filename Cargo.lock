@@ -1880,6 +1880,7 @@ dependencies = [
  "latiq-control-plane",
  "latiq-engine",
  "latiq-engine-duckdb",
+ "latiq-lineage",
  "latiq-mcp",
  "latiq-metrics",
  "latiq-pond-node",

@@ -83,10 +83,38 @@ impl AgentError {
         )
     }
 
+    /// The result was fully materialized before the cap was checked, so `rows`
+    /// is the **true total** and the caller can size its next attempt from it.
+    ///
+    /// Use this ONLY where that is true. The streaming collector cannot say it —
+    /// see [`AgentError::result_cap_exceeded_unknown`], and the sentences are
+    /// deliberately different so the two can never be mistaken for each other.
     pub fn result_cap_exceeded(rows: usize, cap: usize) -> Self {
         Self::of_kind(
             ErrorKind::ResultCapExceeded,
             format!("Result has {rows} rows, over the inline cap of {cap}."),
+        )
+    }
+
+    /// The cap was crossed **mid-stream**, so the total is not known and must
+    /// not be implied.
+    ///
+    /// The streaming collector stops on the first Arrow batch that carries it
+    /// past the cap, and it used to report the number of rows it had collected
+    /// when it stopped — a batch boundary. Every result from 10 240 rows to a
+    /// billion reported "10240", which is not merely imprecise: it is a
+    /// plausible number, two per cent over the cap, and an agent that trusts it
+    /// narrows by two per cent and fails again with the same number. Counting
+    /// the rest honestly would mean draining the whole result the caller just
+    /// asked us not to hand back, so the answer is to stop claiming precision.
+    pub fn result_cap_exceeded_unknown(cap: usize) -> Self {
+        Self::of_kind(
+            ErrorKind::ResultCapExceeded,
+            format!(
+                "Result has more than {cap} rows, over the inline cap of {cap}. Collection \
+                 stopped at the cap, so the exact row count is not known — use \
+                 `SELECT count(*)` or explain_query's `estimated_rows` to size it."
+            ),
         )
     }
 
@@ -290,6 +318,53 @@ mod tests {
                 expected,
                 "the engine's own words, unprefixed"
             );
+        }
+    }
+
+    /// Regression pin. The two cap messages used to be ONE sentence with two
+    /// meanings: `SELECT * FROM range(20000)` and `range(1000000)` both reported
+    /// "Result has 10240 rows" — the Arrow batch boundary where the streaming
+    /// collector gave up — in the same words the materialized path uses for a
+    /// true total. So the number that decides an agent's next `LIMIT` was wrong,
+    /// and wrong in the direction that looks like a near miss.
+    #[test]
+    fn error_contract_the_cap_message_only_states_a_row_count_it_actually_knows() {
+        let exact = AgentError::result_cap_exceeded(10_001, 10_000)
+            .envelope()
+            .message
+            .clone();
+        assert!(
+            exact.contains("has 10001 rows"),
+            "a materialized result knows its size and should say it: {exact}"
+        );
+
+        let unknown = AgentError::result_cap_exceeded_unknown(10_000)
+            .envelope()
+            .message
+            .clone();
+        assert!(
+            unknown.contains("more than 10000"),
+            "a stream cut at the cap can only bound the count: {unknown}"
+        );
+        assert!(
+            !unknown.contains("10240"),
+            "the batch boundary must not appear at all: {unknown}"
+        );
+        assert!(
+            unknown.contains("not known"),
+            "and it must SAY the count is unknown, or `more than` reads as a \
+             turn of phrase: {unknown}"
+        );
+        assert_ne!(
+            exact, unknown,
+            "two different claims must not read as the same sentence"
+        );
+        // Both are the same kind, so `see`/`suggest` routing is unchanged.
+        for e in [
+            AgentError::result_cap_exceeded(1, 0),
+            AgentError::result_cap_exceeded_unknown(0),
+        ] {
+            assert_eq!(e.envelope().kind, ErrorKind::ResultCapExceeded);
         }
     }
 }
