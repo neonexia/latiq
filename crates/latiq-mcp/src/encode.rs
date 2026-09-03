@@ -14,9 +14,19 @@
 
 //! Encode AgentOps results into MCP `CallToolResult`s with BOTH a text content
 //! block (legacy clients) and `structured_content` (modern clients), per spec §8.
+//!
+//! **Every success goes through a TYPE** (`ok`), never a `serde_json::json!`
+//! literal — that is what lets each tool declare an `outputSchema` derived from
+//! the shape it really sends (see `schema.rs`). An error still carries the
+//! `ErrorEnvelope`, which is deliberately OUTSIDE the declared schema: a failed
+//! call sets `is_error`, and both reference MCP clients skip output-schema
+//! validation entirely on an error result, so one envelope shape serves all
+//! thirteen tools instead of thirteen `anyOf`s.
+use crate::response::QueryResponse;
 use latiq_common::ErrorEnvelope;
 use latiq_engine::{ExplainResult, QueryResult};
 use rmcp::model::{CallToolResult, Content};
+use serde::Serialize;
 use serde_json::Value;
 
 fn dual(value: Value, is_error: bool) -> CallToolResult {
@@ -32,9 +42,9 @@ fn dual(value: Value, is_error: bool) -> CallToolResult {
     r
 }
 
-/// Success result from any serializable value.
-pub fn ok_value(value: Value) -> CallToolResult {
-    dual(value, false)
+/// Success result from a value of the tool's DECLARED response type.
+pub fn ok<T: Serialize>(value: &T) -> CallToolResult {
+    dual(serde_json::to_value(value).unwrap_or_default(), false)
 }
 
 /// Error result carrying the structured `ErrorEnvelope`.
@@ -44,20 +54,18 @@ pub fn err_envelope(env: &ErrorEnvelope) -> CallToolResult {
 }
 
 /// Encode a query result in the spec §8 shape:
-/// `{ rows, columns, statement, status, _meta }`.
+/// `{ columns, rows, statement, status, _meta }`.
 pub fn ok_query(statement: &str, qr: QueryResult) -> CallToolResult {
-    let value = serde_json::json!({
-        "columns": qr.columns,
-        "rows": qr.rows,
-        "statement": statement,
-        "status": "ok",
-        "_meta": qr.meta,
-    });
-    dual(value, false)
+    ok(&QueryResponse {
+        columns: qr.columns,
+        rows: qr.rows,
+        statement: statement.to_string(),
+        status: "ok".to_string(),
+        meta: qr.meta,
+    })
 }
 
 /// Encode an explain result.
 pub fn ok_explain(er: ExplainResult) -> CallToolResult {
-    let value = serde_json::to_value(er).unwrap_or(Value::Null);
-    dual(value, false)
+    ok(&er)
 }

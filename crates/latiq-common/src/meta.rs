@@ -13,11 +13,12 @@
 // limitations under the License.
 
 //! The `_meta` envelope carried on every query response ("every response carries signal").
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// What a warning is about. Deliberately a closed set, so a client can decide
 /// which classes it cares about without parsing the message text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningKind {
     Performance,
@@ -28,7 +29,7 @@ pub enum WarningKind {
 
 /// A non-fatal observation about a query that succeeded — advice, never an
 /// error. Rides in `QueryMeta::warnings`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Warning {
     pub kind: WarningKind,
     pub message: String,
@@ -40,7 +41,7 @@ pub struct Warning {
 /// parts: a name that says which *catalog* a table came from (two ponds can
 /// both hold `main.orders`), the namespace an external source must keep, and
 /// the version it was read at.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DatasetRef {
     /// `None` for a table in one of the node's own catalogs — the pond owns it,
     /// and the lineage emitter supplies the pond's namespace, which is the only
@@ -135,7 +136,7 @@ fn is_zero(v: &u64) -> bool {
 /// about the statement that just ran. It is also what the lineage emitter reads
 /// (`inputs`/`outputs`), so a field added here for a client is visible to
 /// provenance too.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QueryMeta {
     pub rows: u64,
     pub rows_affected: u64,

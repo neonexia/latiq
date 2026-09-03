@@ -12,3 +12,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 arrow = { workspace = true }
+# `ExplainResult`/`SchemaSummary` are declared verbatim as MCP output schemas;
+# see latiq-common's note.
+schemars = { workspace = true }

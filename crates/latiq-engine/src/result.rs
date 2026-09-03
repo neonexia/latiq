@@ -14,6 +14,7 @@
 
 //! Neutral, protocol-agnostic query result types produced by any QueryEngine.
 use latiq_common::QueryMeta;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A query result. Rows are positional cells aligned to `columns`.
@@ -28,7 +29,7 @@ pub struct QueryResult {
 /// on (a `full_scan` is a hint to add a filter). File readers (`read_parquet`)
 /// are absent on purpose: the plan JSON carries no path for them, so they are
 /// visible in `raw_plan` only rather than under an invented name.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ScanOp {
     pub table: String,
     /// "full_scan" | "filtered_scan" | "indexed"
@@ -47,7 +48,7 @@ pub struct ScanOp {
 /// There is deliberately no `estimated_bytes` and no `estimated_duration_ms`:
 /// the plan carries no byte estimate and predicts no time, and a field that is
 /// always `0` reads as "this query is free", which is worse than its absence.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ExplainResult {
     /// The root operator's estimated row count — the size of the RESULT, the
     /// number to compare against the inline result cap.
@@ -63,7 +64,7 @@ pub struct ExplainResult {
 
 /// One user table, as `describe_pond` reports it. `row_count_estimate` is what
 /// the engine's catalog says, not a `count(*)` — describe must stay cheap.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TableInfo {
     pub name: String,
     pub columns: Vec<(String, String)>, // (name, type)
@@ -75,7 +76,7 @@ pub struct TableInfo {
 /// A pond's user tables — the orientation an agent reads before writing SQL.
 /// Latiq's own objects never appear here (invariant 6: nothing of ours lives in
 /// the pond catalog).
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SchemaSummary {
     pub tables: Vec<TableInfo>,
 }
