@@ -44,7 +44,7 @@ pub mod sink;
 pub mod writer;
 
 pub use event::{Dataset, EventType, Job, ParentClaim, Run, RunEvent};
-pub use reader::{read_newest, EventPage, PageRequest, ReadError};
+pub use reader::{read_newest, EventPage, PageRequest, ReadError, MAX_LIMIT};
 pub use sink::EventSink;
 #[cfg(feature = "http-sink")]
 pub use sink::HttpSink;

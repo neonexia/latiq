@@ -270,6 +270,7 @@ You are not seeing a half-created pond either way. The eagerness is the point: t
         desc: "Results exceeded the inline cap",
         body: "# Result cap exceeded (`result_cap_exceeded`)\n\n\
 Your read returned more rows than the inline cap (~10k). Narrow with WHERE/LIMIT, aggregate server-side (GROUP BY/count/sum), or materialize with CREATE TABLE AS SELECT and query the smaller table.\n\n\
+**Read the message carefully — it comes in two forms, and only one of them names a row count you can size from.** `Result has N rows` is the true total: the whole result was built before the cap was checked, so N is exact. `Result has more than N rows` means collection STOPPED at the cap and the total is genuinely unknown — N is the cap, not a measurement, and a result of 20 000 rows and one of a billion both say it. Never narrow by a little on the strength of that number; get a real one from `SELECT count(*)` or explain_query's `estimated_rows` first.\n\n\
 **Size it first with explain_query**, so the next attempt is not another guess. In its response: `estimated_rows` is how many rows the query would return — if that is still far over ~10k, narrowing is not enough and you want an aggregate or a CREATE TABLE AS SELECT. `scan_operations` names each table read and whether it was a `full_scan`, and `warnings`/`suggestions` point at the table to filter. All of it is the planner ESTIMATING, not measuring — use it to choose between approaches, not to predict an exact row count. See latiq://recipes/large-results.",
     },
     Res {

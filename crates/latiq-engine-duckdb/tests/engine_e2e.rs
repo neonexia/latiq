@@ -83,6 +83,67 @@ fn pond_lifecycle_end_to_end() {
     assert!(!fs.pond_exists(id));
 }
 
+/// Regression pin (observed live on every pond and every table):
+/// `describe_pond` reported `"columns": []` because `describe_schema` built
+/// `TableInfo` with a hard-coded `vec![]`. An empty list is not a missing field
+/// — an agent reads it as "this table has no columns" and writes SQL against
+/// nothing, which is strictly worse than the field not being there.
+#[test]
+fn describe_schema_reports_each_table_s_columns_in_declaration_order() {
+    let fs = TempFs::new();
+    let eng = DuckEngine::new();
+    let id = PondId::new();
+    let loc = fs.create_pond(id, false).unwrap();
+    eng.init_pond(&loc).unwrap();
+    let agent = Identity::claimed(Some("agent-schema"));
+    let ddl = |sql: &str| {
+        eng.write_query(&loc, sql, &agent, AbortToken::new())
+            .unwrap();
+    };
+    ddl("CREATE TABLE orders(id INTEGER, total DECIMAL(10,2), placed_at TIMESTAMP)");
+    ddl("CREATE TABLE regions(code VARCHAR)");
+
+    let schema = eng.describe_schema(&loc).unwrap();
+    let table = |n: &str| {
+        schema
+            .tables
+            .iter()
+            .find(|t| t.name == n)
+            .unwrap_or_else(|| panic!("'{n}' must be listed; got {:?}", schema.tables))
+    };
+    // Declaration order, with types — the shape an agent needs to write an
+    // INSERT without a column list or a correctly-typed predicate.
+    assert_eq!(
+        table("orders")
+            .columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "total", "placed_at"],
+        "columns must be the table's own, in the order they were declared"
+    );
+    let types: Vec<&str> = table("orders")
+        .columns
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .collect();
+    assert!(
+        types[0].contains("INTEGER") && types[2].contains("TIMESTAMP"),
+        "each column must carry its type; got {types:?}"
+    );
+    // Columns belong to their OWN table: one flat catalog scan is grouped here,
+    // so a grouping bug would hand every table every column in the pond.
+    assert_eq!(
+        table("regions")
+            .columns
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        vec!["code"],
+        "a table must not inherit another table's columns"
+    );
+}
+
 #[test]
 fn attribution_records_the_verified_subject_not_only_the_claimed_leaf() {
     // A caller with a valid token for `svc-lowpriv` claims a flattering leaf id.

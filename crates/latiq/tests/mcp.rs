@@ -1802,3 +1802,374 @@ mod classification {
         c.close().await.unwrap();
     }
 }
+
+/// **Invariant 13 on the agent surface: a short or degraded answer must never
+/// look like a complete one.** Every test here pins a case where Latiq used to
+/// succeed, or report a number, and the number was wrong or the degradation was
+/// invisible — which is worse than an error, because an agent acts confidently
+/// on it. All were observed live against a running stack.
+mod honest_answers {
+    use super::*;
+
+    fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
+    /// D6. `allocate_pond {"tier":"gigantic"}` used to succeed: the pond ran at
+    /// medium (`PondTier::parse(t).unwrap_or_default()`) while `describe_pond`
+    /// reported `gigantic` for the rest of its life — a DURABLE lie, and the
+    /// agent path was permissive while the operator path (`pond set-tier`) was
+    /// strict, which is backwards.
+    #[tokio::test]
+    async fn policy_tier_an_unknown_tier_is_refused_rather_than_run_at_the_default() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-t".into()))
+            .await
+            .unwrap();
+        for bad in ["gigantic", "larg", "Medium!"] {
+            let out = c
+                .call_tool(
+                    "allocate_pond",
+                    args(&[("name", "tierbad".into()), ("tier", bad.into())]),
+                )
+                .await
+                .unwrap();
+            assert!(out.is_error, "tier `{bad}` must not create a pond");
+            assert_eq!(
+                out.value["kind"], "invalid_value",
+                "tier `{bad}` is a bad VALUE, not an internal failure: {:?}",
+                out.value
+            );
+            let msg = out.value["message"].as_str().unwrap_or_default();
+            assert!(msg.contains(bad), "must name the offender: {msg}");
+            for t in latiq_common::tier::CREATABLE {
+                assert!(msg.contains(t), "must offer '{t}': {msg}");
+            }
+            // The pond genuinely does not exist — the lie was durable, so the
+            // absence has to be too.
+            let d = c
+                .call_tool("describe_pond", args(&[("pond", "tierbad".into())]))
+                .await
+                .unwrap();
+            assert_eq!(
+                d.value["kind"], "pond_not_found",
+                "a refused tier must leave no pond behind: {:?}",
+                d.value
+            );
+        }
+        // Anti-vacuity: a real tier still allocates AND is reported back.
+        let out = c
+            .call_tool(
+                "allocate_pond",
+                args(&[("name", "tierok".into()), ("tier", "large".into())]),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.value);
+        let d = c
+            .call_tool("describe_pond", args(&[("pond", "tierok".into())]))
+            .await
+            .unwrap();
+        assert_eq!(d.value["pond"]["tier"], "large");
+        c.close().await.unwrap();
+    }
+
+    /// D6, the discovery half: a model that cannot see the options guesses. The
+    /// schema now enumerates them, so the tier is chosen before the call rather
+    /// than corrected after a failure.
+    #[tokio::test]
+    async fn policy_tier_the_schema_enumerates_the_tiers_a_model_may_choose() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, None).await.unwrap();
+        let tools = c.list_tools().await.unwrap();
+        let alloc = tools
+            .iter()
+            .find(|t| t.name == "allocate_pond")
+            .expect("missing tool allocate_pond");
+        let tier = &alloc.input_schema["properties"]["tier"];
+        let listed: Vec<&str> = tier["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tier needs an `enum`; got {tier}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            latiq_common::tier::CREATABLE,
+            "the schema must offer exactly the tiers the server accepts at \
+             creation — `none` is an operator grant and must not be advertised"
+        );
+        c.close().await.unwrap();
+    }
+
+    /// D11. A pond name becomes the pond's SQL catalog identifier. `""` used to
+    /// succeed and silently become the pond's uuid; `a b/c` used to succeed as
+    /// itself, slash and all.
+    #[tokio::test]
+    async fn pond_lifecycle_an_illegal_pond_name_is_refused_not_repaired() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-n".into()))
+            .await
+            .unwrap();
+        for bad in ["", "a b/c", "sales.2026"] {
+            let out = c
+                .call_tool("allocate_pond", args(&[("name", bad.into())]))
+                .await
+                .unwrap();
+            assert!(out.is_error, "name '{bad}' must be refused, not repaired");
+            assert_eq!(out.value["kind"], "invalid_value", "{:?}", out.value);
+            let msg = out.value["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains(latiq_common::pond_name::RULE),
+                "must say what a name may be: {msg}"
+            );
+        }
+        // Empty must point at the way to get a generated name, since that is
+        // what it used to do by accident.
+        let empty = c
+            .call_tool("allocate_pond", args(&[("name", "".into())]))
+            .await
+            .unwrap();
+        assert!(
+            empty.value["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("omit `name`")),
+            "{:?}",
+            empty.value
+        );
+        // Anti-vacuity: omitting the name still works and still names the pond.
+        let gen = c.call_tool("allocate_pond", Map::new()).await.unwrap();
+        assert!(!gen.is_error, "{:?}", gen.value);
+        assert!(
+            gen.value["pond_name"]
+                .as_str()
+                .is_some_and(|n| !n.is_empty()),
+            "an omitted name must still produce one: {:?}",
+            gen.value
+        );
+        c.close().await.unwrap();
+    }
+
+    /// D11, the `0` divergence. `get_lineage {"limit":0}` was rejected with an
+    /// excellent message while `read_query {"timeout_ms":0}` silently ran at
+    /// 30000 and reported 30000 back — two adjacent tools, opposite policies for
+    /// the same literal. On a JSON surface an explicit `0` is a value the caller
+    /// chose, so both refuse it now.
+    #[tokio::test]
+    async fn cancellation_a_zero_timeout_is_refused_like_a_zero_lineage_limit() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-z".into()))
+            .await
+            .unwrap();
+        c.call_tool("allocate_pond", args(&[("name", "zeros".into())]))
+            .await
+            .unwrap();
+        for tool in ["read_query", "write_query"] {
+            let out = c
+                .call_tool(
+                    tool,
+                    args(&[
+                        ("pond", "zeros".into()),
+                        ("sql", "SELECT 1".into()),
+                        ("timeout_ms", Value::from(0)),
+                    ]),
+                )
+                .await
+                .unwrap();
+            assert!(
+                out.is_error,
+                "{tool}: `0` must not be read as 'use the default': {:?}",
+                out.value
+            );
+            assert_eq!(out.value["kind"], "invalid_value", "{:?}", out.value);
+            assert!(
+                out.value["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("timeout_ms") && m.contains("at least 1")),
+                "the refusal must name the field and the rule: {:?}",
+                out.value
+            );
+        }
+        // Anti-vacuity: omitting it still runs, and a real value is honoured —
+        // this is a rule about `0`, not about `timeout_ms`.
+        let ok = c
+            .call_tool(
+                "read_query",
+                args(&[("pond", "zeros".into()), ("sql", "SELECT 1".into())]),
+            )
+            .await
+            .unwrap();
+        assert!(!ok.is_error, "{:?}", ok.value);
+        assert!(
+            ok.value["_meta"]["timeout_ms"].as_u64().unwrap_or(0) > 0,
+            "{:?}",
+            ok.value
+        );
+        c.close().await.unwrap();
+    }
+
+    /// D11. `get_lineage {"limit":99999}` came back as a 500-event page with
+    /// nothing saying it had been clamped — indistinguishable from a pond that
+    /// has exactly 500 events. `read_query`'s timeout clamp has always been
+    /// reported via `_meta.timeout_ms`; this is the same discipline.
+    #[tokio::test]
+    async fn lineage_an_over_max_limit_is_clamped_and_the_page_says_so() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-l".into()))
+            .await
+            .unwrap();
+        c.call_tool(
+            "allocate_pond",
+            args(&[("name", "traced".into()), ("lineage", Value::Bool(true))]),
+        )
+        .await
+        .unwrap();
+        c.call_tool(
+            "write_query",
+            args(&[
+                ("pond", "traced".into()),
+                ("sql", "CREATE TABLE t(i INTEGER)".into()),
+            ]),
+        )
+        .await
+        .unwrap();
+
+        let page = |limit: u64| {
+            let c = &c;
+            async move {
+                let out = c
+                    .call_tool(
+                        "get_lineage",
+                        args(&[("pond", "traced".into()), ("limit", Value::from(limit))]),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!out.is_error, "{:?}", out.value);
+                out.value
+            }
+        };
+        assert_eq!(
+            page(99_999).await["limit_applied"],
+            Value::from(latiq_lineage::MAX_LIMIT),
+            "a clamped ask must report the value that was actually applied"
+        );
+        // Anti-vacuity: it reports the CALLER's number when nothing was
+        // clamped, so it is not a constant.
+        assert_eq!(page(7).await["limit_applied"], Value::from(7));
+        c.close().await.unwrap();
+    }
+
+    /// D11. A misspelled argument was dropped in silence, so a typo had no
+    /// effect and no warning — an agent could believe it had set a timeout it
+    /// had not set.
+    #[tokio::test]
+    async fn error_contract_an_unknown_argument_is_reported_not_ignored() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-u".into()))
+            .await
+            .unwrap();
+        c.call_tool("allocate_pond", args(&[("name", "typos".into())]))
+            .await
+            .unwrap();
+        let err = c
+            .call_tool(
+                "read_query",
+                args(&[
+                    ("pond", "typos".into()),
+                    ("sql", "SELECT 1".into()),
+                    ("timout_ms", Value::from(5_000)),
+                ]),
+            )
+            .await
+            .expect_err("a misspelled argument must not be silently dropped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timout_ms"),
+            "the refusal must name the key that was not understood: {msg}"
+        );
+        assert!(
+            msg.contains("timeout_ms"),
+            "and list the ones that are, which is the correction: {msg}"
+        );
+        c.close().await.unwrap();
+    }
+
+    /// D16. `describe_pond` reported `"columns": []` for every table in every
+    /// pond — a hard-coded empty vec. An agent reads that as "this table has no
+    /// columns", which is worse than the field being absent, and the tool's own
+    /// description promises "a summary of its tables".
+    #[tokio::test]
+    async fn pond_lifecycle_describe_reports_each_table_s_columns() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-d".into()))
+            .await
+            .unwrap();
+        c.call_tool("allocate_pond", args(&[("name", "described".into())]))
+            .await
+            .unwrap();
+        c.call_tool(
+            "write_query",
+            args(&[
+                ("pond", "described".into()),
+                (
+                    "sql",
+                    "CREATE TABLE orders(id INTEGER, total DOUBLE)".into(),
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+        let out = c
+            .call_tool("describe_pond", args(&[("pond", "described".into())]))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{:?}", out.value);
+        let orders = out.value["schema"]["tables"]
+            .as_array()
+            .expect("tables")
+            .iter()
+            .find(|t| t["name"] == "orders")
+            .unwrap_or_else(|| panic!("orders must be listed: {:?}", out.value));
+        let cols = orders["columns"].as_array().expect("columns");
+        let names: Vec<&str> = cols.iter().filter_map(|c| c[0].as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["id", "total"],
+            "describe must name the table's columns, in declaration order: {orders}"
+        );
+        assert!(
+            cols[0][1].as_str().is_some_and(|t| t.contains("INTEGER")),
+            "and carry each column's type: {orders}"
+        );
+        c.close().await.unwrap();
+    }
+
+    /// `drop_pond`'s `confirm` is the single most consequential argument on the
+    /// only irreversibly destructive tool, and it had NO description at all — an
+    /// agent could only learn what it was for by being refused once.
+    #[tokio::test]
+    async fn pond_lifecycle_the_confirm_argument_is_documented_before_it_is_needed() {
+        let s = start_stack().await;
+        let c = LatiqClient::connect(&s.mcp_endpoint, None).await.unwrap();
+        let tools = c.list_tools().await.unwrap();
+        let drop = tools
+            .iter()
+            .find(|t| t.name == "drop_pond")
+            .expect("missing tool drop_pond");
+        let d = drop.input_schema["properties"]["confirm"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("confirm needs a description: {:?}", drop.input_schema));
+        assert!(
+            d.contains("true"),
+            "it must say what value performs the drop: {d}"
+        );
+        assert!(
+            d.contains("no undo") || d.contains("irreversible"),
+            "and that there is no undo — that is the decision it gates: {d}"
+        );
+        c.close().await.unwrap();
+    }
+}

@@ -27,3 +27,4 @@ pub mod tier;
 pub use tier::{PondTier, ResourceLimits};
 pub mod catalog;
 pub mod extensions;
+pub mod pond_name;
