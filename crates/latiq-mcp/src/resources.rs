@@ -43,7 +43,7 @@ const RESOURCES: &[Res] = &[
 - **Identity:** who you are arrives in the TRANSPORT, never in a tool argument — no tool takes an agent id, so don't try to set one. The `Authorization: Bearer` token is the verified principal (`subject` + `issuer`); the `latiq-agent-id` header is a CLAIM and carries no authority. On a deployment with no issuer configured nothing is verified: you get `verified: false` and a null `subject` wherever identity is reported. Read that as \"nobody proved it\", not \"nobody did it\".\n\
 - **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first), and check the `lineage` flag in describe_pond to know whether a pond has it. It is chosen at allocation and CANNOT be turned on later, so ask for it when you allocate. It is a working record, not tamper-proof evidence — the events are files in the pond, and dropping the pond destroys them. See latiq://recipes/lineage.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
-- **Plan first:** call explain_query before an expensive query to estimate cost, then refine.\n\
+- **Plan first:** call explain_query before an expensive query. It returns `estimated_rows` (the result size — compare it to the ~10k cap), a `scan_operations` entry per table read, and named `warnings`/`suggestions`. They are PLANNER ESTIMATES, not measurements: act on orders of magnitude, not on small differences.\n\
 - **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.",
     },
     Res {
@@ -90,7 +90,7 @@ Send it as one write_query — several plain statements in one call are fine, an
         desc: "Handling results larger than the inline cap",
         body: "# Recipe — large results\n\n\
 **When:** a read_query returns `result_cap_exceeded` or you expect many rows.\n\n\
-**First, plan it:** call **explain_query** on the statement. It does not execute, so it costs you nothing, and it shows which operation is heavy before you spend a result on finding out.\n\n\
+**First, plan it:** call **explain_query** on the statement. It does not execute, so it costs you nothing. Read `estimated_rows` — that is the size of the RESULT, so if it is well over ~10k this read will be capped whatever you do next. Then read `scan_operations` for the table that is heavy (`scan_type` `full_scan` with a big `estimated_rows_scanned` is the one to fix) and the `warnings`/`suggestions`, which name it for you. These are estimates and are routinely wrong on joins — believe the order of magnitude, not the digits.\n\n\
 **Then (pick one):**\n\
 1. **Narrow:** add a WHERE on a selective column and/or LIMIT.\n\
 2. **Aggregate server-side:** `SELECT severity, count(*) FROM events GROUP BY severity`.\n\
@@ -269,7 +269,8 @@ You are not seeing a half-created pond either way. The eagerness is the point: t
         name: "Troubleshooting: large results",
         desc: "Results exceeded the inline cap",
         body: "# Result cap exceeded (`result_cap_exceeded`)\n\n\
-Your read returned more rows than the inline cap (~10k). Narrow with WHERE/LIMIT, aggregate server-side (GROUP BY/count/sum), or materialize with CREATE TABLE AS SELECT and query the smaller table. See latiq://recipes/large-results.",
+Your read returned more rows than the inline cap (~10k). Narrow with WHERE/LIMIT, aggregate server-side (GROUP BY/count/sum), or materialize with CREATE TABLE AS SELECT and query the smaller table.\n\n\
+**Size it first with explain_query**, so the next attempt is not another guess. In its response: `estimated_rows` is how many rows the query would return — if that is still far over ~10k, narrowing is not enough and you want an aggregate or a CREATE TABLE AS SELECT. `scan_operations` names each table read and whether it was a `full_scan`, and `warnings`/`suggestions` point at the table to filter. All of it is the planner ESTIMATING, not measuring — use it to choose between approaches, not to predict an exact row count. See latiq://recipes/large-results.",
     },
     Res {
         uri: "latiq://troubleshooting/timeouts",
@@ -280,7 +281,7 @@ Your statement ran past the timeout in effect for it and was stopped. The error 
 **How the timeout is decided.** `read_query` and `write_query` take an optional `timeout_ms`. Omit it and the node's default applies. Ask for more than the node's maximum and you are CLAMPED to that maximum — the query still runs, it is never refused — so read `_meta.timeout_ms` on every successful result to see what was actually in effect.\n\n\
 **Three levers, in order of cost:**\n\
 1. **Retry with a larger `timeout_ms`**, up to the node's maximum. Cheapest when the work is genuinely large and you simply under-asked.\n\
-2. **Narrow the query** — a WHERE on a selective column, a LIMIT, fewer columns, or aggregate server-side (GROUP BY/count/sum) instead of scanning. Call explain_query first to find the heavy operation.\n\
+2. **Narrow the query** — a WHERE on a selective column, a LIMIT, fewer columns, or aggregate server-side (GROUP BY/count/sum) instead of scanning. Call explain_query first to find the heavy operation: the `scan_operations` entry with the largest `estimated_rows_scanned` — especially one whose `scan_type` is `full_scan` — is what the time went on, and `warnings`/`suggestions` name that table. Note explain estimates ROWS, never TIME: nothing in that response predicts a duration, so a big scan is a reason to narrow, not a measured cost.\n\
 3. **If it already timed out AT the maximum**, a larger `timeout_ms` is not available: the work is too large for this pond's tier. Ask an operator to re-tier the pond.\n\n\
 `query_timeout` and `query_cancelled` are different: the first is the node's deadline, the second is somebody asking for the query to stop. Only the first is fixed by asking for more time.\n\n\
 ## If you got `query_cancelled`\n\n\

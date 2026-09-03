@@ -106,8 +106,14 @@ test("pond lifecycle + read/write/explain/describe through MCP tools", async () 
   const read = ok(await tools.read_query.execute({ pond, sql: "SELECT count(*) AS n FROM t" }, opts()));
   assert.equal(read.rows[0][0], 3, "read returned the rows the write produced");
 
+  // Assert the plan's CONTENT: `estimated_rows` and `scan_operations` were
+  // hard-coded empty until the real-estimates work, and a length check on the
+  // JSON passed happily on that stub.
   const explain = ok(await tools.explain_query.execute({ pond, sql: "SELECT * FROM t WHERE id > 1" }, opts()));
-  assert.ok(JSON.stringify(explain).length > 0, "explain returned a plan");
+  assert.ok(explain.estimated_rows > 0, `explain must estimate a result size: ${JSON.stringify(explain)}`);
+  assert.equal(explain.scan_operations[0].table, "t", `the scan must name the table: ${JSON.stringify(explain)}`);
+  assert.equal(explain.scan_operations[0].scan_type, "filtered_scan", `the WHERE was pushed down: ${JSON.stringify(explain)}`);
+  assert.ok(String(explain.raw_plan).includes("t"), "raw_plan stays the escape hatch");
 
   const desc = ok(await tools.describe_pond.execute({ pond }, opts()));
   assert.ok(JSON.stringify(desc).includes("t"), "describe surfaces the table");

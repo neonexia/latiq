@@ -92,9 +92,25 @@ pub struct QueryArgs {
     #[schemars(description = "SQL statement")]
     pub sql: String,
     #[schemars(
-        description = "How long this statement may run, in milliseconds. Omit for the node's default. Asking for MORE than the node allows is not an error — it is clamped to the node's maximum and the query runs at that ceiling, so always read `_meta.timeout_ms` for what was actually applied. On expiry you get a `query_timeout` error naming both numbers. Ignored by explain_query, which does not execute."
+        description = "How long this statement may run, in milliseconds. Omit for the node's default. Asking for MORE than the node allows is not an error — it is clamped to the node's maximum and the query runs at that ceiling, so always read `_meta.timeout_ms` for what was actually applied. On expiry you get a `query_timeout` error naming both numbers."
     )]
     pub timeout_ms: Option<u64>,
+}
+
+/// `explain_query`'s arguments — deliberately NOT [`QueryArgs`].
+///
+/// It carried a `timeout_ms` whose own description said it was ignored: a dead
+/// argument advertised to the model, which costs a decision on every call and
+/// can only ever be wasted. Explain executes nothing, so there is no deadline to
+/// set; if planning itself ever needs bounding, that is a node-side concern, not
+/// a knob the agent should be offered.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ExplainArgs {
+    #[schemars(description = "Pond id or name")]
+    pub pond: String,
+    #[schemars(description = "SQL statement to plan (it is NOT executed)")]
+    pub sql: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -661,9 +677,15 @@ Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements 
     /// Estimate a query's cost without running it. Call before read/write_query to
     /// reason about scan size; refine, then run.
     #[tool(
-        description = "Plan a query WITHOUT running it — returns the DuckLake/DuckDB plan so you can reason about cost before executing. \
-Use it before an expensive read_query/write_query: inspect the plan, refine (add a WHERE on a selective column, a LIMIT, or pre-aggregate), then run. \
-This makes you thrifty rather than greedy. Read-only and side-effect-free.",
+        description = "Plan a query WITHOUT running it, and get the planner's cost estimates. \
+Returns `estimated_rows` (how many rows the query would RETURN — compare it against the ~10k inline cap), \
+`scan_operations` (one entry per table read: `table`, `scan_type` full_scan/filtered_scan, `estimated_rows_scanned`, `source`), \
+`warnings` + `suggestions` (named, actionable — e.g. a large table read with no filter), and `raw_plan` (the full plan, when you want to read it yourself). \
+Use it before an expensive read_query/write_query: read the estimates, refine (add a WHERE on a selective column, a LIMIT, or pre-aggregate), then run. \
+THESE ARE ESTIMATES, not measurements — nothing is executed, and the planner's row counts are often wrong on multi-way joins. \
+Treat them as an order of magnitude: a scan estimated at 5M rows is a real warning, 900 vs 1100 is noise. \
+There is deliberately no time or byte estimate — the planner predicts neither. \
+Read-only and side-effect-free.",
         annotations(
             title = "Explain query",
             read_only_hint = true,
@@ -673,7 +695,7 @@ This makes you thrifty rather than greedy. Read-only and side-effect-free.",
     )]
     async fn explain_query(
         &self,
-        Parameters(a): Parameters<QueryArgs>,
+        Parameters(a): Parameters<ExplainArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;

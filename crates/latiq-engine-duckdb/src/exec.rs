@@ -14,6 +14,7 @@
 
 //! Query execution against an attached pond instance: read (SELECT),
 //! write (txn-wrapped + native DuckLake attribution), and explain.
+use crate::explain;
 use crate::instance::PondInstance;
 use duckdb::types::ValueRef;
 use latiq_common::{DatasetField, DatasetRef, Identity, QueryMeta};
@@ -848,8 +849,18 @@ fn dedup(mut datasets: Vec<DatasetRef>) -> Vec<DatasetRef> {
     datasets
 }
 
-/// Wrap DuckDB `EXPLAIN`, returning the raw plan text. Richer estimate parsing
-/// is a later refinement (Slice 0+ surfaces the plan; estimates are coarse).
+/// Plan a statement without running it, returning the optimiser's estimates plus
+/// the plan itself.
+///
+/// `EXPLAIN (FORMAT JSON)` is asked for rather than the default box-drawing text
+/// because it carries the same plan in a shape we can read numbers out of —
+/// `raw_plan` is then that JSON, which is strictly more than the ASCII art it
+/// replaced and stays the escape hatch when [`crate::explain`] does not
+/// understand a plan shape.
+///
+/// **Parsing never fails the call.** An unreadable plan returns the plan text
+/// with empty estimates and logs why; an explain that errors is worse than one
+/// that under-reports.
 pub fn run_explain(inst: &PondInstance, sql: &str) -> Result<ExplainResult, EngineError> {
     // `EXPLAIN ANALYZE <stmt>` EXECUTES the statement in DuckDB — refuse it so
     // the "plan only" tool can never run a write. Plain `EXPLAIN` does not run.
@@ -858,31 +869,63 @@ pub fn run_explain(inst: &PondInstance, sql: &str) -> Result<ExplainResult, Engi
             "EXPLAIN ANALYZE executes the statement; use read_query/write_query to run it".into(),
         ));
     }
-    let explain_sql = format!("EXPLAIN {sql}");
+    // Fall back to the text form if this DuckDB will not produce JSON for the
+    // statement at all: a plan with no estimates still beats an error.
+    let (cells, is_json) = match explain_cells(inst, &format!("EXPLAIN (FORMAT JSON) {sql}")) {
+        Ok(c) => (c, true),
+        Err(e) => {
+            tracing::debug!(error = %e, "EXPLAIN (FORMAT JSON) refused; falling back to the text plan");
+            (explain_cells(inst, &format!("EXPLAIN {sql}"))?, false)
+        }
+    };
+    Ok(explain_result(cells, is_json))
+}
+
+/// Assemble the result from an `EXPLAIN`'s text cells. Split out from
+/// [`run_explain`] because THIS is the degradation contract — an unreadable plan
+/// must still come back as a plan — and it is only testable without DuckDB's
+/// cooperation if it is a function of the cells.
+fn explain_result(cells: Vec<String>, is_json: bool) -> ExplainResult {
+    // DuckDB returns `(label, plan)`; the plan is the last cell. Keep every cell
+    // in `raw_plan` — the label is two words and losing the wrong column would
+    // lose the plan.
+    let raw_plan = cells.join("\n");
+
+    let estimates = match cells.last().filter(|_| is_json).map(|j| explain::parse(j)) {
+        Some(Ok(e)) => e,
+        Some(Err(why)) => {
+            tracing::warn!(%why, "explain estimates unavailable: returning the raw plan only");
+            explain::Estimates::default()
+        }
+        None => explain::Estimates::default(),
+    };
+
+    ExplainResult {
+        estimated_rows: estimates.estimated_rows,
+        scan_operations: estimates.scan_operations,
+        warnings: estimates.warnings,
+        suggestions: estimates.suggestions,
+        raw_plan,
+    }
+}
+
+/// Run an `EXPLAIN …` and collect its text cells in order.
+fn explain_cells(inst: &PondInstance, explain_sql: &str) -> Result<Vec<String>, EngineError> {
     let mut stmt = inst
         .conn
-        .prepare(&explain_sql)
+        .prepare(explain_sql)
         .map_err(|e| crate::errclass::classify(&e))?;
     let mut rows = stmt.query([]).map_err(|e| crate::errclass::classify(&e))?;
-    let mut plan = String::new();
+    let mut cells = Vec::new();
     while let Some(row) = rows.next().map_err(|e| crate::errclass::classify(&e))? {
         let ncols = row.as_ref().column_names().len();
         for i in 0..ncols {
             if let Ok(ValueRef::Text(t)) = row.get_ref(i) {
-                plan.push_str(&String::from_utf8_lossy(t));
-                plan.push('\n');
+                cells.push(String::from_utf8_lossy(t).into_owned());
             }
         }
     }
-    Ok(ExplainResult {
-        estimated_rows: 0,
-        estimated_bytes: 0,
-        estimated_duration_ms: 0,
-        scan_operations: vec![],
-        warnings: vec![],
-        suggestions: vec![],
-        raw_plan: plan,
-    })
+    Ok(cells)
 }
 
 #[cfg(test)]
@@ -1360,14 +1403,64 @@ mod tests {
 
     #[test]
     fn explain_refuses_analyze_and_does_not_execute() {
+        // REGRESSION PIN: `EXPLAIN ANALYZE <stmt>` RUNS the statement in DuckDB.
+        // A tool documented as "plan only" that can delete rows is the worst
+        // failure this file guards against — do not weaken it.
         let (_fs, inst) = pond();
         let id = Identity::claimed(None);
         run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
         run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, "pond").unwrap();
-        assert!(run_explain(&inst, "ANALYZE DELETE FROM t").is_err());
+        // The KIND and the reason, not `is_err()`: a bare error check would pass
+        // if the pond had vanished, or if ANALYZE had been rejected as a typo.
+        match run_explain(&inst, "ANALYZE DELETE FROM t") {
+            Err(EngineError::Parse(m)) => assert!(
+                m.contains("ANALYZE") && m.contains("executes"),
+                "the refusal must say WHY, so the agent redirects instead of retrying: {m}"
+            ),
+            other => panic!("ANALYZE must be refused as a parse error, got {other:?}"),
+        }
         // The rows must still be there — ANALYZE was refused, not executed.
         let n = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
         assert_eq!(n.rows[0][0], serde_json::json!(2));
+    }
+
+    #[test]
+    fn explain_degrades_to_the_raw_plan_when_the_json_is_unreadable() {
+        // A DuckDB upgrade that reshapes the plan must cost us the estimates and
+        // NOTHING else: an explain that errors is worse than one that
+        // under-reports, and `raw_plan` is what the agent falls back to.
+        let cells = vec!["physical_plan".to_string(), "{ not json at all".to_string()];
+        let r = explain_result(cells, true);
+        assert_eq!(r.estimated_rows, 0);
+        assert!(
+            r.scan_operations.is_empty() && r.warnings.is_empty() && r.suggestions.is_empty(),
+            "an unreadable plan must not invent estimates: {r:?}"
+        );
+        assert!(
+            r.raw_plan.contains("{ not json at all"),
+            "the plan text must survive the parse failure: {}",
+            r.raw_plan
+        );
+
+        // Anti-vacuity: the SAME assembly over a plan we can read must fill the
+        // fields, or the test above passes because nothing ever fills them.
+        let good = explain_result(
+            vec![
+                "physical_plan".to_string(),
+                r#"[{"name":"DUCKLAKE_SCAN","children":[],
+                     "extra_info":{"Table":"t","Estimated Cardinality":"12"}}]"#
+                    .to_string(),
+            ],
+            true,
+        );
+        assert_eq!(good.estimated_rows, 12);
+        assert_eq!(good.scan_operations[0].table, "t");
+
+        // And the text-plan fallback: same cells, but nobody claimed they were
+        // JSON, so we must not even try to parse them.
+        let text = explain_result(vec!["┌─ SEQ_SCAN ─┐".to_string()], false);
+        assert_eq!(text.estimated_rows, 0);
+        assert!(text.raw_plan.contains("SEQ_SCAN"));
     }
 
     #[test]

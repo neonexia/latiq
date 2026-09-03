@@ -150,14 +150,20 @@ impl ErrorKind {
                 "Write to your own tables/schema, not a reserved one."
             }
             ErrorKind::ResultCapExceeded => {
-                "Narrow with WHERE/LIMIT, aggregate server-side (GROUP BY/count/sum), or materialize with CREATE TABLE AS SELECT."
+                "Narrow with WHERE/LIMIT, aggregate server-side (GROUP BY/count/sum), or \
+                 materialize with CREATE TABLE AS SELECT. Call explain_query on the statement \
+                 first: its `estimated_rows` is how many rows this would return, so you can see \
+                 whether narrowing is enough before spending another attempt on it."
             }
             ErrorKind::ReadOnlyViolation => {
                 "Use write_query for INSERT/UPDATE/DELETE/DDL; read_query is for SELECT."
             }
             ErrorKind::UriNotAllowed => "Use an allowed source URI (a public http(s)/s3 path).",
             ErrorKind::QueryTimeout => {
-                "Narrow the query (WHERE/LIMIT) or aggregate server-side, then retry."
+                "Retry with a larger timeout_ms (up to the node's maximum), or narrow the query \
+                 (WHERE/LIMIT) or aggregate server-side. explain_query shows which table is \
+                 scanned and how big it is estimated to be — it predicts no duration, but the \
+                 largest full_scan in `scan_operations` is what to fix."
             }
             ErrorKind::QueryCancelled => "Re-issue the query if you still need the result.",
             ErrorKind::Unauthenticated => {

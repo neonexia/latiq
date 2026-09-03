@@ -346,24 +346,33 @@ annotations: { readOnlyHint: true, idempotentHint: true }
 input:
   pond: pond_id or pond_name
   sql: string (any SELECT or DML)
-  parameters: [value] (optional)
 output:
-  estimated_rows: int
-  estimated_bytes: int
-  estimated_duration_ms: int (rough cost estimate)
+  estimated_rows: int (the ROOT operator's estimate = the result size)
   scan_operations: [
-    { table: string, type: "full_scan" | "filtered_scan" | "indexed",
+    { table: string, scan_type: "full_scan" | "filtered_scan" | "indexed",
       estimated_rows_scanned: int, source: "pond" | "attached" }
   ]
-  joins: [{ tables: [string], type: string, estimated_rows: int }]
-  warnings: [string]  -- e.g., "Full scan on events (1.2M rows). Consider WHERE on occurred_at."
-  suggestions: [string]  -- e.g., "Filter on severity reduces scan to ~12K rows."
-  raw_plan: string (DuckDB EXPLAIN output, for agents that want it)
+  warnings: [string]  -- e.g., "full scan of `events`: an estimated 1200000 rows are read with no filter"
+  suggestions: [string]  -- e.g., "add a WHERE on a selective column of `events` ..."
+  raw_plan: string (the whole DuckDB plan, for agents that want to read it)
 ```
 
 Plans the query without executing it. Agents call this before `read_query` or `write_query` to reason about cost.
 
-Returns the estimated work the query would do, warnings about heavy operations (full scans, large joins, cross-product accidents), and suggestions for narrowing. Wraps DuckDB's `EXPLAIN` with structured output and added guidance.
+Sourced from `EXPLAIN (FORMAT JSON)`: `estimated_rows` is the root operator's
+`Estimated Cardinality`, `scan_operations` is every operator naming a `Table`,
+and the warnings/suggestions are DERIVED (a scan with no agent-written predicate
+over `latiq_engine_duckdb::explain::FULL_SCAN_WARN_ROWS`). There is **no
+`estimated_bytes` and no `estimated_duration_ms`** — the plan carries no byte
+estimate and predicts no time, and a permanently-zero field reads as "this query
+is free". There is no `joins` array either, for the same reason: nothing fills it.
+`timeout_ms` is not an argument here — explain executes nothing.
+
+Everything numeric is the optimiser ESTIMATING, and it is routinely wrong on
+multi-way joins. The plan JSON is a serialisation internal with no stability
+guarantee, so `engine_e2e.rs::explain_plan_key_names_still_match_this_duckdb_version`
+pins the keys and an unreadable plan degrades to `raw_plan` + empty estimates
+rather than an error.
 
 Common pattern:
 1. Agent forms a query

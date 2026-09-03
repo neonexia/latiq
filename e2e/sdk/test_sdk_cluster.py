@@ -115,30 +115,59 @@ def test_large_read_streams_uncapped_past_the_json_cap(db):
     db.drop_pond(pond=p.name, confirm=True)
 
 
-def test_explain_returns_a_plan(db):
-    """`explain` must return the STRUCTURED plan contract, not merely a
-    non-empty something. A bare truthiness check passes on an error string or on
-    `{}`, so assert the fields a caller actually reads: the estimates, the scan
-    operations (naming the table the query touched, sourced from the pond), and
-    the raw plan text."""
+def test_explain_returns_real_estimates(db):
+    """`explain` must return the STRUCTURED plan contract with REAL numbers in
+    it. This test used to assert only that `scan_operations`/`warnings`/
+    `suggestions` were *lists* — which an always-empty list satisfied, and they
+    were always empty. So every assertion below is a value: the row estimate,
+    the table the scan names, and the derived advice.
+
+    `estimated_bytes` and `estimated_duration_ms` are asserted ABSENT: DuckDB's
+    plan carries no byte estimate and predicts no time, and a field that is
+    always 0 reads as 'this query is free'."""
     p = db.create_pond(name=_name("explain"))
     p.query(sql="CREATE TABLE explain_probe(id INT)")
-    plan = p.explain(sql="SELECT * FROM explain_probe WHERE id > 1")
+    # Over the engine's full-scan warning threshold, so the derived advice fires.
+    p.query(sql="INSERT INTO explain_probe SELECT i FROM range(200000) s(i)")
+    plan = p.explain(sql="SELECT * FROM explain_probe")
 
     assert isinstance(plan, dict), f"explain returns a plan object, got {plan!r}"
-    for key in ("estimated_rows", "estimated_bytes", "estimated_duration_ms"):
-        assert isinstance(plan.get(key), int), f"{key} missing/not numeric: {plan!r}"
+    assert plan.get("estimated_rows") == 200000, (
+        f"estimated_rows must be the planner's real estimate, not a stub: {plan!r}"
+    )
+    for gone in ("estimated_bytes", "estimated_duration_ms"):
+        assert gone not in plan, (
+            f"{gone} is not something the plan can tell us; a 0 there is a lie: {plan!r}"
+        )
     assert isinstance(plan.get("raw_plan"), str) and plan["raw_plan"].strip(), (
         f"raw_plan must carry the engine's plan text: {plan!r}"
     )
-    for key in ("scan_operations", "warnings", "suggestions"):
-        assert isinstance(plan.get(key), list), f"{key} missing/not a list: {plan!r}"
     # The plan must be about the query we ASKED about. This is the assertion
     # that an error string, a `{}`, or a plan for some other statement cannot
     # satisfy — the table name is unique to this test.
     assert "explain_probe" in plan["raw_plan"], (
         f"the plan must describe the query we sent: {plan['raw_plan']!r}"
     )
+
+    scans = plan.get("scan_operations")
+    assert isinstance(scans, list) and len(scans) == 1, (
+        f"one table read is one scan operation: {plan!r}"
+    )
+    assert scans[0]["table"] == "explain_probe", f"the scan must name the table: {scans!r}"
+    assert scans[0]["scan_type"] == "full_scan", f"no WHERE was given: {scans!r}"
+    assert scans[0]["estimated_rows_scanned"] == 200000, f"{scans!r}"
+    assert scans[0]["source"] == "pond", f"the table lives in this pond: {scans!r}"
+
+    advice = " ".join(plan.get("warnings", []) + plan.get("suggestions", []))
+    assert "explain_probe" in advice and "WHERE" in advice, (
+        f"the warning/suggestion must name the table and a concrete fix: {plan!r}"
+    )
+
+    # Anti-vacuity: with a predicate the same query is not warned about, so the
+    # advice above is information rather than a constant.
+    filtered = p.explain(sql="SELECT * FROM explain_probe WHERE id = 7")
+    assert filtered["scan_operations"][0]["scan_type"] == "filtered_scan", f"{filtered!r}"
+    assert filtered["warnings"] == [], f"a filtered scan earns no warning: {filtered!r}"
     db.drop_pond(pond=p.name, confirm=True)
 
 

@@ -1139,3 +1139,211 @@ fn error_contract_duckdb_error_classes_are_unchanged() {
         );
     }
 }
+
+/// `explain_query` over real plans. The subject is OUR parsing of DuckDB's plan
+/// JSON — not DuckDB's optimiser, whose exact cardinalities are its business.
+/// So every assertion is a *band* or a *name*, never an equality on an estimate.
+mod explain {
+    use super::*;
+    use latiq_engine::ExplainResult;
+    use latiq_engine_duckdb::explain::{keys, FILTERED_SCAN, FULL_SCAN, FULL_SCAN_WARN_ROWS};
+    use latiq_storage::PondLocation;
+
+    /// A pond with `big` (comfortably over the full-scan threshold) and `small`.
+    fn pond() -> (TempFs, PondLocation, DuckEngine) {
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        eng.init_pond(&loc).unwrap();
+        let agent = Identity::claimed(Some("agent-explain"));
+        for sql in [
+            "CREATE TABLE big(id INTEGER, g VARCHAR)",
+            &format!(
+                "INSERT INTO big SELECT i, 'g' || (i % 7) FROM range({}) s(i)",
+                FULL_SCAN_WARN_ROWS * 2
+            ),
+            "CREATE TABLE small(id INTEGER, w VARCHAR)",
+            "INSERT INTO small SELECT i, 'w' FROM range(500) s(i)",
+        ] {
+            eng.write_query(&loc, sql, &agent, AbortToken::new())
+                .unwrap();
+        }
+        (fs, loc, eng)
+    }
+
+    fn explain(eng: &DuckEngine, loc: &PondLocation, sql: &str) -> ExplainResult {
+        eng.explain_query(loc, sql)
+            .unwrap_or_else(|e| panic!("explain `{sql}` failed: {e:?}"))
+    }
+
+    fn scan<'a>(r: &'a ExplainResult, table: &str) -> &'a latiq_engine::ScanOp {
+        r.scan_operations
+            .iter()
+            .find(|s| s.table == table)
+            .unwrap_or_else(|| panic!("no scan of `{table}` in {:?}", r.scan_operations))
+    }
+
+    #[test]
+    fn explain_happy_reports_real_estimates_for_every_plan_shape() {
+        // The four shapes an agent actually explains. `estimated_rows` used to
+        // be a literal 0 on all of them, which read as "this query is free" —
+        // so the assertion that matters is that each is non-zero AND ordered
+        // the way the query says it must be.
+        let (_fs, loc, eng) = pond();
+        let rows = FULL_SCAN_WARN_ROWS * 2;
+
+        let filtered = explain(&eng, &loc, "SELECT * FROM big WHERE id > 100");
+        assert!(
+            (1..rows).contains(&filtered.estimated_rows),
+            "a filter must estimate FEWER than the {rows} rows in `big`, and not zero: {}",
+            filtered.estimated_rows
+        );
+        assert_eq!(scan(&filtered, "big").scan_type, FILTERED_SCAN);
+        assert_eq!(
+            scan(&filtered, "big").source,
+            "pond",
+            "`big` lives in this pond's own DuckLake storage"
+        );
+
+        let full = explain(&eng, &loc, "SELECT * FROM big");
+        assert_eq!(
+            full.estimated_rows, rows,
+            "an unfiltered scan estimates the whole table"
+        );
+        assert_eq!(scan(&full, "big").scan_type, FULL_SCAN);
+        assert_eq!(scan(&full, "big").estimated_rows_scanned, rows);
+
+        let agg = explain(&eng, &loc, "SELECT g, count(*) FROM big GROUP BY g");
+        assert!(
+            agg.estimated_rows > 0,
+            "an aggregate still estimates a result size: {agg:?}"
+        );
+        assert_eq!(
+            scan(&agg, "big").estimated_rows_scanned,
+            rows,
+            "the GROUP BY reads every row even though it returns few"
+        );
+
+        let join = explain(
+            &eng,
+            &loc,
+            "SELECT big.g, small.w FROM big JOIN small ON big.id = small.id",
+        );
+        assert!(
+            join.estimated_rows > 0,
+            "a join estimates a result: {join:?}"
+        );
+        // Naming BOTH sides is the point: an agent tuning a join needs to know
+        // which side is the big one.
+        assert_eq!(scan(&join, "big").estimated_rows_scanned, rows);
+        assert_eq!(scan(&join, "small").estimated_rows_scanned, 500);
+    }
+
+    #[test]
+    fn explain_full_scan_earns_a_warning_and_a_suggestion_that_name_the_table() {
+        let (_fs, loc, eng) = pond();
+        let r = explain(&eng, &loc, "SELECT * FROM big");
+        let warnings = r.warnings.join("\n");
+        assert!(
+            warnings.contains("full scan") && warnings.contains("`big`"),
+            "the warning must say what is wrong and WHICH table: {warnings:?}"
+        );
+        let suggestions = r.suggestions.join("\n");
+        assert!(
+            suggestions.contains("WHERE") && suggestions.contains("`big`"),
+            "the suggestion must be actionable on `big`, not generic advice: {suggestions:?}"
+        );
+
+        // Anti-vacuity: the same query WITH a predicate must go quiet, or the
+        // rule is "always warn" and carries no information.
+        let filtered = explain(&eng, &loc, "SELECT * FROM big WHERE id = 3");
+        assert!(
+            filtered.warnings.is_empty() && filtered.suggestions.is_empty(),
+            "a filtered scan must not be warned about: {filtered:?}"
+        );
+        // And a small table read whole is not worth the agent's attention.
+        let small = explain(&eng, &loc, "SELECT * FROM small");
+        assert_eq!(scan(&small, "small").scan_type, FULL_SCAN);
+        assert!(
+            small.warnings.is_empty(),
+            "`small` is under the {FULL_SCAN_WARN_ROWS}-row threshold: {small:?}"
+        );
+    }
+
+    #[test]
+    fn explain_keeps_the_raw_plan_as_the_escape_hatch() {
+        let (_fs, loc, eng) = pond();
+        let r = explain(&eng, &loc, "SELECT * FROM big WHERE id > 100");
+        assert!(
+            r.raw_plan.contains("big") && r.raw_plan.contains(keys::CARDINALITY),
+            "raw_plan must carry the whole plan, so a shape we cannot parse is \
+             still readable by the agent: {}",
+            r.raw_plan
+        );
+    }
+
+    #[test]
+    fn explain_plan_key_names_still_match_this_duckdb_version() {
+        // Verified against duckdb-rs 1.10503.1 (DuckDB 1.5.3).
+        //
+        // `EXPLAIN (FORMAT JSON)` is a SERIALISATION INTERNAL with no stability
+        // guarantee — the same lesson the lineage work learned from
+        // `json_serialize_plan` (see
+        // `lineage_plan_key_names_still_match_this_duckdb_version`). A DuckDB
+        // upgrade that renames one of these keys degrades explain silently back
+        // to the zeros this feature exists to remove, and nothing else in the
+        // suite would go red. So assert each key through a query that can only
+        // pass if that key is still read.
+        let (_fs, loc, eng) = pond();
+        let rows = FULL_SCAN_WARN_ROWS * 2;
+
+        // `name`: without it the tree is rejected outright and EVERY estimate
+        // is empty. Also the DUCKLAKE_SCAN spelling, which decides `source`.
+        let full = explain(&eng, &loc, "SELECT * FROM big");
+        assert_eq!(
+            scan(&full, "big").source,
+            "pond",
+            "the operator `{}` is no longer `DUCKLAKE_SCAN`, so every pond scan \
+             is now mis-reported as `attached`",
+            keys::NAME
+        );
+
+        // `extra_info` + `Estimated Cardinality`: the numbers themselves.
+        assert_eq!(
+            full.estimated_rows,
+            rows,
+            "the root's `{}`.`{}` has moved — estimated_rows is back to a stub",
+            keys::EXTRA_INFO,
+            keys::CARDINALITY
+        );
+
+        // `Table`: without it there are no scan operations at all.
+        assert_eq!(
+            full.scan_operations.len(),
+            1,
+            "`{}` has moved: a plan with one table scan produced {:?}",
+            keys::TABLE,
+            full.scan_operations
+        );
+
+        // `Filters`: without it every scan looks unfiltered, and the agent gets
+        // told to add a WHERE it already wrote.
+        let filtered = explain(&eng, &loc, "SELECT * FROM big WHERE id > 100");
+        assert_eq!(
+            scan(&filtered, "big").scan_type,
+            FILTERED_SCAN,
+            "`{}` has moved: a scan with a pushed-down predicate now reads as a full scan",
+            keys::FILTERS
+        );
+
+        // `children`: a nested plan must still be walked, or only the root is
+        // ever seen and no scan below an aggregate is reported.
+        let agg = explain(&eng, &loc, "SELECT g, count(*) FROM big GROUP BY g");
+        assert_eq!(
+            scan(&agg, "big").estimated_rows_scanned,
+            rows,
+            "`{}` has moved: the scan under the aggregate was not reached",
+            keys::CHILDREN
+        );
+    }
+}
