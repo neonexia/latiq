@@ -20,7 +20,7 @@ build-backend = "maturin"
 
 [project]
 name = "latiq-admin"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lean operator CLI for Latiq — drives a cluster over gRPC (no server, no DuckDB)"
 # The PyPI project page IS the install doc for this channel (there is no
 # `curl | sh` page any more), so ship the README as the long description.

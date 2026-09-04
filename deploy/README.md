@@ -37,19 +37,29 @@ Then:
   `latiq.connect("grpc://localhost:51400", query_gateway="grpc://localhost:51500")`.
 - **Operators (CLI):** `export LATIQ_SERVER=http://localhost:51400 && latiq stats`.
 
-Both images default to the **`0.1.0` release** — a version someone decided to
+Both images default to the **`0.1.1` release** — a version someone decided to
 ship, not whatever main built last night. `LATIQ_IMAGE` / `LATIQ_GATEWAY_IMAGE`
 override that: a newer release to move forward, or `:nightly` to track main. Stop
 with `docker compose down`, add `-v` to wipe pond data.
 
-> **Apple Silicon / ARM:** the published images are `linux/amd64` today. Until
-> multi-arch images land, run with emulation:
-> `DOCKER_DEFAULT_PLATFORM=linux/amd64 docker compose up -d`.
+**Apple Silicon / ARM64 works with no flags.** Both images are published as
+multi-arch manifest lists (`linux/amd64` + `linux/arm64`), so the commands above
+are the whole story on an M-series Mac — no `DOCKER_DEFAULT_PLATFORM`, no
+`--platform`, no emulation, under Docker *and* Podman (#66). The arm64 image is
+built on a native arm64 runner, so it is a real arm64 binary, not an emulated
+amd64 one.
+
+> The **wheels** are a different story and are not fixed by that: PyPI carries
+> only a `manylinux_2_28_x86_64` build of `latiq`, so `pip install latiq` on an
+> Apple Silicon Mac (or any arm64 host) has no distribution to resolve. Drive the
+> cluster from an amd64 client, or use the MCP endpoint, until arm64/macOS wheels
+> are published.
 
 This file is what the nightly's `verify-deployment` job runs against the
-just-published image and wheel — the "the shipped thing actually works" gate. It
-is deliberately kept lean: no profiles, no mounts, nothing that only makes sense
-inside this repo.
+just-published image and wheel — the "the shipped thing actually works" gate —
+and `verify-deployment-arm64` runs the same compose from the same images on a
+native arm64 runner. It is deliberately kept lean: no profiles, no mounts,
+nothing that only makes sense inside this repo.
 
 ## The admin CLI — `pip install latiq-admin`
 
@@ -66,7 +76,7 @@ latiq pond list
 The wheel contains the **native executable**, not Python — pip is only the
 delivery mechanism, the way it is for any other packaged CLI. `pipx` is the
 recommended form because it gets its own environment; plain `pip` works. Pin with
-`latiq-admin==0.1.0`, upgrade with `pipx upgrade latiq-admin`, remove with
+`latiq-admin==0.1.1`, upgrade with `pipx upgrade latiq-admin`, remove with
 `pipx uninstall latiq-admin`.
 
 This replaced a `curl … | sh` installer and four cross-compiled binaries on a

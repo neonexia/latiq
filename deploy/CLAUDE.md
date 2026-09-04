@@ -68,15 +68,63 @@ Both install the same command name, so one or the other per environment.
 two-line `src/main.rs`: the image runs the binary, the wheel calls
 `run_from_args`. Adding a command to one adds it to both, by construction.
 
-Four places carry the version — `Cargo.toml`, `sdk/python/pyproject.toml`,
-`sdk/admin/pyproject.toml`, the git tag — and `release.yml`'s `meta` job fails
-the release if any disagrees. **Add a new one and add it to `meta`.**
+**Six places carry the version**, and `release.yml`'s `meta` job fails the release
+before anything builds if any disagrees with the tag: `Cargo.toml`
+(`[workspace.package]`, inherited by every crate), **`sdk/python/Cargo.toml`**
+(hard-coded, *not* inherited — maturin reads the wheel version from
+`pyproject.toml`, so nothing else ever looks at it and it drifted to a stale
+`0.1.0` unnoticed), `sdk/python/pyproject.toml`, `sdk/admin/pyproject.toml`, the
+**two image pins in `deploy/docker-compose.yml`**, and the git tag itself.
+**Add a new one and add it to `meta`** — an unchecked place is how a release
+ships an artifact at a version that is not the tag.
 
 **The gateway image.** So the user compose stays pure-images, the gateway is a
 published image — `latiq-gateway` (`deploy/gateway.Dockerfile` = `nginx` + baked
 `cluster/nginx.conf`, the **one** gateway-config source). Built + pushed alongside
 `latiq` by the nightly publish + `release.yml`. **Both** GHCR packages
 (`latiq`, `latiq-gateway`) must be **public** for anonymous pulls.
+
+**Both images are multi-arch (`linux/amd64` + `linux/arm64`), and that is not
+optional** (#66). Apple Silicon is what most developers evaluate on; an
+amd64-only manifest fails at `docker pull`/`podman pull`, before a line of our
+code runs, and no amount of documentation makes that an acceptable first
+experience. Three things keep it true, and all three are load-bearing:
+
+- **One place builds them** — `.github/workflows/images.yml`, called by BOTH
+  `nightly.yml` and `release.yml` the way `verify.yml` is. Never inline a
+  `docker/build-push-action` step into a publishing workflow again: the amd64-only
+  images shipped precisely because four copies of that step, in two files, all
+  omitted `platforms:` and so silently inherited the runner's arch.
+- **`latiq` builds on NATIVE runners, one per arch** (`ubuntu-latest` +
+  `ubuntu-24.04-arm`, free for public repos), pushed by digest and merged with
+  `docker buildx imagetools create`. It compiles DuckDB from source — ~21 min
+  native (observed), hours under QEMU. **Do not "simplify" this into a single
+  `platforms: linux/amd64,linux/arm64` job**; that is the emulated build, and it
+  will time out. The gateway image, being `FROM nginx` + one `COPY` with nothing
+  to execute, *is* a single multi-platform job, correctly.
+- **The published manifest is asserted, not assumed** — `images.yml`'s
+  `manifests` job re-reads every published tag of both images from ghcr.io and
+  fails unless `linux/amd64` and `linux/arm64` are both really in the index
+  (attestation manifests, which carry `unknown/unknown`, are filtered out so they
+  cannot pad the list). And `verify-deployment-arm64` / `verify-release-arm64`
+  bring the **user compose** up from the published images on a native arm64
+  runner, with no `--platform` and no `DOCKER_DEFAULT_PLATFORM`, asserting the
+  running containers' `Architecture` is `arm64` — because with binfmt registered
+  an amd64 image runs under qemu-user and would pass every other check. The
+  amd64-only state was invisible for two releases exactly because the only
+  "verify user path" job ran on `ubuntu-latest`.
+
+The **wheels are still x86_64-only** (`target: x86_64`), so `pip install latiq`
+has nothing to resolve on an arm64 host. That is a separate gap from the images
+and is not fixed here; the arm64 verification jobs therefore drive the cluster
+with the image's own CLI and the MCP agent harness rather than the SDK.
+
+**Building the image locally on Apple Silicon needs a properly sized VM.** A
+default `podman machine` (2 GiB) cannot do it: it thrashes to a load average of
+31 with 26 MB free and no swap while still compiling `syn`/`tokio`, long before
+DuckDB's C++ compile starts. Give the machine ≳8 GiB (`podman machine set
+--memory 8192`) — or just pull the published image, which is the point of all of
+the above.
 
 Keep the two composes in sync when the topology changes (manual for now). The
 nightly's `verify-deployment` job runs the **user** compose against the
@@ -166,6 +214,21 @@ See `docs/releasing.md`. We ship **binaries only** — **two wheels → PyPI**
 (`latiq`, `latiq-admin`) and the **`latiq` + `latiq-gateway` images → GHCR**.
 **No Rust crates** (crates.io is out of scope; the crates are not a product), and
 **no loose release-asset binaries** — that channel is gone.
+
+**Two reusable workflows, for the same reason.** `verify.yml` holds every check;
+**`images.yml`** holds every image build (multi-arch, native-per-arch, manifest
+asserted — see above). Both publish paths call both, so neither can drift into
+running a different suite or pushing a different manifest.
+
+**PyPI uploads are gated on `PUBLISH_PYPI_WHEELS`** (a repo variable, off today)
+in *both* paths and for *both* wheels. The wheels are still built and every
+wheel-based test still runs — `verify.yml`'s e2e installs from `dist/`, the auth
+suite installs by path — so the gate costs no coverage; only the upload stops.
+The reason it exists: pre-1.0 we re-cut tags to stabilise the deployment, and
+**a PyPI version is immutable** — burned on first upload, never reusable, so it
+cannot be re-cut with everything else. A gated upload emits a `::warning::` and a
+job-summary block, and the post-publish jobs that install *from PyPI* skip rather
+than silently resolve an older version and report it as this run's.
 
 Two publish paths, both **test-gated on the same reusable workflow**
 (`.github/workflows/verify.yml` — refactored out of the nightly for exactly this

@@ -50,6 +50,8 @@ jobs:
       base_version: ${{ steps.decide.outputs.base_version }}
       image_stamp: ${{ steps.decide.outputs.image_stamp }}
       stamp: ${{ steps.decide.outputs.stamp }}
+      # Newline-separated tag NAMES for both GHCR images, handed to `images.yml`.
+      image_tags: ${{ steps.decide.outputs.image_tags }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,16 +79,28 @@ jobs:
           echo "base_version=${cargo_base}" >> "$GITHUB_OUTPUT"
           echo "image_stamp=nightly-${stamp}" >> "$GITHUB_OUTPUT"
           echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
+          # Both image tags as ONE multi-line output, so `images.yml` never has to
+          # know the difference between a nightly stamp and a release version.
+          {
+            echo "image_tags<<TAGS_EOF"
+            echo "nightly-${stamp}"
+            echo "nightly"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   publish:
-    name: publish (PyPI wheel + GHCR image), versioned
+    name: publish the wheel (PyPI), versioned
     needs: [gate, verify]
     if: needs.gate.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # push the nightly-<stamp> tag (the change-gate marker)
-      packages: write    # GHCR
+      contents: read
       id-token: write    # PyPI trusted publishing (OIDC; no stored token)
+    outputs:
+      # 'true' only if this run actually uploaded to PyPI. The post-publish jobs
+      # that install FROM PyPI read it; without it they would install an older
+      # version and report it as this run's.
+      uploaded: ${{ steps.pypi.outputs.uploaded }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,53 +141,86 @@ jobs:
             unzip -t /tmp/protoc.zip >/dev/null
             unzip -o /tmp/protoc.zip -d /usr/local
             protoc --version
+      # PyPI publishing is OFF unless the repo variable says so — the same switch
+      # `release.yml` uses, and a deliberate policy choice while the deployment
+      # is being stabilised. The wheel is still BUILT here, and `verify.yml`
+      # already ran the full SDK e2e + auth suite against a wheel built from this
+      # tree, so no wheel COVERAGE is lost; only the upload is withheld.
+      - name: Is PyPI publishing enabled? (PUBLISH_PYPI_WHEELS)
+        id: pypi
+        env:
+          V: ${{ needs.gate.outputs.wheel_version }}
+          ENABLED: ${{ vars.PUBLISH_PYPI_WHEELS }}
+        run: |
+          set -eu
+          if [ "${ENABLED:-}" = "true" ]; then
+            echo "PUBLISH_PYPI_WHEELS=true — uploading latiq ${V} to PyPI"
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::PUBLISH_PYPI_WHEELS is not 'true'; the latiq ${V} wheel was BUILT but NOT uploaded to PyPI"
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### :warning: nightly PyPI wheel \`latiq\` **not** uploaded"
+              echo
+              echo "\`${V}\` was built but not uploaded: the repo variable \`PUBLISH_PYPI_WHEELS\`"
+              echo "is not \`true\`. The GHCR images publish as normal, and the post-publish jobs"
+              echo "that install **from PyPI** are skipped rather than testing an older version."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Publish the wheel to PyPI
+        if: steps.pypi.outputs.uploaded == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-      # The container driver is required for `cache-to: type=gha` (the default
-      # docker driver can't export the cache).
-      - uses: docker/setup-buildx-action@v3
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build + push the image (same version as the wheel)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.gate.outputs.image_stamp }}
-            ghcr.io/${{ github.repository_owner }}/latiq:nightly
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      # The gateway image (nginx + baked front-door config) — so the user compose
-      # is pure images (docker + podman). Tiny; context is deploy/cluster (nginx.conf).
-      - name: Build + push the gateway image (same version)
-        uses: docker/build-push-action@v6
-        with:
-          context: deploy/cluster
-          file: deploy/gateway.Dockerfile
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/latiq-gateway:${{ needs.gate.outputs.image_stamp }}
-            ghcr.io/${{ github.repository_owner }}/latiq-gateway:nightly
-      - name: Mark this commit as published
+
+  # Both GHCR images, as MULTI-ARCH manifest lists (linux/amd64 + linux/arm64 —
+  # #66), from the SAME reusable workflow the tagged release calls. This used to
+  # be four steps inside `publish` with no `platforms:` at all, which is how every
+  # published image came out amd64-only. `images.yml` also asserts the published
+  # manifests really carry both platforms, so this cannot go green having shipped
+  # a single-arch image.
+  images:
+    name: publish the images (GHCR, multi-arch)
+    needs: [gate, verify]
+    if: needs.gate.outputs.should_publish == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/images.yml
+    with:
+      tags: ${{ needs.gate.outputs.image_tags }}
+
+  # The change-gate marker, in its own job so it lands only after BOTH the wheel
+  # and the images are published. It used to be the last step of `publish`, which
+  # was equivalent while one job did everything; now that the images are a
+  # separate job, tagging from `publish` would mark the commit published while
+  # the arm64 image was still building — and the next nightly would skip it.
+  mark-published:
+    name: mark this commit as published (nightly-<stamp> tag)
+    needs: [gate, publish, images]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the nightly-<stamp> tag (the change-gate marker)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag it
         run: |
+          set -eu
           git tag "nightly-${{ needs.gate.outputs.stamp }}"
           git push origin "nightly-${{ needs.gate.outputs.stamp }}"
 
   # Post-publish: prove `pip install latiq` actually works for an end user by
   # installing the JUST-PUBLISHED wheel FROM PyPI (not the local build) and running
   # the embedded suite against it — single-node in-process + Arrow→pandas.
+  # Skipped when `publish` did not upload (PUBLISH_PYPI_WHEELS off): every step
+  # here installs FROM PyPI, so there would be nothing at this version to install
+  # — and a fallback to an older one would report it as this run's. `publish`'s
+  # job summary says why.
   verify-published:
     name: verify pip install latiq (from PyPI, embedded)
     needs: [gate, publish]
-    if: needs.gate.outputs.should_publish == 'true'
+    if: needs.gate.outputs.should_publish == 'true' && needs.publish.outputs.uploaded == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -246,7 +293,7 @@ jobs:
   # UNDER TEST is a shipped artifact; only the compose and the test code are local.
   verify-deployment:
     name: verify user path (user compose + GHCR image + PyPI wheel)
-    needs: [gate, publish]
+    needs: [gate, publish, images]
     if: needs.gate.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -284,16 +331,25 @@ jobs:
               sleep 1
             done
           done
+      - name: npm ci for the agent harness
+        run: npm ci --prefix e2e/agent
+      # Gated for the same reason as `verify-published`: with the upload off,
+      # `pip install latiq==<version>` has nothing to resolve — and, worse, a
+      # loose resolve would test an older wheel and report it as this run's. The
+      # image half of this job (the point of it) is unaffected and still runs.
       - name: pip install latiq==<version> from PyPI (retry for propagation)
+        if: needs.publish.outputs.uploaded == 'true'
         run: |
+          set -eu
           v="${{ needs.gate.outputs.wheel_version }}"
           for i in $(seq 1 12); do
-            python -m pip install "latiq==${v}" && break
+            python -m pip install "latiq==${v}" && ok=1 && break
             echo "waiting for PyPI to serve ${v} (attempt $i)"; sleep 15
           done
+          [ "${ok:-0}" = "1" ] || { echo "::error::latiq ${v} never installed from PyPI"; exit 1; }
           python -m pip install -r e2e/sdk/requirements.txt
-          npm ci --prefix e2e/agent
       - name: SDK e2e against the deployed cluster (published wheel + image)
+        if: needs.publish.outputs.uploaded == 'true'
         env:
           LATIQ_CONTROL: http://localhost:51400
           LATIQ_GATEWAY: http://localhost:51500
@@ -301,6 +357,121 @@ jobs:
         # to have run — the reason a cluster was started at all (see conftest.py).
         run: pytest e2e/sdk -v --latiq-mode=remote
       - name: Agent harness (MCP) against the deployed cluster
+        env:
+          LATIQ_MCP: http://localhost:51510/mcp
+        run: npm --prefix e2e/agent test
+      - name: Cluster logs on failure
+        if: failure()
+        run: docker compose logs --tail=300
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # The SAME user path on arm64 — the arch most developers evaluate on, and the
+  # one nothing in CI had ever exercised (#66). `verify-deployment` above runs on
+  # `ubuntu-latest`, so "verify user path" has only ever meant the amd64 half of
+  # it; the published images were unpullable on Apple Silicon while this job was
+  # green every night. The release path has the identical counterpart
+  # (`verify-release-arm64`).
+  #
+  # NO `--platform`, NO `DOCKER_DEFAULT_PLATFORM`, NO emulation setup — what a
+  # user typing `docker compose up -d` gets. No `pip install latiq` either: both
+  # wheels build `target: x86_64` only, so there is no aarch64 wheel to install.
+  # What this proves is the SERVER images running natively on arm64 with the
+  # agent front door reachable through the gateway.
+  verify-deployment-arm64:
+    name: verify user path on arm64 (user compose + GHCR images)
+    needs: [gate, images]
+    if: needs.gate.outputs.should_publish == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The literal command from the bug report, under the runtime that produced
+      # it. Podman resolves OCI manifest lists itself, so this is the check that
+      # `podman compose up` on an Apple Silicon Mac gets past the pull — where
+      # #66 actually failed, before any of our code ran. (Full `podman compose`
+      # orchestration is not exercised in CI.)
+      - name: podman can pull both images on arm64 (the #66 reproduction)
+        env:
+          T: ${{ needs.gate.outputs.image_stamp }}
+          V: ${{ needs.gate.outputs.base_version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          command -v podman >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y podman; }
+          podman --version
+          for img in latiq latiq-gateway; do
+            ref="ghcr.io/${OWNER}/${img}:${T}"
+            echo "::group::podman pull ${ref}"
+            # No --platform: the whole point is that default resolution works.
+            podman pull "$ref"
+            echo "::endgroup::"
+          done
+          # And the arm64 binary actually starts. A manifest that resolved to an
+          # amd64 image would get an exec-format error here, not a silent pass.
+          # The BINARY reports the plain workspace version, not the wheel stamp.
+          got=$(podman run --rm "ghcr.io/${OWNER}/latiq:${T}" --version)
+          echo "podman run latiq --version -> ${got}"
+          [ "$got" = "latiq ${V}" ] || { echo "::error::expected 'latiq ${V}', got '${got}'"; exit 1; }
+      - name: Take the user compose
+        run: cp deploy/docker-compose.yml docker-compose.yml
+      # NOTE: no `docker login` — this tests the ANONYMOUS pull a real user makes.
+      - name: Bring up the cluster from the published images (no platform override)
+        env:
+          LATIQ_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq:${{ needs.gate.outputs.image_stamp }}
+          LATIQ_GATEWAY_IMAGE: ghcr.io/${{ github.repository_owner }}/latiq-gateway:${{ needs.gate.outputs.image_stamp }}
+        run: docker compose up -d
+      # Proof it is NATIVE, not emulated: with binfmt registered, an amd64-only
+      # manifest can still run under qemu-user and pass every check below — which
+      # would make this whole job green against exactly the state we are fixing.
+      - name: The running containers are really arm64
+        run: |
+          set -eu
+          for svc in control-plane pond-node-1 gateway; do
+            cid=$(docker compose ps -q "$svc")
+            [ -n "$cid" ] || { echo "::error::service ${svc} has no container"; exit 1; }
+            img=$(docker inspect -f '{{.Image}}' "$cid")
+            arch=$(docker image inspect -f '{{.Architecture}}' "$img")
+            echo "${svc}: ${arch}"
+            [ "$arch" = "arm64" ] || { echo "::error::${svc} is running a ${arch} image on an arm64 host"; exit 1; }
+          done
+      - name: Wait for control plane + nodes healthy
+        run: |
+          set -eu
+          for _ in $(seq 1 60); do
+            up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+            [ "$up" -ge 3 ] && break
+            sleep 3
+          done
+          docker compose ps
+          # Here the wait IS the assertion: "the images start on this arch" is
+          # the thing under test, so falling through would prove nothing.
+          up=$(docker compose ps --format '{{.Health}}' | grep -c healthy || true)
+          [ "$up" -ge 3 ] || { echo "::error::only ${up} services healthy after 3 minutes"; exit 1; }
+      - name: Wait for the gateway ports to accept
+        run: |
+          for port in 51500 51510; do
+            for _ in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null && break
+              sleep 1
+            done
+          done
+      # The CLI inside the image — the arm64 binary driving Admin gRPC against
+      # the arm64 control plane. Needs no wheel, so it works on this arch today.
+      - name: The image's own CLI reaches the control plane
+        run: |
+          set -eu
+          out=$(docker compose exec -T pond-node-1 latiq pond list)
+          echo "pond list: ${out}"
+      - name: npm ci for the agent harness
+        run: npm ci --prefix e2e/agent
+      # The real end-to-end: allocate, write, read, drop over MCP through the
+      # gateway, against arm64 images. That is what "docker compose up works on
+      # Apple Silicon" has to mean to be worth asserting.
+      - name: Agent harness (MCP) against the arm64 cluster
         env:
           LATIQ_MCP: http://localhost:51510/mcp
         run: npm --prefix e2e/agent test
@@ -336,6 +507,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write    # PyPI trusted publishing (OIDC; no stored token)
+    outputs:
+      uploaded: ${{ steps.pypi.outputs.uploaded }}
     steps:
       - uses: actions/checkout@v4
       # The same version as the `latiq` wheel and the image from this run: the two
@@ -367,7 +540,30 @@ jobs:
             unzip -t /tmp/protoc.zip >/dev/null
             unzip -o /tmp/protoc.zip -d /usr/local
             protoc --version
+      # Same switch as the `latiq` wheel; only the upload is gated, the build
+      # (and so the lean-build compile) still happens every night.
+      - name: Is PyPI publishing enabled? (PUBLISH_PYPI_WHEELS)
+        id: pypi
+        env:
+          V: ${{ needs.gate.outputs.wheel_version }}
+          ENABLED: ${{ vars.PUBLISH_PYPI_WHEELS }}
+        run: |
+          set -eu
+          if [ "${ENABLED:-}" = "true" ]; then
+            echo "PUBLISH_PYPI_WHEELS=true — uploading latiq-admin ${V} to PyPI"
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::PUBLISH_PYPI_WHEELS is not 'true'; the latiq-admin ${V} wheel was BUILT but NOT uploaded to PyPI"
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### :warning: nightly PyPI wheel \`latiq-admin\` **not** uploaded"
+              echo
+              echo "\`${V}\` was built but not uploaded (\`PUBLISH_PYPI_WHEELS\` is not \`true\`);"
+              echo "\`verify-admin-cli\`, which installs it from PyPI, is skipped."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Publish latiq-admin to PyPI
+        if: steps.pypi.outputs.uploaded == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/admin/dist
@@ -385,7 +581,9 @@ jobs:
   verify-admin-cli:
     name: verify pipx install latiq-admin (from PyPI)
     needs: [gate, publish-admin]
-    if: needs.gate.outputs.should_publish == 'true' && vars.PUBLISH_ADMIN_WHEEL == 'true'
+    # Also requires the upload to have happened: every assertion below drives a
+    # binary installed FROM PyPI (`publish-admin`'s summary says so when it did not).
+    if: needs.gate.outputs.should_publish == 'true' && vars.PUBLISH_ADMIN_WHEEL == 'true' && needs.publish-admin.outputs.uploaded == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5

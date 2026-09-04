@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "latiq"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python SDK for Latiq — agent-native data ponds"
 # Ship the README as the long description; without it the PyPI project page is
 # blank, and it is where `pip install latiq` sends people.
