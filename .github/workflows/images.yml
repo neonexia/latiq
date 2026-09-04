@@ -1,0 +1,271 @@
+name: Images
+
+# The ONE place both GHCR images are built and pushed, for BOTH architectures.
+# Called by `nightly.yml` (rolling `:nightly` / `:nightly-<stamp>`) and by
+# `release.yml` (a `v*` tag → `:<version>` [+ `:latest` from 1.0.0]). It is the
+# image-publishing counterpart of `verify.yml`: the two publish paths must push
+# the SAME manifest, not two hand-maintained copies of the same steps (#55).
+#
+# WHY THIS SHAPE (#66) --------------------------------------------------------
+# Both images were `linux/amd64` ONLY, because `docker/build-push-action` with no
+# `platforms:` builds for the runner's arch and every publishing job ran on
+# `ubuntu-latest`. On Apple Silicon — the machine most developers evaluate on —
+# `docker compose up` against `deploy/docker-compose.yml` therefore failed at PULL
+# time, before anything of ours ran:
+#
+#   $ podman pull ghcr.io/neonexia/latiq:0.1.0
+#   Error: no image found in image index for architecture "arm64", variant "v8"
+#
+# Fixed by publishing real multi-arch manifest lists. Two different strategies,
+# for one reason — build cost:
+#
+#  * `latiq` compiles DuckDB from source. On a native amd64 runner that step is
+#    ~21 minutes (observed, nightly run 33870776351). Under QEMU it is hours and
+#    would time out, so each arch is built on its NATIVE runner (`ubuntu-latest`
+#    and `ubuntu-24.04-arm`, both free for public repos), pushed BY DIGEST with
+#    no tag, and the two digests are merged into one manifest list with
+#    `docker buildx imagetools create`. This is docker's documented pattern for
+#    distributing a multi-platform build across runners.
+#  * `latiq-gateway` is `FROM nginx:1.27` + one `COPY`. Nothing executes during
+#    that build, so there is nothing to emulate: a single job builds both
+#    platforms at once.
+#
+# AND THEN IT ASSERTS. This repo has shipped CI checks that were green while
+# running nothing, and "we passed `platforms:`" is exactly that shape of claim.
+# The `manifests` job below re-reads what the REGISTRY now serves for every tag
+# of both images and fails unless `linux/amd64` AND `linux/arm64` are really in
+# it. A lower bound on what was published, read back from the published thing.
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: >-
+          Newline-separated tag NAMES (not full refs) to publish both images
+          under, e.g. "0.2.0\nlatest" or "nightly-202609041202\nnightly".
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  LATIQ_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/latiq
+  GATEWAY_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/latiq-gateway
+
+jobs:
+  # ---- `latiq`: one native runner per arch, pushed by digest ------------------
+  latiq-arch:
+    name: build latiq (${{ matrix.arch }}, native runner)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Not fail-fast: if arm64 breaks we want the amd64 log too, and the
+      # `latiq-manifest` job refuses to merge a partial set anyway.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            # GitHub-hosted arm64, free for public repos. This is the whole
+            # point: DuckDB's C++ build is native here, not emulated.
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      # The container driver is required for `cache-to: type=gha` (the default
+      # docker driver cannot export the cache).
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # `metadata-action` takes tag PATTERNS, not names, so the plain names in
+      # `inputs.tags` are expanded here rather than passed through.
+      - name: Expand the tag names into metadata-action patterns
+        id: tagpatterns
+        env:
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -eu
+          {
+            echo "patterns<<PAT_EOF"
+            for t in $TAGS; do echo "type=raw,value=${t}"; done
+            echo "PAT_EOF"
+          } >> "$GITHUB_OUTPUT"
+      # Labels only — the tags are applied to the MANIFEST LIST in the merge job,
+      # never to a per-arch image (a tag here would make the last arch to finish
+      # the single-platform winner, which is the bug this file exists to fix).
+      # The tag patterns are still supplied so `org.opencontainers.image.version`
+      # is the version being published rather than a branch name.
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.LATIQ_IMAGE_NAME }}
+          tags: ${{ steps.tagpatterns.outputs.patterns }}
+      - name: Build + push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.LATIQ_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # Per-arch scope: one shared scope would have the two jobs evicting
+          # each other's layers on every run.
+          cache-from: type=gha,scope=latiq-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=latiq-${{ matrix.arch }}
+      - name: Export the digest
+        run: |
+          set -eu
+          digest="${{ steps.build.outputs.digest }}"
+          # An empty digest means the build did not push, and the merge job would
+          # then quietly produce a single-arch manifest. Fail here instead.
+          [ -n "$digest" ] || { echo "::error::build-push-action reported no digest for ${{ matrix.platform }}"; exit 1; }
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest#sha256:}"
+          echo "${{ matrix.platform }} -> ${digest}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latiq-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  latiq-manifest:
+    name: merge the latiq manifest list
+    needs: latiq-arch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: latiq-digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the manifest list and push it under every tag
+        working-directory: /tmp/digests
+        env:
+          TAGS: ${{ inputs.tags }}
+          IMAGE: ${{ env.LATIQ_IMAGE_NAME }}
+        run: |
+          set -eu
+          # `fail-fast: false` means one arch can fail while the other succeeds;
+          # merging one digest would publish a single-arch list that LOOKS fixed.
+          n=$(ls -1 | wc -l)
+          [ "$n" -eq 2 ] || { echo "::error::expected 2 per-arch digests, got ${n}"; ls -1; exit 1; }
+          set --
+          for t in $TAGS; do set -- "$@" -t "${IMAGE}:${t}"; done
+          for d in *; do set -- "$@" "${IMAGE}@sha256:${d}"; done
+          echo "docker buildx imagetools create $*"
+          docker buildx imagetools create "$@"
+
+  # ---- `latiq-gateway`: nginx + a COPY, so one job builds both platforms ------
+  gateway:
+    name: build + push latiq-gateway (amd64 + arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Nothing RUNs in gateway.Dockerfile (FROM + COPY), so no instruction is
+      # ever emulated; QEMU is here only so a future RUN cannot silently fail.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Expand the tag names into metadata-action patterns
+        id: tagpatterns
+        env:
+          TAGS: ${{ inputs.tags }}
+        run: |
+          set -eu
+          {
+            echo "patterns<<PAT_EOF"
+            for t in $TAGS; do echo "type=raw,value=${t}"; done
+            echo "PAT_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Image metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.GATEWAY_IMAGE_NAME }}
+          tags: ${{ steps.tagpatterns.outputs.patterns }}
+      - name: Build + push the gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy/cluster
+          file: deploy/gateway.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # ---- The assertion: what does the REGISTRY actually serve? ------------------
+  # Not "did the build step exit 0" and not a local `docker buildx build`
+  # inspection — the thing a user pulls, read back from ghcr.io, per tag, for
+  # both images. If this job is green, `docker pull` on Apple Silicon resolves.
+  manifests:
+    name: assert both images are amd64 + arm64
+    needs: [latiq-manifest, gateway]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Every published tag must carry linux/amd64 AND linux/arm64
+        env:
+          TAGS: ${{ inputs.tags }}
+          LATIQ: ${{ env.LATIQ_IMAGE_NAME }}
+          GATEWAY: ${{ env.GATEWAY_IMAGE_NAME }}
+        run: |
+          set -eu
+          fail=0
+          checked=0
+          for image in "$LATIQ" "$GATEWAY"; do
+            for tag in $TAGS; do
+              ref="${image}:${tag}"
+              echo "::group::${ref}"
+              # --raw is the index document itself. A single-platform push has no
+              # `.manifests`, so it yields an empty platform list and fails below
+              # — the amd64-only state of #66 would not have survived this step.
+              raw=$(docker buildx imagetools inspect --raw "$ref") || {
+                echo "::error::could not inspect ${ref}"; fail=1; echo "::endgroup::"; continue; }
+              # Attestation manifests carry platform `unknown/unknown`; drop them
+              # so a build with provenance on cannot pass this by accident.
+              platforms=$(printf '%s' "$raw" | jq -r '
+                (.manifests // [])
+                | map(select(.platform != null and .platform.os != "unknown"))
+                | map(.platform.os + "/" + .platform.architecture)
+                | unique | .[]')
+              echo "platforms: $(printf '%s' "$platforms" | tr '\n' ' ')"
+              for want in linux/amd64 linux/arm64; do
+                printf '%s\n' "$platforms" | grep -qx "$want" \
+                  || { echo "::error::${ref} does not serve ${want}"; fail=1; }
+              done
+              checked=$((checked + 1))
+              echo "::endgroup::"
+            done
+          done
+          # An empty `tags` input would sail through both loops with nothing
+          # asserted — the "green while running nothing" failure, again.
+          [ "$checked" -ge 2 ] || { echo "::error::asserted only ${checked} refs; the tags input was empty"; exit 1; }
+          [ "$fail" = "0" ] || exit 1
+          echo "OK: ${checked} refs, each serving linux/amd64 + linux/arm64"

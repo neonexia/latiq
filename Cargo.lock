@@ -1866,7 +1866,7 @@ dependencies = [
 
 [[package]]
 name = "latiq"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-agent-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-auth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
  "base64",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "http",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jsonschema",
  "schemars",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-control-plane"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "duckdb",
  "latiq-auth",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "latiq-common",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-engine-duckdb"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "duckdb",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-lineage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "jsonschema",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
  "http",
@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-metrics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
  "metrics",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-pond-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "tonic",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-sdk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "latiq-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "latiq-common",
  "serde",

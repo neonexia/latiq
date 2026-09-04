@@ -46,6 +46,38 @@ at all**. That workflow is deleted.
 Rule: **a publishing job must always `needs:` the verify job.** Adding a check to
 `verify.yml` gates both paths at once; inlining a check into one caller does not.
 
+## The images: `.github/workflows/images.yml`
+
+The same principle, applied to the artifacts rather than the checks. Both GHCR
+images are built by **one** reusable workflow that `nightly.yml` and
+`release.yml` call with a list of tag names, because the two paths must push the
+*same* manifest.
+
+They are **multi-arch manifest lists — `linux/amd64` + `linux/arm64`** — and that
+is the whole point of the file existing ([#66](https://github.com/neonexia/latiq/issues/66)).
+Before it, four copies of a `docker/build-push-action` step across two workflows
+all omitted `platforms:`, so every published image silently inherited the
+`ubuntu-latest` runner's arch and `docker pull` failed outright on Apple Silicon.
+
+- `latiq` is built **once per arch on a native runner** (`ubuntu-latest` +
+  `ubuntu-24.04-arm`), pushed by digest with no tag, and merged with
+  `docker buildx imagetools create`. It compiles DuckDB from source — ~21 minutes
+  native, hours under QEMU. **Do not collapse this into a single
+  `platforms: linux/amd64,linux/arm64` job.**
+- `latiq-gateway` (`FROM nginx` + one `COPY`, nothing executes) *is* a single
+  multi-platform job.
+- The `manifests` job then re-reads **every published tag of both images from
+  ghcr.io** and fails unless both platforms are really in the index. A
+  `platforms:` input we passed is not evidence; what the registry serves is.
+
+`verify-deployment-arm64` (nightly) and `verify-release-arm64` (release) close
+the loop: the **user compose**, from the **published images**, on a native arm64
+runner, with no `--platform` and no `DOCKER_DEFAULT_PLATFORM`, asserting the
+containers really are `arm64` and driving the MCP agent harness through the
+gateway. They also run the literal `podman pull` from the bug report. The
+amd64-only images survived two releases precisely because the only "verify user
+path" job ran on `ubuntu-latest`.
+
 ---
 
 ## Path 1 — the nightly (rolling, unversioned)
@@ -57,9 +89,15 @@ Rule: **a publishing job must always `needs:` the verify job.** Adding a check t
    **`PUBLISH_NIGHTLY=true`** *and* there are commits since the last `nightly-*`
    tag (`force_publish: true` on a manual run bypasses the change check, never
    the tests).
-3. `publish` (`needs: [gate, verify]`) builds the manylinux x86_64 wheel in-job,
-   uploads it to PyPI, pushes both images, then tags the commit `nightly-<stamp>`
-   — the marker the next run's change-gate reads.
+3. `publish` (`needs: [gate, verify]`) builds the manylinux x86_64 wheel in-job
+   and uploads it to PyPI **if `PUBLISH_PYPI_WHEELS=true`** (see *PyPI is
+   gated*, below). `images` (`needs: [gate, verify]`, `images.yml`) pushes both
+   multi-arch images in parallel, and `mark-published` tags the commit
+   `nightly-<stamp>` — the marker the next run's change-gate reads — only after
+   **both** have succeeded. That tag used to be the last step of `publish`; with
+   the images in their own job, tagging from `publish` would mark the commit
+   published while the arm64 image was still building, and the next nightly
+   would skip it.
 4. `publish-admin` (`needs: [gate, publish]`, and gated on
    **`PUBLISH_ADMIN_WHEEL=true`**) stamps `sdk/admin/pyproject.toml` to the same
    version and uploads the `latiq-admin` wheel to PyPI. It is a **separate job**
@@ -71,8 +109,39 @@ Rule: **a publishing job must always `needs:` the verify job.** Adding a check t
    compose, and the `latiq-admin` CLI installed from PyPI.
 
 Nightly versions are **development versions** and are meant to be disposable:
-wheel `0.1.0.devYYYYMMDDHHMM`, images `:nightly` and `:nightly-<stamp>`. They
+wheel `<base>.devYYYYMMDDHHMM`, images `:nightly` and `:nightly-<stamp>`. They
 never move `:latest`, and they never create a GitHub release.
+
+---
+
+## PyPI is gated, and PyPI is immutable
+
+**`PUBLISH_PYPI_WHEELS`** (a repo variable, off by default) is the switch for
+*every* PyPI upload — both wheels, both paths. It is off deliberately while the
+0.1.x deployment is being stabilised: the images are being re-cut repeatedly and
+the wheels should not follow them onto a channel that cannot be undone.
+
+Two things follow, and both matter:
+
+- **The wheels are still built, and every wheel-based test still runs.**
+  `verify.yml`'s e2e installs the wheel from `dist/` and the auth suite installs
+  it by path, so gating the upload costs no coverage. Only the *upload* stops.
+- **A skipped upload must never look like a publish.** Each gated step emits a
+  `::warning::` and writes a job-summary block naming the version and the switch,
+  and the post-publish jobs that install *from PyPI* (`verify-published`,
+  `verify-admin-cli`, the wheel half of `verify-deployment` / `verify-release`)
+  are skipped rather than left to resolve an *older* version and report it as
+  this run's.
+
+**PyPI versions are immutable.** A version number is burned on first upload; a
+re-upload is rejected and deleting the release never frees the number for reuse.
+So a changed wheel always needs a **new version number** — there is no republish.
+(Concretely: the `latiq` **0.1.0** wheel on PyPI predates the CLI-as-wheels work,
+carries no `latiq` console script, and can never be replaced. Only a later
+version can fix it.) `latiq-admin` has never been published at all.
+
+This is the one asymmetry between the channels: GHCR tags, GitHub releases and
+their assets can all be rewritten. PyPI cannot.
 
 ## Path 2 — a versioned release (what a user pins)
 
@@ -82,16 +151,19 @@ manual run with that tag selected as the ref).
 ### Cutting one
 
 ```bash
-# 1. Bump the version in ALL THREE places (they must match the tag exactly).
-#    - Cargo.toml               → [workspace.package] version
+# 1. Bump the version in ALL FOUR declarations (they must match the tag exactly).
+#    - Cargo.toml                → [workspace.package] version (every crate
+#                                  inherits it with `version.workspace = true`)
+#    - sdk/python/Cargo.toml     → [package] version — hard-coded, NOT inherited
 #    - sdk/python/pyproject.toml → [project] version   (the `latiq` wheel)
 #    - sdk/admin/pyproject.toml  → [project] version   (the `latiq-admin` wheel)
-$EDITOR Cargo.toml sdk/python/pyproject.toml sdk/admin/pyproject.toml
-cargo build --workspace          # refresh Cargo.lock
+$EDITOR Cargo.toml sdk/python/Cargo.toml sdk/python/pyproject.toml sdk/admin/pyproject.toml
+cargo update --workspace                  # refresh Cargo.lock
+(cd sdk/python && cargo update --workspace)   # …and sdk/python's own lock
 
 # 2. Point the published compose at the version you are about to ship.
-#    Not checked by `meta` (it is not a package version) and easy to forget —
-#    leave it and the release exists but nothing directs a user to it.
+#    Leave it and the release exists but nothing directs a user to it. `meta`
+#    checks this too now — a mismatch fails the release before anything builds.
 $EDITOR deploy/docker-compose.yml   # LATIQ_IMAGE / LATIQ_GATEWAY_IMAGE defaults
 
 # 3. Land it on main through the normal PR flow.
@@ -103,26 +175,51 @@ git push origin v0.2.0
 ```
 
 The workflow fails fast (in `meta`, before anything is built) if the tag is
-malformed or if **any** of the three versions in the tree disagrees with it.
-Nothing is rewritten at release time on purpose: the tagged tree must be exactly
-what was published, byte for byte. **If you add a fourth place a version lives,
-add it to `meta`** — an unchecked one is how a release ships an artifact at a
-version that is not the tag.
+malformed, if **any** of the four version declarations disagrees with it, or if
+the compose's two image pins are not that version. Nothing is rewritten at
+release time on purpose: the tagged tree must be exactly what was published, byte
+for byte. **If you add a fifth place a version lives, add it to `meta`** — an
+unchecked one is how a release ships an artifact at a version that is not the
+tag, which is exactly how `sdk/python/Cargo.toml` sat at `0.1.0` unnoticed (only
+`pyproject.toml` feeds maturin, so nothing ever read it).
+
+### Re-cutting a pre-1.0 tag is a sanctioned workflow, not an incident
+
+While 0.1.x is being stabilised, **force-moving a `v0.1.z` tag to re-run the
+whole gated pipeline is expected** — the version is not something anyone has
+pinned in production yet, and re-running the tag is how a deployment fix gets
+proven end to end.
+
+```bash
+git tag -f v0.1.1 && git push -f origin v0.1.1
+# or: Actions → Release → Run workflow, selecting the same tag as the ref
+```
+
+Everything except PyPI takes this happily: the GHCR tags are overwritten by the
+new manifest, the GitHub release is reused, and `gh release upload --clobber`
+replaces the assets. PyPI is the exception, which is why `PUBLISH_PYPI_WHEELS`
+exists — see *PyPI is gated, and PyPI is immutable* above. From 1.0.0 this stops:
+a released tag is then something people pin, and the answer is `v1.0.1`.
 
 ### What the tag runs, in order
 
 ```
-meta  (parse v0.2.0, check Cargo.toml + BOTH pyproject.toml agree, decide prerelease)
+meta  (parse v0.2.0, check all four version declarations + the compose pins,
+       decide prerelease, compute the image tags)
   └─ verify  (fmt + clippy + workspace tests, iceberg, cluster scale-out,
               e2e suite, auth e2e)          ←── THE GATE
-       ├─ release          → GitHub release for the tag, --generate-notes
-       │    ├─ wheel       → `latiq` → PyPI (trusted publishing) + attached to the release
-       │    └─ wheel-admin → `latiq-admin` → PyPI + attached to the release
+       ├─ release              → GitHub release for the tag, --generate-notes
+       │    ├─ wheel           → `latiq` built; → PyPI if PUBLISH_PYPI_WHEELS;
+       │    │                     always attached to the release
+       │    └─ wheel-admin     → `latiq-admin`, same rules
        │         └─ verify-admin-cli → pip install latiq-admin==0.2.0 from PyPI,
        │                               drive the binary it puts on PATH
-       ├─ images           → ghcr.io/neonexia/latiq{,-gateway}:0.2.0 (+ :latest)
-       └─ verify-release   → user compose + published images + `pip install latiq==0.2.0`,
-                             the `latiq serve` console script, SDK + MCP agent suites
+       ├─ images (images.yml)  → ghcr.io/neonexia/latiq{,-gateway}:0.2.0 (+ :latest),
+       │                         amd64 + arm64, manifest asserted from the registry
+       ├─ verify-release       → user compose + published images (+ the wheel from
+       │                         PyPI when one was published), SDK + MCP suites
+       └─ verify-release-arm64 → the same user compose + images on a NATIVE arm64
+                                 runner, no --platform, plus the podman pull
 ```
 
 If `verify` fails, **nothing publishes** — no release, no wheel, no image. There
@@ -140,7 +237,7 @@ job list) rather than reporting a publish it did not do.
 image tag. Pre-1.0 means the API can break between minors, and an unpinned
 `docker pull ...:latest` should not silently pick that up. From `v1.0.0` the
 release is marked latest and `:latest` moves with it. Until then the published
-compose pins an explicit release version (`0.1.0` today), overridable via
+compose pins an explicit release version (`0.1.1` today), overridable via
 `LATIQ_IMAGE` / `LATIQ_GATEWAY_IMAGE`. **Bump those defaults as part of cutting a
 release** — otherwise a new version ships that the compose never points anyone
 at.
@@ -154,6 +251,10 @@ through the user compose. If it is green, the release is good. By hand:
 ```bash
 gh release view v0.2.0 --repo neonexia/latiq      # notes + 2 assets (both wheels)
 docker pull ghcr.io/neonexia/latiq:0.2.0          # anonymous — proves the package is public
+# Both platforms are really in the manifest list (what #66 was):
+docker buildx imagetools inspect ghcr.io/neonexia/latiq:0.2.0
+docker buildx imagetools inspect ghcr.io/neonexia/latiq-gateway:0.2.0
+# Only if PUBLISH_PYPI_WHEELS was on for the run:
 pip download latiq==0.2.0 --no-deps -d /tmp/x     # PyPI has the SDK wheel
 pipx install latiq-admin==0.2.0 && latiq --version # → `latiq 0.2.0`, the operator CLI
 ```
@@ -223,6 +324,13 @@ Both publish paths are **inert** until these are done.
    channel cannot fail a publish path that works.
 3. **Enable the nightly publish**: same place → **`PUBLISH_NIGHTLY` = `true`**.
    The tagged-release path does not read this variable and is always live.
+3b. **Enable PyPI uploads**: same place → **`PUBLISH_PYPI_WHEELS` = `true`**.
+   Off today, on purpose, while 0.1.x is being stabilised by re-cutting tags:
+   images and GitHub releases can be rewritten, a PyPI version never can. With it
+   off both wheels are still built and every wheel-based test still runs; the
+   uploads and the post-publish jobs that install from PyPI are skipped, loudly
+   (a `::warning::` plus a job-summary block). Turn it on for the first release
+   whose wheel is meant to be permanent.
 4. **GHCR** needs no secret (built-in `GITHUB_TOKEN`), but both packages —
    `latiq` and `latiq-gateway` — must be set **public** in the org's *Packages*
    settings, or the anonymous-pull verification jobs and every external user

@@ -11,7 +11,7 @@
 #   pip install latiq   → db = latiq.connect("grpc://localhost:51400",
 #                                             query_gateway="grpc://localhost:51500")
 #
-# Defaults to the RELEASE (0.1.0), not :nightly — what a user gets by curling this
+# Defaults to the RELEASE (0.1.1), not :nightly — what a user gets by curling this
 # file must be a version someone decided to ship, not whatever last night's main
 # built. Override either image to move: LATIQ_IMAGE / LATIQ_GATEWAY_IMAGE take a
 # newer release, or `:nightly` to track main. Bump these defaults with the tag.
@@ -19,7 +19,7 @@
 # test/dev stack (Prometheus/MinIO/Iceberg, scale-out) lives in deploy/cluster
 # (repo only).
 x-latiq: &latiq
-  image: ${LATIQ_IMAGE:-ghcr.io/neonexia/latiq:0.1.0}
+  image: ${LATIQ_IMAGE:-ghcr.io/neonexia/latiq:0.1.1}
   restart: unless-stopped
 
 services:
@@ -83,7 +83,7 @@ services:
       retries: 30
 
   gateway:
-    image: ${LATIQ_GATEWAY_IMAGE:-ghcr.io/neonexia/latiq-gateway:0.1.0}
+    image: ${LATIQ_GATEWAY_IMAGE:-ghcr.io/neonexia/latiq-gateway:0.1.1}
     hostname: gateway
     ports:
       - "51500:51500"   # Data + Stream gRPC (SDK/CLI front door)
