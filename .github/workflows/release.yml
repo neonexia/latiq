@@ -37,8 +37,8 @@ env:
 
 jobs:
   # Cheap and first: refuse a malformed tag, and refuse a tag whose version does
-  # not match the version in the tree. One version, four places it shows up (git
-  # tag, wheel, image, release) — if they can drift, they will.
+  # not match the version in the tree. One version, five places it shows up (git
+  # tag, both wheels, image, release) — if they can drift, they will.
   meta:
     name: resolve + check the version
     runs-on: ubuntu-latest
@@ -61,17 +61,24 @@ jobs:
           esac
           version="${REF#v}"
 
-          # The wheel version comes from pyproject.toml (maturin reads it) and the
-          # binary's from the workspace Cargo.toml. Both must already equal the tag
-          # — we do NOT rewrite them here, because a released artifact should be
-          # buildable from the tagged tree byte-for-byte.
-          py=$(grep -m1 -E '^version = ' sdk/python/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          # Each wheel's version comes from its own pyproject.toml (maturin reads
+          # it) and the binary's from the workspace Cargo.toml. All must already
+          # equal the tag — we do NOT rewrite them here, because a released
+          # artifact should be buildable from the tagged tree byte-for-byte.
+          #
+          # `sdk/admin/pyproject.toml` is checked for exactly the reason the other
+          # two are: it is a third place the version can drift, and an unchecked
+          # one is how a tagged release ships `latiq-admin` at a version that is
+          # not the tag.
           rs=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           fail=0
-          if [ "$py" != "$version" ]; then
-            echo "::error file=sdk/python/pyproject.toml::version is '${py}' but the tag says '${version}'"
-            fail=1
-          fi
+          for f in sdk/python/pyproject.toml sdk/admin/pyproject.toml; do
+            got=$(grep -m1 -E '^version = ' "$f" | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "$got" != "$version" ]; then
+              echo "::error file=${f}::version is '${got}' but the tag says '${version}'"
+              fail=1
+            fi
+          done
           if [ "$rs" != "$version" ]; then
             echo "::error file=Cargo.toml::[workspace.package] version is '${rs}' but the tag says '${version}'"
             fail=1
@@ -98,8 +105,8 @@ jobs:
     needs: meta
     uses: ./.github/workflows/verify.yml
 
-  # The GitHub release itself, created first so the wheel + CLI jobs have
-  # somewhere to attach their assets.
+  # The GitHub release itself, created first so the two wheel jobs have somewhere
+  # to attach their assets.
   release:
     name: GitHub release (generated notes)
     needs: [meta, verify]
@@ -240,80 +247,122 @@ jobs:
           tags: ${{ steps.gwmeta.outputs.tags }}
           labels: ${{ steps.gwmeta.outputs.labels }}
 
-  # The client-only CLI (no DuckDB, ~4 MB), cross-compiled for the four platforms
-  # `deploy/install.sh` knows about. Same matrix as the nightly's `build-cli`.
-  build-cli:
-    name: build CLI (${{ matrix.name }})
-    needs: [meta, verify]
-    strategy:
-      matrix:
-        include:
-          - { name: darwin-arm64,  os: macos-14,      target: aarch64-apple-darwin }
-          - { name: darwin-x86_64, os: macos-14,      target: x86_64-apple-darwin }
-          - { name: linux-x86_64,  os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64,   os: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: true }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-      - name: Install protoc + cross linker (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          if [ "${{ matrix.cross }}" = "true" ]; then sudo apt-get install -y gcc-aarch64-linux-gnu; fi
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Build the client-only CLI
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: |
-          cargo build -p latiq --no-default-features --release --target ${{ matrix.target }}
-          mkdir -p out
-          cp "target/${{ matrix.target }}/release/latiq" "out/latiq-${{ matrix.name }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-${{ matrix.name }}
-          path: out/latiq-${{ matrix.name }}
-
-  # Attach the CLI to the version release AND refresh the rolling `cli-latest`
-  # release that `deploy/install.sh` downloads from by default. Both live in this
-  # repo now, so the default GITHUB_TOKEN is enough (no cross-repo PAT).
-  publish-cli:
-    name: publish the CLI binaries
-    needs: [meta, verify, release, build-cli]
+  # The lean operator CLI as a second wheel (`latiq-admin`) — what replaced the
+  # four cross-compiled binaries, the rolling `cli-latest` asset bucket, and the
+  # `curl | sh` installer. Same Rust build (`-p latiq --no-default-features`),
+  # delivered by pip: maturin's `bin` bindings put the native executable in the
+  # wheel's scripts dir, so `pipx install latiq-admin` puts `latiq` on PATH.
+  #
+  # A SEPARATE JOB from `wheel`, deliberately: `latiq-admin` is its own PyPI
+  # project needing its own trusted-publisher entry, and PyPI matches on the
+  # WORKFLOW FILENAME — so it needs one for `release.yml` as well as one for
+  # `nightly.yml` (docs/releasing.md). Splitting it keeps a missing publisher for
+  # the NEW wheel from blocking the WORKING one: `wheel` has already uploaded
+  # `latiq` and attached it to the release before this job starts.
+  #
+  # `PUBLISH_ADMIN_WHEEL` is the same switch the nightly uses — off until the
+  # one-time PyPI setup is done (the job then SKIPS, visibly, rather than
+  # reporting a publish it did not do), and required to pass once it is on. No
+  # version stamping: `meta` already proved sdk/admin/pyproject.toml carries the
+  # tag's version.
+  wheel-admin:
+    name: publish latiq-admin (PyPI + release asset)
+    needs: [meta, verify, release]
+    if: vars.PUBLISH_ADMIN_WHEEL == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # attach the wheel to the release
+      id-token: write   # PyPI trusted publishing
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
         with:
-          path: cli
-          pattern: cli-*
-          merge-multiple: true
-      - name: Upload to the release + refresh `cli-latest`
+          command: build
+          target: x86_64
+          # Matching the `wheel` job's container for the modern protoc below, not
+          # for DuckDB's C++ ABI — this build has no DuckDB at all, which is why
+          # it needs no CARGO_BUILD_JOBS cap and takes a fraction of the time.
+          manylinux: "2_28"
+          # No `-m`: `bindings`/`no-default-features` come from the pyproject.toml
+          # in this directory, so the wheel cannot be built with the server
+          # features that the file exists to exclude.
+          working-directory: sdk/admin
+          args: --release -o dist
+          before-script-linux: |
+            set -e
+            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
+            curl -fsSL --retry 5 -o /tmp/protoc.zip \
+              https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
+            unzip -t /tmp/protoc.zip >/dev/null
+            unzip -o /tmp/protoc.zip -d /usr/local
+            protoc --version
+      - name: Publish latiq-admin to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/admin/dist
+      - name: Attach the admin wheel to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
-          VERSION: ${{ needs.meta.outputs.version }}
-          INSTALL: "curl -fsSL https://raw.githubusercontent.com/neonexia/latiq/main/deploy/install.sh | sh"
+        run: gh release upload "$TAG" --repo "$REPO" --clobber sdk/admin/dist/*.whl
+
+  # The same proof `verify-admin-cli` gives the nightly, against the tagged
+  # release's wheel: install `latiq-admin` FROM PyPI and drive the binary it put
+  # on PATH. Every assertion is on an ARTIFACT or a STRING, never an exit status.
+  verify-admin-cli:
+    name: verify pipx install latiq-admin (from PyPI)
+    needs: [meta, wheel-admin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip install latiq-admin==<version> from PyPI (retry for propagation)
+        env:
+          V: ${{ needs.meta.outputs.version }}
         run: |
           set -eu
-          chmod +x cli/latiq-*
-          gh release upload "$TAG" --repo "$REPO" --clobber cli/latiq-*
-          # `--latest=false`: `cli-latest` is a rolling asset bucket, not the
-          # repo's newest release — the `v*` tag keeps that badge.
-          gh release view cli-latest --repo "$REPO" >/dev/null 2>&1 \
-            || gh release create cli-latest --repo "$REPO" --latest=false \
-                 --title "Latiq CLI (rolling)" \
-                 --notes "Prebuilt client-only \`latiq\` CLI. Install: ${INSTALL}"
-          gh release upload cli-latest --repo "$REPO" --clobber cli/latiq-*
-          gh release edit cli-latest --repo "$REPO" \
-            --notes "Client-only \`latiq\` CLI, version ${VERSION}. Install: ${INSTALL}"
+          for i in $(seq 1 12); do
+            python -m pip install "latiq-admin==${V}" && ok=1 && break
+            echo "waiting for PyPI to serve latiq-admin ${V} (attempt $i)"; sleep 15
+          done
+          # Without this the loop falls through to a green step after 12 failures,
+          # and every assertion below would then run against a `latiq` that was
+          # never installed (or not run at all).
+          [ "${ok:-0}" = "1" ] || { echo "::error::latiq-admin ${V} never installed from PyPI"; exit 1; }
+      - name: The wheel really put a `latiq` on PATH, at the released version
+        env:
+          V: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          bin=$(command -v latiq) || { echo "::error::no \`latiq\` on PATH after installing latiq-admin"; exit 1; }
+          echo "installed: $bin"
+          file "$bin"
+          got=$(latiq --version)
+          [ "$got" = "latiq ${V}" ] || { echo "::error::\`latiq --version\` says '${got}', expected 'latiq ${V}'"; exit 1; }
+      - name: It is the LEAN build — a server role refuses and names the fix
+        run: |
+          set -eu
+          if out=$(latiq serve --bind 127.0.0.1 --port 51400 2>&1); then
+            echo "::error::\`latiq serve\` succeeded in latiq-admin — this wheel is not the client-only build"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q 'needs the full build' \
+            || { echo "::error::not the packaging refusal we ship"; exit 1; }
+          echo "$out" | grep -q 'pip install latiq' \
+            || { echo "::error::the refusal must name the install that CAN serve"; exit 1; }
+      - name: A client command reaches the network (not a stub build)
+        run: |
+          set -eu
+          if out=$(latiq pond list 2>&1); then
+            echo "::error::\`latiq pond list\` succeeded with no control plane running"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q 'could not reach the control plane' \
+            || { echo "::error::expected the control-plane connection error; got: ${out}"; exit 1; }
 
   # Post-publish proof that the SHIPPED artifacts work for an external user: the
   # published compose pulls the JUST-PUSHED GHCR images, `pip install latiq==<v>`
@@ -367,6 +416,33 @@ jobs:
           done
           python -m pip install -r e2e/sdk/requirements.txt
           npm ci --prefix e2e/agent
+      # The `latiq` console script the wheel now installs — `pip install latiq`
+      # then `latiq serve`, the reason the CLI moved into the wheel at all. The
+      # release counterpart of the nightly's identical check; asserted on the
+      # artifact and the version string, and then on a real client round-trip
+      # against a server this wheel started (a `--help` check would pass against
+      # a build that could not serve). Its own port, so the compose cluster
+      # already up in this job is untouched.
+      - name: The wheel's `latiq` console script runs a server
+        env:
+          V: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          bin=$(command -v latiq) || { echo "::error::the latiq wheel installed no \`latiq\` script"; exit 1; }
+          echo "installed: $bin"
+          got=$(latiq --version)
+          [ "$got" = "latiq ${V}" ] || { echo "::error::\`latiq --version\` says '${got}', expected 'latiq ${V}'"; exit 1; }
+          latiq serve --bind 127.0.0.1 --port 51466 --root "${RUNNER_TEMP}/cp" &
+          serve_pid=$!
+          for _ in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/51466) 2>/dev/null && break
+            sleep 1
+          done
+          out=$(LATIQ_SERVER=http://127.0.0.1:51466 latiq pond list) || {
+            echo "::error::\`latiq pond list\` could not reach the control plane the wheel started"
+            kill $serve_pid 2>/dev/null || true; exit 1; }
+          echo "pond list: ${out}"
+          kill $serve_pid
       # The wheel's OWN test suite (sdk/python/tests) — the Python API a user
       # calls, including the `lineage` allocation flag, which nothing else in CI
       # covers. It imports only `latiq` + pyarrow and drives `connect("local")`,

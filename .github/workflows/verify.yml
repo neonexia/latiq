@@ -39,6 +39,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Full suite incl. the deterministic datasets + DuckLake-catalog e2e.
       - run: cargo test --workspace
+      # The LEAN build — `latiq-admin`'s, which drops the `server` feature and
+      # with it the control plane, the pond node and DuckDB. A workspace build
+      # uses default features and never compiles this configuration, so without
+      # these two lines nothing in CI does: `cargo build -p latiq
+      # --no-default-features` used to happen only inside the cross-compile job
+      # this replaced, and the wheel that needs it publishes from a job that is
+      # gated off until PyPI is configured. It would break silently and surface
+      # as a failed release.
+      #
+      # Cheap enough to be unconditional (no DuckDB to compile), and it carries
+      # its own tests: `error_contract_client_only_build_parses_the_server_roles`
+      # is `#[cfg(not(feature = "server"))]` and can ONLY run here.
+      #
+      # `--lib --bins`, NOT `--all-targets`: the full-stack e2e binaries in
+      # `crates/latiq/tests/` start a control plane and a pond node in-process,
+      # so they cannot compile without the feature that provides those. Lib +
+      # bin is exactly what the `latiq-admin` wheel builds.
+      - run: cargo clippy -p latiq --no-default-features --lib --bins -- -D warnings
+      - run: cargo test -p latiq --no-default-features --lib
 
   iceberg:
     name: iceberg + minio catalog e2e

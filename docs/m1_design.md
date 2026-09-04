@@ -51,6 +51,12 @@ reads**; **per-pond resource tiers**; cancellation + prompt-resource release.
   node hop the caller's own token is replayed and re-verified by the owner; there
   is no trusted internal "already verified" header. **Authorization** (who may
   reach which pond) is deliberately a separate slice — see `docs/identity.md`.
+- **Distribution is wheels + images, not a `curl | sh` installer** (§12). Two PyPI
+  wheels — `latiq` (SDK + the full CLI, server roles included) and `latiq-admin`
+  (the lean client-only CLI as a native executable) — plus the `latiq` and
+  `latiq-gateway` GHCR images. No Homebrew formula, no shell installer, no loose
+  release-asset binaries: PyPI already does platform selection, pinning, upgrade
+  and uninstall. `docs/releasing.md` is the runbook.
 - **Result handling:** the unary JSON path (MCP/CLI) is bounded by the inline cap
   (default 10k rows); the **Arrow stream path is uncapped** (the streaming answer to
   large results, ahead of a packaged SDK).

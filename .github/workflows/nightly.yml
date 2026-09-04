@@ -33,8 +33,9 @@ jobs:
   # ---- Versioned publish: only if (a) enabled, (b) something changed since the
   # last publish, and (c) every test/e2e job above is green. Inert until the repo
   # variable PUBLISH_NIGHTLY=true is set (after the one-time PyPI trusted-publisher
-  # setup). Ships TWO artifacts — the Python wheel (PyPI) + the image (GHCR) — with
-  # ONE version. No Rust crates, no source (wheels are binaries). -----------------
+  # setup). Ships THREE artifacts on ONE version — the `latiq` wheel (PyPI), the
+  # images (GHCR), and the `latiq-admin` operator CLI wheel (PyPI, in its own job
+  # below). No Rust crates, no source (wheels are binaries). --------------------
   gate:
     name: publish gate (enabled? changed?)
     if: ${{ github.event_name != 'pull_request' }}
@@ -42,6 +43,11 @@ jobs:
     outputs:
       should_publish: ${{ steps.decide.outputs.should_publish }}
       wheel_version: ${{ steps.decide.outputs.wheel_version }}
+      # The version the BINARY reports. NOT `wheel_version`: the wheels are
+      # stamped `<base>.dev<stamp>` for PyPI, but `latiq --version` comes from
+      # clap via CARGO_PKG_VERSION and is the plain workspace version. Anything
+      # asserting on the CLI's own output must compare against this.
+      base_version: ${{ steps.decide.outputs.base_version }}
       image_stamp: ${{ steps.decide.outputs.image_stamp }}
       stamp: ${{ steps.decide.outputs.stamp }}
     steps:
@@ -62,9 +68,13 @@ jobs:
             echo "should_publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           base=$(grep -m1 -E '^version' sdk/python/pyproject.toml | sed -E 's/.*"([0-9.]+)".*/\1/')
+          # What the compiled binary reports (`latiq --version`), read from the
+          # workspace manifest rather than assumed equal to the wheel's base.
+          cargo_base=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           stamp=$(date -u +%Y%m%d%H%M)
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
           echo "wheel_version=${base}.dev${stamp}" >> "$GITHUB_OUTPUT"
+          echo "base_version=${cargo_base}" >> "$GITHUB_OUTPUT"
           echo "image_stamp=nightly-${stamp}" >> "$GITHUB_OUTPUT"
           echo "stamp=${stamp}" >> "$GITHUB_OUTPUT"
 
@@ -178,6 +188,42 @@ jobs:
             echo "waiting for PyPI to serve ${v} (attempt $i)"; sleep 15
           done
           python -m pip install -r e2e/sdk/requirements.txt
+      # The `latiq` console script the wheel now installs — `pip install latiq`
+      # then `latiq serve`, the reason the CLI moved into the wheel at all. The
+      # binary in the image is covered by the cluster e2e; NOTHING else covers
+      # this entry point, and it can break in ways the Python API cannot (a
+      # missing `[project.scripts]`, a PyO3 signature drift in `_cli_main`).
+      #
+      # Asserted on the artifact and the version string, not exit status: the
+      # script must exist at the path pip generates, and must report the version
+      # we published. `latiq serve` is then started for real and probed on its
+      # port — a `--help` check would pass against a build that could not serve.
+      - name: The wheel's `latiq` console script runs a server
+        env:
+          # The BINARY's version (clap/CARGO_PKG_VERSION), not the wheel's: the
+          # nightly wheel is `<base>.dev<stamp>` on PyPI while the CLI it carries
+          # reports the plain workspace version.
+          V: ${{ needs.gate.outputs.base_version }}
+        run: |
+          set -eu
+          bin=$(command -v latiq) || { echo "::error::the latiq wheel installed no \`latiq\` script"; exit 1; }
+          echo "installed: $bin"
+          got=$(latiq --version)
+          [ "$got" = "latiq ${V}" ] || { echo "::error::\`latiq --version\` says '${got}', expected 'latiq ${V}'"; exit 1; }
+          latiq serve --bind 127.0.0.1 --port 51466 --root "${RUNNER_TEMP}/cp" &
+          serve_pid=$!
+          for _ in $(seq 1 30); do
+            (exec 3<>/dev/tcp/127.0.0.1/51466) 2>/dev/null && break
+            sleep 1
+          done
+          # The proof is a CLIENT round-trip, not an open socket: `pond list`
+          # exercises the Admin gRPC surface of the control plane this wheel just
+          # started. Fails if `serve` died, never bound, or is a stub.
+          out=$(LATIQ_SERVER=http://127.0.0.1:51466 latiq pond list) || {
+            echo "::error::\`latiq pond list\` could not reach the control plane the wheel started"
+            kill $serve_pid 2>/dev/null || true; exit 1; }
+          echo "pond list: ${out}"
+          kill $serve_pid
       # The wheel's OWN test suite (sdk/python/tests) — the Python API a user
       # calls, including the `lineage` allocation flag, which nothing else in CI
       # covers. It imports only `latiq` + pyarrow, so run from the repo root it
@@ -265,80 +311,141 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  # Cross-compile the client-only CLI (no DuckDB, ~4 MB) for the common platforms
-  # and publish the binaries to THIS repo's rolling `cli-latest` release, so admins
-  # install a native `latiq` with `curl … install.sh | sh`. Test-gated +
-  # change-gated (needs publish). Pure Rust → cross-compile is trivial.
-  build-cli:
-    name: build CLI (${{ matrix.name }})
+  # The lean operator CLI, as a SECOND wheel (`latiq-admin`) rather than the four
+  # cross-compiled binaries + `curl | sh` installer this replaces. Same Rust build
+  # (`-p latiq --no-default-features`), delivered by pip: maturin's `bin` bindings
+  # put the native executable in the wheel's scripts dir, so `pipx install
+  # latiq-admin` puts `latiq` on PATH with none of a shell installer's problems
+  # (no unsigned pipe to sh, no hand-rolled platform detection, no rolling asset
+  # bucket to keep in sync with the installer, and an uninstall that works).
+  #
+  # A SEPARATE JOB from `publish`, deliberately: `latiq-admin` is a distinct PyPI
+  # project and needs its OWN trusted-publisher entry (docs/releasing.md). Until
+  # that exists this job cannot succeed, and putting it in `publish` would mean a
+  # missing publisher for the NEW wheel blocked the WORKING one — the `latiq`
+  # wheel and both images are already pushed by the time this starts.
+  #
+  # `PUBLISH_ADMIN_WHEEL` is the same shape of switch as `PUBLISH_NIGHTLY`: off
+  # until the one-time PyPI setup is done, and then required to pass. Off, the job
+  # SKIPS (visibly, in the run's job list) rather than reporting a green publish it
+  # did not do; on, nothing here tolerates a failure.
+  publish-admin:
+    name: publish latiq-admin (PyPI)
     needs: [gate, publish]
-    if: needs.gate.outputs.should_publish == 'true'
-    strategy:
-      matrix:
-        include:
-          - { name: darwin-arm64,  os: macos-14,      target: aarch64-apple-darwin }
-          - { name: darwin-x86_64, os: macos-14,      target: x86_64-apple-darwin }
-          - { name: linux-x86_64,  os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { name: linux-arm64,   os: ubuntu-latest, target: aarch64-unknown-linux-gnu, cross: true }
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-      - name: Install protoc + cross linker (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          if [ "${{ matrix.cross }}" = "true" ]; then sudo apt-get install -y gcc-aarch64-linux-gnu; fi
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Build the client-only CLI
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: |
-          cargo build -p latiq --no-default-features --release --target ${{ matrix.target }}
-          mkdir -p out
-          cp "target/${{ matrix.target }}/release/latiq" "out/latiq-${{ matrix.name }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: cli-${{ matrix.name }}
-          path: out/latiq-${{ matrix.name }}
-
-  # The assets used to go to `neonexia/latiq-deploy` because this repo was private.
-  # `deploy/install.sh` now lives here and defaults to this repo, so the rolling
-  # `cli-latest` release lives here too — no cross-repo PAT, and the installer and
-  # the publisher can no longer disagree. Change BOTH together (deploy/CLAUDE.md).
-  # The assets already in latiq-deploy are left untouched and keep working.
-  publish-cli:
-    name: publish CLI binaries → cli-latest release
-    needs: [gate, build-cli]
-    if: needs.gate.outputs.should_publish == 'true'
+    if: needs.gate.outputs.should_publish == 'true' && vars.PUBLISH_ADMIN_WHEEL == 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # create/update the `cli-latest` release in this repo
+      id-token: write    # PyPI trusted publishing (OIDC; no stored token)
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: cli
-          pattern: cli-*
-          merge-multiple: true
-      - name: Upload to this repo's rolling `cli-latest` release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          VERSION: ${{ needs.gate.outputs.wheel_version }}
-          INSTALL: "curl -fsSL https://raw.githubusercontent.com/neonexia/latiq/main/deploy/install.sh | sh"
+      - uses: actions/checkout@v4
+      # The same version as the `latiq` wheel and the image from this run: the two
+      # wheels are one CLI built two ways, so a user comparing them must not have
+      # to work out which pair of versions goes together.
+      - name: Stamp the admin wheel version
         run: |
-          chmod +x cli/latiq-*
-          # `--latest=false`: `cli-latest` is a rolling asset bucket, not the
-          # repo's newest release — a `v*` tag must keep that badge.
-          gh release view cli-latest --repo "$REPO" >/dev/null 2>&1 \
-            || gh release create cli-latest --repo "$REPO" --latest=false \
-                 --title "Latiq CLI (rolling)" \
-                 --notes "Prebuilt client-only \`latiq\` CLI. Install: ${INSTALL}"
-          gh release upload cli-latest --repo "$REPO" --clobber cli/latiq-*
-          gh release edit cli-latest --repo "$REPO" \
-            --notes "Client-only \`latiq\` CLI, version ${VERSION}. Install: ${INSTALL}"
+          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/admin/pyproject.toml
+          rm -f sdk/admin/pyproject.toml.bak
+          grep -E '^version = ' sdk/admin/pyproject.toml
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: x86_64
+          # Matching `publish`'s container, for the modern protoc below rather
+          # than for DuckDB's C++ ABI — this build has no DuckDB at all, which is
+          # why it needs no CARGO_BUILD_JOBS cap and takes a fraction of the time.
+          manylinux: "2_28"
+          # No `-m`: `bindings`/`no-default-features` come from the pyproject.toml
+          # in this directory, so the wheel cannot be built with the server
+          # features that the file exists to exclude.
+          working-directory: sdk/admin
+          args: --release -o dist
+          before-script-linux: |
+            set -e
+            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
+            curl -fsSL --retry 5 -o /tmp/protoc.zip \
+              https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
+            unzip -t /tmp/protoc.zip >/dev/null
+            unzip -o /tmp/protoc.zip -d /usr/local
+            protoc --version
+      - name: Publish latiq-admin to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/admin/dist
+
+  # Post-publish proof for the channel that REPLACED the installer, mirroring what
+  # `verify-published` does for the `latiq` wheel: install `latiq-admin` FROM PyPI
+  # and drive the binary it put on PATH.
+  #
+  # Every assertion here is on an ARTIFACT or a STRING, never on an exit status:
+  # `pip install` is checked by resolving `latiq` on PATH and matching the exact
+  # version we just published, and the lean build is proved by the refusal text
+  # `latiq serve` prints — a full build would start a control plane instead. A
+  # check that only ran `latiq --help` would pass against any `latiq` that
+  # happened to be on the runner.
+  verify-admin-cli:
+    name: verify pipx install latiq-admin (from PyPI)
+    needs: [gate, publish-admin]
+    if: needs.gate.outputs.should_publish == 'true' && vars.PUBLISH_ADMIN_WHEEL == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: pip install latiq-admin==<version> from PyPI (retry for propagation)
+        env:
+          V: ${{ needs.gate.outputs.wheel_version }}
+        run: |
+          set -eu
+          for i in $(seq 1 12); do
+            python -m pip install "latiq-admin==${V}" && ok=1 && break
+            echo "waiting for PyPI to serve latiq-admin ${V} (attempt $i)"; sleep 15
+          done
+          # Without this the loop falls through to a green step after 12 failures,
+          # and every assertion below would then run against a `latiq` that was
+          # never installed (or not run at all).
+          [ "${ok:-0}" = "1" ] || { echo "::error::latiq-admin ${V} never installed from PyPI"; exit 1; }
+      - name: The wheel really put a `latiq` on PATH, at the version we published
+        env:
+          # As above: the binary reports the workspace version, while the wheel
+          # it shipped in is `<base>.dev<stamp>`.
+          V: ${{ needs.gate.outputs.base_version }}
+        run: |
+          set -eu
+          bin=$(command -v latiq) || { echo "::error::no \`latiq\` on PATH after installing latiq-admin"; exit 1; }
+          echo "installed: $bin"
+          # A native executable, not a Python shim: `bindings = "bin"` ships the
+          # compiled binary itself, and if that ever silently became a script the
+          # wheel would no longer be the thing this channel promises.
+          file "$bin"
+          got=$(latiq --version)
+          [ "$got" = "latiq ${V}" ] || { echo "::error::\`latiq --version\` says '${got}', expected 'latiq ${V}'"; exit 1; }
+      - name: It is the LEAN build — a server role refuses and names the fix
+        run: |
+          set -eu
+          # `latiq serve` must FAIL here. In the full build it would bind a port
+          # and never return, so `set -o pipefail` + an inverted status is the
+          # assertion: a green step means the client-only build refused.
+          if out=$(latiq serve --bind 127.0.0.1 --port 51400 2>&1); then
+            echo "::error::\`latiq serve\` succeeded in latiq-admin — this wheel is not the client-only build"
+            exit 1
+          fi
+          echo "$out"
+          # The refusal has to be OURS (crates/latiq/src/lib.rs::server_role_unavailable),
+          # not clap's "unrecognized subcommand" and not a bind error, and it has to
+          # name the install that can serve.
+          echo "$out" | grep -q 'needs the full build' \
+            || { echo "::error::not the packaging refusal we ship"; exit 1; }
+          echo "$out" | grep -q 'pip install latiq' \
+            || { echo "::error::the refusal must name the install that CAN serve"; exit 1; }
+      - name: A client command reaches the network (not a stub build)
+        run: |
+          set -eu
+          # No control plane here, so this must fail — but with the CONNECTION
+          # error, which only a build that really dialled gRPC can produce.
+          if out=$(latiq pond list 2>&1); then
+            echo "::error::\`latiq pond list\` succeeded with no control plane running"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q 'could not reach the control plane' \
+            || { echo "::error::expected the control-plane connection error; got: ${out}"; exit 1; }

@@ -5,7 +5,7 @@ role is the command (`serve` = control plane, `node add` = pond node, else the C
 `ENTRYPOINT ["latiq"]`; compose/k8s pick the role.
 
 **`deploy/` is the single home for deployment artifacts** — the user compose, the
-cluster compose, the fixtures, both Dockerfiles, the CLI installer. `README.md`
+cluster compose, the fixtures, both Dockerfiles. `README.md`
 here is the human front door (which file is which); this file is the invariants.
 Nothing deployment-shaped should live outside this directory or in another repo.
 
@@ -40,13 +40,37 @@ Control plane + pond nodes behind an **nginx gateway** — the single front door
   **Keep it mount-free** — a single bind mount both breaks the clone-free path and
   is the most likely thing to break Podman.
 
-`install.sh` installs the client-only CLI from **this repo's** rolling `cli-latest`
-release (`LATIQ_RELEASE_REPO`/`LATIQ_RELEASE_TAG` override it; a `v*` tag works as
-a pin). Three places name that release — `install.sh`, `nightly.yml`'s
-`publish-cli`, `release.yml`'s `publish-cli` — **change them together** or the
-installer and the publisher silently disagree. (It used to point at
-`neonexia/latiq-deploy`, from when this repo was private; those assets are left
-untouched and still resolve, so nothing breaks for existing users mid-flight.)
+**The CLI ships as a wheel, not a shell installer.** There is no `install.sh` and
+no rolling `cli-latest` release; both were deleted along with the four
+cross-compiled binaries that fed them. PyPI already does platform selection,
+version pinning, upgrade and uninstall — everything the installer hand-rolled —
+and nothing has to pipe an unsigned script into a shell. **If you are adding an
+install path, it is a wheel; do not reintroduce `curl | sh`.**
+
+**Two wheels, two builds of one CLI, and they are not interchangeable:**
+- **`latiq`** (`sdk/python/`) — the SDK wheel, default features. Its
+  `[project.scripts]` entry point runs the **full** CLI, server roles included,
+  through PyO3 (`_cli_main` → `latiq::run_from_args`). `pip install latiq &&
+  latiq serve` works because `latiq-sdk` already linked the control plane and the
+  pond node — the wheel gained an argument parser, not a server.
+- **`latiq-admin`** (`sdk/admin/`) — maturin `bindings = "bin"` +
+  `no-default-features`: the native client-only executable in the wheel's scripts
+  dir, no DuckDB, no server. `latiq serve` here fails with
+  `server_role_unavailable` (`crates/latiq/src/lib.rs`), which names
+  `pip install latiq` — *not* clap's "unrecognized subcommand", which would tell
+  an operator the command does not exist when the truth is that this build cannot
+  run it. **`serve`/`node add` must keep PARSING in the lean build** (pinned by
+  `error_contract_client_only_build_parses_the_server_roles`).
+
+Both install the same command name, so one or the other per environment.
+
+**One clap layer serves both**, which is why `crates/latiq` is a library with a
+two-line `src/main.rs`: the image runs the binary, the wheel calls
+`run_from_args`. Adding a command to one adds it to both, by construction.
+
+Four places carry the version — `Cargo.toml`, `sdk/python/pyproject.toml`,
+`sdk/admin/pyproject.toml`, the git tag — and `release.yml`'s `meta` job fails
+the release if any disagrees. **Add a new one and add it to `meta`.**
 
 **The gateway image.** So the user compose stays pure-images, the gateway is a
 published image — `latiq-gateway` (`deploy/gateway.Dockerfile` = `nginx` + baked
@@ -138,17 +162,27 @@ POST, so it is the only signal a backend has stopped keeping up.
    Service/Ingress; the front-door + forwarding model is unchanged.
 
 ## Publishing
-See `docs/releasing.md`. We ship **binaries only** — the `latiq` **wheel → PyPI**,
-the **`latiq` + `latiq-gateway` images → GHCR**, and the **client-only CLI
-binaries → GitHub releases**. **No Rust crates** (crates.io is out of scope; the
-crates are not a product).
+See `docs/releasing.md`. We ship **binaries only** — **two wheels → PyPI**
+(`latiq`, `latiq-admin`) and the **`latiq` + `latiq-gateway` images → GHCR**.
+**No Rust crates** (crates.io is out of scope; the crates are not a product), and
+**no loose release-asset binaries** — that channel is gone.
 
 Two publish paths, both **test-gated on the same reusable workflow**
 (`.github/workflows/verify.yml` — refactored out of the nightly for exactly this
 reason, #55):
-- **`nightly.yml`** — rolling + change-gated. Wheel `0.1.0.devYYYYMMDDHHMM`, image
-  `:nightly` / `:nightly-<stamp>`. Inert unless `PUBLISH_NIGHTLY=true`.
-- **`release.yml`** — a `v<x>.<y>.<z>` tag. GitHub release + wheel + images
-  `:<version>` + CLI binaries. `latest` only moves from 1.0.0 on.
+- **`nightly.yml`** — rolling + change-gated. Wheels `0.1.0.devYYYYMMDDHHMM`,
+  image `:nightly` / `:nightly-<stamp>`. Inert unless `PUBLISH_NIGHTLY=true`.
+- **`release.yml`** — a `v<x>.<y>.<z>` tag. GitHub release + both wheels + images
+  `:<version>`. `latest` only moves from 1.0.0 on.
 
-**Never add a publishing step that does not `needs:` the verify job.**
+**`latiq-admin` publishes from its own job** in both files (`publish-admin` /
+`wheel-admin`), gated on `PUBLISH_ADMIN_WHEEL`. That split is load-bearing:
+PyPI trusted publishing matches on the **workflow filename**, so `latiq-admin`
+needs its own publisher entry per workflow, and a missing one must not be able to
+wedge the `latiq` wheel that already works. The `latiq` upload completes before
+the admin job starts. Off, the job **skips visibly**; on, it must pass.
+
+**Never add a publishing step that does not `needs:` the verify job**, and never
+let a publish be *verified* by anything weaker than the artifact itself: both
+`verify-admin-cli` jobs assert on a resolved binary and an exact version string,
+because a check that only inspects an exit status goes green having run nothing.
