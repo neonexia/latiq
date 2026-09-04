@@ -1,0 +1,292 @@
+name: Wheels
+
+# The ONE place both PyPI wheels are built, for EVERY platform we ship, and the
+# one place the built set is verified before a caller is allowed to upload it.
+# Called by `nightly.yml` and by `release.yml` — the wheel counterpart of
+# `verify.yml` (the checks) and `images.yml` (the images), for the same reason:
+# the two publish paths must produce the SAME artifacts, not two hand-maintained
+# copies of the same steps (#55).
+#
+# WHY THIS SHAPE (#108) --------------------------------------------------------
+# `latiq` 0.1.0 has exactly ONE file on PyPI:
+#
+#   $ curl -s https://pypi.org/pypi/latiq/0.1.0/json | jq -r '.urls[].filename'
+#   latiq-0.1.0-cp39-abi3-manylinux_2_28_x86_64.whl
+#
+# No aarch64 wheel, no macOS wheel, and no sdist — so on an Apple Silicon Mac
+# `pip install latiq` has nothing to resolve and no source fallback, and fails
+# outright. `latiq-admin` (the ONLY non-Docker way to get the operator CLI since
+# the raw-binary channel was retired, #102) was about to inherit the same gap.
+# The cause was one line, in four copies: both wheel jobs in both workflows
+# passed `target: x86_64` and ran on `ubuntu-latest`. Exactly #66's blind spot,
+# one channel over: the only job that "verified the pip install path" ran on
+# amd64, so nobody could see it.
+#
+# Three platforms, one job each, all NATIVE:
+#   * manylinux_2_28 x86_64   (ubuntu-latest)
+#   * manylinux_2_28 aarch64  (ubuntu-24.04-arm — free for public repos)
+#   * macOS arm64             (macos-14)
+# The `latiq` wheel compiles DuckDB from source (~21 min native, observed in
+# #107); under QEMU that is hours, so emulation is not an option here either.
+# Builds are `cp39-abi3`, so it is one wheel per platform, not per Python.
+#
+# NO sdist, deliberately — see docs/releasing.md ("Why there is no sdist").
+#
+# AND THEN IT ASSERTS. `collect` runs `.github/scripts/assert-wheel-platforms.sh`
+# over the actual `dist/` contents and fails unless every platform above is
+# present for BOTH projects (and fails if it examined zero files). The callers
+# run the same script against the PyPI JSON API after an upload. A matrix we
+# passed is not evidence; the file list is.
+#
+# AND THEN IT INSTALLS THEM ON arm64. `verify-linux-arm64` and
+# `verify-macos-arm64` pip-install the wheels this run built, on the arch that
+# was broken, and drive them (`latiq --version`, `latiq serve` + a client
+# round-trip, `import latiq`, and the admin wheel's lean-build refusal). That is
+# the job whose absence let this ship.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >-
+          The version BOTH wheels are stamped to and must carry, e.g. "0.2.0" or
+          "0.1.1.dev202609041202". Every built filename is asserted against it.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.project }} (${{ matrix.plat }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Not fail-fast: if one platform breaks we want the others' logs too, and
+      # `collect` refuses to hand a partial set to a publisher anyway.
+      fail-fast: false
+      matrix:
+        project: [latiq, latiq-admin]
+        plat: [linux-x86_64, linux-aarch64, macos-arm64]
+        include:
+          # --- per-platform: where it builds and what it builds for -----------
+          - plat: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+            # 2_28 = AlmaLinux 8: modern GCC + the C++11 CXX ABI DuckDB requires.
+            # The default (manylinux2014/CentOS 7) has the legacy ABI (DuckDB
+            # refuses) AND a proto2-only protoc (can't parse our proto3).
+            manylinux: "2_28"
+          - plat: linux-aarch64
+            # GitHub-hosted arm64, free for public repos. Native: maturin runs
+            # the aarch64 manylinux container on an aarch64 host, so DuckDB's
+            # C++ build is not emulated.
+            runner: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: "2_28"
+          - plat: macos-arm64
+            # Apple Silicon — the platform in the bug report.
+            runner: macos-14
+            target: aarch64-apple-darwin
+            manylinux: auto   # ignored off Linux; maturin-action wants a value
+          # --- per-project: what maturin is pointed at ------------------------
+          - project: latiq
+            pyproject: sdk/python/pyproject.toml
+            workdir: "."
+            maturin_args: --release -m sdk/python/Cargo.toml -o dist
+            dist: dist
+            artifact: wheel-latiq
+          - project: latiq-admin
+            pyproject: sdk/admin/pyproject.toml
+            # No `-m`: `bindings = "bin"` / `no-default-features` come from the
+            # pyproject.toml in THIS directory, so the wheel cannot be built with
+            # the server features that file exists to exclude.
+            workdir: sdk/admin
+            maturin_args: --release -o dist
+            dist: sdk/admin/dist
+            artifact: wheel-latiq-admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # maturin reads the wheel version from pyproject.toml. Stamped here rather
+      # than in the caller because each platform builds on its own runner: one
+      # caller-side edit would not reach five of the six builds. For a tagged
+      # release this is a no-op — `meta` has already proved the file carries the
+      # tag's version — and `collect` asserts every filename carries it anyway.
+      - name: Stamp the wheel version
+        shell: bash
+        env:
+          V: ${{ inputs.version }}
+          F: ${{ matrix.pyproject }}
+        run: |
+          set -eu
+          # BSD sed (macOS) needs the backup-suffix argument; -i.bak works on both.
+          sed -i.bak -E "s/^version = \"[0-9][^\"]*\"/version = \"${V}\"/" "$F"
+          rm -f "${F}.bak"
+          grep -E '^version = ' "$F"
+      # macOS builds are NOT containerised, so the manylinux image's protoc trick
+      # does not apply: latiq-proto needs a protoc on the runner itself.
+      - name: protoc (macOS runners only)
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          command -v protoc >/dev/null 2>&1 || brew install protobuf
+          protoc --version
+      - uses: PyO3/maturin-action@v1
+        env:
+          # DuckDB's release (-O3) compile is memory-heavy; cap parallelism so it
+          # does not OOM the runner (or the manylinux container). Harmless for
+          # the admin build, which has no DuckDB at all.
+          CARGO_BUILD_JOBS: "2"
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: ${{ matrix.workdir }}
+          args: ${{ matrix.maturin_args }}
+          before-script-linux: |
+            # The container's distro protoc is too old (proto2-only) — install a
+            # modern protoc so latiq-proto's proto3 compiles. The ARCH IS DERIVED,
+            # not hard-coded: this same script runs in the x86_64 and the aarch64
+            # container, and a hard-coded x86_64 zip would put an unrunnable
+            # binary on PATH in the arm64 build. `-f` makes curl fail on an HTTP
+            # error instead of writing an error page to the file (which then
+            # fails unzip with "end-of-central-directory not found"); retries ride
+            # out transient GitHub blips; the zip is verified before use.
+            set -e
+            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
+            case "$(uname -m)" in
+              x86_64)  PROTOC_ARCH=linux-x86_64 ;;
+              aarch64) PROTOC_ARCH=linux-aarch_64 ;;
+              *) echo "unsupported build arch $(uname -m)"; exit 1 ;;
+            esac
+            # (--retry-all-errors is unavailable on the container's older curl.)
+            curl -fsSL --retry 5 -o /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-${PROTOC_ARCH}.zip"
+            unzip -t /tmp/protoc.zip >/dev/null
+            unzip -o /tmp/protoc.zip -d /usr/local
+            protoc --version
+      # An empty dist would otherwise surface as a missing platform three jobs
+      # later, with no log to explain it.
+      - name: The build really produced a wheel
+        shell: bash
+        env:
+          DIST: ${{ matrix.dist }}
+        run: |
+          set -eu
+          shopt -s nullglob
+          built=("$DIST"/*.whl)
+          [ "${#built[@]}" -ge 1 ] || { echo "::error::${{ matrix.project }} ${{ matrix.plat }} produced no wheel"; exit 1; }
+          printf '%s\n' "${built[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ matrix.plat }}
+          path: ${{ matrix.dist }}/*.whl
+          if-no-files-found: error
+          # The `latiq` wheel is ~25 MB × 3 platforms; these exist only to reach
+          # `collect` and the caller's publish step in the same run.
+          retention-days: 1
+
+  # THE ASSERTION, over what was actually produced. Also the hand-off point: the
+  # callers download `wheels-latiq` / `wheels-latiq-admin` from here, so nothing
+  # can be uploaded to PyPI that this job did not first find complete.
+  collect:
+    name: assert both wheel sets cover every platform
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4    # for .github/scripts/
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/latiq
+          pattern: wheel-latiq-linux-*
+          merge-multiple: true
+      # `wheel-latiq-*` would also match `wheel-latiq-admin-*`, hence the two
+      # explicit patterns per project rather than one prefix glob.
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/latiq
+          pattern: wheel-latiq-macos-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/latiq-admin
+          pattern: wheel-latiq-admin-*
+          merge-multiple: true
+      - name: Every platform, for both projects
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -eu
+          .github/scripts/assert-wheel-platforms.sh dist dist/latiq latiq "$V"
+          .github/scripts/assert-wheel-platforms.sh dist dist/latiq-admin latiq-admin "$V"
+      # One consolidated artifact per project, for the caller's publish step:
+      # `pypa/gh-action-pypi-publish` uploads a whole directory, and the two
+      # projects are two PyPI projects with two trusted publishers.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-latiq
+          path: dist/latiq/*.whl
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-latiq-admin
+          path: dist/latiq-admin/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---- The blind spot that caused #108, closed: INSTALL them on arm64 --------
+  # Not "a wheel with an aarch64 tag exists" — pip-installed and run, on the arch
+  # that was broken, for both wheels. This runs with `PUBLISH_PYPI_WHEELS` off
+  # (it uses the wheels this run built, not PyPI), so the coverage does not
+  # depend on the publishing gate.
+  verify-linux-arm64:
+    name: install + run both wheels on linux arm64
+    needs: collect
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-latiq
+          path: dist/latiq
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-latiq-admin
+          path: dist/latiq-admin
+      - name: The aarch64 wheels install and run here
+        env:
+          V: ${{ inputs.version }}
+          PLAT: manylinux_2_28_aarch64
+        run: bash .github/scripts/verify-wheels.sh
+
+  verify-macos-arm64:
+    name: install + run both wheels on macOS arm64 (Apple Silicon)
+    needs: collect
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-latiq
+          path: dist/latiq
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-latiq-admin
+          path: dist/latiq-admin
+      # The literal machine from the bug report: an Apple Silicon Mac, a plain
+      # `pip install`, no `--platform`, no toolchain, no env vars.
+      - name: The macOS arm64 wheels install and run here
+        env:
+          V: ${{ inputs.version }}
+          PLAT: macosx
+        run: bash .github/scripts/verify-wheels.sh

@@ -88,9 +88,24 @@ jobs:
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
+  # Both wheels, for EVERY platform we ship (manylinux x86_64 + aarch64, macOS
+  # arm64), from the SAME reusable workflow the tagged release calls. This used
+  # to be a `target: x86_64` maturin step inside `publish`, which is why `latiq`
+  # 0.1.0 is a single amd64 file on PyPI and `pip install latiq` fails outright
+  # on an Apple Silicon Mac (#108). `wheels.yml` also asserts the built set
+  # covers every platform and pip-installs BOTH wheels on arm64 runners, so this
+  # cannot go green having built an x86_64-only set.
+  wheels:
+    name: build the wheels (all platforms)
+    needs: [gate, verify]
+    if: needs.gate.outputs.should_publish == 'true'
+    uses: ./.github/workflows/wheels.yml
+    with:
+      version: ${{ needs.gate.outputs.wheel_version }}
+
   publish:
     name: publish the wheel (PyPI), versioned
-    needs: [gate, verify]
+    needs: [gate, verify, wheels]
     if: needs.gate.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -102,48 +117,22 @@ jobs:
       # version and report it as this run's.
       uploaded: ${{ steps.pypi.outputs.uploaded }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4    # for .github/scripts/
+      # The wheels are BUILT in `wheels.yml` (one job per platform, on native
+      # runners) and handed over as an artifact. The upload itself stays HERE, in
+      # the caller, on purpose: PyPI's trusted publishing matches on the workflow
+      # filename, so moving `gh-action-pypi-publish` into the reusable workflow
+      # would invalidate the configured `nightly.yml` / `release.yml` publishers.
+      - uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-      - name: Stamp the wheel version
-        run: |
-          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/python/pyproject.toml
-          rm -f sdk/python/pyproject.toml.bak
-      # Build the manylinux wheel IN this job and publish from it — no cross-job
-      # artifact handoff (the wheel statically links the whole server and is large;
-      # artifacts blow the storage quota). Nightly ships the Linux/manylinux wheel
-      # (the SDK's real consumers: servers, CI, Docker, Colab). macOS/other-platform
-      # wheels are a tagged-release concern, not nightly.
-      - uses: PyO3/maturin-action@v1
-        env:
-          # DuckDB's release (-O3) compile is memory-heavy; cap parallelism so it
-          # doesn't OOM the runner inside the manylinux container.
-          CARGO_BUILD_JOBS: "2"
-        with:
-          command: build
-          target: x86_64
-          # 2_28 = AlmaLinux 8 toolchain: modern GCC + the C++11 CXX ABI DuckDB
-          # requires. The default (manylinux2014/CentOS 7) has the legacy ABI
-          # (DuckDB refuses) AND a proto2-only protoc (can't parse our proto3).
-          manylinux: "2_28"
-          args: --release -m sdk/python/Cargo.toml -o dist
-          before-script-linux: |
-            # The container's distro protoc is too old (proto2-only) — install a
-            # modern protoc binary so latiq-proto's proto3 compiles. `-f` makes curl
-            # fail (non-zero) on an HTTP error instead of writing an error page to the
-            # file (which then fails unzip with "end-of-central-directory not found");
-            # retries ride out transient GitHub blips. Verify the zip before using it.
-            set -e
-            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
-            # (--retry-all-errors is unavailable on the container's older curl.)
-            curl -fsSL --retry 5 -o /tmp/protoc.zip \
-              https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
-            unzip -t /tmp/protoc.zip >/dev/null
-            unzip -o /tmp/protoc.zip -d /usr/local
-            protoc --version
+          name: wheels-latiq
+          path: dist
+      - name: What we are about to publish
+        run: ls -l dist
       # PyPI publishing is OFF unless the repo variable says so — the same switch
       # `release.yml` uses, and a deliberate policy choice while the deployment
-      # is being stabilised. The wheel is still BUILT here, and `verify.yml`
+      # is being stabilised. The wheels are still BUILT (all three platforms, in
+      # `wheels.yml`, which also installs and runs them on arm64), `verify.yml`
       # already ran the full SDK e2e + auth suite against a wheel built from this
       # tree, so no wheel COVERAGE is lost; only the upload is withheld.
       - name: Is PyPI publishing enabled? (PUBLISH_PYPI_WHEELS)
@@ -172,6 +161,16 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+      # Read back what PyPI now SERVES for this version — the list `pip install`
+      # has to resolve from — and fail unless every platform is in it. The same
+      # script `wheels.yml` ran over `dist/`, now against the published channel:
+      # the only evidence that survives a bad upload, a partial upload, or a
+      # matrix we thought we passed (#108).
+      - name: Assert PyPI serves every platform for this version
+        if: steps.pypi.outputs.uploaded == 'true'
+        env:
+          V: ${{ needs.gate.outputs.wheel_version }}
+        run: .github/scripts/assert-wheel-platforms.sh pypi latiq "$V"
 
   # Both GHCR images, as MULTI-ARCH manifest lists (linux/amd64 + linux/arm64 —
   # #66), from the SAME reusable workflow the tagged release calls. This used to
@@ -375,10 +374,15 @@ jobs:
   # (`verify-release-arm64`).
   #
   # NO `--platform`, NO `DOCKER_DEFAULT_PLATFORM`, NO emulation setup — what a
-  # user typing `docker compose up -d` gets. No `pip install latiq` either: both
-  # wheels build `target: x86_64` only, so there is no aarch64 wheel to install.
-  # What this proves is the SERVER images running natively on arm64 with the
-  # agent front door reachable through the gateway.
+  # user typing `docker compose up -d` gets. What this proves is the SERVER
+  # images running natively on arm64 with the agent front door reachable through
+  # the gateway.
+  #
+  # It deliberately does NOT `pip install latiq`, and no longer because there is
+  # no aarch64 wheel (#108 fixed that): `wheels.yml`'s `verify-linux-arm64` and
+  # `verify-macos-arm64` install BOTH wheels on arm64 and drive them, and they do
+  # it against the wheels this run BUILT — so that coverage exists even while
+  # `PUBLISH_PYPI_WHEELS` is off, which a PyPI-installing step here could not.
   verify-deployment-arm64:
     name: verify user path on arm64 (user compose + GHCR images)
     needs: [gate, images]
@@ -502,7 +506,7 @@ jobs:
   # did not do; on, nothing here tolerates a failure.
   publish-admin:
     name: publish latiq-admin (PyPI)
-    needs: [gate, publish]
+    needs: [gate, verify, wheels, publish]
     if: needs.gate.outputs.should_publish == 'true' && vars.PUBLISH_ADMIN_WHEEL == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -510,36 +514,18 @@ jobs:
     outputs:
       uploaded: ${{ steps.pypi.outputs.uploaded }}
     steps:
-      - uses: actions/checkout@v4
-      # The same version as the `latiq` wheel and the image from this run: the two
+      - uses: actions/checkout@v4    # for .github/scripts/
+      # Built in `wheels.yml` — for all three platforms, and stamped there to the
+      # same version as the `latiq` wheel and the image from this run: the two
       # wheels are one CLI built two ways, so a user comparing them must not have
-      # to work out which pair of versions goes together.
-      - name: Stamp the admin wheel version
-        run: |
-          sed -i.bak -E 's/^version = "[0-9.]+"/version = "${{ needs.gate.outputs.wheel_version }}"/' sdk/admin/pyproject.toml
-          rm -f sdk/admin/pyproject.toml.bak
-          grep -E '^version = ' sdk/admin/pyproject.toml
-      - uses: PyO3/maturin-action@v1
+      # to work out which pair of versions goes together. The upload stays here
+      # because PyPI's trusted publisher matches this workflow's filename.
+      - uses: actions/download-artifact@v4
         with:
-          command: build
-          target: x86_64
-          # Matching `publish`'s container, for the modern protoc below rather
-          # than for DuckDB's C++ ABI — this build has no DuckDB at all, which is
-          # why it needs no CARGO_BUILD_JOBS cap and takes a fraction of the time.
-          manylinux: "2_28"
-          # No `-m`: `bindings`/`no-default-features` come from the pyproject.toml
-          # in this directory, so the wheel cannot be built with the server
-          # features that the file exists to exclude.
-          working-directory: sdk/admin
-          args: --release -o dist
-          before-script-linux: |
-            set -e
-            command -v unzip >/dev/null 2>&1 || dnf install -y unzip || yum install -y unzip
-            curl -fsSL --retry 5 -o /tmp/protoc.zip \
-              https://github.com/protocolbuffers/protobuf/releases/download/v27.2/protoc-27.2-linux-x86_64.zip
-            unzip -t /tmp/protoc.zip >/dev/null
-            unzip -o /tmp/protoc.zip -d /usr/local
-            protoc --version
+          name: wheels-latiq-admin
+          path: sdk/admin/dist
+      - name: What we are about to publish
+        run: ls -l sdk/admin/dist
       # Same switch as the `latiq` wheel; only the upload is gated, the build
       # (and so the lean-build compile) still happens every night.
       - name: Is PyPI publishing enabled? (PUBLISH_PYPI_WHEELS)
@@ -567,6 +553,11 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/admin/dist
+      - name: Assert PyPI serves every platform for this version
+        if: steps.pypi.outputs.uploaded == 'true'
+        env:
+          V: ${{ needs.gate.outputs.wheel_version }}
+        run: .github/scripts/assert-wheel-platforms.sh pypi latiq-admin "$V"
 
   # Post-publish proof for the channel that REPLACED the installer, mirroring what
   # `verify-published` does for the `latiq` wheel: install `latiq-admin` FROM PyPI

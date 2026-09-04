@@ -49,11 +49,14 @@ are the whole story on an M-series Mac — no `DOCKER_DEFAULT_PLATFORM`, no
 built on a native arm64 runner, so it is a real arm64 binary, not an emulated
 amd64 one.
 
-> The **wheels** are a different story and are not fixed by that: PyPI carries
-> only a `manylinux_2_28_x86_64` build of `latiq`, so `pip install latiq` on an
-> Apple Silicon Mac (or any arm64 host) has no distribution to resolve. Drive the
-> cluster from an amd64 client, or use the MCP endpoint, until arm64/macOS wheels
-> are published.
+> The **wheels** were the same gap, one channel over, and are fixed in CI but not
+> yet on PyPI (#108). Every build now produces manylinux `x86_64` + `aarch64` and
+> macOS `arm64` wheels for both `latiq` and `latiq-admin`, and CI installs and
+> runs them on arm64 — but PyPI still serves only the amd64-only `latiq` 0.1.0
+> (PyPI versions are immutable; uploads are gated off while 0.1.x stabilises).
+> **Until the next version is published**, `pip install latiq` on an arm64 host
+> has nothing to resolve: drive the cluster from an amd64 client, or use the MCP
+> endpoint.
 
 This file is what the nightly's `verify-deployment` job runs against the
 just-published image and wheel — the "the shipped thing actually works" gate —
