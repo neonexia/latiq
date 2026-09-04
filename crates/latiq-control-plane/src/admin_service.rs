@@ -23,8 +23,9 @@
 //! Every handler records its action on the `latiq::access` trace target, with
 //! the same fields as `AgentOps::audit`, so operator actions (create a dataset,
 //! set policy, change a tier) and agent actions land in one searchable stream.
-use crate::error::{to_status, ControlPlaneError};
+use crate::error::{to_status_traced, ControlPlaneError};
 use crate::registry::Registry;
+use crate::trace_meta::trace_id_of;
 use latiq_common::Identity;
 use latiq_proto::v1::admin_server::Admin;
 use latiq_proto::v1::*;
@@ -97,13 +98,17 @@ impl AdminService {
         req: &Request<T>,
         op: &'static str,
         started: Instant,
-    ) -> Result<Identity, Status> {
+    ) -> Result<(Identity, String), Status> {
+        // Read once, here, so the two rejection records below carry it too: a
+        // call turned away at the door is exactly the one an operator wants to
+        // join to whatever the caller did next.
+        let trace = trace_id_of(req);
         let claimed = req
             .metadata()
             .get("latiq-agent-id")
             .and_then(|v| v.to_str().ok());
         let Some(verifier) = self.verifier.as_ref() else {
-            return Ok(Identity::claimed(claimed));
+            return Ok((Identity::claimed(claimed), trace));
         };
         let token = req
             .metadata()
@@ -120,10 +125,11 @@ impl AdminService {
                 "rejected: no token",
                 ERROR,
                 started,
+                &trace,
             );
             return Err(self.unauthenticated("a bearer token is required"));
         };
-        verifier.verify(token, claimed).await.map_err(|e| {
+        let verified = verifier.verify(token, claimed).await.map_err(|e| {
             // Logged in full here, summarised on the wire: the detail is for the
             // operator, and an unauthenticated caller must not be able to probe
             // our issuer list or key endpoints by reading error text.
@@ -135,9 +141,11 @@ impl AdminService {
                 "rejected: invalid token",
                 ERROR,
                 started,
+                &trace,
             );
             self.unauthenticated("the bearer token was rejected")
-        })
+        })?;
+        Ok((verified, trace))
     }
 
     /// The `created_by` to persist on a registry row. A verified subject is
@@ -187,6 +195,7 @@ fn audit(
     summary: &str,
     outcome: &str,
     started: Instant,
+    trace: &str,
 ) {
     tracing::info!(
         target: "latiq::access",
@@ -196,12 +205,16 @@ fn audit(
         verified = identity.verified,        // scopes subject/issuer, NOT agent
         op,
         pond = pond.unwrap_or("-"),
-        // Present, and deliberately always `-`: the field set must be identical
-        // to the pond node's or a `trace_id=` grep would silently skip operator
-        // actions. There is nothing to put in it — an Admin call is answered by
-        // the control plane alone, never forwarded, so it has no second record
-        // on another node to be joined to.
-        trace_id = "-",
+        // The caller's W3C trace id, or `-` where it sent no `traceparent`.
+        //
+        // It used to be hard-coded `-`, on the reasoning that an Admin call is
+        // answered by the control plane alone and so has no second record to
+        // join to. That was true of the RECORD and false of the REQUEST: a
+        // `latiq pond create` is one operator action that becomes a Control
+        // call, a MaterializePond on a pond node, and records on both — and an
+        // operator debugging their own CLI session has every reason to want the
+        // Admin reads around it on the same id.
+        trace_id = if trace.is_empty() { "-" } else { trace },
         duration_ms = started.elapsed().as_millis() as u64,
         summary,
         outcome,                             // ok | error — did it LAND?
@@ -216,9 +229,20 @@ impl Admin for AdminService {
         req: Request<ListNodesRequest>,
     ) -> Result<Response<ListNodesResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "list_nodes", started).await?;
-        let res = self.registry.list_nodes().map_err(to_status);
-        audit(&identity, "list_nodes", None, "", outcome(&res), started);
+        let (identity, trace) = self.identity_of(&req, "list_nodes", started).await?;
+        let res = self
+            .registry
+            .list_nodes()
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
+        audit(
+            &identity,
+            "list_nodes",
+            None,
+            "",
+            outcome(&res),
+            started,
+            &trace,
+        );
         let nodes = res?.into_iter().map(node_info).collect();
         Ok(Response::new(ListNodesResponse { nodes }))
     }
@@ -228,9 +252,12 @@ impl Admin for AdminService {
         req: Request<DescribeNodeRequest>,
     ) -> Result<Response<DescribeNodeResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "describe_node", started).await?;
+        let (identity, trace) = self.identity_of(&req, "describe_node", started).await?;
         let node_id = req.into_inner().node_id;
-        let res = self.registry.describe_node(&node_id).map_err(to_status);
+        let res = self
+            .registry
+            .describe_node(&node_id)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "describe_node",
@@ -238,6 +265,7 @@ impl Admin for AdminService {
             &format!("node={node_id}"),
             outcome(&res),
             started,
+            &trace,
         );
         Ok(Response::new(DescribeNodeResponse {
             node: Some(node_info(res?)),
@@ -249,9 +277,20 @@ impl Admin for AdminService {
         req: Request<PolicyGetRequest>,
     ) -> Result<Response<PolicyGetResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "policy_get", started).await?;
-        let res = self.registry.policy_get().map_err(to_status);
-        audit(&identity, "policy_get", None, "", outcome(&res), started);
+        let (identity, trace) = self.identity_of(&req, "policy_get", started).await?;
+        let res = self
+            .registry
+            .policy_get()
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
+        audit(
+            &identity,
+            "policy_get",
+            None,
+            "",
+            outcome(&res),
+            started,
+            &trace,
+        );
         Ok(Response::new(PolicyGetResponse {
             policy_json: res?.to_string(),
         }))
@@ -262,12 +301,12 @@ impl Admin for AdminService {
         req: Request<PolicySetRequest>,
     ) -> Result<Response<PolicySetResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "policy_set", started).await?;
+        let (identity, trace) = self.identity_of(&req, "policy_set", started).await?;
         let r = req.into_inner();
         let res = self
             .registry
             .policy_set(&r.key, &r.value)
-            .map_err(to_status);
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         // The value is operator-supplied policy, not a secret, and knowing what
         // a setting was changed TO is the point of recording the change.
         audit(
@@ -277,6 +316,7 @@ impl Admin for AdminService {
             &format!("key={} value={}", r.key, r.value),
             outcome(&res),
             started,
+            &trace,
         );
         res?;
         Ok(Response::new(PolicySetResponse {}))
@@ -287,9 +327,20 @@ impl Admin for AdminService {
         req: Request<PondListRequest>,
     ) -> Result<Response<PondListResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "pond_list", started).await?;
-        let listed = self.registry.list_ponds().map_err(to_status);
-        audit(&identity, "pond_list", None, "", outcome(&listed), started);
+        let (identity, trace) = self.identity_of(&req, "pond_list", started).await?;
+        let listed = self
+            .registry
+            .list_ponds()
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
+        audit(
+            &identity,
+            "pond_list",
+            None,
+            "",
+            outcome(&listed),
+            started,
+            &trace,
+        );
         let rows = listed?;
         let mut ponds = Vec::with_capacity(rows.len());
         for row in rows {
@@ -299,7 +350,7 @@ impl Admin for AdminService {
             {
                 Ok(info) => info,
                 Err(ControlPlaneError::PondNotFound(_)) => continue,
-                Err(e) => return Err(to_status(e)),
+                Err(e) => return Err(to_status_traced(e, Some(trace.clone()))),
             };
             ponds.push(PondSummary {
                 pond_id: row.pond_id,
@@ -320,7 +371,7 @@ impl Admin for AdminService {
         req: Request<PondSetTierRequest>,
     ) -> Result<Response<PondSetTierResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "pond_set_tier", started).await?;
+        let (identity, trace) = self.identity_of(&req, "pond_set_tier", started).await?;
         let r = req.into_inner();
         if r.pond.trim().is_empty() {
             audit(
@@ -330,13 +381,14 @@ impl Admin for AdminService {
                 "rejected: pond is required",
                 ERROR,
                 started,
+                &trace,
             );
             return Err(Status::invalid_argument("pond is required"));
         }
         let res = self
             .registry
             .set_pond_tier(&r.pond, &r.tier)
-            .map_err(to_status);
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "pond_set_tier",
@@ -344,6 +396,7 @@ impl Admin for AdminService {
             &format!("tier={}", r.tier),
             outcome(&res),
             started,
+            &trace,
         );
         res?;
         Ok(Response::new(PondSetTierResponse {
@@ -362,7 +415,7 @@ impl Admin for AdminService {
         req: Request<PondForgetRequest>,
     ) -> Result<Response<PondForgetResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "pond_forget", started).await?;
+        let (identity, trace) = self.identity_of(&req, "pond_forget", started).await?;
         let r = req.into_inner();
         if r.pond.trim().is_empty() {
             audit(
@@ -372,6 +425,7 @@ impl Admin for AdminService {
                 "rejected: pond is required",
                 ERROR,
                 started,
+                &trace,
             );
             return Err(Status::invalid_argument("pond is required"));
         }
@@ -386,6 +440,7 @@ impl Admin for AdminService {
                 "rejected: confirm is required",
                 ERROR,
                 started,
+                &trace,
             );
             return Err(Status::invalid_argument(format!(
                 "pond_forget removes the registry record for pond '{}' (its data on the departed \
@@ -393,7 +448,10 @@ impl Admin for AdminService {
                 r.pond
             )));
         }
-        let res = self.registry.forget_pond(&r.pond).map_err(to_status);
+        let res = self
+            .registry
+            .forget_pond(&r.pond)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         // The node is named in the record on purpose: it is where the orphaned
         // files are, and this line may be the only place that is written down.
         audit(
@@ -406,6 +464,7 @@ impl Admin for AdminService {
             },
             outcome(&res),
             started,
+            &trace,
         );
         let f = res?;
         Ok(Response::new(PondForgetResponse {
@@ -421,7 +480,7 @@ impl Admin for AdminService {
         req: Request<DatasetAddRequest>,
     ) -> Result<Response<DatasetAddResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "dataset_add", started).await?;
+        let (identity, trace) = self.identity_of(&req, "dataset_add", started).await?;
         let Some(d) = req.into_inner().dataset else {
             audit(
                 &identity,
@@ -430,6 +489,7 @@ impl Admin for AdminService {
                 "rejected: dataset is required",
                 ERROR,
                 started,
+                &trace,
             );
             return Err(Status::invalid_argument("dataset is required"));
         };
@@ -446,7 +506,10 @@ impl Admin for AdminService {
             created_at: String::new(),
         };
         let dataset_name = row.name.clone();
-        let res = self.registry.add_dataset(&row).map_err(to_status);
+        let res = self
+            .registry
+            .add_dataset(&row)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "dataset_add",
@@ -454,6 +517,7 @@ impl Admin for AdminService {
             &format!("dataset={dataset_name}"),
             outcome(&res),
             started,
+            &trace,
         );
         Ok(Response::new(DatasetAddResponse { name: res? }))
     }
@@ -463,9 +527,12 @@ impl Admin for AdminService {
         req: Request<DatasetRemoveRequest>,
     ) -> Result<Response<DatasetRemoveResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "dataset_remove", started).await?;
+        let (identity, trace) = self.identity_of(&req, "dataset_remove", started).await?;
         let name = req.into_inner().name;
-        let res = self.registry.remove_dataset(&name).map_err(to_status);
+        let res = self
+            .registry
+            .remove_dataset(&name)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "dataset_remove",
@@ -473,6 +540,7 @@ impl Admin for AdminService {
             &format!("dataset={name}"),
             outcome(&res),
             started,
+            &trace,
         );
         res?;
         Ok(Response::new(DatasetRemoveResponse {}))
@@ -483,9 +551,12 @@ impl Admin for AdminService {
         req: Request<DatasetListRequest>,
     ) -> Result<Response<DatasetListResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "dataset_list", started).await?;
+        let (identity, trace) = self.identity_of(&req, "dataset_list", started).await?;
         let query = req.into_inner().query;
-        let res = self.registry.list_datasets(&query).map_err(to_status);
+        let res = self
+            .registry
+            .list_datasets(&query)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "dataset_list",
@@ -493,6 +564,7 @@ impl Admin for AdminService {
             &format!("query={query}"),
             outcome(&res),
             started,
+            &trace,
         );
         let datasets = res?
             .into_iter()
@@ -506,7 +578,7 @@ impl Admin for AdminService {
         req: Request<CatalogAddRequest>,
     ) -> Result<Response<CatalogAddResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "catalog_add", started).await?;
+        let (identity, trace) = self.identity_of(&req, "catalog_add", started).await?;
         let Some(c) = req.into_inner().catalog else {
             audit(
                 &identity,
@@ -515,6 +587,7 @@ impl Admin for AdminService {
                 "rejected: catalog is required",
                 ERROR,
                 started,
+                &trace,
             );
             return Err(Status::invalid_argument("catalog is required"));
         };
@@ -526,6 +599,7 @@ impl Admin for AdminService {
                 &format!("rejected: unknown catalog type {}", c.r#type),
                 ERROR,
                 started,
+                &trace,
             );
             return Err(Status::invalid_argument(format!(
                 "unknown catalog type '{}' (supported: iceberg)",
@@ -546,7 +620,10 @@ impl Admin for AdminService {
         };
         let catalog_name = row.name.clone();
         let catalog_type = row.r#type.clone();
-        let res = self.registry.add_catalog(&row).map_err(to_status);
+        let res = self
+            .registry
+            .add_catalog(&row)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         // Params are already credential-filtered above, but the record still
         // names only the catalog and its type — never the locator values.
         audit(
@@ -556,6 +633,7 @@ impl Admin for AdminService {
             &format!("catalog={catalog_name} type={catalog_type}"),
             outcome(&res),
             started,
+            &trace,
         );
         Ok(Response::new(CatalogAddResponse {
             name: res?,
@@ -568,9 +646,12 @@ impl Admin for AdminService {
         req: Request<CatalogRemoveRequest>,
     ) -> Result<Response<CatalogRemoveResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "catalog_remove", started).await?;
+        let (identity, trace) = self.identity_of(&req, "catalog_remove", started).await?;
         let name = req.into_inner().name;
-        let res = self.registry.remove_catalog(&name).map_err(to_status);
+        let res = self
+            .registry
+            .remove_catalog(&name)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "catalog_remove",
@@ -578,6 +659,7 @@ impl Admin for AdminService {
             &format!("catalog={name}"),
             outcome(&res),
             started,
+            &trace,
         );
         res?;
         Ok(Response::new(CatalogRemoveResponse {}))
@@ -588,9 +670,12 @@ impl Admin for AdminService {
         req: Request<CatalogListRequest>,
     ) -> Result<Response<CatalogListResponse>, Status> {
         let started = Instant::now();
-        let identity = self.identity_of(&req, "catalog_list", started).await?;
+        let (identity, trace) = self.identity_of(&req, "catalog_list", started).await?;
         let query = req.into_inner().query;
-        let res = self.registry.list_catalogs(&query).map_err(to_status);
+        let res = self
+            .registry
+            .list_catalogs(&query)
+            .map_err(|e| to_status_traced(e, Some(trace.clone())));
         audit(
             &identity,
             "catalog_list",
@@ -598,6 +683,7 @@ impl Admin for AdminService {
             &format!("query={query}"),
             outcome(&res),
             started,
+            &trace,
         );
         let catalogs = res?
             .into_iter()

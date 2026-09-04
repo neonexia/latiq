@@ -26,7 +26,7 @@
 //! operator filtering it saw a complete picture of operator activity and a
 //! systematically incomplete one of everything else.
 //!
-//! ## Why this is its own binary (and why the two tests share it)
+//! ## Why this is its own binary (and why the tests share it)
 //!
 //! Capturing `tracing` output needs a subscriber installed as the *process*
 //! default, because callsite interest is cached process-wide the first time a
@@ -44,6 +44,7 @@
 //! token`, which both SURFACES emit within one test.
 mod common;
 
+use latiq_client::LatiqClient;
 use latiq_proto::v1::admin_client::AdminClient;
 use latiq_proto::v1::control_client::ControlClient;
 use latiq_proto::v1::data_client::DataClient;
@@ -477,7 +478,11 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
             .collect()
     };
 
-    let streamed = access("op=\"read_arrow\"");
+    // Narrowed by this test's own VERIFIED subject, not by the RPC alone: the
+    // MCP trace test in this binary also reaches `read_arrow` (a forwarded MCP
+    // read rides the Arrow hop), and its record would otherwise be a legal
+    // answer to this find — the same trap the file's header documents.
+    let streamed = access_rpc("read_arrow", "subject=svc-analyst");
     assert!(
         streamed.contains("outcome=\"ok\""),
         "an established stream is an access that happened, however it ends: {streamed}"
@@ -569,15 +574,23 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
     );
 }
 
-/// A request tagged with the caller's own trace id and agent claim. No token:
-/// this stack runs relaxed (the default), and identity is not what is under
-/// test here.
+/// A request tagged with the caller's own W3C `traceparent` and agent claim. No
+/// token: this stack runs relaxed (the default), and identity is not what is
+/// under test here.
+///
+/// The header is a real `traceparent` — the surfaces parse it strictly and mint
+/// a FRESH trace for anything malformed, so a made-up id would make this test
+/// pass or fail for reasons that have nothing to do with propagation.
 fn traced_req<T>(msg: T, agent: &str, trace_id: &str) -> Request<T> {
     let mut r = Request::new(msg);
     r.metadata_mut()
         .insert("latiq-agent-id", agent.parse().unwrap());
-    r.metadata_mut()
-        .insert("latiq-trace-id", trace_id.parse().unwrap());
+    r.metadata_mut().insert(
+        "traceparent",
+        format!("00-{trace_id}-00f067aa0ba902b7-01")
+            .parse()
+            .unwrap(),
+    );
     r
 }
 
@@ -590,14 +603,16 @@ async fn access_trail_trace_id_ties_a_forwarded_op_to_the_request_that_started_i
     // access trail had no field an operator could follow across the hop.
     //
     // `trace_id` is that field. The client mints one, the greeter scopes it,
-    // the forwarder replays it in `latiq-trace-id`, and the owner records it —
-    // so the owner's record is reachable from the greeter's `forwarding to
+    // the forwarder replays it in the W3C `traceparent`, and the owner records
+    // it — so the owner's record is reachable from the greeter's `forwarding to
     // owner node` log and from the client's own id.
     let captured = captured();
     let stack = common::start_stack_n(2).await;
 
-    const FORWARDED: &str = "trace-forwarded-0001";
-    const DIRECT: &str = "trace-direct-0002";
+    // 32 lowercase hex digits: a W3C trace-id. Distinct in the last digits so a
+    // record carrying the wrong one is obvious in the failure message.
+    const FORWARDED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaa0001";
+    const DIRECT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbb0002";
 
     let mut n0 = DataClient::connect(stack.nodes[0].data_endpoint.clone())
         .await
@@ -610,7 +625,7 @@ async fn access_trail_trace_id_ties_a_forwarded_op_to_the_request_that_started_i
             lineage: false,
         },
         "alice",
-        "trace-allocate-0000",
+        "cccccccccccccccccccccccccccc0000",
     ))
     .await
     .unwrap();
@@ -686,4 +701,205 @@ async fn access_trail_trace_id_ties_a_forwarded_op_to_the_request_that_started_i
             found[0]
         );
     }
+}
+
+/// The join #101 exists for: ONE agent request, and the three records it leaves
+/// behind, all carrying the same id — **on the forwarded path**, where the node
+/// the agent dialled and the node that ran the query are different processes'
+/// worth of logs.
+///
+/// This is the surface that had NO trace at all: `grep -i trace
+/// crates/latiq-mcp/src/` returned zero hits, so every agent call logged
+/// `trace_id="-"`, emitted `traceId: null` in its lineage, and could not be
+/// joined to the node that answered it. Which is backwards — agents are the
+/// audience the product is for, and the gRPC clients were the traced ones.
+///
+/// Nothing here is fabricated: a real MCP client sends a real `traceparent` to a
+/// node that does not own the pond, the request really is forwarded, and the
+/// three ids are read back out of a response, a captured log line and a lineage
+/// file that the run itself produced.
+#[tokio::test]
+async fn access_trail_one_agent_request_joins_its_response_its_log_and_its_lineage() {
+    let captured = captured();
+    let stack = common::start_stack_n(2).await;
+
+    // 32 lowercase hex digits each — real W3C trace ids, because the surfaces
+    // parse strictly and mint a FRESH trace for anything malformed. A made-up
+    // id would make this test pass or fail for reasons unrelated to propagation.
+    const SETUP: &str = "11111111111111111111111111110001";
+    const READ: &str = "22222222222222222222222222220002";
+    const FAILED: &str = "33333333333333333333333333330003";
+    const POND: &str = "traced-mcp";
+
+    // Allocate WITH lineage (fixed at allocate; there is no switching it on) and
+    // create a table, through node 0.
+    let setup = LatiqClient::connect_traced(
+        &stack.nodes[0].mcp_endpoint,
+        Some("tracer".into()),
+        None,
+        Some(format!("00-{SETUP}-00f067aa0ba902b7-01")),
+    )
+    .await
+    .unwrap();
+    let mut args = serde_json::Map::new();
+    args.insert("name".into(), POND.into());
+    args.insert("lineage".into(), true.into());
+    let allocated = setup.call_tool("allocate_pond", args).await.unwrap();
+    assert!(
+        !allocated.is_error,
+        "allocate failed: {:?}",
+        allocated.value
+    );
+    let out = setup
+        .write(POND, "CREATE TABLE t(i INTEGER); INSERT INTO t VALUES (1)")
+        .await
+        .unwrap();
+    assert!(!out.is_error, "write failed: {:?}", out.value);
+    setup.close().await.unwrap();
+
+    // Find the owner, and dial the OTHER node — so the read really crosses a hop.
+    let owner = ControlClient::connect(stack.control_endpoint.clone())
+        .await
+        .unwrap()
+        .get_pond_location(GetPondLocationRequest {
+            pond_ref: POND.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .node_endpoint;
+    let greeter = stack.other_than(&owner);
+    assert_ne!(
+        greeter.data_endpoint, owner,
+        "the agent must dial a node that does NOT own the pond, or the hop this \
+         test is about never happens"
+    );
+
+    let agent = LatiqClient::connect_traced(
+        &greeter.mcp_endpoint,
+        Some("tracer".into()),
+        None,
+        Some(format!("00-{READ}-00f067aa0ba902b7-01")),
+    )
+    .await
+    .unwrap();
+    let read = agent.query(POND, "SELECT i FROM t").await.unwrap();
+    assert!(!read.is_error, "read failed: {:?}", read.value);
+
+    // 1. THE RESPONSE. The greeter answers the agent, so this is the greeter's
+    //    view of the id — and it must be the agent's own, not a fresh one.
+    let meta = &read.value["_meta"];
+    assert_eq!(
+        meta["trace_id"].as_str(),
+        Some(READ),
+        "the agent must be able to cite the id of its own request: {meta}"
+    );
+    assert_eq!(
+        meta["served_by"].as_str(),
+        Some(owner.as_str()),
+        "and this must be the FORWARDED case — the owner ran it, the greeter \
+         answered: {meta}"
+    );
+
+    // 2. THE LOGS, on BOTH SIDES of the hop — the half the issue is really
+    //    about. The greeter and the owner are separate node instances with
+    //    separate scopes; the only thing that can make them agree is the
+    //    `traceparent` the greeter stamped on the forward.
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+
+    // The GREETER: an MCP span it entered for this request (it entered none at
+    // all before #101 — `grep -i trace crates/latiq-mcp/src/` was empty), on the
+    // line where it decides to forward.
+    let forwarded = log
+        .lines()
+        .filter(|l| l.contains("forwarding to owner node"))
+        .find(|l| l.contains(&format!("mcp{{name=\"read_query\" trace_id={READ}}}")))
+        .unwrap_or_else(|| panic!("the greeter's MCP span must carry {READ}:\n{log}"));
+    assert!(
+        forwarded.contains(&format!("endpoint=\"{owner}\"")),
+        "and it must be forwarding to the pond's actual owner: {forwarded}"
+    );
+
+    // The OWNER: the access record, written by the node that ran the query (the
+    // greeter returns before its own audit, so attribution stays there). Its op
+    // is `read_arrow`, not `read_query` — a forwarded read rides the Arrow hop —
+    // which is exactly why an operator needs the ID rather than the op name to
+    // follow one request across the two.
+    let record = log
+        .lines()
+        .filter(|l| l.contains("latiq::access") && l.contains("op=\"read_arrow\""))
+        .find(|l| l.contains(&format!("trace_id=\"{READ}\"")))
+        .unwrap_or_else(|| {
+            panic!("no access record on the owner carries the agent's id {READ}:\n{log}")
+        });
+    assert!(
+        record.contains("outcome=\"ok\"") && record.contains("agent=tracer"),
+        "and it is the record of the read that landed: {record}"
+    );
+    assert!(
+        record.contains("summary=\"SELECT i FROM t\""),
+        "and of THIS read, not another test's: {record}"
+    );
+
+    // 3. THE LINEAGE, written by the owner's emitter from the same scope. Read
+    //    it back through the agent's own tool rather than off disk: this is the
+    //    id an agent asking "where did this come from?" actually gets.
+    let mut page_args = serde_json::Map::new();
+    page_args.insert("pond".into(), POND.into());
+    let page = agent.call_tool("get_lineage", page_args).await.unwrap();
+    assert!(!page.is_error, "get_lineage failed: {:?}", page.value);
+    let events = page.value["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a lineage page has events: {}", page.value));
+    let traced: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["run"]["facets"]["latiq_query"]["traceId"].as_str() == Some(READ))
+        .collect();
+    assert!(
+        !traced.is_empty(),
+        "the read's lineage must carry the agent's id — it used to be null for \
+         every MCP call: {events:#?}"
+    );
+    assert!(
+        traced
+            .iter()
+            .any(|e| e["run"]["facets"]["latiq_query"]["op"].as_str() == Some("read_arrow")),
+        "and specifically the run of THIS read — recorded under the op the owner \
+         actually executed, which is the Arrow hop: {traced:#?}"
+    );
+
+    // 4. A FAILED call cites its id too. An agent that cannot name the request
+    //    that failed cannot ask anyone about it — which is the whole reason the
+    //    field is on the envelope and not only in our logs.
+    let failing = LatiqClient::connect_traced(
+        &greeter.mcp_endpoint,
+        Some("tracer".into()),
+        None,
+        Some(format!("00-{FAILED}-00f067aa0ba902b7-01")),
+    )
+    .await
+    .unwrap();
+    let err = failing
+        .query(POND, "SELECT * FROM no_such_table")
+        .await
+        .unwrap();
+    assert!(err.is_error, "the statement must fail: {:?}", err.value);
+    assert_eq!(
+        err.value["kind"].as_str(),
+        Some("catalog_error"),
+        "asserting the kind, so this cannot pass for an unrelated failure: {}",
+        err.value
+    );
+    assert_eq!(
+        err.value["trace_id"].as_str(),
+        Some(FAILED),
+        "the envelope must carry the failed request's own id: {}",
+        err.value
+    );
+    // A different id from the successful read, so a constant — or an id copied
+    // from the wrong request — is visible here.
+    assert_ne!(err.value["trace_id"].as_str(), Some(READ));
+
+    agent.close().await.unwrap();
+    failing.close().await.unwrap();
 }

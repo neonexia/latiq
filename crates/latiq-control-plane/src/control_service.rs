@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Control gRPC service (pond-nodes call this).
-use crate::error::{to_status, ControlPlaneError};
+use crate::error::{to_status, to_status_traced, ControlPlaneError};
 use crate::node_client::{CallerAuth, NodeMaterializer};
 use crate::registry::Registry;
 use latiq_proto::v1::control_server::Control;
@@ -86,6 +86,14 @@ impl ControlService {
             } else {
                 None
             },
+            // The node hop dropped the trace entirely, so a `pond create` — one
+            // caller action that becomes a Control call here and a
+            // MaterializePond over there — could not be followed across the two
+            // processes. That is the single most useful trace in the system to
+            // have, because it is the one place the control plane is allowed to
+            // touch a node at all. Minted when the caller sent none, since an
+            // id we propagate IS a correlation even if we invented it.
+            traceparent: Some(crate::trace_meta::trace_of(req).traceparent()),
         }
     }
 
@@ -98,7 +106,14 @@ impl ControlService {
     /// for, so it is said out loud in both directions: an `error!` an operator
     /// can grep for with the pond id in it, and a different `suggest` for the
     /// caller, who must not be told to retry a name that may still be taken.
-    fn compensate(&self, pond_id: &str, name: &str, owner: &str, cause: String) -> Status {
+    fn compensate(
+        &self,
+        pond_id: &str,
+        name: &str,
+        owner: &str,
+        cause: String,
+        trace_id: Option<String>,
+    ) -> Status {
         let compensated = match self.registry.drop_pond(pond_id) {
             Ok(()) => true,
             Err(e) => {
@@ -114,12 +129,18 @@ impl ControlService {
                 false
             }
         };
-        to_status(ControlPlaneError::AllocationNotMaterialized {
-            name: name.to_string(),
-            owner: owner.to_string(),
-            cause,
-            compensated,
-        })
+        // Stamped, unlike the pure registry reads around it: this is the ONE
+        // control-plane failure that happened on another process, so the id is
+        // the only way its caller reaches the node's side of the story.
+        to_status_traced(
+            ControlPlaneError::AllocationNotMaterialized {
+                name: name.to_string(),
+                owner: owner.to_string(),
+                cause,
+                compensated,
+            },
+            trace_id,
+        )
     }
 }
 
@@ -172,6 +193,14 @@ impl Control for ControlService {
         req: Request<CreatePondAssignmentRequest>,
     ) -> Result<Response<CreatePondAssignmentResponse>, Status> {
         let caller = self.caller_auth(&req, &req.get_ref().owner_identity);
+        // The id the node hop will carry, kept so a failure can name it too — a
+        // caller told "the node could not materialise this" needs the id to find
+        // out WHY on that node.
+        let trace_id = caller
+            .traceparent
+            .as_deref()
+            .and_then(latiq_common::TraceContext::parse)
+            .map(|c| c.trace_id().to_string());
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -209,12 +238,13 @@ impl Control for ControlService {
                     &pond.name,
                     &pond.node_id,
                     format!("the registry can no longer say where it was placed: {e}"),
+                    trace_id,
                 ))
             }
         };
         if let Some(m) = &self.materializer {
             if let Err(cause) = m.materialize(&endpoint, &pond.pond_id, &caller).await {
-                return Err(self.compensate(&pond.pond_id, &pond.name, &endpoint, cause));
+                return Err(self.compensate(&pond.pond_id, &pond.name, &endpoint, cause, trace_id));
             }
         }
         Ok(Response::new(CreatePondAssignmentResponse {

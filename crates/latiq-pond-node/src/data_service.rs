@@ -20,7 +20,7 @@
 //! whose code derives from the ErrorKind and whose `details` carry the
 //! JSON-encoded `ErrorEnvelope` (so the client can render kind/suggest/see).
 use crate::wire::query_value;
-use latiq_agent_core::{AgentError, AgentOps};
+use latiq_agent_core::{current_trace_id, AgentError, AgentOps, TraceContext};
 use latiq_auth::Verifier;
 use latiq_common::{ErrorKind, Identity};
 use latiq_proto::v1::data_server::Data;
@@ -173,7 +173,13 @@ fn record_rejection(claimed: Option<&str>, op: &'static str, summary: &str) {
 }
 
 pub(crate) fn to_status(e: AgentError) -> Status {
-    let env = e.into_envelope();
+    // Stamped HERE, at the edge, from the ambient scope rather than at each of
+    // the ~40 places an `AgentError` is built: a construction site deep in the
+    // core would have to remember to, and the one that forgot would return an
+    // envelope a caller cannot cite. An error decoded from a peer already
+    // carries the id (the same one — it is the same request), so this is a
+    // no-op on the forwarded path rather than an overwrite.
+    let env = e.into_envelope().with_trace_id(current_trace_id());
     let code = match env.kind {
         ErrorKind::PondNotFound => Code::NotFound,
         ErrorKind::NameConflict => Code::AlreadyExists,
@@ -220,30 +226,35 @@ fn json_resp(value: serde_json::Value) -> Response<JsonResponse> {
     })
 }
 
-/// The request's trace id (`latiq-trace-id` metadata), or a fresh one. Propagated
-/// node-to-node by the forwarder so a request's spans correlate across nodes.
-pub(crate) fn trace_id_of<T>(req: &Request<T>) -> String {
-    req.metadata()
-        .get("latiq-trace-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(latiq_agent_core::new_trace_id)
+/// The request's W3C trace context, from its `traceparent` metadata, or a fresh
+/// trace when it carried none we could honour. Propagated node-to-node by the
+/// forwarder so a request's spans correlate across nodes.
+///
+/// The header is attribution-grade, never authority-grade — the same standing as
+/// `latiq-agent-id` (root invariant 9). We record and propagate it; no access
+/// decision reads it.
+pub(crate) fn trace_of<T>(req: &Request<T>) -> TraceContext {
+    TraceContext::inbound(
+        req.metadata()
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok()),
+    )
 }
 
-/// Run a handler body under the request's trace id + a span, so AgentOps logs
-/// carry the id and the forwarder can read it for the node-to-node hop. The
-/// caller's bearer token rides the same scope, for the same reason
-/// (`latiq_agent_core::bearer` — shared with the MCP adapter, which forwards
-/// through the same `AgentOps`).
+/// Run a handler body under the request's trace context + a span, so AgentOps
+/// logs carry the id and every outbound hop can read it. The caller's bearer
+/// token rides the same scope, for the same reason (`latiq_agent_core::bearer` —
+/// shared with the MCP adapter, which forwards through the same `AgentOps`).
 pub(crate) async fn traced<T>(
     name: &'static str,
-    tid: String,
+    ctx: TraceContext,
     bearer: Option<String>,
     fut: impl std::future::Future<Output = T>,
 ) -> T {
     use tracing::Instrument;
-    let inner = latiq_agent_core::with_trace_id(
-        tid.clone(),
+    let tid = ctx.trace_id().to_string();
+    let inner = latiq_agent_core::with_trace(
+        ctx,
         fut.instrument(tracing::info_span!("rpc", name, trace_id = %tid)),
     );
     latiq_agent_core::with_bearer(bearer, inner).await
@@ -262,7 +273,7 @@ impl Data for DataService {
         // authenticated deployment would allocate fine on the local node and
         // fail with `Unauthenticated` the moment placement picked a peer.
         let (id, tok) = self.identity(&req, "allocate_pond").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let name = if r.name.is_empty() {
             None
@@ -304,7 +315,7 @@ impl Data for DataService {
         req: Request<MaterializePondRequest>,
     ) -> Result<Response<MaterializePondResponse>, Status> {
         let (id, tok) = self.identity(&req, "materialize_pond").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("materialize_pond", tid, tok, async move {
@@ -321,7 +332,7 @@ impl Data for DataService {
         req: Request<DropPondRequest>,
     ) -> Result<Response<DropPondResponse>, Status> {
         let (id, tok) = self.identity(&req, "drop_pond").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("drop_pond", tid, tok, async move {
@@ -338,7 +349,7 @@ impl Data for DataService {
         req: Request<DescribePondRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "describe_pond").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("describe_pond", tid, tok, async move {
@@ -353,7 +364,7 @@ impl Data for DataService {
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "read_query").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         // Reads ride the Arrow internal hop, collected to JSON here at the edge.
@@ -372,7 +383,7 @@ impl Data for DataService {
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "write_query").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("write_query", tid, tok, async move {
@@ -390,7 +401,7 @@ impl Data for DataService {
         req: Request<QueryRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "explain_query").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("explain_query", tid, tok, async move {
@@ -408,7 +419,7 @@ impl Data for DataService {
         req: Request<LoadDatasetRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "load_dataset").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("load_dataset", tid, tok, async move {
@@ -426,7 +437,7 @@ impl Data for DataService {
         req: Request<CatalogPullRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "catalog_pull").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("catalog_pull", tid, tok, async move {
@@ -453,7 +464,7 @@ impl Data for DataService {
         req: Request<GetLineageRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "get_lineage").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("get_lineage", tid, tok, async move {
@@ -477,7 +488,7 @@ impl Data for DataService {
         req: Request<CatalogDescribeRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
         let (id, tok) = self.identity(&req, "catalog_describe").await?;
-        let tid = trace_id_of(&req);
+        let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         traced("catalog_describe", tid, tok, async move {

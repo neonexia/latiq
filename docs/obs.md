@@ -57,9 +57,14 @@ which does not own the pond is forwarded, and it is the **owner** that records
 it (the greeter returns before its own audit, so attribution stays on the node
 that ran the op) — under the trace id the client's request carried, which the
 greeter propagates. Without that field the record sits on a node the client
-never dialled with nothing tying it back to the request that caused it. `trace_id="-"` where there is no trace scope to inherit: the control
-plane's Admin surface (it answers alone and never forwards) and auth rejections
-(recorded at the door, before the handler enters the scope).
+never dialled with nothing tying it back to the request that caused it.
+`trace_id="-"` only where there is no trace to inherit: an Admin call whose
+caller sent no `traceparent`, and auth rejections (recorded at the door, before
+the handler enters the scope).
+
+Note that the **op can change across the hop**: an agent's `read_query` reaches
+the owner as `read_arrow`, because a forwarded read rides the Arrow stream. The
+id is what joins the two records; the op name is not.
 
 ```bash
 # tail just the access trail
@@ -72,11 +77,30 @@ jq 'select(.target == "latiq::access" and .fields.agent == "agent-x")'
 
 ## 2. Tracing (request correlation)
 
-Each request gets a `trace_id` (from an incoming `latiq-trace-id` gRPC metadata
-header, or freshly generated at the edge). It is set as a task-local span field
-for the whole request and **propagated across the node-to-node forward hop** (the
-greeter stamps `latiq-trace-id` on its call to the owner). So one request's spans
-share a `trace_id` across nodes — and so does the access record the owner writes.
+Latiq speaks **W3C Trace Context**. Send a standard `traceparent` — an HTTP
+header on MCP, gRPC metadata on Data/Stream/Admin — and every record Latiq writes
+for that request carries its `trace_id` (32 hex digits). Send none and one is
+minted at the edge. One spelling on every surface, so an existing collector or
+agent orchestrator needs no adapter.
+
+The context is a task-local for the whole request, and is stamped back onto every
+outbound hop: the node-to-node forward, the node → control-plane call, and the
+control plane → node call that materialises a pond. So one request's spans share
+a `trace_id` across processes — and so do the access record the owner writes and
+the OpenLineage events it emits.
+
+An inbound `traceparent` is **attribution-grade, not authority-grade**: it is
+recorded and propagated, never consulted for an access decision, and a malformed
+one is replaced rather than refused (a trace id is not worth failing a query
+over). The span id is always Latiq's own, so a caller cannot forge our spans.
+
+**The id comes back to the caller**, which is what makes it usable from the agent
+side rather than only from the log stack:
+
+- `_meta.trace_id` on every query result.
+- `trace_id` on the `ErrorEnvelope` of every failed call — an agent that cannot
+  cite the id of its own failed request cannot ask anyone about it.
+- `run.facets.latiq_query.traceId` on every OpenLineage event.
 
 The response says who ran it: `_meta.served_by` on every query result names the
 node that **actually executed** the statement (its advertised internal endpoint,
@@ -85,11 +109,21 @@ OWNER, not the node the client dialled — the cheapest way to see, from the cli
 side, which node did the work. The Arrow stream carries the same value on its
 first chunk.
 
-**Correlate a request across nodes** by that id in your log stack:
+**Correlate a request across nodes** by the `trace_id` — the one on the span, on
+the access record, on the response's `_meta`, and on the envelope of a failure.
+It is `served_by`'s complement, not the same thing: `served_by` says WHICH node
+ran one statement, `trace_id` gathers EVERY record of one request wherever it
+landed.
+
 ```bash
-# in a JSON log stream
-jq 'select(.spans[]?.trace_id == "16d7e16e-a6bc-484b-954f-a611ba1e1ada")'
+# every record of one request, on every node, whatever the op was called there
+jq 'select(.fields.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")'
+# or by the enclosing span, which carries it too
+jq 'select(.spans[]?.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736")'
 ```
+
+Start from an id you were handed: `_meta.trace_id` on a slow result, or
+`trace_id` on the error an agent is stuck on.
 
 OTLP export to a collector (Jaeger/Tempo) is a planned add-on; today the trace id
 lives in the structured logs.

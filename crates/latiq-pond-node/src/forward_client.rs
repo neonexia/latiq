@@ -107,9 +107,13 @@ fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
             req.metadata_mut().insert("authorization", v);
         }
     }
-    if let Some(tid) = latiq_agent_core::current_trace_id() {
-        if let Ok(v) = MetadataValue::try_from(tid.as_str()) {
-            req.metadata_mut().insert("latiq-trace-id", v);
+    // W3C `traceparent`, the one spelling every surface uses. The owner records
+    // the op (the greeter returns before its own audit), so without this the
+    // access record on the node the client never dialled has nothing tying it
+    // back to the request that caused it.
+    if let Some(tp) = latiq_agent_core::current_traceparent() {
+        if let Ok(v) = MetadataValue::try_from(tp.as_str()) {
+            req.metadata_mut().insert("traceparent", v);
         }
     }
     req

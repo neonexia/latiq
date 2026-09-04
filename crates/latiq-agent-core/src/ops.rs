@@ -1492,6 +1492,10 @@ impl AgentOps {
         // one the caller must see. Assigning `self.serving_name()` here is exactly
         // the bug the field exists to catch.
         meta.served_by = served_by;
+        // From THIS scope, not from the peer's meta: the id is identical on both
+        // sides of a forward, and a stream that carried no meta at all (a peer's
+        // chunks) must still be able to tell the caller which request it was.
+        meta.trace_id = crate::trace::current_trace_id().unwrap_or_default();
         Ok(QueryResult {
             columns,
             rows,
@@ -1679,6 +1683,10 @@ impl AgentOps {
         // on every success is what makes a clamp visible — an agent that asked
         // for 30 minutes on a node capped at 5 can see it got 5.
         qr.meta.timeout_ms = deadline.effective_ms();
+        // Unlike the two above, this one is the SAME on both sides of a hop —
+        // that is what a trace id is for — so it is read from the ambient scope
+        // rather than being carefully preserved from the peer's meta.
+        qr.meta.trace_id = crate::trace::current_trace_id().unwrap_or_default();
         Ok(qr)
     }
 

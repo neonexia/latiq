@@ -19,6 +19,8 @@ pub mod identity;
 pub use identity::Identity;
 pub mod error;
 pub use error::{Audience, ErrorEnvelope, ErrorKind, Fact, Facts, Location, Retryable};
+pub mod trace;
+pub use trace::TraceContext;
 pub mod meta;
 pub use meta::{DatasetField, DatasetRef, QueryMeta, Warning, WarningKind};
 pub mod timeout;

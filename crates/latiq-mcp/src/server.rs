@@ -266,6 +266,11 @@ fn reject_zero(field: &str, value: Option<u64>) -> Option<CallToolResult> {
 /// key on the Data surface, so one deployment has one spelling.
 const AGENT_ID_HEADER: &str = "latiq-agent-id";
 
+/// The W3C Trace Context header. Standard-spelled, and the SAME name the gRPC
+/// surfaces read as metadata — one deployment, one spelling, so an operator
+/// greps one thing and an external collector already understands it.
+const TRACEPARENT_HEADER: &str = "traceparent";
+
 /// RFC 9728's fixed location for the protected-resource metadata document.
 pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
 
@@ -335,6 +340,52 @@ impl LatiqServer {
             .map(|c| (c.identity, Some(c.token)))
             .ok_or_else(|| McpError::invalid_request("a bearer token is required", None))
     }
+
+    /// Run one tool handler inside this request's **trace scope**, its span, and
+    /// its bearer scope — the MCP twin of the Data surface's `traced`.
+    ///
+    /// This surface entered no trace scope at all until #101, which is exactly
+    /// backwards for the one audience the product is built for: every agent call
+    /// logged `trace_id="-"` on the access trail, emitted `traceId: null` in its
+    /// lineage, and a forwarded agent query could not be joined to the node that
+    /// actually ran it. All three read from the same ambient scope, so all three
+    /// are fixed by entering it once, here, rather than by threading an id
+    /// through thirteen handlers.
+    ///
+    /// The bearer scope was already per-handler and is folded in so a handler
+    /// cannot acquire one without the other.
+    async fn traced<T>(
+        &self,
+        name: &'static str,
+        ctx: &RequestContext<RoleServer>,
+        bearer: Option<String>,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        use tracing::Instrument;
+        let trace = trace_of(ctx);
+        let tid = trace.trace_id().to_string();
+        let inner = latiq_agent_core::with_trace(
+            trace,
+            fut.instrument(tracing::info_span!("mcp", name, trace_id = %tid)),
+        );
+        with_bearer(bearer, inner).await
+    }
+}
+
+/// This request's W3C trace context, from the `traceparent` HTTP header, or a
+/// fresh trace when it carried none we could honour.
+///
+/// Attribution-grade, never authority-grade — the same standing as
+/// `latiq-agent-id` (invariant 9): recorded and propagated, never read for an
+/// access decision. rmcp injects the request's `http::request::Parts` on the
+/// POST path, which is where every tool call lands.
+fn trace_of(ctx: &RequestContext<RoleServer>) -> latiq_agent_core::TraceContext {
+    latiq_agent_core::TraceContext::inbound(
+        ctx.extensions
+            .get::<http::request::Parts>()
+            .and_then(|p| p.headers.get(TRACEPARENT_HEADER))
+            .and_then(|v| v.to_str().ok()),
+    )
 }
 
 /// The outcome of verifying one request's bearer token, handed from the auth
@@ -583,17 +634,18 @@ See latiq://guidance.",
                 ))
             }
         };
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .allocate_pond(&id, a.name, "{}", tier, &exts, a.lineage.unwrap_or(false))
-                .await
-            {
-                Ok(r) => ok(&r),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("allocate_pond", &ctx, tok, async {
+                match self
+                    .ops
+                    .allocate_pond(&id, a.name, "{}", tier, &exts, a.lineage.unwrap_or(false))
+                    .await
+                {
+                    Ok(r) => ok(&r),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Describe a pond: its metadata + a summary of its tables. Pass pond id or name.
@@ -616,13 +668,14 @@ To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self.ops.describe_pond(&id, &a.pond).await {
-                Ok(r) => ok(&r),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("describe_pond", &ctx, tok, async {
+                match self.ops.describe_pond(&id, &a.pond).await {
+                    Ok(r) => ok(&r),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// List all ponds in the deployment.
@@ -643,13 +696,14 @@ Follow with describe_pond on a candidate to inspect its tables.",
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self.ops.list_ponds(&id).await {
-                Ok(ponds) => ok(&ListPondsResponse { ponds }),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("list_ponds", &ctx, tok, async {
+                match self.ops.list_ponds(&id).await {
+                    Ok(ponds) => ok(&ListPondsResponse { ponds }),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Drop a pond and reclaim its storage. Destructive.
@@ -670,20 +724,21 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .drop_pond(&id, &a.pond, a.confirm.unwrap_or(false))
-                .await
-            {
-                Ok(()) => ok(&DropPondResponse {
-                    status: "dropped".into(),
-                    pond: a.pond.clone(),
-                }),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("drop_pond", &ctx, tok, async {
+                match self
+                    .ops
+                    .drop_pond(&id, &a.pond, a.confirm.unwrap_or(false))
+                    .await
+                {
+                    Ok(()) => ok(&DropPondResponse {
+                        status: "dropped".into(),
+                        pond: a.pond.clone(),
+                    }),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Run a read-only SQL query (SELECT / read-only metadata) against a pond.
@@ -713,17 +768,18 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
         }
         let controls = query_controls(&a, &ctx);
         // Reads ride the Arrow internal hop, collected to the neutral result here.
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .read_collected_with(&id, &a.pond, &a.sql, controls)
-                .await
-            {
-                Ok(qr) => ok_query("read_query", qr),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("read_query", &ctx, tok, async {
+                match self
+                    .ops
+                    .read_collected_with(&id, &a.pond, &a.sql, controls)
+                    .await
+                {
+                    Ok(qr) => ok_query("read_query", qr),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Run a write/DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/CTAS) against a
@@ -755,17 +811,18 @@ Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements 
             return Ok(refusal);
         }
         let controls = query_controls(&a, &ctx);
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .write_query_with(&id, &a.pond, &a.sql, controls)
-                .await
-            {
-                Ok(qr) => ok_query("write_query", qr),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("write_query", &ctx, tok, async {
+                match self
+                    .ops
+                    .write_query_with(&id, &a.pond, &a.sql, controls)
+                    .await
+                {
+                    Ok(qr) => ok_query("write_query", qr),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Estimate a query's cost without running it. Call before read/write_query to
@@ -794,13 +851,14 @@ Read-only and side-effect-free.",
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self.ops.explain_query(&id, &a.pond, &a.sql).await {
-                Ok(er) => ok_explain(er),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("explain_query", &ctx, tok, async {
+                match self.ops.explain_query(&id, &a.pond, &a.sql).await {
+                    Ok(er) => ok_explain(er),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Discover curated datasets (simple public files) you can copy into a pond.
@@ -827,17 +885,18 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
         // every other tool, so this stays symmetric with the Data surface
         // rather than relying on "this one happens never to forward".
         let (_id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .list_datasets(a.query.as_deref().unwrap_or(""))
-                .await
-            {
-                Ok(datasets) => ok(&ListDatasetsResponse { datasets }),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("list_datasets", &ctx, tok, async {
+                match self
+                    .ops
+                    .list_datasets(a.query.as_deref().unwrap_or(""))
+                    .await
+                {
+                    Ok(datasets) => ok(&ListDatasetsResponse { datasets }),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Copy a dataset's tables into a pond, under a schema named after the dataset. Pick a name from list_datasets.
@@ -860,13 +919,14 @@ This is a WRITE (it creates a schema + tables, attributed to you). For an extern
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self.ops.load_dataset(&id, &a.pond, &a.dataset).await {
-                Ok(r) => ok(&r),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("load_dataset", &ctx, tok, async {
+                match self.ops.load_dataset(&id, &a.pond, &a.dataset).await {
+                    Ok(r) => ok(&r),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Discover registered external catalogs (iceberg/…) you can pull data from.
@@ -891,17 +951,18 @@ Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sour
         // Required + scoped for the same reasons as list_datasets, though no
         // identity reaches the op.
         let (_id, tok) = self.identity(&ctx)?;
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .list_catalogs(a.query.as_deref().unwrap_or(""))
-                .await
-            {
-                Ok(catalogs) => ok(&ListCatalogsResponse { catalogs }),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("list_catalogs", &ctx, tok, async {
+                match self
+                    .ops
+                    .list_catalogs(a.query.as_deref().unwrap_or(""))
+                    .await
+                {
+                    Ok(catalogs) => ok(&ListCatalogsResponse { catalogs }),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// List an external catalog's tables (transient attach on a pond). Pass creds via `set`.
@@ -925,23 +986,24 @@ If a credential is missing the attach fails with a clear error — read it and r
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
         let set = a.set.unwrap_or_default().into_iter().collect();
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .catalog_describe(&id, &a.pond, &a.catalog, set)
-                .await
-            {
-                Ok(tables) => ok(&DescribeCatalogResponse {
-                    catalog: a.catalog.clone(),
-                    tables: tables
-                        .into_iter()
-                        .map(|(schema, table)| CatalogTableRef { schema, table })
-                        .collect(),
-                }),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("describe_catalog", &ctx, tok, async {
+                match self
+                    .ops
+                    .catalog_describe(&id, &a.pond, &a.catalog, set)
+                    .await
+                {
+                    Ok(tables) => ok(&DescribeCatalogResponse {
+                        catalog: a.catalog.clone(),
+                        tables: tables
+                            .into_iter()
+                            .map(|(schema, table)| CatalogTableRef { schema, table })
+                            .collect(),
+                    }),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Pull a subset of an external catalog into a pond: transient attach → your query → detach.
@@ -965,17 +1027,18 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
         let set = a.set.unwrap_or_default().into_iter().collect();
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .catalog_pull(&id, &a.pond, &a.catalog, &a.query, set)
-                .await
-            {
-                Ok(r) => ok(&r),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("pull_catalog", &ctx, tok, async {
+                match self
+                    .ops
+                    .catalog_pull(&id, &a.pond, &a.catalog, &a.query, set)
+                    .await
+                {
+                    Ok(r) => ok(&r),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 
     /// Read the pond's OpenLineage trail — canonical events, newest first.
@@ -1010,17 +1073,18 @@ A record, not proof: these are files in the pond, reachable by anything that can
         // because "how much of an agent's context may one answer cost" is a
         // question about this surface's audience.
         let limit = a.limit.unwrap_or(DEFAULT_LINEAGE_LIMIT) as usize;
-        Ok(with_bearer(tok, async {
-            match self
-                .ops
-                .get_lineage(&id, &a.pond, limit, a.since.as_deref(), a.before.as_deref())
-                .await
-            {
-                Ok(page) => ok(&page),
-                Err(e) => err_envelope(e.envelope()),
-            }
-        })
-        .await)
+        Ok(self
+            .traced("get_lineage", &ctx, tok, async {
+                match self
+                    .ops
+                    .get_lineage(&id, &a.pond, limit, a.since.as_deref(), a.before.as_deref())
+                    .await
+                {
+                    Ok(page) => ok(&page),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
     }
 }
 

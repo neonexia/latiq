@@ -20,6 +20,7 @@ pub mod error;
 pub mod migrations;
 pub mod node_client;
 pub mod registry;
+mod trace_meta;
 pub use error::ControlPlaneError;
 pub use registry::Registry;
 

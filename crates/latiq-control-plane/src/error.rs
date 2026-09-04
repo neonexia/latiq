@@ -200,8 +200,20 @@ impl ControlPlaneError {
 /// `details` (same contract as the Data gRPC), so the CLI renders guidance — not
 /// a bare ref — on every Control/Admin call.
 pub fn to_status(e: ControlPlaneError) -> Status {
+    to_status_traced(e, None)
+}
+
+/// As [`to_status`], stamping the request's trace id on the envelope so the
+/// caller can cite the id of its own failed call.
+///
+/// A separate entry point rather than an ambient read: the control plane keeps
+/// no trace scope (see `trace_meta`), so the id has to arrive from the handler
+/// that read it off the request.
+pub fn to_status_traced(e: ControlPlaneError, trace_id: Option<String>) -> Status {
     let code = e.code();
-    let env = e.envelope();
+    let env = e
+        .envelope()
+        .with_trace_id(trace_id.filter(|t| !t.is_empty()));
     let details = serde_json::to_vec(&env).unwrap_or_default();
     Status::with_details(code, env.message.clone(), details.into())
 }

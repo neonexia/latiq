@@ -19,8 +19,15 @@ use latiq_engine::EngineError;
 /// The core's one error type: a newtype over [`ErrorEnvelope`], so an error that
 /// crosses a node hop or a surface boundary keeps the kind and guidance it was
 /// created with rather than being re-derived at each layer.
+///
+/// **Boxed**, so `AgentError` is one pointer wide. Nearly every method in this
+/// crate returns `Result<_, AgentError>`, and the envelope grew past clippy's
+/// `result_large_err` threshold when it gained `facts` and `trace_id` — which is
+/// the lint working: an error carried by value in every `Result` in the system
+/// makes the SUCCESS path pay for the failure path's size. An error is cold, so
+/// the indirection costs nothing that matters.
 #[derive(Debug, Clone)]
-pub struct AgentError(ErrorEnvelope);
+pub struct AgentError(Box<ErrorEnvelope>);
 
 impl AgentError {
     pub fn new(
@@ -29,14 +36,14 @@ impl AgentError {
         suggest: impl Into<String>,
         see: impl Into<String>,
     ) -> Self {
-        AgentError(ErrorEnvelope::new(kind, message, suggest, see))
+        AgentError(Box::new(ErrorEnvelope::new(kind, message, suggest, see)))
     }
 
     /// Wrap an already-built envelope (e.g. one decoded from a gRPC `Status`'s
     /// details, or produced by `ControlPlaneError::envelope()`), so every surface
     /// carries the same guidance rather than re-deriving it.
     pub fn from_envelope(env: ErrorEnvelope) -> Self {
-        AgentError(env)
+        AgentError(Box::new(env))
     }
 
     pub fn envelope(&self) -> &ErrorEnvelope {
@@ -44,7 +51,7 @@ impl AgentError {
     }
 
     pub fn into_envelope(self) -> ErrorEnvelope {
-        self.0
+        *self.0
     }
 
     /// Build from `kind`'s canonical suggest/see defaults (the single source in
@@ -53,13 +60,13 @@ impl AgentError {
     /// For a message that quotes a number or a name, use [`Self::rendered`]
     /// instead: it renders the sentence FROM the facts, so the two cannot drift.
     pub fn of_kind(kind: ErrorKind, message: impl Into<String>) -> Self {
-        AgentError(ErrorEnvelope::for_kind(kind, message))
+        AgentError(Box::new(ErrorEnvelope::for_kind(kind, message)))
     }
 
     /// Build from `kind`'s canonical guidance with a message rendered from
     /// `facts` — see [`ErrorEnvelope::rendered`].
     pub fn rendered(kind: ErrorKind, template: &str, facts: Facts) -> Self {
-        AgentError(ErrorEnvelope::rendered(kind, template, facts))
+        AgentError(Box::new(ErrorEnvelope::rendered(kind, template, facts)))
     }
 
     /// As [`Self::rendered`] with bespoke `suggest`/`see`, both rendered from
@@ -71,9 +78,9 @@ impl AgentError {
         suggest: &str,
         see: impl Into<String>,
     ) -> Self {
-        AgentError(ErrorEnvelope::rendered_with(
+        AgentError(Box::new(ErrorEnvelope::rendered_with(
             kind, template, facts, suggest, see,
-        ))
+        )))
     }
 
     pub fn pond_not_found(pond_ref: &str) -> Self {

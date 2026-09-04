@@ -40,7 +40,7 @@ pub use forward::{Forwarder, Peer};
 pub use inflight::InFlightRegistry;
 pub use ops::{AgentConfig, AgentOps};
 pub use registry_control::RegistryControlPlane;
-pub use trace::{current_trace_id, new_trace_id, with_trace_id};
+pub use trace::{current_trace, current_trace_id, current_traceparent, with_trace, TraceContext};
 pub use types::{
     AllocateResult, CatalogInfo, DatasetInfo, DatasetTableInfo, DescribeResult, LineagePage,
     LoadDatasetResult, PondInfo, PullResult,

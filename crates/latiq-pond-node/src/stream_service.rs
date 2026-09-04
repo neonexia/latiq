@@ -85,13 +85,13 @@ impl StreamSvc for StreamService {
             "read_arrow",
         )
         .await?;
-        let tid = crate::data_service::trace_id_of(&req);
+        let ctx = crate::data_service::trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
         // Resolving the read (incl. pond-not-found / parse errors and the schema)
-        // happens before we return — and so does any forward — so the trace id
-        // must be ambient here; the batch encoding runs after, untraced.
-        let read = crate::data_service::traced("read_arrow", tid, tok, async move {
+        // happens before we return — and so does any forward — so the trace
+        // context must be ambient here.
+        let read = crate::data_service::traced("read_arrow", ctx.clone(), tok, async move {
             ops.read_arrow_with(
                 &id,
                 &r.pond,
@@ -103,7 +103,16 @@ impl StreamSvc for StreamService {
         })
         .await?;
         let (tx, rx) = mpsc::channel::<Result<ArrowChunk, Status>>(4);
-        tokio::spawn(encode_to_chunks(read, tx));
+        // RE-SCOPED, not merely spawned. The batch encoding runs after the
+        // handler has returned, on a task of its own — task-locals do not cross
+        // a `spawn` — so everything that can still go wrong here (an IPC encode
+        // failure, and every mid-stream engine error the batches carry) used to
+        // be emitted with no trace id at all. That is the half of a streaming
+        // read most likely to need explaining, and it was the untraced half.
+        tokio::spawn(latiq_agent_core::with_trace(
+            ctx,
+            encode_to_chunks(read, tx),
+        ));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }

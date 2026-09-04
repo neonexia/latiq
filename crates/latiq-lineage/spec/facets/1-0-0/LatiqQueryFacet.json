@@ -29,7 +29,7 @@
               "type": "string"
             },
             "traceId": {
-              "description": "The `latiq-trace-id` this run was logged under, so a lineage event joins to the access trail.",
+              "description": "The W3C trace id (32 hex digits, from the request's `traceparent`) this run was logged under, so a lineage event joins to the access trail and to the response's `_meta.trace_id`.",
               "type": [
                 "string",
                 "null"
