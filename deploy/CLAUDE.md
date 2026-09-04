@@ -114,10 +114,39 @@ experience. Three things keep it true, and all three are load-bearing:
   amd64-only state was invisible for two releases exactly because the only
   "verify user path" job ran on `ubuntu-latest`.
 
-The **wheels are still x86_64-only** (`target: x86_64`), so `pip install latiq`
-has nothing to resolve on an arm64 host. That is a separate gap from the images
-and is not fixed here; the arm64 verification jobs therefore drive the cluster
-with the image's own CLI and the MCP agent harness rather than the SDK.
+**The wheels are multi-platform too, for the same reason and by the same
+pattern** (#108 — the sibling of #66, one channel over). `latiq` 0.1.0 is a
+single `manylinux_2_28_x86_64` file on PyPI with no sdist, so `pip install latiq`
+fails outright on Apple Silicon; both wheel jobs in both workflows passed
+`target: x86_64` on `ubuntu-latest`. `.github/workflows/wheels.yml` is the wheel
+counterpart of `images.yml`:
+- **Both wheels × three platforms**, one job each on a **native** runner —
+  manylinux `x86_64` (`ubuntu-latest`), manylinux `aarch64`
+  (`ubuntu-24.04-arm`), macOS `arm64` (`macos-14`). The `latiq` wheel compiles
+  DuckDB, so QEMU is out here as well. Builds are `cp39-abi3`: one wheel per
+  platform, not per Python version. The manylinux `before-script-linux` derives
+  protoc's arch from `uname -m` — a hard-coded `linux-x86_64` zip would put an
+  unrunnable protoc on PATH in the aarch64 container.
+- **The built set is asserted** by `.github/scripts/assert-wheel-platforms.sh`
+  (every platform present, every filename at the published version, and never
+  zero files examined), and the publish jobs run the same script in `pypi` mode
+  against the file list PyPI serves afterwards.
+- **Both wheels are pip-installed and driven on arm64** (`verify-linux-arm64`,
+  `verify-macos-arm64`) — from what the run built, so the coverage survives
+  `PUBLISH_PYPI_WHEELS` being off.
+- **No sdist**, deliberately: it would need protoc + a Rust toolchain + a
+  ~20-minute DuckDB compile on the user's machine, on platforms we never build or
+  test. Cover a platform by building a wheel for it — matrix row *and*
+  `EXPECTED_TAGS` entry, together. (`docs/releasing.md`, *Why there is no sdist*.)
+- **The upload stays in the callers.** PyPI trusted publishing matches on the
+  workflow filename, so `wheels.yml` builds and `nightly.yml` / `release.yml`
+  upload, from a run artifact. Moving `gh-action-pypi-publish` into the reusable
+  workflow would invalidate all four configured publishers.
+
+The arm64 *image* verification jobs still drive the cluster with the image's own
+CLI and the MCP agent harness rather than the SDK: their subject is the images,
+and the wheel jobs above already cover arm64 pip installs without depending on a
+PyPI upload having happened.
 
 **Building the image locally on Apple Silicon needs a properly sized VM.** A
 default `podman machine` (2 GiB) cannot do it: it thrashes to a load average of
@@ -215,10 +244,12 @@ See `docs/releasing.md`. We ship **binaries only** — **two wheels → PyPI**
 **No Rust crates** (crates.io is out of scope; the crates are not a product), and
 **no loose release-asset binaries** — that channel is gone.
 
-**Two reusable workflows, for the same reason.** `verify.yml` holds every check;
-**`images.yml`** holds every image build (multi-arch, native-per-arch, manifest
-asserted — see above). Both publish paths call both, so neither can drift into
-running a different suite or pushing a different manifest.
+**Three reusable workflows, for the same reason.** `verify.yml` holds every
+check; **`images.yml`** holds every image build (multi-arch, native-per-arch,
+manifest asserted); **`wheels.yml`** holds every wheel build (multi-platform,
+native-per-platform, `dist/` asserted, installed on arm64). All three publish
+paths call all three, so none can drift into running a different suite, pushing a
+different manifest, or building a different set of wheels.
 
 **PyPI uploads are gated on `PUBLISH_PYPI_WHEELS`** (a repo variable, off today)
 in *both* paths and for *both* wheels. The wheels are still built and every
