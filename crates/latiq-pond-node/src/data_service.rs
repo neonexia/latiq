@@ -20,7 +20,7 @@
 //! whose code derives from the ErrorKind and whose `details` carry the
 //! JSON-encoded `ErrorEnvelope` (so the client can render kind/suggest/see).
 use crate::wire::query_value;
-use latiq_agent_core::{current_trace_id, AgentError, AgentOps, TraceContext};
+use latiq_agent_core::{current_trace_id, current_traceparent, AgentError, AgentOps, TraceContext};
 use latiq_auth::Verifier;
 use latiq_common::{ErrorKind, Identity};
 use latiq_proto::v1::data_server::Data;
@@ -179,7 +179,14 @@ pub(crate) fn to_status(e: AgentError) -> Status {
     // envelope a caller cannot cite. An error decoded from a peer already
     // carries the id (the same one — it is the same request), so this is a
     // no-op on the forwarded path rather than an overwrite.
-    let env = e.into_envelope().with_trace_id(current_trace_id());
+    let env = e
+        .into_envelope()
+        .with_trace_id(current_trace_id())
+        // The span, not just the trace. Unlike the id above this is genuinely a
+        // no-op on the forwarded path rather than an equal overwrite: the owner
+        // produced the failure, so the owner's span is the one to name, and
+        // `with_traceparent` keeps a value already present.
+        .with_traceparent(current_traceparent());
     let code = match env.kind {
         ErrorKind::PondNotFound => Code::NotFound,
         ErrorKind::NameConflict => Code::AlreadyExists,

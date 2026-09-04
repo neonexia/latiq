@@ -19,9 +19,27 @@
 //! literal — that is what lets each tool declare an `outputSchema` derived from
 //! the shape it really sends (see `schema.rs`). An error still carries the
 //! `ErrorEnvelope`, which is deliberately OUTSIDE the declared schema: a failed
-//! call sets `is_error`, and both reference MCP clients skip output-schema
-//! validation entirely on an error result, so one envelope shape serves all
-//! thirteen tools instead of thirteen `anyOf`s.
+//! call sets `is_error`, and a client that skips output-schema validation on an
+//! error result never sees the mismatch — so one envelope shape serves all
+//! thirteen tools instead of thirteen `anyOf`s, each of which would also have
+//! loosened its success schema.
+//!
+//! **What that rests on, stated exactly.** The skip is verified in the two
+//! REFERENCE SDKs and nowhere else: `modelcontextprotocol/typescript-sdk`, whose
+//! client guards both validation branches with `&& !result.isError`, and
+//! `modelcontextprotocol/python-sdk`, whose client session guards its own with
+//! `if … and not result.is_error`. It is **not** in the MCP specification, so it
+//! is a fact
+//! about two implementations, not a guarantee about clients in general, and no
+//! test here can hold it: the behaviour lives in someone else's code, and it is
+//! load-bearing for every error this surface returns — a client that DID
+//! validate would turn each one into a protocol violation instead of an
+//! actionable. It also widened when `40cb97a` gave every tool an `outputSchema`;
+//! before that there was no schema to validate against and the question could not
+//! arise. Nexus (the agent-readiness harness) is settling it empirically against
+//! Claude Code — a real client that is neither reference SDK — in its L0
+//! workflow; until that lands, treat the scope above as the whole of the
+//! evidence and do not restate it as "clients skip validation".
 use crate::response::QueryResponse;
 use latiq_common::ErrorEnvelope;
 use latiq_engine::{ExplainResult, QueryResult};
@@ -58,7 +76,11 @@ pub fn ok<T: Serialize>(value: &T) -> CallToolResult {
 pub fn err_envelope(env: &ErrorEnvelope) -> CallToolResult {
     let stamped = env
         .clone()
-        .with_trace_id(latiq_agent_core::current_trace_id());
+        .with_trace_id(latiq_agent_core::current_trace_id())
+        // Additive to the id, and it KEEPS one already there: an envelope
+        // decoded from the pond's owner names the owner's span, which is the
+        // span that produced the failure.
+        .with_traceparent(latiq_agent_core::current_traceparent());
     let value = serde_json::to_value(&stamped).unwrap_or(Value::Null);
     dual(value, true)
 }

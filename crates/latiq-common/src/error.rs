@@ -113,6 +113,25 @@ pub enum Audience {
     Operator,
 }
 
+impl Audience {
+    /// Every value, once — the same reason [`ErrorKind::ALL`] exists. The
+    /// agent-facing documentation of this field (`latiq://guidance`) is pinned
+    /// against this list by `latiq-mcp`, so a variant added here without being
+    /// explained to agents fails the build rather than shipping as a value
+    /// nothing on the surface defines.
+    pub const ALL: [Audience; 2] = [Audience::Agent, Audience::Operator];
+
+    /// The snake_case wire name (matches the serde `rename_all`
+    /// serialization) — use it wherever the value is compared as a string, so
+    /// prose and wire cannot disagree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Audience::Agent => "agent",
+            Audience::Operator => "operator",
+        }
+    }
+}
+
 /// Whether sending this request again can ever work — the field that stops an
 /// agent looping on a statement that can never succeed.
 ///
@@ -133,6 +152,22 @@ pub enum Retryable {
     /// Send this call again only after changing it — the arguments are what
     /// failed. `suggest` says what to change.
     AfterChange,
+}
+
+impl Retryable {
+    /// Every value, once. See [`Audience::ALL`] — same guard, same reason: the
+    /// field is a control channel only while the agent surface explains it, and
+    /// `latiq-mcp` asserts `latiq://guidance` names every value in this list.
+    pub const ALL: [Retryable; 3] = [Retryable::Never, Retryable::AsIs, Retryable::AfterChange];
+
+    /// The snake_case wire name (matches the serde `rename_all` serialization).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Retryable::Never => "never",
+            Retryable::AsIs => "as_is",
+            Retryable::AfterChange => "after_change",
+        }
+    }
 }
 
 /// One value behind a message: a number we MEASURED, or a name we were given.
@@ -247,8 +282,9 @@ fn render_facts(template: &str, facts: &Facts) -> String {
 /// The one error shape every surface returns.
 ///
 /// Four fields are for reading — `kind` to branch on, `message` to read,
-/// `suggest` to retry from, `see` to learn from — and four make it an actionable
-/// rather than a report: `audience`, `retryable`, `facts` and `trace_id`. Prefer
+/// `suggest` to retry from, `see` to learn from — and the rest make it an
+/// actionable rather than a report: `audience`, `retryable`, `facts`, and
+/// `trace_id`/`traceparent` (the same trace, with and without our span). Prefer
 /// [`ErrorEnvelope::for_kind`] (canonical guidance) or [`ErrorEnvelope::rendered`]
 /// (guidance plus facts) so the wording stays the same wherever a kind surfaces.
 ///
@@ -286,6 +322,23 @@ pub struct ErrorEnvelope {
     /// trace scope; `None` outside one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// The full W3C `traceparent` of the span that PRODUCED this error — the
+    /// same trace as [`Self::trace_id`], plus the span id that field cannot
+    /// carry.
+    ///
+    /// Added because `trace_id` alone gives a collector a flat set: every record
+    /// under one trace, with no parent/child edge between the greeter and the
+    /// owner of a forwarded query. A caller that wants only the join key still
+    /// reads `trace_id`; a caller building a span tree gets a parent to attach
+    /// to. **Additive on purpose** — nothing that reads `trace_id` changes.
+    ///
+    /// `None` where there is no span of ours to name: outside a trace scope, and
+    /// on the control plane's Admin/Control surfaces, which deliberately keep no
+    /// trace scope and mint no span (see `latiq-control-plane`'s `trace_meta`).
+    /// An invented span id, logged nowhere and propagated nowhere, would look
+    /// like a hierarchy and join nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
 }
 
 impl ErrorKind {
@@ -535,6 +588,7 @@ impl ErrorEnvelope {
             retryable: kind.retryable(),
             facts: Facts::new(),
             trace_id: None,
+            traceparent: None,
         }
     }
 
@@ -587,6 +641,7 @@ impl ErrorEnvelope {
             retryable: kind.retryable(),
             facts,
             trace_id: None,
+            traceparent: None,
         }
     }
 
@@ -603,6 +658,24 @@ impl ErrorEnvelope {
         self.trace_id = trace_id;
         self
     }
+
+    /// Stamp the `traceparent` of the span producing this envelope — **keeping
+    /// one that is already there**.
+    ///
+    /// That is the difference from [`Self::with_trace_id`], and it is not a
+    /// style choice. The trace id is the same on both sides of a node hop, so
+    /// re-stamping it is a no-op; the span id is not. An envelope decoded from
+    /// the pond's owner names the OWNER's span, and the owner is the node that
+    /// produced the failure — the same rule `QueryMeta` follows for
+    /// `served_by`/`trace_id`, where a forwarding node never overwrites what it
+    /// relayed with its own. One rule for both records: the span named is the
+    /// span that did the work this record describes.
+    pub fn with_traceparent(mut self, traceparent: Option<String>) -> Self {
+        if self.traceparent.is_none() {
+            self.traceparent = traceparent;
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -612,7 +685,7 @@ mod tests {
 
     /// The vendored schema, read at COMPILE time: an `include_str!` cannot pass
     /// because a file was missing at runtime.
-    const SCHEMA: &str = include_str!("../spec/ErrorEnvelope-1-0-0.json");
+    const SCHEMA: &str = include_str!("../spec/ErrorEnvelope-1-0-1.json");
 
     fn validator() -> jsonschema::Validator {
         let schema: Value = serde_json::from_str(SCHEMA).expect("the vendored schema is JSON");
@@ -627,7 +700,10 @@ mod tests {
             "Pond '{pond}' failed after {duration_ms} ms.",
             facts! { "pond" => "incident-001", "duration_ms" => 42u64 },
         )
-        .with_trace_id(Some("4bf92f3577b34da6a3ce929d0e0e4736".into()));
+        .with_trace_id(Some("4bf92f3577b34da6a3ce929d0e0e4736".into()))
+        .with_traceparent(Some(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
+        ));
         if kind == ErrorKind::ParseError {
             env.with_location(Location {
                 line: 1,
@@ -791,6 +867,97 @@ mod tests {
         assert_eq!(ErrorKind::ReadOnlyViolation.audience(), Audience::Agent);
     }
 
+    /// The wire names the agent surface documents must be the wire names we
+    /// serialize. `latiq://guidance` teaches these values as literal strings
+    /// (`retryable: after_change`), and `latiq-mcp` checks the text against
+    /// `as_str()` — so if `as_str()` and serde ever disagreed, the guard would
+    /// pass while teaching agents a value they will never receive.
+    #[test]
+    fn error_contract_audience_and_retryable_wire_names_match_serde() {
+        for a in Audience::ALL {
+            assert_eq!(serde_json::to_value(a).unwrap(), json!(a.as_str()));
+        }
+        for r in Retryable::ALL {
+            assert_eq!(serde_json::to_value(r).unwrap(), json!(r.as_str()));
+        }
+        assert_eq!(Audience::ALL.len(), 2);
+        assert_eq!(Retryable::ALL.len(), 3);
+    }
+
+    /// The claim `latiq://guidance` makes about `never`, run rather than
+    /// proofread: **`never` is about THIS call, and the goal may still be
+    /// reachable — `suggest` names the different call that reaches it.**
+    ///
+    /// An agent that reads "never" and finds no alternative in the advice
+    /// abandons the sub-goal, which is the failure mode the Nexus audit flagged
+    /// (its finding 2) and the wording is chosen to avoid. Asserted across every
+    /// `Never` kind rather than the one we happen to be thinking of, so a new
+    /// one cannot be added with advice that is a dead end.
+    #[test]
+    fn error_contract_never_still_names_a_move() {
+        // Not exhaustive, and it does not need to be: the property is "the
+        // advice names a call", so any one of these appearing proves it.
+        const CALLS: [&str; 6] = [
+            "write_query",
+            "read_query",
+            "describe_pond",
+            "list_ponds",
+            "allocate_pond",
+            "explain_query",
+        ];
+        let mut agent = 0;
+        let mut operator = 0;
+        for kind in ErrorKind::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.retryable() == Retryable::Never)
+        {
+            let suggest = kind.default_suggest();
+            match kind.audience() {
+                Audience::Agent => {
+                    agent += 1;
+                    assert!(
+                        CALLS.iter().any(|c| suggest.contains(c)),
+                        "{kind:?} is `never` and the caller's to fix, so its advice must name \
+                         the call that DOES work — otherwise `never` reads as 'give up': {suggest}"
+                    );
+                }
+                Audience::Operator => {
+                    operator += 1;
+                    // The other half of `never`: there is no different call,
+                    // and the advice must say who to tell instead of leaving
+                    // the agent to invent one.
+                    assert!(suggest.contains("operator"), "{kind:?}: {suggest}");
+                }
+            }
+        }
+        // Anti-vacuity: both branches ran, on the kinds we mean.
+        assert_eq!(agent, 1, "ReadOnlyViolation");
+        assert_eq!(operator, 1, "PondUnavailable");
+    }
+
+    /// `traceparent` names the span that PRODUCED the error, so an envelope
+    /// relayed from a pond's owner keeps the owner's span across the hop — the
+    /// same rule `QueryMeta` follows for `served_by`. The trace id, being equal
+    /// on both sides, is re-stamped freely; the span id is not.
+    #[test]
+    fn error_contract_a_relayed_traceparent_is_not_overwritten_by_the_forwarder() {
+        const OWNER: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        const GREETER: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-b7a9021ba760f000-01";
+        let relayed = ErrorEnvelope::for_kind(ErrorKind::CatalogError, "no such table")
+            .with_traceparent(Some(OWNER.into()))
+            .with_traceparent(Some(GREETER.into()));
+        assert_eq!(relayed.traceparent.as_deref(), Some(OWNER));
+        // …and an envelope raised locally still gets stamped.
+        let local = ErrorEnvelope::for_kind(ErrorKind::CatalogError, "no such table")
+            .with_traceparent(Some(GREETER.into()));
+        assert_eq!(local.traceparent.as_deref(), Some(GREETER));
+        // Absent by default: a span we do not have is not invented.
+        assert!(ErrorEnvelope::for_kind(ErrorKind::Internal, "boom")
+            .traceparent
+            .is_none());
+    }
+
     /// `audience` must agree with `suggest`: a kind whose advice tells the
     /// caller to fetch an operator is not the caller's to fix, and a kind whose
     /// advice names a call the caller can make is. If the two disagree, one of
@@ -899,6 +1066,10 @@ mod tests {
                 mutate(&|b| b["trace_id"] = json!("not-a-trace")),
             ),
             (
+                "a traceparent missing its span — the half a bare trace id already gave us",
+                mutate(&|b| b["traceparent"] = json!("00-4bf92f3577b34da6a3ce929d0e0e4736-01")),
+            ),
+            (
                 "an extra field — a surface inventing its own contract",
                 mutate(&|b| b["next"] = json!("call describe_pond")),
             ),
@@ -911,6 +1082,6 @@ mod tests {
         for (why, bad) in &cases {
             assert!(!v.is_valid(bad), "the schema must reject {why}: {bad}");
         }
-        assert_eq!(cases.len(), 10, "every mutation was probed");
+        assert_eq!(cases.len(), 11, "every mutation was probed");
     }
 }

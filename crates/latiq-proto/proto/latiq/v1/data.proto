@@ -114,4 +114,12 @@ message ArrowChunk {
   // node learns who served the read before the first batch arrives and relays
   // that name instead of its own.
   string served_by = 2;
+  // The W3C `traceparent` of the span EXECUTING this read, as
+  // `QueryMeta.traceparent`. Rides the first chunk beside `served_by`, for the
+  // same reason and with the same rule: the two name the node that ran the
+  // query, so a forwarding node relays both rather than substituting its own.
+  // Without it a forwarded read is the one case with no span at all — the
+  // greeter's meta never crosses this hop — which is exactly the pair a trace
+  // viewer would want to nest. Empty from a node that predates the field.
+  string traceparent = 3;
 }

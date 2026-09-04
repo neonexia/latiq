@@ -140,6 +140,7 @@ async fn encode_to_chunks(read: ArrowReadStream, tx: mpsc::Sender<Result<ArrowCh
         .send(Ok(ArrowChunk {
             ipc: schema_bytes,
             served_by: read.served_by.clone(),
+            traceparent: read.traceparent.clone(),
         }))
         .await
         .is_err()
@@ -156,13 +157,14 @@ async fn encode_to_chunks(read: ArrowReadStream, tx: mpsc::Sender<Result<ArrowCh
                     return;
                 }
                 let chunk = std::mem::take(writer.get_mut());
-                // `served_by` only on the first chunk (above): repeating it on
-                // every batch would put a node name on the wire per batch for a
-                // fact that cannot change mid-stream.
+                // `served_by` and `traceparent` only on the first chunk (above):
+                // repeating them on every batch would put a node name and a span
+                // on the wire per batch for facts that cannot change mid-stream.
                 if tx
                     .send(Ok(ArrowChunk {
                         ipc: chunk,
                         served_by: String::new(),
+                        traceparent: String::new(),
                     }))
                     .await
                     .is_err()
@@ -183,6 +185,7 @@ async fn encode_to_chunks(read: ArrowReadStream, tx: mpsc::Sender<Result<ArrowCh
                 .send(Ok(ArrowChunk {
                     ipc: tail,
                     served_by: String::new(),
+                    traceparent: String::new(),
                 }))
                 .await;
         }

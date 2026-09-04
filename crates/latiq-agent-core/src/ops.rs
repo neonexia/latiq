@@ -1358,6 +1358,9 @@ impl AgentOps {
             // because the streaming adapter must announce it on its first chunk
             // — long before the last batch resolves that meta.
             served_by: self.serving_name().to_string(),
+            // Same timing, same reason: the adapter announces the span on the
+            // first chunk, long before the meta that would otherwise carry it.
+            traceparent: crate::trace::current_traceparent().unwrap_or_default(),
         })
     }
 
@@ -1482,6 +1485,7 @@ impl AgentOps {
         // A meta only fails to arrive when the producer could not speak for the
         // engine (a stream decoded from a peer's chunks), and then an empty one
         // is the honest answer: this node did not run the query.
+        let stream_traceparent = stream.traceparent;
         let mut meta = match meta {
             Some(rx) => rx.await.unwrap_or_default(),
             None => QueryMeta::default(),
@@ -1496,6 +1500,12 @@ impl AgentOps {
         // sides of a forward, and a stream that carried no meta at all (a peer's
         // chunks) must still be able to tell the caller which request it was.
         meta.trace_id = crate::trace::current_trace_id().unwrap_or_default();
+        // From the STREAM, exactly like `served_by` and for the same reason: the
+        // `traceparent` names the span that EXECUTED, and on a forwarded read
+        // that is the peer's — our span read no rows, and nesting the caller's
+        // trace under it would attribute the work to the wrong node. Empty only
+        // where no producer said (a peer too old to send it).
+        meta.traceparent = stream_traceparent;
         Ok(QueryResult {
             columns,
             rows,
@@ -1687,6 +1697,11 @@ impl AgentOps {
         // that is what a trace id is for — so it is read from the ambient scope
         // rather than being carefully preserved from the peer's meta.
         qr.meta.trace_id = crate::trace::current_trace_id().unwrap_or_default();
+        // Back with `served_by` and `timeout_ms` rather than with the trace id:
+        // the span is this node's, and a forwarded result (returned untouched
+        // further up) keeps the OWNER's. The trace id is equal on both sides of a
+        // hop; the span id is precisely what is not.
+        qr.meta.traceparent = crate::trace::current_traceparent().unwrap_or_default();
         Ok(qr)
     }
 
