@@ -16,3 +16,4 @@
 # Internal working notes — kept on disk for the local agent workflow, never published.
 /.claude/handoffs/
 /docs/superpowers/
+/.claude/EVOLVE.md
