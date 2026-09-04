@@ -33,6 +33,34 @@ KC_CONTAINER=latiq-dev-keycloak
 KC_URL=http://localhost:8080
 KC_REALM_URL="$KC_URL/realms/latiq"
 
+# Remove the Keycloak container left by a `--auth` run. Called unconditionally on
+# every teardown AND from the EXIT trap of every run, including the ordinary
+# no-Docker-needed one -- so it must be safe on a machine that cannot talk to a
+# container daemon at all.
+#
+# It is time-boxed rather than merely error-suppressed because the docker CLI
+# does NOT fail fast against a daemon that is installed but not running: it
+# BLOCKS, indefinitely. `>/dev/null 2>&1 || true` therefore buys nothing, and the
+# bare call hung `./dev.sh` for 40 minutes on a machine with Docker Desktop
+# installed-but-stopped (a very common state, and the default one where podman is
+# the engine) -- before a single line was built. A dev script must never hang on
+# a runtime it does not need.
+#
+# `wait` returns either when docker finishes or when the watchdog kills it, so
+# this costs nothing when the daemon is healthy and at most 3s when it is not.
+kc_rm() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local pid killer
+  docker rm -f "$KC_CONTAINER" >/dev/null 2>&1 &
+  pid=$!
+  ( sleep 3; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  killer=$!
+  wait "$pid" 2>/dev/null || true
+  kill -9 "$killer" 2>/dev/null || true
+  wait "$killer" 2>/dev/null || true
+  return 0
+}
+
 usage() {
   cat <<EOF
 Usage: ./dev.sh [options]
@@ -134,7 +162,7 @@ if [[ $DOWN -eq 1 ]]; then
   # Unconditional and error-suppressed, for the same reason the PID file is swept
   # unconditionally: a hard-killed `--auth` run leaves the container behind, and
   # `--down` is the one command that must always leave nothing running.
-  docker rm -f "$KC_CONTAINER" >/dev/null 2>&1 || true
+  kc_rm
   if [[ -f "$PID_FILE" ]]; then
     sweep_stale
     printf '%sstack down.%s\n' "$DIM" "$RST"
@@ -188,7 +216,7 @@ cleanup() {
   [[ -n "$NGINX_PID" ]] && kill "$NGINX_PID" 2>/dev/null || true
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
   rm -f "$PID_FILE"     # children are being killed; drop the tracking file
-  docker rm -f "$KC_CONTAINER" >/dev/null 2>&1 || true   # no-op unless --auth ran
+  kc_rm                 # no-op unless --auth ran
 }
 trap cleanup INT TERM EXIT
 
@@ -226,6 +254,22 @@ if [[ $AUTH -eq 1 ]]; then
     printf '%sERROR%s: --auth needs Docker to run Keycloak, and `docker` is not on PATH.\n' "$ERRC" "$RST" >&2
     exit 1
   }
+  # On PATH is not the same as usable: an installed-but-stopped daemon makes every
+  # docker call BLOCK rather than fail, so without this probe `--auth` hangs here
+  # with no output instead of saying what is wrong. Time-boxed for that reason.
+  docker_ready=0
+  docker info >/dev/null 2>&1 &
+  di_pid=$!
+  ( sleep 5; kill -9 "$di_pid" 2>/dev/null ) >/dev/null 2>&1 &
+  di_killer=$!
+  if wait "$di_pid" 2>/dev/null; then docker_ready=1; fi
+  kill -9 "$di_killer" 2>/dev/null || true
+  wait "$di_killer" 2>/dev/null || true
+  if [[ $docker_ready -eq 0 ]]; then
+    printf '%sERROR%s: --auth needs Docker to run Keycloak. `docker` is on PATH but the daemon is not responding.\n' "$ERRC" "$RST" >&2
+    printf '  Start it (Docker Desktop, or `colima start`), then re-run. Everything except --auth works without it.\n' >&2
+    exit 1
+  fi
   if [[ -n "$(docker ps -q -f "name=^${KC_CONTAINER}$" 2>/dev/null)" ]]; then
     printf '%sreusing keycloak container %s…%s\n' "$DIM" "$KC_CONTAINER" "$RST"
   else
