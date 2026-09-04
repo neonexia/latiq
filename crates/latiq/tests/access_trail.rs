@@ -800,6 +800,21 @@ async fn access_trail_one_agent_request_joins_its_response_its_log_and_its_linea
         "and this must be the FORWARDED case — the owner ran it, the greeter \
          answered: {meta}"
     );
+    // …and the SPAN, not only the trace. `trace_id` alone leaves a collector
+    // with a flat set — every record of this request with no parent/child edge
+    // between the greeter and the owner. `traceparent` is the parent a caller
+    // building that tree attaches to, so it has to arrive on the wire, be
+    // well-formed, and carry the caller's own trace.
+    let read_tp = meta["traceparent"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the result must carry a traceparent: {meta}"));
+    let read_span = assert_traceparent(read_tp, READ);
+    // OURS, never the caller's: a span id we echoed back would let a caller
+    // forge our spans, and would nest the work under itself.
+    assert_ne!(
+        read_span, "00f067aa0ba902b7",
+        "the span must be the node's own, not the one the client sent: {read_tp}"
+    );
 
     // 2. THE LOGS, on BOTH SIDES of the hop — the half the issue is really
     //    about. The greeter and the owner are separate node instances with
@@ -899,7 +914,47 @@ async fn access_trail_one_agent_request_joins_its_response_its_log_and_its_linea
     // A different id from the successful read, so a constant — or an id copied
     // from the wrong request — is visible here.
     assert_ne!(err.value["trace_id"].as_str(), Some(READ));
+    // The envelope carries the span too, under the failed request's own trace.
+    let err_tp = err.value["traceparent"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the envelope must carry a traceparent: {}", err.value));
+    let err_span = assert_traceparent(err_tp, FAILED);
+    assert_ne!(
+        err_span, read_span,
+        "two requests are two spans — a constant here would join everything to \
+         one node's work: {err_tp} vs {read_tp}"
+    );
 
     agent.close().await.unwrap();
     failing.close().await.unwrap();
+}
+
+/// A W3C `traceparent` we returned: version `00`, the expected trace id, a real
+/// 16-hex span, and the sampled flag we propagate. Returns the span id.
+///
+/// Asserted field by field rather than with `starts_with`, because the value's
+/// whole purpose is to be parsed by somebody else's collector — a header that is
+/// nearly right is a header that silently joins nothing.
+fn assert_traceparent(header: &str, trace_id: &str) -> String {
+    let parts: Vec<&str> = header.split('-').collect();
+    assert_eq!(
+        parts.len(),
+        4,
+        "a version-00 traceparent has 4 fields: {header}"
+    );
+    assert_eq!(parts[0], "00", "we emit the version we implement: {header}");
+    assert_eq!(
+        parts[1], trace_id,
+        "the traceparent must carry the SAME trace as `trace_id`, or the two \
+         halves of one join disagree: {header}"
+    );
+    assert_eq!(parts[2].len(), 16, "span id is 16 hex digits: {header}");
+    assert!(
+        parts[2]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "the spec is lowercase hex only: {header}"
+    );
+    assert_eq!(parts[3], "01", "the caller sent sampled=01: {header}");
+    parts[2].to_string()
 }

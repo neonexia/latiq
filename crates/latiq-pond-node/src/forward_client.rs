@@ -194,6 +194,10 @@ fn parse_json(json: &str) -> Result<serde_json::Value, AgentError> {
 struct Served {
     schema: SchemaRef,
     served_by: String,
+    /// The peer's `traceparent` — the span that is really running this read.
+    /// Relayed for the same reason as `served_by`, and never replaced with ours:
+    /// see `ArrowReadStream::with_traceparent`.
+    traceparent: String,
 }
 
 /// Deliver the schema on the oneshot the first time the decoder knows it, with
@@ -202,12 +206,14 @@ fn deliver_schema(
     schema_tx: &mut Option<oneshot::Sender<Result<Served, AgentError>>>,
     decoder: &StreamDecoder,
     served_by: &str,
+    traceparent: &str,
 ) {
     if schema_tx.is_some() {
         if let Some(sc) = decoder.schema() {
             let _ = schema_tx.take().unwrap().send(Ok(Served {
                 schema: sc,
                 served_by: served_by.to_string(),
+                traceparent: traceparent.to_string(),
             }));
         }
     }
@@ -244,17 +250,23 @@ fn decode_arrow_stream(
         // the first chunk carries it, and it is recorded before the schema is
         // delivered from that same chunk.
         let mut served_by = String::new();
+        // Same rule, same chunk: the peer's span, recorded before the schema is
+        // delivered from that chunk.
+        let mut traceparent = String::new();
         loop {
             match streaming.message().await {
                 Ok(Some(chunk)) => {
                     if !chunk.served_by.is_empty() {
                         served_by = chunk.served_by;
                     }
+                    if !chunk.traceparent.is_empty() {
+                        traceparent = chunk.traceparent;
+                    }
                     let mut buf = Buffer::from_vec(chunk.ipc);
                     loop {
                         match decoder.decode(&mut buf) {
                             Ok(Some(batch)) => {
-                                deliver_schema(&mut schema_tx, &decoder, &served_by);
+                                deliver_schema(&mut schema_tx, &decoder, &served_by, &traceparent);
                                 if batch_tx.send(Ok(batch)).await.is_err() {
                                     return;
                                 }
@@ -278,7 +290,7 @@ fn decode_arrow_stream(
                         }
                     }
                     // Schema-only chunk / empty result: surface the schema now.
-                    deliver_schema(&mut schema_tx, &decoder, &served_by);
+                    deliver_schema(&mut schema_tx, &decoder, &served_by, &traceparent);
                 }
                 Ok(None) => {
                     // Stream ended; ensure the schema (or an error) was delivered.
@@ -287,6 +299,7 @@ fn decode_arrow_stream(
                             Some(sc) => s.send(Ok(Served {
                                 schema: sc,
                                 served_by: served_by.clone(),
+                                traceparent: traceparent.clone(),
                             })),
                             None => s.send(Err(AgentError::internal("forward arrow: no schema"))),
                         };
@@ -383,14 +396,16 @@ impl Forwarder for GrpcForwarder {
         // No meta: the peer that RAN this query is the one that records its
         // lineage, and inventing one here would put datasets on the wrong node.
         //
-        // `served_by` is the deliberate exception, and for the opposite reason:
-        // it is not invented here but RELAYED verbatim from the peer. Naming
-        // this node instead — or leaving it empty — would make a forwarded read
-        // indistinguishable from one this node served itself, which is the one
-        // thing the field exists to distinguish.
+        // `served_by` and `traceparent` are the deliberate exceptions, and for
+        // the opposite reason: they are not invented here but RELAYED verbatim
+        // from the peer. Naming this node instead — or leaving them empty —
+        // would make a forwarded read indistinguishable from one this node
+        // served itself, which is the one thing they exist to distinguish, and
+        // would nest the caller's trace under a span that read no rows.
         Ok(
             ArrowReadStream::new(served.schema, Box::pin(ReceiverStream::new(parts.batch_rx)))
-                .with_served_by(served.served_by),
+                .with_served_by(served.served_by)
+                .with_traceparent(served.traceparent),
         )
     }
 

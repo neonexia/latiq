@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/neonexia/latiq/error-envelope-1-0-1/crates/latiq-common/spec/ErrorEnvelope-1-0-1.json",
+  "title": "Latiq ErrorEnvelope",
+  "description": "The one error shape every Latiq surface returns. An actionable: `kind` to branch on, `audience` for who can fix it, `retryable` for whether to send the call again, `facts` for the values behind `message`, `suggest` for the next call, `see` for the resource that explains the kind, and `trace_id`/`traceparent` for the request that failed.",
+  "type": "object",
+  "required": ["kind", "message", "suggest", "see", "audience", "retryable"],
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "description": "The closed taxonomy of what went wrong. Classified by the failure, never by which call raised it.",
+      "type": "string",
+      "enum": [
+        "pond_not_found",
+        "dataset_not_found",
+        "name_conflict",
+        "catalog_error",
+        "parse_error",
+        "invalid_value",
+        "missing_argument",
+        "write_to_reserved_schema",
+        "result_cap_exceeded",
+        "read_only_violation",
+        "uri_not_allowed",
+        "query_timeout",
+        "query_cancelled",
+        "unauthenticated",
+        "pond_unavailable",
+        "source_unavailable",
+        "storage",
+        "internal"
+      ]
+    },
+    "message": {
+      "description": "One sentence on what went wrong, rendered from `facts` wherever it quotes a number or a name. Never empty: an error with nothing to read is not an actionable.",
+      "type": "string",
+      "minLength": 1
+    },
+    "location": {
+      "description": "Where in the caller's SQL the error was found, so a client can point at it rather than restating the whole statement.",
+      "type": "object",
+      "required": ["line", "column", "byte"],
+      "additionalProperties": false,
+      "properties": {
+        "line": { "type": "integer", "minimum": 0 },
+        "column": { "type": "integer", "minimum": 0 },
+        "byte": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "suggest": {
+      "description": "The NEXT CALL to make, copy-paste ready. There is deliberately no separate `next` field; this is it.",
+      "type": "string",
+      "minLength": 1
+    },
+    "see": {
+      "description": "A `latiq://` resource URI about this kind — the deeper learning path. Must resolve to a resource the MCP surface actually serves.",
+      "type": "string",
+      "pattern": "^latiq://"
+    },
+    "audience": {
+      "description": "Who can actually fix this. `agent`: the caller, from a call it can make. `operator`: whoever runs the deployment. Two-valued on purpose — a variant no envelope can carry is a dead variant.",
+      "type": "string",
+      "enum": ["agent", "operator"]
+    },
+    "retryable": {
+      "description": "Whether to send this call again. `never`: not this call, ever. `as_is`: the same call, unchanged. `after_change`: the same call with corrected arguments.",
+      "type": "string",
+      "enum": ["never", "as_is", "after_change"]
+    },
+    "facts": {
+      "description": "The named values behind `message` — measured numbers and given names, so a client branches on a value instead of parsing prose. Scalars only, by design: a string, a non-negative integer, or a boolean.",
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "integer", "boolean"],
+        "minimum": 0
+      }
+    },
+    "trace_id": {
+      "description": "The W3C trace id (32 lowercase hex digits) of the request that failed, so a caller can cite the id of its own failed request.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "traceparent": {
+      "description": "The full W3C `traceparent` of the span that produced this error: the same trace as `trace_id`, plus the span id that field cannot carry, so a collector can nest this record under the caller's span instead of seeing a flat set. Absent where there is no span of ours to name — outside a trace scope, and on the control plane, which mints none.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    }
+  }
+}

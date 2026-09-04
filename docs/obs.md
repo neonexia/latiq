@@ -101,6 +101,18 @@ side rather than only from the log stack:
 - `trace_id` on the `ErrorEnvelope` of every failed call — an agent that cannot
   cite the id of its own failed request cannot ask anyone about it.
 - `run.facets.latiq_query.traceId` on every OpenLineage event.
+- `_meta.traceparent` and `traceparent` on the envelope: the **full W3C header**,
+  which is the trace id plus the span id the bare field cannot carry. `trace_id`
+  is unchanged and stays — a caller that only wants the join key reads exactly
+  what it always did — but a collector building a span tree needs a parent to
+  attach to, and without one every record of a request is a flat set with no
+  edge between the greeter and the owner of a forwarded query. The span named is
+  the span that **did the work**: on a forwarded request it is the owner's, the
+  same rule `served_by` follows, so the two agree about which node they describe.
+  Absent where we have no span of our own — the control plane's Admin/Control
+  surfaces mint none (an id logged nowhere and propagated nowhere is not a
+  correlation), and a peer too old to send one leaves it empty rather than being
+  given ours.
 
 The response says who ran it: `_meta.served_by` on every query result names the
 node that **actually executed** the statement (its advertised internal endpoint,

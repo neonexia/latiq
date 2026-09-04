@@ -50,6 +50,16 @@ pub struct ArrowReadStream {
     /// for a stream that carries no meta at all (one decoded from a peer's
     /// chunks). Empty only where no producer said.
     pub served_by: String,
+    /// The W3C `traceparent` of the span producing these batches
+    /// (`QueryMeta::traceparent`).
+    ///
+    /// Here rather than in `meta` for exactly the reason `served_by` is: it must
+    /// be known when the stream is CREATED, because the gRPC stream adapter puts
+    /// it on the first chunk, and because the collecting edge must be able to
+    /// report it for a stream carrying no meta at all — which is every forwarded
+    /// read, i.e. the one case where the span the caller wants is not this
+    /// node's. Empty only where no producer said.
+    pub traceparent: String,
 }
 
 impl ArrowReadStream {
@@ -61,6 +71,7 @@ impl ArrowReadStream {
             batches,
             meta: None,
             served_by: String::new(),
+            traceparent: String::new(),
         }
     }
 
@@ -68,6 +79,14 @@ impl ArrowReadStream {
     /// PEER reported, never with its own id — relaying, not claiming.
     pub fn with_served_by(mut self, served_by: impl Into<String>) -> Self {
         self.served_by = served_by.into();
+        self
+    }
+
+    /// Name the span producing this stream. As with `with_served_by`, the
+    /// forwarder calls it with what the PEER reported: the span that ran the
+    /// query is the one a caller nests its trace under, and ours read no rows.
+    pub fn with_traceparent(mut self, traceparent: impl Into<String>) -> Self {
+        self.traceparent = traceparent.into();
         self
     }
 }

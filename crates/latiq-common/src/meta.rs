@@ -223,6 +223,27 @@ pub struct QueryMeta {
     /// a default-constructed meta, or one built outside a trace scope.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub trace_id: String,
+    /// The full W3C `traceparent` of the span that EXECUTED this statement — the
+    /// same trace as [`Self::trace_id`], plus the span id that field cannot
+    /// carry.
+    ///
+    /// `trace_id` alone gives a collector a flat set: every record of one
+    /// request, with no parent/child edge between the greeter and the owner of a
+    /// forwarded query — two spans a trace viewer would naturally nest. This is
+    /// the parent a caller building that tree attaches to. It is **additive**:
+    /// `trace_id` is unchanged, and a caller that only wants the join key reads
+    /// exactly what it read before.
+    ///
+    /// Stamped on the LOCAL execution path and relayed unchanged, for the same
+    /// reason as `served_by`: the span named is the span that did the work, so
+    /// on a forwarded query this is the OWNER's — the node that ran the
+    /// statement, not the one that took the call. Unlike `trace_id`, that is not
+    /// trivially true, because the two nodes are different spans.
+    ///
+    /// Empty (and omitted from the wire) only where nothing executed anything —
+    /// a default-constructed meta, or one built outside a trace scope.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub traceparent: String,
 }
 
 impl QueryMeta {

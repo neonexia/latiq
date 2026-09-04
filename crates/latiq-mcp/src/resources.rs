@@ -44,7 +44,17 @@ const RESOURCES: &[Res] = &[
 - **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first), and check the `lineage` flag in describe_pond to know whether a pond has it. It is chosen at allocation and CANNOT be turned on later, so ask for it when you allocate. It is a working record, not tamper-proof evidence — the events are files in the pond, and dropping the pond destroys them. See latiq://recipes/lineage.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
 - **Plan first:** call explain_query before an expensive query. It returns `estimated_rows` (the result size — compare it to the ~10k cap), a `scan_operations` entry per table read, and named `warnings`/`suggestions`. They are PLANNER ESTIMATES, not measurements: act on orders of magnitude, not on small differences.\n\
-- **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.",
+- **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.\n\n\
+## Reading an error\n\n\
+Every failed call returns one envelope, and it carries **machine-readable fields alongside the prose**. Read them before deciding what to do next: they are AUTHORITATIVE over the sentence, and they are the fields to branch on.\n\
+- `retryable: as_is` — send the same call again, unchanged. The failure was timing, capacity or the world, not your request. Once; a second identical failure is not transient.\n\
+- `retryable: after_change` — the arguments are what failed. `suggest` says what to change. Do not re-send it unchanged.\n\
+- `retryable: never` — **this call** cannot be made to work, however you edit its arguments. That does NOT mean your goal is blocked: `suggest` names the different call that is the move. A write sent to read_query is `never` there and belongs in **write_query** — switch calls, don't abandon the task. Only when `audience` is `operator` is there nothing for you to do.\n\
+- `audience: agent` — yours to fix, from a call you can make.\n\
+- `audience: operator` — nothing you can call resolves it. Report it and stop; retrying only adds load to a deployment already unwell.\n\
+- `facts` — the numbers and names behind the sentence, **as values**. Branch on `facts.cap`; never parse a number out of `message`. A message we did not compose (an engine's own text) carries no facts rather than invented ones.\n\
+- `trace_id` / `traceparent` — the id of your own failed request. Quote it when you report anything; it is what joins your transcript to the node logs.\n\
+And the three you already read: `kind` (what went wrong — a closed set, classified by the failure, never by which call raised it), `message` (one sentence) and `see` (a latiq:// resource about that kind). Start at latiq://troubleshooting.",
     },
     Res {
         uri: "latiq://dialect",
@@ -194,6 +204,7 @@ A **dataset** is a curated file this deployment already knows how to fetch — y
         desc: "Problem-keyed recovery guides",
         body: "# Troubleshooting\n\n\
 Every page here is keyed by the `kind` on the error envelope you received — match the kind, don't browse.\n\n\
+**Before you pick a page, read the envelope's machine-readable fields** — they are authoritative over the prose and usually decide the next move on their own: `retryable` (`as_is` = re-send unchanged, `after_change` = fix the arguments first, `never` = this call cannot work and `suggest` names the different call that can), `audience` (`operator` = report it and stop) and `facts` (branch on the values; don't parse numbers out of `message`). The full contract is in latiq://guidance.\n\n\
 - latiq://troubleshooting/pond-not-found — `pond_not_found`: the pond id/name doesn't resolve.\n\
 - latiq://troubleshooting/pond-unavailable — `pond_unavailable`: the pond exists but no node is serving it, or allocate_pond could not create one on the node it was assigned to.\n\
 - latiq://troubleshooting/catalog-error — `catalog_error`: a table/column/function in your SQL doesn't exist, or already does.\n\
@@ -527,7 +538,7 @@ See latiq://troubleshooting/conflicts.",
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latiq_common::ErrorKind;
+    use latiq_common::{Audience, ErrorKind, Retryable};
 
     /// Every kind an agent can receive must be able to explain itself.
     ///
@@ -552,6 +563,79 @@ mod tests {
                 kind.as_str()
             );
         }
+    }
+
+    /// The body of a resource this server serves, or a panic naming the URI.
+    fn body_of(uri: &str) -> &'static str {
+        RESOURCES
+            .iter()
+            .find(|r| r.uri == uri)
+            .unwrap_or_else(|| panic!("{uri} is not served"))
+            .body
+    }
+
+    /// **Every `retryable` and `audience` value must be explained where agents
+    /// read.** Same shape as the `see`-resolves guard above, and for the same
+    /// reason: the enum is enumerated, so the documentation cannot fall behind a
+    /// new variant.
+    ///
+    /// This is the fix for the Nexus audit's finding 1. `retryable`, `audience`
+    /// and `facts` shipped as "the fields that stop an agent looping on a
+    /// statement that can never succeed" and appeared **zero times** in the whole
+    /// agent-facing crate — not in a tool description, not in the server
+    /// instructions, not in any of the 19 `latiq://` resources, including the
+    /// troubleshooting tree that exists to explain errors. An LLM read `message`
+    /// and `suggest`, which is the prose it already had: the envelope gained a
+    /// control channel and no receiver. Without this test that recurs the next
+    /// time a variant is added.
+    ///
+    /// Matched against `as_str()` rather than a literal, so the text is checked
+    /// against the WIRE name an agent will actually receive
+    /// (`error_contract_audience_and_retryable_wire_names_match_serde` in
+    /// `latiq-common` holds `as_str()` to serde).
+    #[test]
+    fn error_contract_guidance_documents_every_envelope_control_field() {
+        let guidance = body_of("latiq://guidance");
+        for r in Retryable::ALL {
+            let needle = format!("`retryable: {}`", r.as_str());
+            assert!(
+                guidance.contains(&needle),
+                "latiq://guidance never mentions {needle} — an agent cannot act on a value \
+                 nothing tells it about"
+            );
+        }
+        for a in Audience::ALL {
+            let needle = format!("`audience: {}`", a.as_str());
+            assert!(
+                guidance.contains(&needle),
+                "latiq://guidance is missing {needle}"
+            );
+        }
+        assert!(
+            guidance.contains("`facts`") && guidance.contains("facts.cap"),
+            "facts must be documented as VALUES to branch on, with the branch spelled out"
+        );
+        // The load-bearing half of the `never` wording: an agent that reads
+        // "never" and infers "give up" abandons a reachable goal (audit finding
+        // 2, which this wording exists to mitigate).
+        assert!(
+            guidance.contains("write_query") && guidance.contains("don't abandon the task"),
+            "`never` must be taught as 'this CALL, and suggest names the one that works'"
+        );
+
+        // The index is where an agent lands from a `see`, so it carries the
+        // pointer even when guidance was never read.
+        let index = body_of("latiq://troubleshooting");
+        for needle in ["retryable", "audience", "facts", "latiq://guidance"] {
+            assert!(
+                index.contains(needle),
+                "the troubleshooting index must point at the envelope's {needle}"
+            );
+        }
+
+        // Anti-vacuity: both loops ran over the whole enum.
+        assert_eq!(Retryable::ALL.len(), 3);
+        assert_eq!(Audience::ALL.len(), 2);
     }
 
     /// The two kinds added for the classification fix point at resources

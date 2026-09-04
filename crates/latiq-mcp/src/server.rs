@@ -1111,8 +1111,10 @@ pull_catalog for an external database/lakehouse (iceberg) — you pull a subset 
 (external catalogs are never queried live). \
 WHO YOU ARE: your identity arrives in the transport (bearer token + the `latiq-agent-id` header), never as a tool argument — no tool takes one, so don't look for it. \
 PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be explainable later; it cannot be enabled afterwards. \
-Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow; tool errors carry \
-suggest/see links to latiq:// resources. Prompts provide SOPs for common multi-agent workflows.",
+Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow. \
+ERRORS ARE STRUCTURED: alongside `message`/`suggest`/`see`, every failure carries `retryable` (`as_is` / `after_change` / `never` — `never` means THIS call, and `suggest` names the different call that works), \
+`audience` (`operator` means report it and stop) and `facts` (the numbers as values, so don't parse the sentence). Branch on those, not on the prose — latiq://guidance has the contract. \
+Prompts provide SOPs for common multi-agent workflows.",
         )
     }
 
