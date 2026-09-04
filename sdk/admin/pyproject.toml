@@ -1,0 +1,39 @@
+# latiq-admin — the lean operator CLI, distributed as a wheel.
+#
+# There is no Python API here and no extension module: maturin's `bin` bindings
+# build the `latiq` executable from `crates/latiq` and put it in the wheel's
+# scripts directory, so `pip install latiq-admin` puts a native `latiq` on PATH
+# exactly the way `pipx install` puts any other CLI there. pip is the delivery
+# mechanism; nothing about this is Python.
+#
+# `no-default-features` is the whole point: it drops the `server` feature, and
+# with it latiq-control-plane + latiq-pond-node and therefore DuckDB, which is
+# most of the full build's size and all of its build time. `latiq serve` and
+# `latiq node add` still parse in this build and fail with an error naming
+# `pip install latiq` (crates/latiq/src/lib.rs::server_role_unavailable).
+#
+# NOTE: `latiq` (the SDK wheel) installs a `latiq` console script too — they are
+# two builds of one CLI. Install one or the other into an environment, not both.
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "latiq-admin"
+version = "0.1.0"
+description = "Lean operator CLI for Latiq — drives a cluster over gRPC (no server, no DuckDB)"
+# The PyPI project page IS the install doc for this channel (there is no
+# `curl | sh` page any more), so ship the README as the long description.
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Rust",
+  "Environment :: Console",
+]
+
+[tool.maturin]
+manifest-path = "../../crates/latiq/Cargo.toml"
+bindings = "bin"
+no-default-features = true

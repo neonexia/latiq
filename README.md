@@ -49,14 +49,19 @@ Reads stream back as Arrow (uncapped); writes are attributed and snapshotted. Se
 The whole system is one binary; the role is the command (`serve`, `node add`, or
 the CLI). Everything deployment-shaped lives in [`deploy/`](deploy/README.md) —
 the compose above, the multi-node cluster, the Dockerfiles. Install the admin CLI
-natively (a small client-only build — no server/DuckDB) and point it at the
+(`latiq-admin` — a small client-only build, no server/DuckDB) and point it at the
 control plane:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neonexia/latiq/main/deploy/install.sh | sh
+pipx install latiq-admin      # a native `latiq` on PATH; pip works too
 export LATIQ_SERVER=http://your-control-plane:51400
 latiq stats          # nodes, ponds, tiers   ·   latiq pond list · latiq dataset list
 ```
+
+`pip install latiq` (the SDK wheel) also puts a `latiq` on PATH — the *full*
+build, which can additionally run the servers (`latiq serve`, `latiq node add`).
+Two builds of one CLI: install `latiq-admin` to drive a cluster, `latiq` to run
+one, and only one of them into a given environment.
 
 ## How it fits together
 

@@ -10,7 +10,7 @@ below is the same image, started differently.
 | I want to… | Use | Needs a clone? |
 |---|---|---|
 | **try Latiq / run it for real** | [`docker-compose.yml`](docker-compose.yml) | no |
-| **just the admin CLI**, against a cluster someone else runs | [`install.sh`](install.sh) | no |
+| **just the admin CLI**, against a cluster someone else runs | `pipx install latiq-admin` | no |
 | **hack on Latiq locally** (no containers) | `./dev.sh` in the repo root | yes |
 | **a multi-node cluster** — scale-out, metrics, auth, catalogs | [`cluster/`](cluster/README.md) | yes |
 | **an Iceberg/MinIO catalog to test against** | [`iceberg-minio/`](iceberg-minio/README.md) | yes |
@@ -37,8 +37,10 @@ Then:
   `latiq.connect("grpc://localhost:51400", query_gateway="grpc://localhost:51500")`.
 - **Operators (CLI):** `export LATIQ_SERVER=http://localhost:51400 && latiq stats`.
 
-Pin a version with `LATIQ_IMAGE` / `LATIQ_GATEWAY_IMAGE` (both default to
-`:nightly`). Stop with `docker compose down`, add `-v` to wipe pond data.
+Both images default to the **`0.1.0` release** — a version someone decided to
+ship, not whatever main built last night. `LATIQ_IMAGE` / `LATIQ_GATEWAY_IMAGE`
+override that: a newer release to move forward, or `:nightly` to track main. Stop
+with `docker compose down`, add `-v` to wipe pond data.
 
 > **Apple Silicon / ARM:** the published images are `linux/amd64` today. Until
 > multi-arch images land, run with emulation:
@@ -49,22 +51,36 @@ just-published image and wheel — the "the shipped thing actually works" gate. 
 is deliberately kept lean: no profiles, no mounts, nothing that only makes sense
 inside this repo.
 
-## The admin CLI — `install.sh`
+## The admin CLI — `pip install latiq-admin`
 
 A small **client-only** `latiq` (no server, no bundled DuckDB) for driving a
 cluster you did not start:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neonexia/latiq/main/deploy/install.sh | sh
+pipx install latiq-admin    # or: pip install latiq-admin
 export LATIQ_SERVER=http://your-control-plane:51400
 latiq stats                 # nodes, ponds, tiers
 latiq pond list
 ```
 
-macOS + Linux, arm64 + x86_64. Installs to `~/.local/bin` (`LATIQ_BIN_DIR` to
-change that). The prebuilt binaries come from this repo's rolling **`cli-latest`**
-release, refreshed by the nightly and by every tagged release. To pin a version,
-`LATIQ_RELEASE_TAG=v0.2.0` (`LATIQ_RELEASE_REPO` overrides the repo).
+The wheel contains the **native executable**, not Python — pip is only the
+delivery mechanism, the way it is for any other packaged CLI. `pipx` is the
+recommended form because it gets its own environment; plain `pip` works. Pin with
+`latiq-admin==0.1.0`, upgrade with `pipx upgrade latiq-admin`, remove with
+`pipx uninstall latiq-admin`.
+
+This replaced a `curl … | sh` installer and four cross-compiled binaries on a
+rolling GitHub release. PyPI already solves what that hand-rolled: platform
+selection, version pinning, upgrade, uninstall — and nothing has to pipe an
+unsigned script into a shell.
+
+**Two builds of one CLI.** `pip install latiq` (the SDK wheel) also puts a
+`latiq` on PATH: the *full* build, which can run the servers too (`latiq serve`,
+`latiq node add`). Install `latiq-admin` to **drive** a cluster and `latiq` to
+**run** one — and only one of the two into any single environment, since they
+install the same command name. In the lean build the server roles still parse and
+fail with an error naming `pip install latiq`, rather than claiming the command
+does not exist.
 
 ## The multi-node cluster — `cluster/`
 

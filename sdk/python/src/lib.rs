@@ -339,9 +339,43 @@ fn connect(
     })
 }
 
+/// The `latiq` console script this wheel installs (`[project.scripts]` in
+/// `pyproject.toml`): `sys.exit(latiq._cli_main())`.
+///
+/// The wheel has ALWAYS contained the server — `latiq-sdk` links
+/// `latiq-control-plane` + `latiq-pond-node`, which is what `connect("local")`
+/// starts. What was missing was a way to *reach* it as `latiq serve`; this is
+/// that way, and it runs the same clap layer as the binary in the image
+/// (`crates/latiq`), so the two cannot drift.
+///
+/// Underscore-prefixed: it is the script's entry point, not part of the Python
+/// API. `argv[0]` is replaced with `latiq` so usage/errors name the command
+/// rather than the absolute path of the generated script. The GIL is released
+/// for the whole run — `latiq serve` never returns until the process is
+/// signalled, and holding the GIL for that would wedge any other thread in the
+/// interpreter.
+#[pyfunction]
+fn _cli_main(py: Python<'_>) -> PyResult<i32> {
+    let argv: Vec<String> = py.import_bound("sys")?.getattr("argv")?.extract()?;
+    let args: Vec<String> = std::iter::once("latiq".to_string())
+        .chain(argv.into_iter().skip(1))
+        .collect();
+    Ok(py.allow_threads(|| match latiq_cli::run_from_args(args) {
+        Ok(()) => 0,
+        // Same rendering `main` gets from returning `Result` (anyhow's `{:#}`
+        // chains the causes), so an error reads identically from the wheel and
+        // from the binary.
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            1
+        }
+    }))
+}
+
 #[pymodule]
 fn latiq(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(_cli_main, m)?)?;
     m.add_class::<PyDatabase>()?;
     m.add_class::<PyPond>()?;
     Ok(())

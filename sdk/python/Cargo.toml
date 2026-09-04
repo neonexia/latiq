@@ -16,6 +16,13 @@ crate-type = ["cdylib"]
 
 [dependencies]
 latiq-sdk = { path = "../../crates/latiq-sdk" }
+# The CLI/server clap layer, so the wheel can install a `latiq` console script
+# (`_cli_main` below → `latiq::run_from_args`). Renamed because the dependency's
+# lib and this cdylib are BOTH called `latiq`. It costs the wheel almost nothing:
+# `latiq-sdk` already links latiq-control-plane + latiq-pond-node (that is how
+# `connect("local")` runs a cluster in-process), so this adds the argument parser
+# to a server that was already in the wheel — it does not add the server.
+latiq-cli = { package = "latiq", path = "../../crates/latiq" }
 pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
 pythonize = "0.22"
 serde_json = "1"

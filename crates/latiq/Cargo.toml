@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The clap layer is a LIBRARY with a two-line binary on top, because it has two
+# entry points: this executable (image, ./dev.sh) and the `latiq` console script
+# the PyPI wheel installs, which calls `latiq::run_from_env` through PyO3
+# (sdk/python/src/lib.rs). One parser, so the two can never disagree.
+[lib]
+name = "latiq"
+path = "src/lib.rs"
+
 [[bin]]
 name = "latiq"
 path = "src/main.rs"
@@ -13,8 +21,14 @@ path = "src/main.rs"
 # their heavy deps — control-plane + pond-node, which embed DuckDB. On by default
 # (the container/dev binary is all-roles). A client-only build
 # (`--no-default-features`) drops DuckDB entirely and keeps just the CLI client
-# commands (pond/query/dataset/catalog/stats/node list) — tiny, cross-compiles to
-# any platform in seconds. That's the artifact admins install on their laptops.
+# commands (pond/query/dataset/catalog/stats/node list) — tiny, and seconds to
+# build. It is what the `latiq-admin` wheel ships (sdk/admin/), the artifact
+# operators install; `serve`/`node add` still parse there and refuse with an
+# error naming the full install (`server_role_unavailable` in src/lib.rs).
+#
+# Nothing else in CI compiles this configuration, so `verify.yml` clippy-and-
+# tests it explicitly. Don't remove that: the wheel needing it publishes from a
+# job that stays gated off until PyPI is configured.
 default = ["server"]
 server = ["dep:latiq-control-plane", "dep:latiq-pond-node", "dep:latiq-metrics", "dep:metrics", "dep:latiq-auth"]
 
