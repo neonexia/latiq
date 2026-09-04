@@ -60,9 +60,9 @@ fn with_caller<T>(msg: T, agent_id: &str) -> tonic::Request<T> {
             req.metadata_mut().insert("authorization", v);
         }
     }
-    if let Some(tid) = latiq_agent_core::current_trace_id() {
-        if let Ok(v) = tonic::metadata::MetadataValue::try_from(tid.as_str()) {
-            req.metadata_mut().insert("latiq-trace-id", v);
+    if let Some(tp) = latiq_agent_core::current_traceparent() {
+        if let Ok(v) = tonic::metadata::MetadataValue::try_from(tp.as_str()) {
+            req.metadata_mut().insert("traceparent", v);
         }
     }
     req

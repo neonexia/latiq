@@ -67,6 +67,12 @@ pub struct CallerAuth {
     /// on its own authority. `None` when the control plane has no auth
     /// configured — see `ControlService::replaying_bearer`.
     pub bearer: Option<String>,
+    /// The W3C `traceparent` for the hop, so the node's records for this
+    /// materialise join the caller's `pond create`. Not the caller's header
+    /// verbatim: `ControlService::caller_auth` re-derives it, which mints one
+    /// when the caller sent none and puts THIS process's span in the parent
+    /// position.
+    pub traceparent: Option<String>,
 }
 
 /// Ensure a pond's storage exists on the node that owns it.
@@ -146,6 +152,11 @@ impl NodeMaterializer for GrpcNodeMaterializer {
         if let Some(bearer) = caller.bearer.as_deref() {
             if let Ok(v) = MetadataValue::try_from(bearer) {
                 req.metadata_mut().insert("authorization", v);
+            }
+        }
+        if let Some(tp) = caller.traceparent.as_deref() {
+            if let Ok(v) = MetadataValue::try_from(tp) {
+                req.metadata_mut().insert("traceparent", v);
             }
         }
         match client.materialize_pond(req).await {

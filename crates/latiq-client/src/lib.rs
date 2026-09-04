@@ -60,12 +60,39 @@ impl LatiqClient {
         agent_id: Option<String>,
         token: Option<String>,
     ) -> Result<Self> {
+        Self::connect_traced(endpoint, agent_id, token, None).await
+    }
+
+    /// Connect presenting a W3C `traceparent`, so every call on this connection
+    /// joins a trace the caller already started.
+    ///
+    /// Agent-simulation only, like the rest of this crate — but a real one: an
+    /// orchestrator that drives several agents through Latiq is exactly the
+    /// caller that has a trace of its own, and it is what makes the id an agent
+    /// reads back (in `_meta.trace_id`, or on a failed call's envelope) joinable
+    /// to something outside Latiq.
+    pub async fn connect_traced(
+        endpoint: &str,
+        agent_id: Option<String>,
+        token: Option<String>,
+        traceparent: Option<String>,
+    ) -> Result<Self> {
         let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint);
+        let mut headers = HashMap::new();
         if let Some(a) = agent_id {
-            config = config.custom_headers(HashMap::from([(
+            headers.insert(
                 HeaderName::from_static("latiq-agent-id"),
                 HeaderValue::from_str(&a)?,
-            )]));
+            );
+        }
+        if let Some(tp) = traceparent {
+            headers.insert(
+                HeaderName::from_static("traceparent"),
+                HeaderValue::from_str(&tp)?,
+            );
+        }
+        if !headers.is_empty() {
+            config = config.custom_headers(headers);
         }
         if let Some(t) = token {
             config = config.auth_header(t);

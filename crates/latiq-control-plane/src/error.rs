@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Control-plane error type.
-use latiq_common::{ErrorEnvelope, ErrorKind};
+use latiq_common::{facts, ErrorEnvelope, ErrorKind};
 use tonic::{Code, Status};
 
 /// Registry-level failures. Each variant maps to one `ErrorKind` + gRPC code via
@@ -63,12 +63,15 @@ impl ControlPlaneError {
     /// we phrase a real message here instead of leaking the ref as the message.
     pub fn envelope(&self) -> ErrorEnvelope {
         match self {
-            ControlPlaneError::NameConflict(name) => {
-                ErrorEnvelope::for_kind(ErrorKind::NameConflict, format!("Name '{name}' is taken."))
-            }
-            ControlPlaneError::PondNotFound(r) => ErrorEnvelope::for_kind(
+            ControlPlaneError::NameConflict(name) => ErrorEnvelope::rendered(
+                ErrorKind::NameConflict,
+                "Name '{name}' is taken.",
+                facts! { "name" => name.as_str() },
+            ),
+            ControlPlaneError::PondNotFound(r) => ErrorEnvelope::rendered(
                 ErrorKind::PondNotFound,
-                format!("Pond '{r}' does not exist."),
+                "Pond '{pond}' does not exist.",
+                facts! { "pond" => r.as_str() },
             ),
             // No node available to host the pond is an availability/precondition
             // failure, not a missing pond — so it is NOT PondNotFound (review #13).
@@ -80,30 +83,32 @@ impl ControlPlaneError {
             ),
             // A node-lookup miss (e.g. `node describe <bad-id>`) — the node simply
             // isn't registered; this is a not-found, not an outage.
-            ControlPlaneError::NodeNotFound(n) => ErrorEnvelope::new(
+            ControlPlaneError::NodeNotFound(n) => ErrorEnvelope::rendered_with(
                 ErrorKind::Internal,
-                format!("Node '{n}' is not registered."),
+                "Node '{node_id}' is not registered.",
+                facts! { "node_id" => n.as_str() },
                 "Run `latiq node list` to see registered nodes.",
                 "latiq://troubleshooting",
             ),
-            ControlPlaneError::DatasetNotFound(r) => ErrorEnvelope::for_kind(
+            ControlPlaneError::DatasetNotFound(r) => ErrorEnvelope::rendered(
                 ErrorKind::DatasetNotFound,
-                format!("Dataset '{r}' is not in the catalog."),
+                "Dataset '{dataset}' is not in the catalog.",
+                facts! { "dataset" => r.as_str() },
             ),
-            ControlPlaneError::CatalogNotFound(r) => ErrorEnvelope::new(
+            ControlPlaneError::CatalogNotFound(r) => ErrorEnvelope::rendered_with(
                 ErrorKind::DatasetNotFound,
-                format!("Catalog '{r}' is not registered."),
+                "Catalog '{catalog}' is not registered.",
+                facts! { "catalog" => r.as_str() },
                 "Call list_catalogs to see registered catalogs.",
                 "latiq://guidance",
             ),
             // Not an argument the operator can correct — the pond and the verb
             // are both fine, the CLUSTER is in a state this verb is not for.
-            ControlPlaneError::PondStillOwned { pond, node_id } => ErrorEnvelope::new(
+            ControlPlaneError::PondStillOwned { pond, node_id } => ErrorEnvelope::rendered_with(
                 ErrorKind::InvalidValue,
-                format!(
-                    "Pond '{pond}' is still owned by node '{node_id}', which is registered and \
-                     active — forgetting it would orphan data a live node is serving."
-                ),
+                "Pond '{pond}' is still owned by node '{node_id}', which is registered and active \
+                 — forgetting it would orphan data a live node is serving.",
+                facts! { "pond" => pond.as_str(), "node_id" => node_id.as_str() },
                 "Use `latiq pond drop <pond> --confirm`, which deletes the pond AND its data via \
                  the owning node. `pond forget` is only for a pond whose node is gone.",
                 "latiq://guidance",
@@ -123,13 +128,17 @@ impl ControlPlaneError {
                 owner,
                 cause,
                 compensated: true,
-            } => ErrorEnvelope::new(
+            } => ErrorEnvelope::rendered_with(
                 ErrorKind::PondUnavailable,
-                format!(
-                    "Pond '{name}' was NOT created: the node it was assigned to ({owner}) could \
-                     not materialise its storage ({cause}). The assignment has been rolled back, \
-                     so the name is free and nothing was left behind."
-                ),
+                "Pond '{name}' was NOT created: the node it was assigned to ({node_endpoint}) \
+                 could not materialise its storage ({cause}). The assignment has been rolled \
+                 back, so the name is free and nothing was left behind.",
+                facts! {
+                    "name" => name.as_str(),
+                    "node_endpoint" => owner.as_str(),
+                    "cause" => cause.as_str(),
+                    "compensated" => true,
+                },
                 "Retry allocate_pond (or `latiq pond create`) — the failed attempt left nothing \
                  behind, so the same name is free. If it keeps failing, that node is down: report \
                  it to your operator.",
@@ -140,14 +149,18 @@ impl ControlPlaneError {
                 owner,
                 cause,
                 compensated: false,
-            } => ErrorEnvelope::new(
+            } => ErrorEnvelope::rendered_with(
                 ErrorKind::PondUnavailable,
-                format!(
-                    "Pond '{name}' was NOT created: the node it was assigned to ({owner}) could \
-                     not materialise its storage ({cause}), AND the assignment could not be \
-                     rolled back — a registry row named '{name}' may still exist with no storage \
-                     behind it."
-                ),
+                "Pond '{name}' was NOT created: the node it was assigned to ({node_endpoint}) \
+                 could not materialise its storage ({cause}), AND the assignment could not be \
+                 rolled back — a registry row named '{name}' may still exist with no storage \
+                 behind it.",
+                facts! {
+                    "name" => name.as_str(),
+                    "node_endpoint" => owner.as_str(),
+                    "cause" => cause.as_str(),
+                    "compensated" => false,
+                },
                 "Retry under a DIFFERENT name; the original may still be taken. Ask an operator \
                  to remove the stranded record with `latiq pond forget <pond> --confirm` (it \
                  deletes the registry row only, never data).",
@@ -187,8 +200,20 @@ impl ControlPlaneError {
 /// `details` (same contract as the Data gRPC), so the CLI renders guidance — not
 /// a bare ref — on every Control/Admin call.
 pub fn to_status(e: ControlPlaneError) -> Status {
+    to_status_traced(e, None)
+}
+
+/// As [`to_status`], stamping the request's trace id on the envelope so the
+/// caller can cite the id of its own failed call.
+///
+/// A separate entry point rather than an ambient read: the control plane keeps
+/// no trace scope (see `trace_meta`), so the id has to arrive from the handler
+/// that read it off the request.
+pub fn to_status_traced(e: ControlPlaneError, trace_id: Option<String>) -> Status {
     let code = e.code();
-    let env = e.envelope();
+    let env = e
+        .envelope()
+        .with_trace_id(trace_id.filter(|t| !t.is_empty()));
     let details = serde_json::to_vec(&env).unwrap_or_default();
     Status::with_details(code, env.message.clone(), details.into())
 }

@@ -204,6 +204,25 @@ pub struct QueryMeta {
     /// value it relayed with its own.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub served_by: String,
+    /// The W3C trace id of the request that produced this result — the same
+    /// value the `latiq::access` record and the lineage events carry.
+    ///
+    /// Returned to the caller for one reason: a client that cannot cite the id
+    /// of its own request cannot ask anyone about it. It is how a slow query in
+    /// an agent's transcript is joined to the node log that explains it, and on
+    /// a forwarded request it is the ONLY thing tying the caller's node to the
+    /// owner that did the work.
+    ///
+    /// Stamped on the LOCAL execution path, for the same reason as `served_by`
+    /// and `timeout_ms`: the node that ran the statement is the one that knows.
+    /// A forwarding node relays the value it received and never overwrites it —
+    /// which is trivially correct here, because the id is the same on both
+    /// sides of the hop.
+    ///
+    /// Empty (and omitted from the wire) only where nothing executed anything —
+    /// a default-constructed meta, or one built outside a trace scope.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trace_id: String,
 }
 
 impl QueryMeta {

@@ -48,8 +48,18 @@ pub fn ok<T: Serialize>(value: &T) -> CallToolResult {
 }
 
 /// Error result carrying the structured `ErrorEnvelope`.
+///
+/// The request's trace id is stamped HERE, at the edge, from the ambient scope
+/// — the same place and for the same reason as the Data surface's `to_status`.
+/// Every tool error funnels through this one function, so an agent can always
+/// cite the id of its own failed request; asking ~40 construction sites deep in
+/// the core to remember would guarantee that the one that forgot is the one an
+/// agent is holding when it needs to ask about it.
 pub fn err_envelope(env: &ErrorEnvelope) -> CallToolResult {
-    let value = serde_json::to_value(env).unwrap_or(Value::Null);
+    let stamped = env
+        .clone()
+        .with_trace_id(latiq_agent_core::current_trace_id());
+    let value = serde_json::to_value(&stamped).unwrap_or(Value::Null);
     dual(value, true)
 }
 

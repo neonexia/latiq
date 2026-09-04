@@ -15,3 +15,7 @@ schemars = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# Validates constructed envelopes against the vendored `spec/ErrorEnvelope-*.json`.
+# A dev-dependency, exactly as in `latiq-lineage`: nothing in `src/` reads the
+# schema at runtime — it is a test input and an audit artefact.
+jsonschema = { workspace = true }
