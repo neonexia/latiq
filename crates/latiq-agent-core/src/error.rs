@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Agent-facing errors carrying a structured `ErrorEnvelope`.
-use latiq_common::{ErrorEnvelope, ErrorKind};
+use latiq_common::{facts, ErrorEnvelope, ErrorKind, Facts};
 use latiq_engine::EngineError;
 
 /// The core's one error type: a newtype over [`ErrorEnvelope`], so an error that
@@ -49,14 +49,38 @@ impl AgentError {
 
     /// Build from `kind`'s canonical suggest/see defaults (the single source in
     /// `latiq-common`); pass only the specific message.
+    ///
+    /// For a message that quotes a number or a name, use [`Self::rendered`]
+    /// instead: it renders the sentence FROM the facts, so the two cannot drift.
     pub fn of_kind(kind: ErrorKind, message: impl Into<String>) -> Self {
         AgentError(ErrorEnvelope::for_kind(kind, message))
     }
 
+    /// Build from `kind`'s canonical guidance with a message rendered from
+    /// `facts` — see [`ErrorEnvelope::rendered`].
+    pub fn rendered(kind: ErrorKind, template: &str, facts: Facts) -> Self {
+        AgentError(ErrorEnvelope::rendered(kind, template, facts))
+    }
+
+    /// As [`Self::rendered`] with bespoke `suggest`/`see`, both rendered from
+    /// the same facts — see [`ErrorEnvelope::rendered_with`].
+    pub fn rendered_with(
+        kind: ErrorKind,
+        template: &str,
+        facts: Facts,
+        suggest: &str,
+        see: impl Into<String>,
+    ) -> Self {
+        AgentError(ErrorEnvelope::rendered_with(
+            kind, template, facts, suggest, see,
+        ))
+    }
+
     pub fn pond_not_found(pond_ref: &str) -> Self {
-        Self::of_kind(
+        Self::rendered(
             ErrorKind::PondNotFound,
-            format!("Pond '{pond_ref}' does not exist."),
+            "Pond '{pond}' does not exist.",
+            facts! { "pond" => pond_ref },
         )
     }
 
@@ -66,20 +90,19 @@ impl AgentError {
     /// pond's files, and serving it here would create an empty pond of the same
     /// name and answer with plausible, empty results.
     pub fn pond_unavailable(pond_ref: &str) -> Self {
-        Self::of_kind(
+        Self::rendered(
             ErrorKind::PondUnavailable,
-            format!(
-                "Pond '{pond_ref}' exists, but the node that owns it is not registered with this \
-                 deployment — no node is currently serving it, and this node does not hold its \
-                 data."
-            ),
+            "Pond '{pond}' exists, but the node that owns it is not registered with this \
+             deployment — no node is currently serving it, and this node does not hold its data.",
+            facts! { "pond" => pond_ref },
         )
     }
 
     pub fn name_conflict(name: &str) -> Self {
-        Self::of_kind(
+        Self::rendered(
             ErrorKind::NameConflict,
-            format!("A pond named '{name}' already exists."),
+            "A pond named '{name}' already exists.",
+            facts! { "name" => name },
         )
     }
 
@@ -90,9 +113,13 @@ impl AgentError {
     /// see [`AgentError::result_cap_exceeded_unknown`], and the sentences are
     /// deliberately different so the two can never be mistaken for each other.
     pub fn result_cap_exceeded(rows: usize, cap: usize) -> Self {
-        Self::of_kind(
+        Self::rendered(
             ErrorKind::ResultCapExceeded,
-            format!("Result has {rows} rows, over the inline cap of {cap}."),
+            "Result has {rows} rows, over the inline cap of {cap}.",
+            // `rows` is an exact total, which is the whole difference between
+            // this constructor and the one below — a client sizing its next
+            // LIMIT can read it as a number here and cannot there.
+            facts! { "rows" => rows, "cap" => cap },
         )
     }
 
@@ -108,20 +135,23 @@ impl AgentError {
     /// the rest honestly would mean draining the whole result the caller just
     /// asked us not to hand back, so the answer is to stop claiming precision.
     pub fn result_cap_exceeded_unknown(cap: usize) -> Self {
-        Self::of_kind(
+        Self::rendered(
             ErrorKind::ResultCapExceeded,
-            format!(
-                "Result has more than {cap} rows, over the inline cap of {cap}. Collection \
-                 stopped at the cap, so the exact row count is not known — use \
-                 `SELECT count(*)` or explain_query's `estimated_rows` to size it."
-            ),
+            "Result has more than {cap} rows, over the inline cap of {cap}. Collection stopped at \
+             the cap, so the exact row count is not known — use `SELECT count(*)` or \
+             explain_query's `estimated_rows` to size it.",
+            // Deliberately NO `rows` fact. The count is not known, and a fact is
+            // a value we measured; supplying the batch boundary here is the very
+            // bug the two-constructor split exists to prevent.
+            facts! { "cap" => cap },
         )
     }
 
     pub fn dataset_not_found(reference: &str) -> Self {
-        Self::of_kind(
+        Self::rendered(
             ErrorKind::DatasetNotFound,
-            format!("Dataset '{reference}' is not in the catalog."),
+            "Dataset '{dataset}' is not in the catalog.",
+            facts! { "dataset" => reference },
         )
     }
 
@@ -146,26 +176,27 @@ impl AgentError {
     /// win. That case is the tier's problem, not the timeout's.
     pub fn query_timeout(effective_ms: u64, max_ms: u64) -> Self {
         let at_ceiling = effective_ms >= max_ms;
+        let facts = facts! { "timeout_ms" => effective_ms, "max_timeout_ms" => max_ms };
         let suggest = if at_ceiling {
             "This ran at the node's maximum, so a larger timeout_ms is not available. Narrow the \
              query — add a WHERE on a selective column, a LIMIT, or fewer columns — or aggregate \
              server-side (GROUP BY/count/sum) instead of scanning. If the work is genuinely this \
              large, it is too big for this pond's tier: ask an operator to re-tier the pond."
-                .to_string()
         } else {
-            format!(
-                "Retry with a larger timeout_ms (this node allows up to {max_ms}), or narrow the \
-                 query — add a WHERE on a selective column, a LIMIT, or fewer columns — or \
-                 aggregate server-side (GROUP BY/count/sum). If it still times out at {max_ms} \
-                 ms, the query is too large for this pond's tier: ask an operator to re-tier it."
-            )
+            // Both numbers in the suggest come from the same facts as the
+            // message, so the ceiling an agent is told to retry under can never
+            // differ from the one the message quotes.
+            "Retry with a larger timeout_ms (this node allows up to {max_timeout_ms}), or narrow \
+             the query — add a WHERE on a selective column, a LIMIT, or fewer columns — or \
+             aggregate server-side (GROUP BY/count/sum). If it still times out at \
+             {max_timeout_ms} ms, the query is too large for this pond's tier: ask an operator to \
+             re-tier it."
         };
-        Self::new(
+        Self::rendered_with(
             ErrorKind::QueryTimeout,
-            format!(
-                "Query stopped after {effective_ms} ms — the timeout in effect for this request. \
-                 This node allows up to {max_ms} ms."
-            ),
+            "Query stopped after {timeout_ms} ms — the timeout in effect for this request. This \
+             node allows up to {max_timeout_ms} ms.",
+            facts,
             suggest,
             ErrorKind::QueryTimeout.default_see(),
         )
@@ -359,6 +390,24 @@ mod tests {
             exact, unknown,
             "two different claims must not read as the same sentence"
         );
+        // And the difference is machine-readable, not only prose: the exact
+        // path publishes `rows` as a value; the streaming path publishes NO
+        // `rows` fact at all, because it does not know one. A client that
+        // branches on the fact can never be handed a batch boundary.
+        assert_eq!(
+            AgentError::result_cap_exceeded(10_001, 10_000)
+                .envelope()
+                .facts
+                .get("rows"),
+            Some(&latiq_common::Fact::Number(10_001))
+        );
+        assert!(
+            !AgentError::result_cap_exceeded_unknown(10_000)
+                .envelope()
+                .facts
+                .contains_key("rows"),
+            "a count we did not measure must not appear as a fact"
+        );
         // Both are the same kind, so `see`/`suggest` routing is unchanged.
         for e in [
             AgentError::result_cap_exceeded(1, 0),
@@ -366,5 +415,71 @@ mod tests {
         ] {
             assert_eq!(e.envelope().kind, ErrorKind::ResultCapExceeded);
         }
+    }
+
+    /// Every fact-carrying constructor, driven for real, asserting the two
+    /// things that make `facts` worth having.
+    ///
+    /// 1. **No `{placeholder}` survives into what a caller reads.** The renderer
+    ///    deliberately leaves an unresolved placeholder verbatim (see
+    ///    `latiq-common`'s `error_contract_an_unresolved_placeholder_is_left_visible`),
+    ///    so a typo'd name in a template is visible here rather than shipping a
+    ///    sentence with a hole in it. This is the whole reason the renderer does
+    ///    not silently drop them.
+    /// 2. **Every fact is actually USED**, in the message or the suggest. A fact
+    ///    nobody renders is a value the prose is not built from, which is the
+    ///    drift this mechanism exists to prevent — in the other direction.
+    #[test]
+    fn error_contract_every_rendered_message_resolves_its_facts() {
+        let cases = [
+            AgentError::pond_not_found("incident-001"),
+            AgentError::pond_unavailable("incident-001"),
+            AgentError::name_conflict("taken"),
+            AgentError::dataset_not_found("tpch"),
+            AgentError::result_cap_exceeded(10_001, 10_000),
+            AgentError::result_cap_exceeded_unknown(10_000),
+            // Both timeout shapes: below the ceiling (the suggest quotes the
+            // ceiling twice) and AT it (the suggest quotes nothing).
+            AgentError::query_timeout(500, 60_000),
+            AgentError::query_timeout(60_000, 60_000),
+        ];
+        // Anti-vacuity: an empty list would make every assertion below vacuous.
+        assert_eq!(cases.len(), 8, "every fact-carrying constructor is driven");
+        for e in cases {
+            let env = e.envelope();
+            let label = format!("{:?}", env.kind);
+            assert!(
+                !env.facts.is_empty(),
+                "{label}: a constructor that quotes a value must publish it"
+            );
+            for text in [&env.message, &env.suggest] {
+                assert!(
+                    !text.contains('{'),
+                    "{label}: an unresolved placeholder reached the caller: {text}"
+                );
+            }
+            for (name, fact) in &env.facts {
+                let rendered = fact.to_string();
+                assert!(
+                    env.message.contains(&rendered) || env.suggest.contains(&rendered),
+                    "{label}: fact `{name}` = {rendered} is published but never rendered — \
+                     the prose is not built from it"
+                );
+            }
+        }
+    }
+
+    /// Regression pin (#100). `AgentError::from(EngineError::…)` must NOT
+    /// fabricate facts: the message is the engine's own words, and the only
+    /// honest set of named values behind it is the empty one. A `sql` or
+    /// `table` fact here would be us guessing at what DuckDB meant.
+    #[test]
+    fn error_contract_an_engine_message_publishes_no_facts_of_ours() {
+        let env = AgentError::from(EngineError::Catalog(
+            "Catalog Error: Table with name nope does not exist!".into(),
+        ))
+        .into_envelope();
+        assert_eq!(env.kind, ErrorKind::CatalogError);
+        assert!(env.facts.is_empty(), "{:?}", env.facts);
     }
 }

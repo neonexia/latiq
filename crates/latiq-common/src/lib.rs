@@ -18,7 +18,7 @@ pub use id::PondId;
 pub mod identity;
 pub use identity::Identity;
 pub mod error;
-pub use error::{ErrorEnvelope, ErrorKind, Location};
+pub use error::{Audience, ErrorEnvelope, ErrorKind, Fact, Facts, Location, Retryable};
 pub mod meta;
 pub use meta::{DatasetField, DatasetRef, QueryMeta, Warning, WarningKind};
 pub mod timeout;

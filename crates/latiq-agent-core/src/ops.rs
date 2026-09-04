@@ -761,19 +761,21 @@ impl AgentOps {
         if !confirm {
             // Recorded, not silently refused: "someone tried to drop this pond"
             // is exactly the kind of attempt an operator wants in the trail.
-            return Err(self.audit_err(
-                identity,
-                "drop_pond",
-                Some(pond_ref),
-                None,
-                0,
-                AgentError::new(
-                    ErrorKind::MissingArgument,
-                    format!("drop_pond deletes pond '{pond_ref}' and all its data; set confirm=true to proceed"),
-                    "Re-issue drop_pond with confirm=true once you're certain.",
-                    "latiq://guidance",
-                ),
-            ).await);
+            return Err(self
+                .audit_err(
+                    identity,
+                    "drop_pond",
+                    Some(pond_ref),
+                    None,
+                    0,
+                    AgentError::rendered(
+                        ErrorKind::MissingArgument,
+                        "drop_pond deletes pond '{pond}' and all its data; set confirm=true to \
+                     proceed",
+                        latiq_common::facts! { "pond" => pond_ref },
+                    ),
+                )
+                .await);
         }
         let info = self
             .pond_info_audited(identity, "drop_pond", pond_ref)
@@ -1788,15 +1790,12 @@ impl AgentOps {
                     Some(&info.pond_id),
                     None,
                     0,
-                    AgentError::new(
+                    AgentError::rendered_with(
                         ErrorKind::InvalidValue,
-                        "`limit` must be at least 1.".to_string(),
-                        format!(
-                            "Omit `limit` for the default page, or pass a positive count \
-                             (clamped to {}, and the page reports the value applied as \
-                             `limit_applied`).",
-                            latiq_lineage::MAX_LIMIT
-                        ),
+                        "`limit` must be at least 1.",
+                        latiq_common::facts! { "max_limit" => latiq_lineage::MAX_LIMIT },
+                        "Omit `limit` for the default page, or pass a positive count (clamped to \
+                         {max_limit}, and the page reports the value applied as `limit_applied`).",
                         LINEAGE_RECIPE,
                     ),
                 )
@@ -1851,14 +1850,12 @@ impl AgentOps {
         // empty list as proof the data appeared from nowhere. So: an error,
         // with the one action that fixes it.
         if !info.lineage {
-            return Err(AgentError::new(
+            return Err(AgentError::rendered_with(
                 ErrorKind::InvalidValue,
-                format!(
-                    "Pond '{}' does not record lineage — it was allocated without it, and that is \
-                     fixed for the pond's lifetime. No events exist for it, which is NOT the same \
-                     as nothing having happened here.",
-                    info.name
-                ),
+                "Pond '{pond}' does not record lineage — it was allocated without it, and that is \
+                 fixed for the pond's lifetime. No events exist for it, which is NOT the same as \
+                 nothing having happened here.",
+                latiq_common::facts! { "pond" => info.name.as_str() },
                 "Allocate a new pond with lineage=true and do the work there; an existing pond \
                  cannot be switched on.",
                 LINEAGE_RECIPE,
@@ -1871,13 +1868,11 @@ impl AgentOps {
         // the pond was never materialized on the node that holds it — nothing
         // has run against it yet, and there is no trail to read.
         let loc = self.storage.pond_location(pid).map_err(|_| {
-            AgentError::new(
+            AgentError::rendered_with(
                 ErrorKind::Storage,
-                format!(
-                    "Pond '{}' has no lineage directory on the node that owns it — nothing has \
-                     been recorded for it yet.",
-                    info.name
-                ),
+                "Pond '{pond}' has no lineage directory on the node that owns it — nothing has \
+                 been recorded for it yet.",
+                latiq_common::facts! { "pond" => info.name.as_str() },
                 "Run a query against the pond first; its events appear once something has \
                  happened in it.",
                 LINEAGE_RECIPE,
@@ -1908,9 +1903,10 @@ impl AgentOps {
         .await
         .map_err(|e| AgentError::internal(format!("join: {e}")))?
         .map_err(|e| match e {
-            latiq_lineage::ReadError::BadTimestamp { field, value } => AgentError::new(
+            latiq_lineage::ReadError::BadTimestamp { field, value } => AgentError::rendered_with(
                 ErrorKind::InvalidValue,
-                format!("`{field}` is not an RFC-3339 timestamp: '{value}'."),
+                "`{field}` is not an RFC-3339 timestamp: '{value}'.",
+                latiq_common::facts! { "field" => field, "value" => value },
                 "Pass an RFC-3339 instant, e.g. since='2026-08-14T10:00:00Z', or omit it.",
                 LINEAGE_RECIPE,
             ),

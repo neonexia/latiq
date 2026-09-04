@@ -121,7 +121,11 @@ fn with_identity<T>(msg: T, id: &Identity) -> Request<T> {
 fn status_to_error(peer: Peer<'_>, pond: &str, s: Status) -> AgentError {
     if !s.details().is_empty() {
         if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(s.details()) {
-            return AgentError::new(env.kind, env.message, env.suggest, env.see);
+            // The WHOLE envelope, not four of its fields: rebuilding it field by
+            // field silently dropped `location`, and would now also drop the
+            // owner's `facts` and the `trace_id` of the request that failed —
+            // exactly the values a forwarded caller cannot obtain any other way.
+            return AgentError::from_envelope(env);
         }
     }
     match s.code() {
@@ -163,15 +167,16 @@ fn status_to_error(peer: Peer<'_>, pond: &str, s: Status) -> AgentError {
 /// page) was unreachable in production. The message names the pond AND the node
 /// because the fix is an operator's and it starts with knowing which node died.
 fn unreachable_owner(peer: Peer<'_>, pond: &str, detail: &str) -> AgentError {
-    AgentError::of_kind(
+    AgentError::rendered(
         ErrorKind::PondUnavailable,
-        format!(
-            "Pond '{pond}' is owned by node '{}', which is not answering at {} ({}). The pond's \
-             data is on that node; no other node can serve it.",
-            peer.node_id,
-            peer.endpoint,
-            detail.trim()
-        ),
+        "Pond '{pond}' is owned by node '{node_id}', which is not answering at {node_endpoint} \
+         ({detail}). The pond's data is on that node; no other node can serve it.",
+        latiq_common::facts! {
+            "pond" => pond,
+            "node_id" => peer.node_id,
+            "node_endpoint" => peer.endpoint,
+            "detail" => detail.trim(),
+        },
     )
 }
 

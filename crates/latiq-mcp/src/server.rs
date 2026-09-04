@@ -250,10 +250,11 @@ fn query_controls(a: &QueryArgs, ctx: &RequestContext<RoleServer>) -> QueryContr
 fn reject_zero(field: &str, value: Option<u64>) -> Option<CallToolResult> {
     (value == Some(0)).then(|| {
         err_envelope(
-            AgentError::new(
+            AgentError::rendered_with(
                 latiq_common::ErrorKind::InvalidValue,
-                format!("`{field}` must be at least 1."),
-                format!("Omit `{field}` to use the node's default; `0` is not 'unlimited'."),
+                "`{field}` must be at least 1.",
+                latiq_common::facts! { "field" => field },
+                "Omit `{field}` to use the node's default; `0` is not 'unlimited'.",
                 "latiq://guidance",
             )
             .envelope(),
