@@ -34,6 +34,11 @@ use std::collections::HashMap;
 pub struct CallOutcome {
     pub value: Value,
     pub is_error: bool,
+    /// The result's PROTOCOL-level `_meta` block (`CallToolResult._meta`), which
+    /// is where this surface returns the call's `traceparent`. Distinct from the
+    /// `_meta` INSIDE a query response body (`QueryMeta`): that one is a field of
+    /// the value and arrives in `value["_meta"]`.
+    pub meta: Map<String, Value>,
 }
 
 /// A connected MCP session, standing in for an agent. Tests drive the agent
@@ -111,6 +116,7 @@ impl LatiqClient {
         Ok(CallOutcome {
             value: res.structured_content.unwrap_or(Value::Null),
             is_error: res.is_error.unwrap_or(false),
+            meta: res.meta.map(|m| m.0).unwrap_or_default(),
         })
     }
 
@@ -215,6 +221,7 @@ impl LatiqClient {
         Ok(CallOutcome {
             value: res.structured_content.unwrap_or(Value::Null),
             is_error: res.is_error.unwrap_or(false),
+            meta: res.meta.map(|m| m.0).unwrap_or_default(),
         })
     }
 

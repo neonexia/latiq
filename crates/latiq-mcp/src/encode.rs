@@ -47,6 +47,15 @@ use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 use serde_json::Value;
 
+/// The `_meta` key carrying this call's W3C trace context.
+///
+/// Unprefixed on purpose: MCP reserves the `modelcontextprotocol`/`mcp` prefixes
+/// and leaves bare names to the implementation, and `traceparent` is the one
+/// spelling this deployment already uses on every surface and every hop
+/// (invariant 9) — a `latiq.dev/`-prefixed synonym would be a second name for
+/// one thing that an agent then has to be taught.
+const TRACEPARENT_META: &str = "traceparent";
+
 fn dual(value: Value, is_error: bool) -> CallToolResult {
     let text = serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
     let content = vec![Content::text(text)];
@@ -57,7 +66,45 @@ fn dual(value: Value, is_error: bool) -> CallToolResult {
         CallToolResult::success(content)
     };
     r.structured_content = Some(value);
+    r.meta = trace_meta();
     r
+}
+
+/// The protocol-level `_meta` every tool result carries: this request's
+/// `traceparent`, read from the ambient trace scope `traced` entered.
+///
+/// **Set HERE, once, for the same reason `err_envelope` stamps the trace id
+/// here** — every tool result on this surface funnels through `dual`, so a tool
+/// added tomorrow correlates without its author remembering anything. Until
+/// #113 only the three query tools returned a trace id on SUCCESS (they carry a
+/// `QueryMeta`, which gained `traceparent` in #110), while every FAILURE carried
+/// one — exactly backwards, since a successful `allocate_pond` is the call you
+/// later need to join against the lineage and access records it produced. The
+/// alternative — a `traceparent` field on nine neutral result structs — is nine
+/// chances to forget, and would have put an MCP concern in `latiq-agent-core`
+/// (invariant 5).
+///
+/// **One source, so the two places cannot disagree by accident.** The query
+/// tools also report a `traceparent` inside their body (`QueryMeta`), and both
+/// values come from `latiq_agent_core::current_traceparent()`. Note what "agree"
+/// means: the TRACE ID is identical by construction (one ambient scope per
+/// request). The SPAN id is identical only when the pond is local — a forwarded
+/// query relays the OWNER's `QueryMeta.traceparent`, because the span the caller
+/// wants nested is the one that ran the statement (`latiq-agent-core`'s
+/// "`QueryMeta::traceparent` follows `served_by`"). So the protocol `_meta` is
+/// always the span of the node the agent dialled, and the body's is always the
+/// span that did the work; forcing them equal would destroy the distinction
+/// #110 exists for.
+///
+/// Absent rather than empty when there is no scope (a handful of argument
+/// validations answer before `traced` is entered): invariant 13(a) — we do not
+/// report a correlation id we did not have.
+fn trace_meta() -> Option<rmcp::model::Meta> {
+    let tp = latiq_agent_core::current_traceparent()?;
+    let mut meta = rmcp::model::Meta::new();
+    meta.0
+        .insert(TRACEPARENT_META.to_string(), Value::String(tp));
+    Some(meta)
 }
 
 /// Success result from a value of the tool's DECLARED response type.
