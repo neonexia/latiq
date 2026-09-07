@@ -2175,49 +2175,27 @@ mod honest_answers {
 }
 
 // ---------------------------------------------------------------------------
-/// **The declared output contract.** Every tool publishes an `outputSchema`, and
-/// the point of publishing one is that a client may rely on it — so this drives
-/// each tool to a REAL success response over the real transport and validates
-/// that response against the schema the server itself advertised in
-/// `tools/list`. rmcp deliberately does not validate responses against
-/// `outputSchema` ("since rust is a strong type language…", `model.rs`), so if
-/// we do not, nobody does and the declaration is a document rather than a
-/// contract.
+/// **Driving EVERY advertised tool to a real success response, once.**
 ///
-/// A submodule, not a new binary (tests/CLAUDE.md rule 5).
+/// Two guards need exactly that — the declared `outputSchema` really being
+/// satisfied, and every result really carrying `_meta.traceparent` — and a
+/// property claimed "for every tool" is only worth what its coverage is. So the
+/// plan lives here, and both tests check it against `tools/list` before running
+/// it: a tool added tomorrow FAILS both rather than being quietly skipped.
 // ---------------------------------------------------------------------------
-mod output_schema {
-    use crate::common::start_stack;
-    use latiq_client::LatiqClient;
+mod every_tool {
+    use crate::common::TestStack;
+    use latiq_client::{CallOutcome, LatiqClient};
     use latiq_proto::v1::admin_client::AdminClient;
     use latiq_proto::v1::{CatalogAddRequest, CatalogMsg};
     use serde_json::{Map, Value};
     use std::collections::HashMap;
 
-    /// Every tool this surface advertises. Pinned as a list so a NEW tool fails
-    /// this test rather than slipping in undeclared and unvalidated: the count
-    /// assertion below is the anti-vacuity guard (tests/CLAUDE.md rule 3).
-    const TOOLS: &[&str] = &[
-        "allocate_pond",
-        "describe_pond",
-        "list_ponds",
-        "drop_pond",
-        "read_query",
-        "write_query",
-        "explain_query",
-        "list_datasets",
-        "load_dataset",
-        "list_catalogs",
-        "describe_catalog",
-        "pull_catalog",
-        "get_lineage",
-    ];
-
     /// A local DuckLake catalog with one table — file metadata + local data, no
     /// network and no docker, so `describe_catalog`/`pull_catalog` reach a real
     /// SUCCESS response in this suite rather than only an error one. Same seed
     /// the Data-surface catalog test uses (`admin.rs::catalogs`).
-    fn seed_ducklake(dir: &std::path::Path) -> (String, String) {
+    pub async fn seed_catalog(s: &TestStack, dir: &std::path::Path) {
         let meta = dir.join("meta.duckdb");
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
@@ -2231,21 +2209,6 @@ mod output_schema {
             data.display(),
         ))
         .unwrap();
-        (meta.display().to_string(), data.display().to_string())
-    }
-
-    fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn output_schema_every_tool_declares_one_and_its_real_response_validates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (metadata_path, data_path) = seed_ducklake(tmp.path());
-        let s = start_stack().await;
         AdminClient::connect(s.admin_endpoint.clone())
             .await
             .unwrap()
@@ -2254,8 +2217,8 @@ mod output_schema {
                     name: "ext".into(),
                     r#type: "ducklake".into(),
                     params: HashMap::from([
-                        ("metadata_path".into(), metadata_path),
-                        ("data_path".into(), data_path),
+                        ("metadata_path".into(), meta.display().to_string()),
+                        ("data_path".into(), data.display().to_string()),
                     ]),
                     description: "local ducklake".into(),
                     tags: vec!["test".into()],
@@ -2265,6 +2228,137 @@ mod output_schema {
             })
             .await
             .unwrap();
+    }
+
+    fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    /// One successful call per tool, in dependency order: the pond exists before
+    /// it is queried, `get_lineage` runs on a pond allocated WITH lineage, and
+    /// the drop is last because it is the one irreversible step.
+    ///
+    /// Requires `seed_catalog` to have run on the same stack.
+    pub fn plan(pond: &str) -> Vec<(&'static str, Map<String, Value>)> {
+        let p: Value = pond.into();
+        vec![
+            (
+                "allocate_pond",
+                args(&[("name", p.clone()), ("lineage", true.into())]),
+            ),
+            (
+                "write_query",
+                args(&[
+                    ("pond", p.clone()),
+                    ("sql", "CREATE TABLE t AS SELECT 1 AS id, 'a' AS nm".into()),
+                ]),
+            ),
+            (
+                "read_query",
+                args(&[("pond", p.clone()), ("sql", "SELECT * FROM t".into())]),
+            ),
+            (
+                "explain_query",
+                args(&[("pond", p.clone()), ("sql", "SELECT * FROM t".into())]),
+            ),
+            ("describe_pond", args(&[("pond", p.clone())])),
+            ("list_ponds", Map::new()),
+            ("list_datasets", Map::new()),
+            (
+                "load_dataset",
+                args(&[("pond", p.clone()), ("dataset", "holdings".into())]),
+            ),
+            ("list_catalogs", Map::new()),
+            (
+                "describe_catalog",
+                args(&[("pond", p.clone()), ("catalog", "ext".into())]),
+            ),
+            (
+                "pull_catalog",
+                args(&[
+                    ("pond", p.clone()),
+                    ("catalog", "ext".into()),
+                    (
+                        "query",
+                        "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
+                            .into(),
+                    ),
+                ]),
+            ),
+            ("get_lineage", args(&[("pond", p.clone())])),
+            // Destructive, so last.
+            (
+                "drop_pond",
+                args(&[("pond", p.clone()), ("confirm", true.into())]),
+            ),
+        ]
+    }
+
+    /// The plan must cover the tools the server ADVERTISES — read from
+    /// `tools/list`, never written down here, because a hand-kept list of names
+    /// is precisely what rots when a tool is added or renamed.
+    pub fn assert_plan_covers_the_advertised_tools(
+        plan: &[(&'static str, Map<String, Value>)],
+        advertised: &[&str],
+    ) {
+        let mut planned: Vec<&str> = plan.iter().map(|(n, _)| *n).collect();
+        planned.sort();
+        let mut advertised: Vec<&str> = advertised.to_vec();
+        advertised.sort();
+        assert_eq!(
+            advertised, planned,
+            "every advertised tool must be driven to a real response here — a new \
+             tool has to earn its coverage, not slip past unexercised"
+        );
+        assert!(
+            !planned.is_empty(),
+            "an empty plan would make every per-tool assertion vacuous"
+        );
+    }
+
+    /// Run the plan, asserting each call really succeeded (a guard that ran only
+    /// on error responses would be measuring the error path twelve times).
+    pub async fn drive(
+        c: &LatiqClient,
+        plan: &[(&'static str, Map<String, Value>)],
+    ) -> Vec<(&'static str, CallOutcome)> {
+        let mut observed = Vec::new();
+        for (name, a) in plan {
+            let out = c.call_tool(name, a.clone()).await.unwrap();
+            assert!(!out.is_error, "{name} must succeed here: {:#}", out.value);
+            observed.push((*name, out));
+        }
+        observed
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// **The declared output contract.** Every tool publishes an `outputSchema`, and
+/// the point of publishing one is that a client may rely on it — so this drives
+/// each tool to a REAL success response over the real transport and validates
+/// that response against the schema the server itself advertised in
+/// `tools/list`. rmcp deliberately does not validate responses against
+/// `outputSchema` ("since rust is a strong type language…", `model.rs`), so if
+/// we do not, nobody does and the declaration is a document rather than a
+/// contract.
+///
+/// A submodule, not a new binary (tests/CLAUDE.md rule 5).
+// ---------------------------------------------------------------------------
+mod output_schema {
+    use crate::common::start_stack;
+    use crate::every_tool;
+    use latiq_client::LatiqClient;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn output_schema_every_tool_declares_one_and_its_real_response_validates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = start_stack().await;
+        every_tool::seed_catalog(&s, tmp.path()).await;
 
         let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
             .await
@@ -2283,118 +2377,32 @@ mod output_schema {
             });
             declared.insert(t.name.to_string(), Value::Object((**schema).clone()));
         }
-        let mut names: Vec<&str> = TOOLS.to_vec();
-        names.sort();
-        let mut advertised: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        advertised.sort();
-        assert_eq!(
-            advertised, names,
-            "the advertised tool set must match the list this test drives — a new \
-             tool has to gain a declared+validated response, not slip past"
-        );
+        let plan = every_tool::plan("sch");
+        let advertised: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        every_tool::assert_plan_covers_the_advertised_tools(&plan, &advertised);
 
         // Drive every tool to a real SUCCESS response, in dependency order.
-        let mut observed: Vec<(&str, Value)> = Vec::new();
-        let mut record = |name: &'static str, out: latiq_client::CallOutcome| {
-            assert!(!out.is_error, "{name} must succeed here: {:#}", out.value);
-            observed.push((name, out.value));
-        };
-
-        record(
-            "allocate_pond",
-            c.call_tool(
-                "allocate_pond",
-                args(&[("name", "sch".into()), ("lineage", true.into())]),
-            )
-            .await
-            .unwrap(),
-        );
-        record(
-            "write_query",
-            c.write("sch", "CREATE TABLE t AS SELECT 1 AS id, 'a' AS nm")
-                .await
-                .unwrap(),
-        );
-        record(
-            "read_query",
-            c.query("sch", "SELECT * FROM t").await.unwrap(),
-        );
-        record(
-            "explain_query",
-            c.explain("sch", "SELECT * FROM t").await.unwrap(),
-        );
-        record("describe_pond", c.describe_pond("sch").await.unwrap());
-        record("list_ponds", c.list_ponds().await.unwrap());
-        record(
-            "list_datasets",
-            c.call_tool("list_datasets", Map::new()).await.unwrap(),
-        );
-        record(
-            "load_dataset",
-            c.call_tool(
-                "load_dataset",
-                args(&[("pond", "sch".into()), ("dataset", "holdings".into())]),
-            )
-            .await
-            .unwrap(),
-        );
-        record(
-            "list_catalogs",
-            c.call_tool("list_catalogs", Map::new()).await.unwrap(),
-        );
-        record(
-            "describe_catalog",
-            c.call_tool(
-                "describe_catalog",
-                args(&[("pond", "sch".into()), ("catalog", "ext".into())]),
-            )
-            .await
-            .unwrap(),
-        );
-        record(
-            "pull_catalog",
-            c.call_tool(
-                "pull_catalog",
-                args(&[
-                    ("pond", "sch".into()),
-                    ("catalog", "ext".into()),
-                    (
-                        "query",
-                        "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
-                            .into(),
-                    ),
-                ]),
-            )
-            .await
-            .unwrap(),
-        );
-        record(
-            "get_lineage",
-            c.call_tool("get_lineage", args(&[("pond", "sch".into())]))
-                .await
-                .unwrap(),
-        );
-        // Destructive, so last.
-        record("drop_pond", c.drop_pond("sch").await.unwrap());
+        let observed = every_tool::drive(&c, &plan).await;
 
         // The whole point: the real response satisfies the declared schema.
-        for (name, value) in &observed {
+        for (name, out) in &observed {
             let schema = declared
                 .get(*name)
                 .unwrap_or_else(|| panic!("no declared schema for {name}"));
             let validator = jsonschema::validator_for(schema)
                 .unwrap_or_else(|e| panic!("{name}'s declared outputSchema must compile: {e}"));
-            if let Err(e) = validator.validate(value) {
+            if let Err(e) = validator.validate(&out.value) {
                 panic!(
                     "{name}'s real response does not satisfy its DECLARED outputSchema \
-                     at `{}`: {e}\nresponse: {value:#}\nschema: {schema:#}",
-                    e.instance_path()
+                     at `{}`: {e}\nresponse: {:#}\nschema: {schema:#}",
+                    e.instance_path(),
+                    out.value,
                 );
             }
         }
         assert_eq!(
             observed.len(),
-            TOOLS.len(),
+            plan.len(),
             "every tool must contribute a real response — a tool validated against \
              nothing is a tool nobody checked"
         );
@@ -2449,6 +2457,162 @@ mod output_schema {
             "the envelope is NOT the success shape — if it validated, the schema \
              would be too loose to promise anything about a successful read"
         );
+        c.close().await.unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+/// **Every tool result correlates — successes included.**
+///
+/// Nexus (the agent-readiness harness) found the asymmetry: an MCP FAILURE
+/// carried a trace id and a SUCCESS did not, unless it happened to be one of the
+/// three query tools, which return a `QueryMeta` that gained `traceparent` in
+/// #110. That is backwards. A successful `allocate_pond` is exactly the call an
+/// agent later has to correlate against the lineage and access records it
+/// produced, and "which request was that?" is unanswerable without an id.
+///
+/// The fix is one line in the response encoder rather than a field on nine
+/// neutral result structs (invariant 5 keeps MCP concerns out of
+/// `latiq-agent-core`, and nine structs is nine chances to forget). This guard
+/// is the half that matters: it iterates the tools the server ADVERTISES — not a
+/// list written here, which is how the gap survived #110 in the first place.
+// ---------------------------------------------------------------------------
+mod trace_meta {
+    use crate::common::start_stack;
+    use crate::every_tool;
+    use latiq_client::LatiqClient;
+
+    /// The caller's own trace. Real W3C shape (32 hex digits): the surface parses
+    /// strictly and mints a FRESH trace for anything malformed, so a made-up id
+    /// would make this pass or fail for a reason unrelated to the property.
+    const TRACE: &str = "44444444444444444444444444440004";
+
+    /// A `traceparent` we returned, asserted field by field — presence alone
+    /// would pass for a value no collector could parse (tests/CLAUDE.md rule 2).
+    /// Returns the span id.
+    fn assert_traceparent(header: &str, trace_id: &str) -> String {
+        let parts: Vec<&str> = header.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "a version-00 traceparent has 4 fields: {header}"
+        );
+        assert_eq!(parts[0], "00", "we emit the version we implement: {header}");
+        assert_eq!(
+            parts[1], trace_id,
+            "the id must be the CALLER's trace, or the correlation joins nothing: {header}"
+        );
+        assert_eq!(parts[2].len(), 16, "span id is 16 hex digits: {header}");
+        assert!(
+            parts[2]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "the spec is lowercase hex only: {header}"
+        );
+        assert_eq!(parts[3], "01", "the caller sent sampled=01: {header}");
+        parts[2].to_string()
+    }
+
+    #[tokio::test]
+    async fn trace_meta_every_advertised_tool_returns_a_traceparent_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = start_stack().await;
+        every_tool::seed_catalog(&s, tmp.path()).await;
+
+        let c = LatiqClient::connect_traced(
+            &s.mcp_endpoint,
+            Some("tracer".into()),
+            None,
+            Some(format!("00-{TRACE}-00f067aa0ba902b7-01")),
+        )
+        .await
+        .unwrap();
+
+        let tools = c.list_tools().await.unwrap();
+        let plan = every_tool::plan("tp");
+        let advertised: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        every_tool::assert_plan_covers_the_advertised_tools(&plan, &advertised);
+
+        let observed = every_tool::drive(&c, &plan).await;
+        let mut checked = 0usize;
+        for (name, out) in &observed {
+            let tp = out.meta.get("traceparent").unwrap_or_else(|| {
+                panic!(
+                    "`{name}` succeeded without a `_meta.traceparent` — the one \
+                     thing that lets an agent ask about this exact call later. \
+                     _meta was {:?}",
+                    out.meta
+                )
+            });
+            let tp = tp
+                .as_str()
+                .unwrap_or_else(|| panic!("`{name}`'s traceparent must be a string: {tp}"));
+            assert_traceparent(tp, TRACE);
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            plan.len(),
+            "a per-tool guard that examined {checked} of {} tools is not a guard",
+            plan.len()
+        );
+
+        // The query tools also report a `traceparent` inside their body
+        // (`QueryMeta`). One source feeds both, so on the LOCAL path they are the
+        // same span; across a forward the body's is deliberately the OWNER's
+        // (`QueryMeta::traceparent` follows `served_by`), which is why the
+        // protocol block cannot simply be dropped in favour of it.
+        let mut paired = 0usize;
+        for (name, out) in &observed {
+            let Some(body) = out.value.get("_meta").and_then(|m| m.get("traceparent")) else {
+                continue;
+            };
+            assert_eq!(
+                body.as_str(),
+                out.meta["traceparent"].as_str(),
+                "`{name}` reports a traceparent in two places and this stack is \
+                 single-node, so they must name the same span: {:#}",
+                out.value
+            );
+            paired += 1;
+        }
+        assert!(
+            paired >= 2,
+            "read_query and write_query both carry a body `_meta` — finding {paired} \
+             means the comparison above ran on nothing"
+        );
+
+        // An ERROR answers the same way — including an argument refusal, decided
+        // before the op is ever called.
+        let refused = c
+            .call_tool(
+                "read_query",
+                serde_json::from_value(serde_json::json!({
+                    "pond": "tp", "sql": "SELECT 1", "timeout_ms": 0
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            refused.is_error,
+            "timeout_ms 0 is refused: {:#}",
+            refused.value
+        );
+        let envelope_tp = refused.value["traceparent"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the envelope carries one: {:#}", refused.value));
+        let meta_tp = refused.meta["traceparent"]
+            .as_str()
+            .expect("and so does the protocol _meta");
+        assert_eq!(
+            assert_traceparent(meta_tp, TRACE),
+            assert_traceparent(envelope_tp, TRACE),
+            "an argument refusal must be inside the request's trace scope like \
+             every other answer — otherwise the calls an agent most needs to ask \
+             about are the ones it cannot cite"
+        );
+
         c.close().await.unwrap();
     }
 }

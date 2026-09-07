@@ -126,7 +126,7 @@ Allocation is **eager and holistic**: it returns only once the pond's storage re
 
 **Lifecycle is the workflow's, not the operator's.** Agents allocate and release ponds; operators set boundaries and stay out of the way. The mental model is closer to "memory a workflow allocates" than "an asset someone administers."
 
-**Interfaces are written for AI agents.** Tool descriptions are mini-tutorials. Errors are structured — kind, message, suggestion, reference — and suggest next actions with examples and fuzzy-matched alternatives. Every query response carries forward signal: what was scanned, what was touched, whether it could have been better. The surface treats agents as colleagues, not as untrusted clients.
+**Interfaces are written for AI agents.** Tool names and the server instructions do the discovery work — the name and the `initialize` block are what every client shows the model, while descriptions may be deferred until after a tool is chosen, so descriptions teach rather than attract. Errors are structured — kind, message, suggestion, reference — and suggest next actions with examples and fuzzy-matched alternatives. Every query response carries forward signal: what was scanned, what was touched, whether it could have been better. The surface treats agents as colleagues, not as untrusted clients.
 
 **Federation by curation, then locality.** Operators publish a curated menu of sources; agents pull the subset they need and work on it locally. Governance sits at the menu, not at every query, and no credential ever reaches an agent.
 

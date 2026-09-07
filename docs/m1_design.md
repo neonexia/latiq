@@ -566,6 +566,8 @@ The MCP surface is the product. Agents are LLMs reasoning over tool calls and re
 
 ### Principle 1 — Tool descriptions are mini-tutorials, not API docs
 
+> **Corrected after measurement (2026, Nexus agent-readiness harness).** This principle holds for *teaching* and is wrong if read as *discovery*. In a realistic 47-tool belt the client advertised our thirteen tools by NAME and deferred their descriptions, so every agent read a description only after it had already decided to look at Latiq. **Discovery is carried by the tool name and by the server `instructions`** (sent at `initialize`, never deferred); a description teaches a tool that has already been selected. Keep them rich — just do not expect them to win the selection. See `crates/latiq-mcp/CLAUDE.md`.
+
 A tool description should teach an LLM how to use the tool well in one read, not just enumerate parameters. Every tool description includes:
 
 - **What it does**, in one sentence, agent-relevant

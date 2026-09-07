@@ -603,42 +603,56 @@ See latiq://guidance.",
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        let tier = a.tier.as_deref().unwrap_or("medium");
-        // The registry refuses an unknown tier or an illegal name too — it is
-        // the choke point every create path shares, and it is what makes the
-        // guarantee durable. Checked here as well because THIS surface can see
-        // what the caller actually typed: an empty `name` is a deliberate empty
-        // string to a JSON caller and "unset" by the time it has crossed
-        // proto3, and only one of those two should become a generated uuid.
-        if let Some(name) = a.name.as_deref() {
-            if let Err(msg) = latiq_common::pond_name::validate(name) {
-                return Ok(err_envelope(
-                    AgentError::new(
-                        latiq_common::ErrorKind::InvalidValue,
-                        msg,
-                        "Retry with a name of letters, digits, `_` or `-`, or omit `name` and \
-                         use the one Latiq generates.",
-                        "latiq://guidance",
-                    )
-                    .envelope(),
-                ));
-            }
-        }
-        // Validate requested extensions against the signed/official allowlist
-        // before allocating, so a bad name returns a clear, actionable error.
-        let exts = match latiq_common::extensions::validate(&a.extensions.unwrap_or_default()) {
-            Ok(e) => e,
-            Err(msg) => {
-                return Ok(err_envelope(
-                    AgentError::unsupported_extension(msg).envelope(),
-                ))
-            }
-        };
+        // Argument validation runs INSIDE the trace scope, like the call it
+        // guards: every answer this surface gives carries a `_meta.traceparent`
+        // (see `encode::trace_meta`), and a refusal that answered before the
+        // scope was entered would be the one result an agent could not correlate
+        // — on the argument mistakes it is most likely to have to ask about.
         Ok(self
             .traced("allocate_pond", &ctx, tok, async {
+                let tier = a.tier.as_deref().unwrap_or("medium");
+                // The registry refuses an unknown tier or an illegal name too —
+                // it is the choke point every create path shares, and it is what
+                // makes the guarantee durable. Checked here as well because THIS
+                // surface can see what the caller actually typed: an empty
+                // `name` is a deliberate empty string to a JSON caller and
+                // "unset" by the time it has crossed proto3, and only one of
+                // those two should become a generated uuid.
+                if let Some(name) = a.name.as_deref() {
+                    if let Err(msg) = latiq_common::pond_name::validate(name) {
+                        return err_envelope(
+                            AgentError::new(
+                                latiq_common::ErrorKind::InvalidValue,
+                                msg,
+                                "Retry with a name of letters, digits, `_` or `-`, or omit `name` \
+                                 and use the one Latiq generates.",
+                                "latiq://guidance",
+                            )
+                            .envelope(),
+                        );
+                    }
+                }
+                // Validate requested extensions against the signed/official
+                // allowlist before allocating, so a bad name returns a clear,
+                // actionable error.
+                let exts = match latiq_common::extensions::validate(
+                    a.extensions.as_deref().unwrap_or(&[]),
+                ) {
+                    Ok(e) => e,
+                    Err(msg) => {
+                        return err_envelope(AgentError::unsupported_extension(msg).envelope())
+                    }
+                };
                 match self
                     .ops
-                    .allocate_pond(&id, a.name, "{}", tier, &exts, a.lineage.unwrap_or(false))
+                    .allocate_pond(
+                        &id,
+                        a.name.clone(),
+                        "{}",
+                        tier,
+                        &exts,
+                        a.lineage.unwrap_or(false),
+                    )
                     .await
                 {
                     Ok(r) => ok(&r),
@@ -763,13 +777,15 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        if let Some(refusal) = reject_zero("timeout_ms", a.timeout_ms) {
-            return Ok(refusal);
-        }
         let controls = query_controls(&a, &ctx);
         // Reads ride the Arrow internal hop, collected to the neutral result here.
         Ok(self
             .traced("read_query", &ctx, tok, async {
+                // Inside the scope: a refusal is an answer, and every answer
+                // here carries `_meta.traceparent` (`encode::trace_meta`).
+                if let Some(refusal) = reject_zero("timeout_ms", a.timeout_ms) {
+                    return refusal;
+                }
                 match self
                     .ops
                     .read_collected_with(&id, &a.pond, &a.sql, controls)
@@ -807,12 +823,13 @@ Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements 
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        if let Some(refusal) = reject_zero("timeout_ms", a.timeout_ms) {
-            return Ok(refusal);
-        }
         let controls = query_controls(&a, &ctx);
         Ok(self
             .traced("write_query", &ctx, tok, async {
+                // Inside the scope, for the same reason as `read_query`.
+                if let Some(refusal) = reject_zero("timeout_ms", a.timeout_ms) {
+                    return refusal;
+                }
                 match self
                     .ops
                     .write_query_with(&id, &a.pond, &a.sql, controls)
@@ -1092,18 +1109,24 @@ A record, not proof: these are files in the pond, reachable by anything that can
 /// agent asking for provenance is spending its context window on the answer.
 const DEFAULT_LINEAGE_LIMIT: u32 = 50;
 
-#[tool_handler(router = self.tool_router)]
-impl ServerHandler for LatiqServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .enable_prompts()
-                .build(),
-        )
-        .with_instructions(
-            "Latiq — the agent-native data pond. Allocate a pond (a private DuckLake workspace), \
+/// The server `instructions`, sent once at `initialize`.
+///
+/// **This is the surface's discovery channel, and it is load-bearing.** We used
+/// to say tool descriptions did that job; they cannot. Nexus (the agent-readiness
+/// harness) drove real models against this server inside a 47-tool belt and every
+/// one of them spent its first turn fetching our schemas: the client advertised
+/// all thirteen tools by NAME and deferred their descriptions, so a description
+/// was read only after the agent had already decided to look at us. What reaches
+/// the model unconditionally is the tool NAME and this block — `initialize`
+/// carries it before any tool is chosen and no client defers it.
+///
+/// So it must stay short enough to be read, and it must never point at a tool
+/// nobody serves. A renamed tool that left a name here dangling would send an
+/// agent's first move to `unknown tool` — the same failure the repo already
+/// shipped once with a resource that taught a removed tool — which is why
+/// `instructions_name_only_tools_this_server_advertises` checks every tool-shaped
+/// name in this text against the router's own list.
+const INSTRUCTIONS: &str = "Latiq — the agent-native data pond. Allocate a pond (a private DuckLake workspace), \
 write/read SQL with native attribution. Latiq owns the transaction around every write — send plain statements, never BEGIN/COMMIT/ROLLBACK. \
 FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new one; then write_query/read_query. \
 TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
@@ -1114,8 +1137,20 @@ PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be ex
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow. \
 ERRORS ARE STRUCTURED: alongside `message`/`suggest`/`see`, every failure carries `retryable` (`as_is` / `after_change` / `never` — `never` means THIS call, and `suggest` names the different call that works), \
 `audience` (`operator` means report it and stop) and `facts` (the numbers as values, so don't parse the sentence). Branch on those, not on the prose — latiq://guidance has the contract. \
-Prompts provide SOPs for common multi-agent workflows.",
+Every tool result also carries `_meta.traceparent` — the W3C trace id of that call, the one to quote when asking an operator about it. \
+Prompts provide SOPs for common multi-agent workflows.";
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for LatiqServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
         )
+        .with_instructions(INSTRUCTIONS)
     }
 
     async fn list_resources(
@@ -1258,8 +1293,87 @@ pub async fn serve_mcp_with_listener(
 mod tests {
     use super::{
         advertised_mcp_url, mcp_allowed_hosts, protected_resource_metadata_url,
-        resolve_public_mcp_url,
+        resolve_public_mcp_url, LatiqServer, INSTRUCTIONS,
     };
+
+    /// The tool names this server really advertises, from the router itself —
+    /// never a list written down here, which is the thing that rots.
+    fn advertised_tools() -> Vec<String> {
+        LatiqServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect()
+    }
+
+    /// Snake_case words in the instructions that are NOT tool names, and are not
+    /// meant to be: the error-envelope vocabulary the same text documents. Kept
+    /// explicit so a genuine tool name can never hide in it.
+    const NON_TOOL_WORDS: &[&str] = &["as_is", "after_change"];
+
+    /// **Discovery runs on the tool NAME and on this block, not on tool
+    /// descriptions** — a client may defer descriptions until after the agent
+    /// has already decided to look (Nexus measured exactly that in a 47-tool
+    /// belt), but `initialize` carries `instructions` to every session.
+    ///
+    /// So the first moves it names must be tools that exist. The repo has
+    /// already shipped a resource teaching a tool that had been removed; this is
+    /// the same class of rot one layer earlier, where it would break an agent's
+    /// very first call.
+    #[test]
+    fn instructions_name_only_tools_this_server_advertises() {
+        let tools = advertised_tools();
+        assert!(
+            tools.len() >= 13,
+            "the router advertises {} tools — if this fell, the test below is \
+             checking the instructions against almost nothing",
+            tools.len()
+        );
+
+        // 1. The first moves are named, and each one is served.
+        for first_move in ["list_ponds", "allocate_pond", "read_query", "write_query"] {
+            assert!(
+                INSTRUCTIONS.contains(first_move),
+                "the instructions must name `{first_move}` — it is a first move, \
+                 and the tool name plus this block is all an agent sees before \
+                 it decides whether Latiq is relevant"
+            );
+            assert!(
+                tools.iter().any(|t| t == first_move),
+                "the instructions send an agent's FIRST call to `{first_move}`, \
+                 which this server does not advertise: {tools:?}"
+            );
+        }
+
+        // 2. Nothing tool-shaped in the text points at a tool nobody serves.
+        let mut named: Vec<String> = Vec::new();
+        for word in INSTRUCTIONS.split(|c: char| !(c.is_ascii_lowercase() || c == '_')) {
+            // A tool name never starts or ends with `_`, which is what tells a
+            // response field (`_meta`) apart from a call.
+            if !word.contains('_')
+                || word.starts_with('_')
+                || word.ends_with('_')
+                || NON_TOOL_WORDS.contains(&word)
+            {
+                continue;
+            }
+            assert!(
+                tools.iter().any(|t| t == word),
+                "the instructions mention `{word}`, which is neither a tool this \
+                 server advertises ({tools:?}) nor listed in NON_TOOL_WORDS — a \
+                 renamed tool leaves an agent's first move pointing at nothing"
+            );
+            if !named.contains(&word.to_string()) {
+                named.push(word.to_string());
+            }
+        }
+        assert!(
+            named.len() >= 8,
+            "only {} tool names were found in the instructions ({named:?}) — the \
+             scan must be finding them, or this guard checks nothing",
+            named.len()
+        );
+    }
 
     #[test]
     fn allowed_hosts_keep_loopback_and_add_the_public_host() {
