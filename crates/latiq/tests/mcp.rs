@@ -2399,6 +2399,16 @@ mod output_schema {
                     out.value,
                 );
             }
+            // Validation alone cannot catch this: these schemas do not close
+            // `additionalProperties`, so an UNDECLARED `_meta` would validate
+            // happily while the declaration was wrong about a field we send on
+            // every single response. So assert the declaration itself.
+            assert!(
+                schema["properties"]["_meta"]["type"] == "object"
+                    || schema["properties"]["_meta"]["$ref"].is_string(),
+                "{name} sends `_meta` on every success (the traceparent an agent \
+                 cites), so its outputSchema must declare it: {schema:#}"
+            );
         }
         assert_eq!(
             observed.len(),
@@ -2557,18 +2567,37 @@ mod trace_meta {
             plan.len()
         );
 
-        // The query tools also report a `traceparent` inside their body
-        // (`QueryMeta`). One source feeds both, so on the LOCAL path they are the
-        // same span; across a forward the body's is deliberately the OWNER's
+        // **And the BODY carries it, for every tool.** Nexus measured what a
+        // real client hands the model: Claude Code's `tool_result` block has
+        // exactly `content`/`is_error`/`tool_use_id`/`type`, so the protocol
+        // `_meta` asserted above reached the model on 0 of 3 measured calls
+        // while the body's reached it on 2 of 2. An id the model cannot read is
+        // not a citable id, and `latiq://guidance` promises the agent it can
+        // cite one. This half is what makes that promise true, so it is
+        // asserted per tool, not "somewhere".
+        //
+        // One source feeds both, so on the LOCAL path they are the same span;
+        // across a forward the body's is deliberately the OWNER's
         // (`QueryMeta::traceparent` follows `served_by`), which is why the
         // protocol block cannot simply be dropped in favour of it.
         let mut paired = 0usize;
         for (name, out) in &observed {
-            let Some(body) = out.value.get("_meta").and_then(|m| m.get("traceparent")) else {
-                continue;
-            };
+            let body = out
+                .value
+                .get("_meta")
+                .and_then(|m| m.get("traceparent"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{name}` succeeded with no `_meta.traceparent` in the RESPONSE BODY — \
+                         the protocol `_meta` does not reach the model in Claude Code, so this \
+                         is the only copy an agent can cite: {:#}",
+                        out.value
+                    )
+                });
+            assert_traceparent(body, TRACE);
             assert_eq!(
-                body.as_str(),
+                Some(body),
                 out.meta["traceparent"].as_str(),
                 "`{name}` reports a traceparent in two places and this stack is \
                  single-node, so they must name the same span: {:#}",
@@ -2576,10 +2605,11 @@ mod trace_meta {
             );
             paired += 1;
         }
-        assert!(
-            paired >= 2,
-            "read_query and write_query both carry a body `_meta` — finding {paired} \
-             means the comparison above ran on nothing"
+        assert_eq!(
+            paired,
+            plan.len(),
+            "every advertised tool must carry the body copy, not only the {paired} \
+             that happened to be checked"
         );
 
         // An ERROR answers the same way — including an argument refusal, decided

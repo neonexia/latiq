@@ -83,6 +83,19 @@ impl AgentError {
         )))
     }
 
+    /// Attach facts to an envelope whose `message` we did NOT compose.
+    ///
+    /// The normal way to publish a fact is [`Self::rendered`], which generates
+    /// the sentence from the values so the two cannot drift. That is impossible
+    /// when the sentence is the engine's own words — and a value the ENGINE
+    /// named (the feature it says it does not implement) is still a value a
+    /// client should branch on rather than parse out of prose. So: facts lifted
+    /// from the message, never facts invented beside it.
+    pub fn with_facts(mut self, facts: Facts) -> Self {
+        self.0.facts = facts;
+        self
+    }
+
     pub fn pond_not_found(pond_ref: &str) -> Self {
         Self::rendered(
             ErrorKind::PondNotFound,
@@ -272,6 +285,62 @@ impl From<EngineError> for AgentError {
                 "latiq://dialect",
             ),
             EngineError::SourceIo(m) => AgentError::of_kind(ErrorKind::SourceUnavailable, m),
+            // Nexus finding 8. This arrived as `internal` + "Retry; if it
+            // persists, report to your operator" for `CREATE TABLE
+            // t(id INTEGER PRIMARY KEY)` — a statement an agent writes on its
+            // first attempt, an identical retry that can never succeed, and an
+            // operator with nothing to fix. The suggest NAMES the clause when
+            // the engine named it, and the same name rides in `facts` so a
+            // client branches on the value instead of the sentence.
+            EngineError::Unsupported { message, feature } => match feature {
+                Some(feature) => AgentError::new(
+                    ErrorKind::UnsupportedFeature,
+                    message,
+                    format!(
+                        "This pond's engine does not support {feature} — remove that from the \
+                         statement and re-send; the statement as written can never succeed. A \
+                         DuckLake pond has no PRIMARY KEY/UNIQUE or CHECK constraints, no \
+                         indexes, no sequences and no generated columns: declare the columns and \
+                         their types, and check uniqueness with a query (read_query \"SELECT id, \
+                         count(*) FROM <table> GROUP BY id HAVING count(*) > 1\") instead of \
+                         declaring a constraint."
+                    ),
+                    ErrorKind::UnsupportedFeature.default_see(),
+                )
+                .with_facts(facts! { "feature" => feature }),
+                // The engine did not name the feature in a shape we recognise,
+                // so neither do we: the kind's own advice still says what to do,
+                // and no `feature` fact is published rather than a guessed one.
+                None => AgentError::of_kind(ErrorKind::UnsupportedFeature, message),
+            },
+            // The value or argument is the caller's, and the message says which
+            // one. Not `Conversion`'s advice: a CAST does not fix an overflow, a
+            // bad format specifier or a file that is not the format it was read
+            // as.
+            EngineError::InvalidInput(m) => AgentError::new(
+                ErrorKind::InvalidValue,
+                m,
+                "A value or argument in the statement is not acceptable to the engine — out of \
+                 range for its type, or invalid for the function or file it was passed to. The \
+                 message names it. Fix that value and re-send: a wider type for an arithmetic \
+                 overflow (CAST the operands to BIGINT/HUGEINT or aggregate differently), a \
+                 correct format string, a path that really holds the format you are reading.",
+                "latiq://dialect",
+            ),
+            // Transaction control is the one caller mistake that may have
+            // COMMITTED something before failing, so the advice has to say so:
+            // "re-send it" without that warning is advice to double-write.
+            EngineError::TransactionControl(m) => AgentError::new(
+                ErrorKind::UnsupportedFeature,
+                m,
+                "Latiq owns the transaction, so a statement must not contain BEGIN / COMMIT / \
+                 ROLLBACK / START TRANSACTION — send plain statements and Latiq commits them \
+                 together as one attributed snapshot. Your own transaction control ended Latiq's \
+                 bracket, so part of the statement may ALREADY have been committed: check with \
+                 read_query \"SELECT count(*) FROM <table>\" before re-sending, then re-send only \
+                 what is missing, without the transaction control.",
+                "latiq://dialect",
+            ),
             EngineError::Engine(m) => AgentError::internal(format!("engine error: {m}")),
         }
     }
@@ -310,14 +379,37 @@ mod tests {
                 EngineError::SourceIo("IO Error: x".into()),
                 ErrorKind::SourceUnavailable,
             ),
+            (
+                EngineError::Unsupported {
+                    message: "Not implemented Error: x".into(),
+                    feature: Some("indexes".into()),
+                },
+                ErrorKind::UnsupportedFeature,
+            ),
+            (
+                EngineError::Unsupported {
+                    message: "Not implemented Error: x".into(),
+                    feature: None,
+                },
+                ErrorKind::UnsupportedFeature,
+            ),
+            (
+                EngineError::InvalidInput("Out of Range Error: x".into()),
+                ErrorKind::InvalidValue,
+            ),
+            (
+                EngineError::TransactionControl("TransactionContext Error: x".into()),
+                ErrorKind::UnsupportedFeature,
+            ),
             (EngineError::ReadOnlyViolation, ErrorKind::ReadOnlyViolation),
             (EngineError::Cancelled, ErrorKind::QueryCancelled),
             (EngineError::Timeout, ErrorKind::QueryTimeout),
         ];
         // Anti-vacuity: the list is every variant except `Engine`, which is the
-        // deliberate `internal` one. A new variant added without a mapping
-        // decision fails here.
-        assert_eq!(cases.len(), 8, "an EngineError variant is unaccounted for");
+        // deliberate `internal` one (both shapes of `Unsupported` are driven,
+        // because the named-feature branch and the unnamed one build different
+        // envelopes). A new variant added without a mapping decision fails here.
+        assert_eq!(cases.len(), 12, "an EngineError variant is unaccounted for");
         for (engine_err, want) in cases {
             let label = format!("{engine_err:?}");
             let env = AgentError::from(engine_err).into_envelope();
@@ -488,5 +580,52 @@ mod tests {
         .into_envelope();
         assert_eq!(env.kind, ErrorKind::CatalogError);
         assert!(env.facts.is_empty(), "{:?}", env.facts);
+    }
+
+    /// The one fact allowed to ride an engine-composed message: a name the
+    /// ENGINE gave us, lifted out of its own sentence rather than invented
+    /// beside it (Nexus finding 8 asked for the unsupported feature as a value,
+    /// so a client can branch on it instead of matching prose).
+    #[test]
+    fn error_contract_the_unsupported_feature_rides_as_a_fact_and_in_the_advice() {
+        let env = AgentError::from(EngineError::Unsupported {
+            message: "Not implemented Error: PRIMARY KEY/UNIQUE constraints are not supported in \
+                      DuckLake"
+                .into(),
+            feature: Some("PRIMARY KEY/UNIQUE constraints".into()),
+        })
+        .into_envelope();
+        assert_eq!(env.kind, ErrorKind::UnsupportedFeature);
+        assert_eq!(
+            env.facts.get("feature"),
+            Some(&latiq_common::Fact::Text(
+                "PRIMARY KEY/UNIQUE constraints".into()
+            )),
+            "a client must be able to branch on the feature without parsing the sentence"
+        );
+        assert!(
+            env.suggest.contains("PRIMARY KEY/UNIQUE constraints"),
+            "and the advice must name the same thing the fact does: {}",
+            env.suggest
+        );
+        assert!(
+            !env.suggest.contains("report to your operator"),
+            "{}",
+            env.suggest
+        );
+        // The engine's own words reach the caller unrelabelled…
+        assert!(
+            env.message.starts_with("Not implemented Error:"),
+            "{}",
+            env.message
+        );
+        // …and where the engine named nothing, we publish nothing.
+        let unnamed = AgentError::from(EngineError::Unsupported {
+            message: "Not implemented Error: unsupported type".into(),
+            feature: None,
+        })
+        .into_envelope();
+        assert!(unnamed.facts.is_empty(), "{:?}", unnamed.facts);
+        assert_eq!(unnamed.kind, ErrorKind::UnsupportedFeature);
     }
 }

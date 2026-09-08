@@ -72,7 +72,14 @@ Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
 An `invalid_value` error is about the DATA in your statement, not its syntax — the statement parsed and the names resolved.\n\
 - **Type conversion:** a literal or column is not convertible to the type it is used as (`Conversion Error: Could not convert string 'notanint' to INT32`). Quoted text is not coerced into a numeric column because it looks numeric. Check the target with `DESCRIBE <table>` and pass the right type, or CAST explicitly: `CAST('7' AS INTEGER)`.\n\
 - **Constraints:** the value is well-typed but breaks a rule on the table — primary key, unique, not null, check (`Constraint Error: Duplicate key …`). Read the conflicting row first (`SELECT * FROM t WHERE <key> = <value>`), then correct the value, UPDATE the existing row, or use `INSERT OR REPLACE` / `ON CONFLICT`.\n\n\
-Neither is fixed by retrying the same statement, and neither is a `parse_error`: if your statement had a syntax problem you would have been told `parse_error` with DuckDB's `Parser Error` text.",
+Neither is fixed by retrying the same statement, and neither is a `parse_error`: if your statement had a syntax problem you would have been told `parse_error` with DuckDB's `Parser Error` text.\n\n\
+## What a pond does NOT have (`unsupported_feature`)\n\n\
+A pond is DuckLake storage, and DuckLake implements a subset of DuckDB's DDL. These parse, and are then REFUSED — `unsupported_feature`, `audience: agent`, `retryable: after_change`, with the rejected thing in `facts.feature`:\n\
+- **`PRIMARY KEY` / `UNIQUE` constraints** — `CREATE TABLE t(id INTEGER PRIMARY KEY)` fails. Declare `id INTEGER` and check uniqueness with a query when you need to: `SELECT id, count(*) FROM t GROUP BY id HAVING count(*) > 1`.\n\
+- **`CHECK` constraints** — validate in the INSERT (`WHERE`) or with a read afterwards.\n\
+- **Indexes** (`CREATE INDEX`), **sequences** (`CREATE SEQUENCE`, `nextval`) and **generated columns**. For a surrogate key, generate the value in the INSERT — `row_number() OVER ()`, a hash, or a UUID.\n\
+- **Transaction control** — `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`, for the reason above: the transaction is Latiq's. If one of yours reached write_query, part of the statement may already have committed — check the table before re-sending.\n\
+`NOT NULL` and `DEFAULT` **are** supported, and `NOT NULL` is enforced (a violation is `invalid_value`, not this). The fix for `unsupported_feature` is always the same shape: delete the clause the message names and re-send. The identical statement can never succeed, so do not retry it unchanged.",
     },
     Res {
         uri: "latiq://recipes/schema-design",
@@ -244,7 +251,7 @@ This is never a syntax problem (that arrives as `parse_error`) and never somethi
 The statement named a data source outside the pond — a URL, an object-store path, a file — and the engine could not read it: `IO Error: Could not connect to server …`, `HTTP Error: … (404)`.\n\n\
 **Nothing in Latiq is broken, and this is not the pond's storage.** The address is yours, in your SQL, so the fix is too:\n\
 1. **Check the address** — spelling, scheme, host, bucket, the file actually being there. `read_csv('http://127.0.0.1:9/none.csv')` fails for the obvious reason.\n\
-2. **Check it is reachable from the NODE**, not from you — the node's network decides, and it is not yours. Your laptop's localhost and your VPN's private hosts are not the node's. A refused URI (blocked by policy rather than unreachable) arrives as `uri_not_allowed` instead.\n\
+2. **Check it is reachable from the NODE**, not from you — the node's network decides, and it is not yours. Your laptop's localhost and your VPN's private hosts are not the node's. There is no URI allowlist: a source is refused because it could not be read, never because it was disallowed.\n\
 3. **Credentials:** Latiq attaches none to a URL in your SQL, so anything requiring authentication fails here. For those use **pull_catalog** with `set:{…}` (used once, never stored) — see latiq://recipes/external-data.\n\
 4. **Retry once, not repeatedly.** A transient network fault is worth one retry; a second identical failure is the source, and repeating it will not change that.\n\n\
 Once the data is in the pond it can't fail this way again: `CREATE TABLE raw AS SELECT * FROM read_csv('<url>')` copies it in, and later queries read the pond.",
@@ -671,6 +678,31 @@ mod tests {
         }
     }
 
+    /// `unsupported_feature`'s `see` is `latiq://dialect` rather than a
+    /// troubleshooting page, so the guard that holds troubleshooting pages to
+    /// naming their kind skips it. It still has to teach the kind — an agent
+    /// that lands there needs the list of what a pond does not have, not a
+    /// general grammar tour (that is the whole reason this is not a
+    /// `parse_error`).
+    #[test]
+    fn error_contract_the_dialect_page_lists_what_a_pond_does_not_support() {
+        let dialect = body_of(ErrorKind::UnsupportedFeature.default_see());
+        for phrase in [
+            ErrorKind::UnsupportedFeature.as_str(),
+            "PRIMARY KEY",
+            "CHECK",
+            "CREATE INDEX",
+            "sequences",
+            "generated columns",
+            "facts.feature",
+        ] {
+            assert!(
+                dialect.contains(phrase),
+                "latiq://dialect is where this kind's `see` lands, and it never mentions {phrase:?}"
+            );
+        }
+    }
+
     /// The index is how an agent browsing `latiq://troubleshooting` finds them;
     /// a page nothing links to is a page nothing reads. And a page the index
     /// links but nobody serves costs a round trip to learn nothing, so the
@@ -884,7 +916,7 @@ mod tests {
         ErrorKind::WriteToReservedSchema,
         ErrorKind::ResultCapExceeded,
         ErrorKind::ReadOnlyViolation,
-        ErrorKind::UriNotAllowed,
+        ErrorKind::UnsupportedFeature,
         ErrorKind::QueryTimeout,
         ErrorKind::QueryCancelled,
         ErrorKind::Unauthenticated,
