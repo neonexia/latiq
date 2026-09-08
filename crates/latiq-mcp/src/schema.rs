@@ -72,6 +72,7 @@ fn build<T: JsonSchema>() -> JsonObject {
         ),
     };
     strip_descriptions(&mut object);
+    declare_body_meta(&mut object);
     // MCP requires the root of an `outputSchema` to be `type: "object"` (rmcp
     // enforces the same on the paths that generate one for you). Every shape we
     // declare is a struct, so this is a guard against a future one that is not —
@@ -83,6 +84,38 @@ fn build<T: JsonSchema>() -> JsonObject {
         std::any::type_name::<T>()
     );
     object
+}
+
+/// Declare the `_meta` the ENCODER adds to every success body.
+///
+/// `encode::with_body_traceparent` injects `_meta.traceparent` into every tool's
+/// response body, and a schema that did not mention it would be wrong about a
+/// field we always send — the exact failure mode `strip_descriptions`' sibling
+/// tests exist to prevent, and worse here because several of these schemas
+/// declare `additionalProperties` behaviour a validating client would enforce.
+///
+/// Only where the type does not declare `_meta` itself: `QueryResponse` carries
+/// a full `QueryMeta` there, and replacing it with this two-line stub would
+/// under-declare a shape we do send.
+///
+/// **Not `required`.** The value comes from the ambient trace scope, and a
+/// handful of argument validations answer before that scope is entered, so an
+/// ordinary response can legitimately omit it (`QueryResponse`'s own `_meta`
+/// stays required, as it always was — it is a non-optional field of the struct).
+fn declare_body_meta(object: &mut JsonObject) {
+    let Some(Value::Object(props)) = object.get_mut("properties") else {
+        return;
+    };
+    if props.contains_key(crate::encode::BODY_META) {
+        return;
+    }
+    props.insert(
+        crate::encode::BODY_META.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "properties": { "traceparent": { "type": "string" } },
+        }),
+    );
 }
 
 /// Drop every `description` keyword from a generated schema.
@@ -247,6 +280,38 @@ mod tests {
         assert!(
             page_req.contains(&"events".to_string()),
             "…while the page's substance stays required: {page_req:?}"
+        );
+    }
+
+    /// The encoder puts `_meta.traceparent` in every success body, so every
+    /// declared schema has to say so — a client that validates the body against
+    /// a schema which does not mention a field we always send is the failure
+    /// mode `outputSchema` exists to avoid. And it must NOT be required: the
+    /// value comes from the ambient trace scope, which a few argument
+    /// validations answer outside of.
+    #[test]
+    fn declared_schemas_admit_the_meta_the_encoder_injects() {
+        let lifecycle = output_schema::<crate::response::DropPondResponse>();
+        let meta = &Value::Object((*lifecycle).clone())["properties"]["_meta"];
+        assert_eq!(
+            meta["properties"]["traceparent"]["type"], "string",
+            "the injected block must be declared: {meta:#}"
+        );
+        assert!(
+            !required_at(&lifecycle, &[]).contains(&"_meta".to_string()),
+            "a body outside a trace scope carries no `_meta`, so requiring it \
+             would make a conforming client reject a valid response"
+        );
+        // …and a type that declares `_meta` itself keeps its own, fuller shape:
+        // `QueryResponse._meta` is a whole `QueryMeta`, not the two-line stub.
+        let query = output_schema::<QueryResponse>();
+        assert!(
+            required_at(&query, &["_meta"]).contains(&"duration_ms".to_string()),
+            "QueryResponse's own `_meta` must not have been replaced by the stub"
+        );
+        assert!(
+            required_at(&query, &[]).contains(&"_meta".to_string()),
+            "…and it stays required there, because it is a field of the struct"
         );
     }
 

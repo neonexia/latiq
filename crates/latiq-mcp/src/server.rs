@@ -1137,7 +1137,7 @@ PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be ex
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow. \
 ERRORS ARE STRUCTURED: alongside `message`/`suggest`/`see`, every failure carries `retryable` (`as_is` / `after_change` / `never` — `never` means THIS call, and `suggest` names the different call that works), \
 `audience` (`operator` means report it and stop) and `facts` (the numbers as values, so don't parse the sentence). Branch on those, not on the prose — latiq://guidance has the contract. \
-Every tool result also carries `_meta.traceparent` — the W3C trace id of that call, the one to quote when asking an operator about it. \
+Every tool result also carries `_meta.traceparent` IN ITS BODY — the W3C trace id of that call, the one to quote when asking an operator about it (a failure puts the same id on the envelope's own `traceparent`/`trace_id`). \
 Prompts provide SOPs for common multi-agent workflows.";
 
 #[tool_handler(router = self.tool_router)]
@@ -1309,7 +1309,9 @@ mod tests {
     /// Snake_case words in the instructions that are NOT tool names, and are not
     /// meant to be: the error-envelope vocabulary the same text documents. Kept
     /// explicit so a genuine tool name can never hide in it.
-    const NON_TOOL_WORDS: &[&str] = &["as_is", "after_change"];
+    // Envelope field VALUES and field NAMES, which are snake_case like a tool
+    // name and are not one.
+    const NON_TOOL_WORDS: &[&str] = &["as_is", "after_change", "trace_id"];
 
     /// **Discovery runs on the tool NAME and on this block, not on tool
     /// descriptions** — a client may defer descriptions until after the agent
