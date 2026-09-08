@@ -300,6 +300,198 @@ async fn full_agent_loop() {
     assert!(ops.describe_pond(&id, "incident-9").await.is_err());
 }
 
+/// **No statement a caller can edit may come back addressed to an operator.**
+///
+/// Nexus finding 8's guard, and the strongest part of it: the bug was not in
+/// the taxonomy but in the MAPPING, so it is driven by running real SQL through
+/// the real engine and reading the envelope an agent would receive. Fabricating
+/// `EngineError` values would have passed on the day the finding was filed —
+/// `Not implemented` never reached `classify` in any unit test, because nothing
+/// constructed it.
+///
+/// The rule this pins: `internal` + "Retry; if it persists, report to your
+/// operator" is for OUR failures. If a different statement fixes it, the
+/// envelope is the caller's — otherwise an agent is told to repeat a statement
+/// that can never succeed and then to wake a human who has nothing to fix.
+///
+/// One class is deliberately outside the table and stays `internal`/`as_is`:
+/// `Out of Memory`, which a statement can provoke (`SET memory_limit='1KB'`)
+/// but which is the deployment's ceiling rather than a property of the SQL — a
+/// retry under less load can succeed, which is exactly what `as_is` means. It
+/// is not asserted here because provoking it depends on process memory state,
+/// and a flaky guard is worse than a documented one.
+#[tokio::test]
+async fn error_contract_no_statement_a_caller_can_edit_is_addressed_to_an_operator() {
+    use latiq_common::{Audience, ErrorKind, Retryable};
+
+    let ops = ops();
+    let id = Identity::claimed(Some("agent-classify"));
+    ops.allocate_pond(&id, Some("classify".into()), "{}", "medium", &[], false)
+        .await
+        .unwrap();
+    ops.write_query(
+        &id,
+        "classify",
+        "CREATE TABLE t(id INTEGER NOT NULL, name VARCHAR)",
+    )
+    .await
+    .unwrap();
+
+    // (statement, the kind an agent must receive, why this statement is here).
+    // Every one is SQL a competent agent writes without being reckless.
+    let cases: &[(&str, ErrorKind, &str)] = &[
+        (
+            "CREATE TABLE sample_data (id INTEGER PRIMARY KEY, name VARCHAR, value DECIMAL(10,2))",
+            ErrorKind::UnsupportedFeature,
+            "the statement from the Nexus run, verbatim",
+        ),
+        (
+            "CREATE TABLE ck(id INTEGER CHECK (id > 0))",
+            ErrorKind::UnsupportedFeature,
+            "CHECK is the same DuckLake refusal in different words",
+        ),
+        (
+            "CREATE INDEX idx ON t(id)",
+            ErrorKind::UnsupportedFeature,
+            "an index — the obvious next move after being told to drop the PRIMARY KEY",
+        ),
+        (
+            "CREATE SEQUENCE s",
+            ErrorKind::UnsupportedFeature,
+            "a sequence — the other way an agent reaches for a surrogate key",
+        ),
+        (
+            "BEGIN TRANSACTION",
+            ErrorKind::UnsupportedFeature,
+            "the transaction control latiq://dialect tells agents not to send",
+        ),
+        (
+            "SELECT 9223372036854775807::BIGINT + 1::BIGINT",
+            ErrorKind::InvalidValue,
+            "an arithmetic overflow: the value is the caller's",
+        ),
+        (
+            "SELECT strptime('nope', '%Y-%m-%d')",
+            ErrorKind::InvalidValue,
+            "an argument no function will ever accept",
+        ),
+        (
+            "SELEKT 1",
+            ErrorKind::ParseError,
+            "the already-classified kinds are re-driven so this guard covers the whole path",
+        ),
+        (
+            "INSERT INTO nope VALUES (1)",
+            ErrorKind::CatalogError,
+            "a name that does not resolve",
+        ),
+        (
+            "INSERT INTO t VALUES (NULL, 'x')",
+            ErrorKind::InvalidValue,
+            "a NOT NULL violation — DuckLake DOES enforce that one",
+        ),
+    ];
+
+    for (sql, want, why) in cases {
+        let err = ops
+            .write_query(&id, "classify", sql)
+            .await
+            .expect_err(&format!("`{sql}` must fail — {why}"));
+        let env = err.envelope();
+        assert_eq!(env.kind, *want, "`{sql}` ({why}): {}", env.message);
+        assert_eq!(
+            env.audience,
+            Audience::Agent,
+            "`{sql}` is fixed by editing the statement, so it must not be addressed to an \
+             operator: {env:?}"
+        );
+        assert_ne!(
+            env.retryable,
+            Retryable::AsIs,
+            "`{sql}` cannot succeed unchanged, so `as_is` would be the retry loop `retryable` \
+             exists to prevent: {}",
+            env.suggest
+        );
+        assert!(
+            !env.suggest.contains("report to your operator"),
+            "`{sql}`: {}",
+            env.suggest
+        );
+        assert!(
+            !env.message.starts_with("engine error:"),
+            "`{sql}`: the `engine error:` prefix is the catch-all's, and this kind is not the \
+             catch-all: {}",
+            env.message
+        );
+    }
+    assert_eq!(cases.len(), 10, "every statement in the table was driven");
+}
+
+/// The four control fields, on the exact statement Nexus observed. The mapping
+/// guard above proves the property across many statements; this one is the
+/// regression pin on the report itself — all four fields were wrong, each in
+/// the direction that harms the agent most.
+#[tokio::test]
+async fn error_contract_the_nexus_primary_key_statement_is_agent_fixable() {
+    use latiq_common::{Audience, ErrorKind, Fact, Retryable};
+
+    let ops = ops();
+    let id = Identity::claimed(Some("agent-nexus"));
+    ops.allocate_pond(&id, Some("nexus".into()), "{}", "medium", &[], false)
+        .await
+        .unwrap();
+    let env = ops
+        .write_query(
+            &id,
+            "nexus",
+            "CREATE TABLE sample_data (id INTEGER PRIMARY KEY, name VARCHAR, value \
+             DECIMAL(10,2));",
+        )
+        .await
+        .expect_err("DuckLake has no PRIMARY KEY")
+        .into_envelope();
+
+    assert_eq!(env.kind, ErrorKind::UnsupportedFeature); // was `internal`
+    assert_eq!(env.audience, Audience::Agent); // was `operator`
+    assert_eq!(env.retryable, Retryable::AfterChange); // was `as_is`
+                                                       // …and the advice names the clause to delete instead of the retry loop and
+                                                       // the escalation. It was: "Retry; if it persists, report to your operator."
+    assert!(
+        env.suggest.contains("PRIMARY KEY") && env.suggest.contains("remove"),
+        "the suggest must name what to remove: {}",
+        env.suggest
+    );
+    assert!(
+        !env.suggest.to_lowercase().starts_with("retry"),
+        "{}",
+        env.suggest
+    );
+    // The engine's own sentence still reaches the agent — it was the one field
+    // the report called accurate — and the feature it names is also a VALUE.
+    assert!(
+        env.message
+            .contains("PRIMARY KEY/UNIQUE constraints are not supported"),
+        "{}",
+        env.message
+    );
+    assert_eq!(
+        env.facts.get("feature"),
+        Some(&Fact::Text("PRIMARY KEY/UNIQUE constraints".into())),
+        "a client must be able to branch on the feature without parsing the message"
+    );
+    assert_eq!(env.see, "latiq://dialect");
+
+    // And the statement the agent in that run reached for on its own — the same
+    // DDL without the constraint — works, so the advice leads somewhere.
+    ops.write_query(
+        &id,
+        "nexus",
+        "CREATE TABLE sample_data (id INTEGER, name VARCHAR, value DECIMAL(10,2))",
+    )
+    .await
+    .expect("dropping the unsupported clause is the whole fix");
+}
+
 #[tokio::test]
 async fn read_arrow_streams_rows_locally() {
     use tokio_stream::StreamExt;

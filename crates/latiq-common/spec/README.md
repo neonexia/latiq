@@ -1,6 +1,6 @@
 # The ErrorEnvelope schema
 
-`ErrorEnvelope-1-0-1.json` (the current version — see *Versioning*) is the
+`ErrorEnvelope-1-0-2.json` (the current version — see *Versioning*) is the
 machine-auditable shape of the one error every Latiq surface returns. It is here for the same reason `latiq-lineage/spec/` holds
 the OpenLineage schemas: so `cargo test -p latiq-common` can prove, offline, that
 what we actually construct matches what we say we return. `jsonschema` is a
@@ -38,7 +38,19 @@ here. `additionalProperties: false` is the whole point of this schema, so a
 validator holding `1-0-0` rejects an envelope carrying a field only `1-0-1`
 knows: "optional to the producer" is not "invisible to the consumer".
 
-### `ErrorEnvelope-1-0-1.json` — current
+### `ErrorEnvelope-1-0-2.json` — current
+
+Two `kind` values change, which is a shape change in both directions: adds
+`unsupported_feature` and removes `uri_not_allowed`. The new kind is what a
+statement asking for a feature the engine does not implement now returns —
+`CREATE TABLE t(id INTEGER PRIMARY KEY)` used to arrive as `internal` +
+"report to your operator" (Nexus finding 8). The removed one had **zero
+construction sites**: it was declared, documented to agents, and unreachable,
+because the URI allowlist it described is not built (issue #79). A kind nobody
+can reach is not a feature, so it went rather than being left as a promise the
+surface does not keep.
+
+### `ErrorEnvelope-1-0-1.json` — superseded
 
 Adds optional `traceparent`. `trace_id` is unchanged and stays: a consumer that
 only wants the join key reads the same field it always did, while one building a
@@ -50,7 +62,7 @@ deliberately mints nothing it would not also propagate).
 ### `ErrorEnvelope-1-0-0.json` — superseded
 
 Kept as the record of what `0.1.x` shipped before `traceparent`. Nothing in the
-test suite validates against it any more.
+test suite validates against `1-0-0` or `1-0-1` any more.
 
 As with the Latiq lineage facets, the `$id` is an **identifier, not a fetchable
 document** — the repo is private and no `error-envelope-1-0-0` ref has been cut.

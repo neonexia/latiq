@@ -210,7 +210,7 @@ pub(crate) fn to_status(e: AgentError) -> Status {
         ErrorKind::SourceUnavailable => Code::FailedPrecondition,
         ErrorKind::Storage | ErrorKind::Internal => Code::Internal,
         // ParseError / InvalidValue / MissingArgument / ReadOnlyViolation /
-        // WriteToReservedSchema / ResultCapExceeded / UriNotAllowed
+        // WriteToReservedSchema / ResultCapExceeded / UnsupportedFeature
         _ => Code::InvalidArgument,
     };
     let details = serde_json::to_vec(&env).unwrap_or_default();

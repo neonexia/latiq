@@ -60,7 +60,19 @@ pub enum ErrorKind {
     WriteToReservedSchema,
     ResultCapExceeded,
     ReadOnlyViolation,
-    UriNotAllowed,
+    /// The statement is valid SQL, every name in it resolves, and the engine
+    /// does not implement the feature it asks for — `PRIMARY KEY`/`UNIQUE`,
+    /// `CHECK`, an index, a sequence, a generated column, or transaction
+    /// control, none of which a DuckLake pond has. Deliberately NOT
+    /// `ParseError` (the syntax was fine, so "check the SQL against the
+    /// dialect" sends the agent to read a grammar that will agree with it) and
+    /// deliberately NOT `Internal`: nothing of ours failed, no operator has
+    /// anything to fix, and the identical statement can never succeed — which
+    /// is exactly what "Retry; if it persists, report to your operator" told an
+    /// agent to do with `CREATE TABLE t(id INTEGER PRIMARY KEY)` (Nexus finding
+    /// 8). The fix is the caller's and is always the same shape: drop the
+    /// clause the message names.
+    UnsupportedFeature,
     QueryTimeout,
     QueryCancelled,
     /// The caller's credential was absent, expired, or refused. The one failure
@@ -358,7 +370,7 @@ impl ErrorKind {
         ErrorKind::WriteToReservedSchema,
         ErrorKind::ResultCapExceeded,
         ErrorKind::ReadOnlyViolation,
-        ErrorKind::UriNotAllowed,
+        ErrorKind::UnsupportedFeature,
         ErrorKind::QueryTimeout,
         ErrorKind::QueryCancelled,
         ErrorKind::Unauthenticated,
@@ -383,7 +395,7 @@ impl ErrorKind {
             ErrorKind::WriteToReservedSchema => "write_to_reserved_schema",
             ErrorKind::ResultCapExceeded => "result_cap_exceeded",
             ErrorKind::ReadOnlyViolation => "read_only_violation",
-            ErrorKind::UriNotAllowed => "uri_not_allowed",
+            ErrorKind::UnsupportedFeature => "unsupported_feature",
             ErrorKind::QueryTimeout => "query_timeout",
             ErrorKind::QueryCancelled => "query_cancelled",
             ErrorKind::Unauthenticated => "unauthenticated",
@@ -431,7 +443,19 @@ impl ErrorKind {
             ErrorKind::ReadOnlyViolation => {
                 "Use write_query for INSERT/UPDATE/DELETE/DDL; read_query is for SELECT."
             }
-            ErrorKind::UriNotAllowed => "Use an allowed source URI (a public http(s)/s3 path).",
+            // Names the clause to delete, not a call to repeat: the whole point
+            // of this kind is that the statement as written can never succeed.
+            // The specific engine wording (which feature, in DuckDB's own
+            // words) arrives in `message`; a call site with the feature name in
+            // hand overrides this with a sentence that quotes it.
+            ErrorKind::UnsupportedFeature => {
+                "Remove the clause the message names and re-send — this engine does not implement \
+                 it, so the identical statement can never succeed. A DuckLake pond has no PRIMARY \
+                 KEY/UNIQUE or CHECK constraints, no indexes, no sequences and no generated \
+                 columns: declare the columns and their types, and enforce uniqueness with a query \
+                 (read_query \"SELECT id, count(*) FROM t GROUP BY id HAVING count(*) > 1\") \
+                 instead of a constraint. See latiq://dialect."
+            }
             ErrorKind::QueryTimeout => {
                 "Retry with a larger timeout_ms (up to the node's maximum), or narrow the query \
                  (WHERE/LIMIT) or aggregate server-side. explain_query shows which table is \
@@ -472,7 +496,7 @@ impl ErrorKind {
     pub fn audience(self) -> Audience {
         match self {
             // The caller's, every one: a different name, a corrected statement,
-            // a narrower query, a fresh token, an allowed URI.
+            // a narrower query, a fresh token, a clause removed.
             ErrorKind::PondNotFound
             | ErrorKind::DatasetNotFound
             | ErrorKind::NameConflict
@@ -483,7 +507,7 @@ impl ErrorKind {
             | ErrorKind::WriteToReservedSchema
             | ErrorKind::ResultCapExceeded
             | ErrorKind::ReadOnlyViolation
-            | ErrorKind::UriNotAllowed
+            | ErrorKind::UnsupportedFeature
             | ErrorKind::QueryTimeout
             | ErrorKind::QueryCancelled
             | ErrorKind::Unauthenticated
@@ -525,7 +549,7 @@ impl ErrorKind {
             | ErrorKind::MissingArgument
             | ErrorKind::WriteToReservedSchema
             | ErrorKind::ResultCapExceeded
-            | ErrorKind::UriNotAllowed
+            | ErrorKind::UnsupportedFeature
             // A new token is a change to the request, not the same request
             // again: replaying the rejected one loops forever.
             | ErrorKind::Unauthenticated => Retryable::AfterChange,
@@ -546,6 +570,10 @@ impl ErrorKind {
             ErrorKind::ResultCapExceeded => "latiq://troubleshooting/large-results",
             ErrorKind::ReadOnlyViolation
             | ErrorKind::ParseError
+            // The dialect page is where "what this pond's SQL does NOT have" is
+            // written down, so it is the page that teaches this kind rather than
+            // merely resolving for it.
+            | ErrorKind::UnsupportedFeature
             | ErrorKind::WriteToReservedSchema => "latiq://dialect",
             ErrorKind::QueryTimeout => "latiq://troubleshooting/timeouts",
             ErrorKind::CatalogError => "latiq://troubleshooting/catalog-error",
@@ -553,8 +581,7 @@ impl ErrorKind {
             ErrorKind::PondUnavailable => "latiq://troubleshooting/pond-unavailable",
             ErrorKind::NameConflict
             | ErrorKind::InvalidValue
-            | ErrorKind::MissingArgument
-            | ErrorKind::UriNotAllowed => "latiq://guidance",
+            | ErrorKind::MissingArgument => "latiq://guidance",
             // These four used to share `latiq://troubleshooting`, the INDEX.
             // It resolved, so the guard was green — and it covered none of
             // them, so an agent holding the two worst envelopes landed on a
@@ -685,7 +712,7 @@ mod tests {
 
     /// The vendored schema, read at COMPILE time: an `include_str!` cannot pass
     /// because a file was missing at runtime.
-    const SCHEMA: &str = include_str!("../spec/ErrorEnvelope-1-0-1.json");
+    const SCHEMA: &str = include_str!("../spec/ErrorEnvelope-1-0-2.json");
 
     fn validator() -> jsonschema::Validator {
         let schema: Value = serde_json::from_str(SCHEMA).expect("the vendored schema is JSON");
@@ -865,6 +892,33 @@ mod tests {
             "read_query handed a write can never succeed on THIS call"
         );
         assert_eq!(ErrorKind::ReadOnlyViolation.audience(), Audience::Agent);
+    }
+
+    /// Nexus finding 8, at the taxonomy layer: every control field of
+    /// `unsupported_feature` points the agent at the fix, and none of them
+    /// points at an operator. All four were wrong when this arrived as
+    /// `internal` — `audience: operator` (nobody to fix it), `retryable: as_is`
+    /// (the loop the field exists to prevent) and a `suggest` that named the
+    /// retry and the escalation instead of the clause to delete.
+    #[test]
+    fn error_contract_unsupported_feature_never_sends_the_agent_to_an_operator() {
+        let kind = ErrorKind::UnsupportedFeature;
+        assert_eq!(kind.audience(), Audience::Agent);
+        assert_eq!(
+            kind.retryable(),
+            Retryable::AfterChange,
+            "the identical statement can never succeed, and it is the caller who changes it"
+        );
+        let suggest = kind.default_suggest();
+        assert!(
+            !suggest.contains("operator") && !suggest.starts_with("Retry"),
+            "the advice must be the edit, not the escalation: {suggest}"
+        );
+        assert!(
+            suggest.contains("Remove") && suggest.contains("PRIMARY KEY"),
+            "it must name what to remove, since that is the entire fix: {suggest}"
+        );
+        assert_eq!(kind.default_see(), "latiq://dialect");
     }
 
     /// The wire names the agent surface documents must be the wire names we

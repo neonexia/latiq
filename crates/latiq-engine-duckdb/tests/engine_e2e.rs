@@ -1174,6 +1174,36 @@ fn error_contract_duckdb_error_classes_are_unchanged() {
             class: latiq_engine_duckdb::errclass::IO,
             want: "SourceIo",
         },
+        Case {
+            // Nexus finding 8's statement, minus the columns that are beside
+            // the point. This whole class used to fall through to `Engine`.
+            sql: "CREATE TABLE pk(id INTEGER PRIMARY KEY)",
+            class: latiq_engine_duckdb::errclass::NOT_IMPLEMENTED,
+            want: "Unsupported",
+        },
+        Case {
+            sql: "SELECT 9223372036854775807::BIGINT + 1::BIGINT",
+            class: latiq_engine_duckdb::errclass::OUT_OF_RANGE,
+            want: "InvalidInput",
+        },
+        Case {
+            sql: "SELECT strptime('nope', '%Y-%m-%d')",
+            class: latiq_engine_duckdb::errclass::INVALID_INPUT,
+            want: "InvalidInput",
+        },
+        Case {
+            // The caller driving the transaction the write path owns — the one
+            // thing latiq://dialect tells agents not to send.
+            sql: "BEGIN TRANSACTION",
+            class: latiq_engine_duckdb::errclass::TRANSACTION,
+            want: "TransactionControl",
+        },
+        Case {
+            // DuckDB's other name for "the statement is not well formed".
+            sql: "SET threads=-3",
+            class: latiq_engine_duckdb::errclass::SYNTAX,
+            want: "Parse",
+        },
     ];
 
     for Case { sql, class, want } in cases {
@@ -1184,6 +1214,9 @@ fn error_contract_duckdb_error_classes_are_unchanged() {
             EngineError::Conversion(m) => ("Conversion", m),
             EngineError::Constraint(m) => ("Constraint", m),
             EngineError::SourceIo(m) => ("SourceIo", m),
+            EngineError::Unsupported { message, .. } => ("Unsupported", message),
+            EngineError::InvalidInput(m) => ("InvalidInput", m),
+            EngineError::TransactionControl(m) => ("TransactionControl", m),
             EngineError::Engine(m) => ("Engine", m),
             other => panic!("unexpected variant for `{sql}`: {other:?}"),
         };

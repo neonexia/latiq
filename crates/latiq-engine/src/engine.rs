@@ -57,6 +57,35 @@ pub enum EngineError {
     /// outside this deployment.
     #[error("source I/O error: {0}")]
     SourceIo(String),
+    /// The statement parses and its names resolve, but it asks for a feature
+    /// this engine/storage does not implement — a `PRIMARY KEY`, an index, a
+    /// sequence, a generated column. Nothing is broken and nothing retries into
+    /// success: the caller drops the clause or does not get it. Deliberately not
+    /// `Parse` (the syntax was fine) and deliberately not `Engine` (nothing of
+    /// ours failed, and an operator has nothing to fix).
+    ///
+    /// `feature` is the thing the engine NAMED as unsupported, lifted out of its
+    /// own sentence so a client can branch on a value instead of parsing prose.
+    /// `None` when the message names one in a shape we do not recognise — an
+    /// unnamed feature is left unnamed rather than guessed at.
+    #[error("unsupported feature: {message}")]
+    Unsupported {
+        message: String,
+        feature: Option<String>,
+    },
+    /// A value or argument in the statement is not acceptable to the engine —
+    /// out of range for its type, or invalid for the function or file it was
+    /// passed to. Distinct from [`Self::Conversion`], which is specifically
+    /// "this text is not that type": the fix here is the value or the argument,
+    /// not a CAST.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    /// The caller's own statement drove the transaction Latiq owns (`BEGIN` /
+    /// `COMMIT` / `ROLLBACK`), or that transaction could not be closed. Its own
+    /// variant because the retry advice is different from every other one here:
+    /// part of the statement may already have committed.
+    #[error("transaction error: {0}")]
+    TransactionControl(String),
     #[error("read_query received a non-read statement; use write_query")]
     ReadOnlyViolation,
     #[error("query was cancelled")]

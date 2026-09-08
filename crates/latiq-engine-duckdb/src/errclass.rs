@@ -26,9 +26,15 @@
 //! (so an existing table came back as *internal*, with "retry" as the advice).
 //! The kind an agent received was an accident of binder phasing.
 //!
-//! Unrecognised classes stay `EngineError::Engine`. That is the honest answer:
-//! we have not decided what a caller should do about them, and inventing an
-//! action is worse than admitting we have none.
+//! Unrecognised classes stay `EngineError::Engine`. That is the honest answer
+//! for a class we have never seen — but it is the WRONG answer for a class we
+//! know is caller-fixable and simply had not listed. `Not implemented Error:`
+//! (`CREATE TABLE … PRIMARY KEY`, which is ordinary SQL an agent writes on its
+//! first try) fell through to `internal` + "Retry; if it persists, report to
+//! your operator": a loop that can never succeed, then an escalation to someone
+//! with nothing to fix. Nexus finding 8. DuckDB's classes are a finite set, so
+//! the ones a caller's statement can raise are enumerated below rather than
+//! defaulted; see [`class_of`] for the ones deliberately left unmapped.
 use latiq_engine::EngineError;
 
 /// The class prefixes we key on. Pinned against the real engine by
@@ -36,12 +42,17 @@ use latiq_engine::EngineError;
 /// a DuckDB upgrade that renames one silently drops everything in that class
 /// back to `internal` + "retry", so it must fail loudly instead.
 pub const PARSER: &str = "Parser Error";
+pub const SYNTAX: &str = "Syntax Error";
 pub const CATALOG: &str = "Catalog Error";
 pub const BINDER: &str = "Binder Error";
 pub const CONVERSION: &str = "Conversion Error";
 pub const CONSTRAINT: &str = "Constraint Error";
 pub const IO: &str = "IO Error";
 pub const HTTP: &str = "HTTP Error";
+pub const NOT_IMPLEMENTED: &str = "Not implemented Error";
+pub const INVALID_INPUT: &str = "Invalid Input Error";
+pub const OUT_OF_RANGE: &str = "Out of Range Error";
+pub const TRANSACTION: &str = "TransactionContext Error";
 
 /// Classify a duckdb-rs error by the exception class in its message.
 ///
@@ -71,7 +82,10 @@ pub fn classify_message(msg: &str) -> EngineError {
     // one line.
     let owned = || m.to_string();
     match class_of(line) {
-        Some(PARSER) => EngineError::Parse(owned()),
+        // `Syntax Error` is DuckDB's other name for the same thing — the
+        // statement (or a value inside a `SET`) is not well formed. One class
+        // prefix, one action: fix the statement.
+        Some(PARSER) | Some(SYNTAX) => EngineError::Parse(owned()),
         // Catalog and Binder are one action: the statement is valid SQL, but a
         // name in it doesn't match the pond. "Table with name nope does not
         // exist", "Referenced column x not found", "No function matches the
@@ -83,15 +97,96 @@ pub fn classify_message(msg: &str) -> EngineError {
         // The source is not ours: a URL, a bucket, a file. `HTTP Error` is
         // httpfs's own class for the same situation.
         Some(IO) | Some(HTTP) => EngineError::SourceIo(owned()),
+        // The statement is fine; the engine does not implement what it asks
+        // for. Everything DuckLake rejects this way is a clause the caller
+        // wrote and can delete — measured against the real engine, not assumed:
+        // PRIMARY KEY/UNIQUE, CHECK, indexes, sequences and generated columns
+        // all arrive here (`engine_e2e.rs`'s class pin, and
+        // `latiq-agent-core`'s
+        // `error_contract_no_statement_a_caller_can_edit_is_addressed_to_an_operator`,
+        // which drives each of them through to the envelope).
+        Some(NOT_IMPLEMENTED) => EngineError::Unsupported {
+            feature: unsupported_feature(line),
+            message: owned(),
+        },
+        // Both are "a value or argument in the statement is not acceptable":
+        // an overflowing sum, a string that does not match a format specifier,
+        // a file that is not the format it was read as. One action — fix the
+        // value — so one variant, the same merge Catalog/Binder already make.
+        Some(INVALID_INPUT) | Some(OUT_OF_RANGE) => EngineError::InvalidInput(owned()),
+        // The caller sent transaction control inside the bracket the write path
+        // owns. Its own variant because the advice has to warn that part of the
+        // statement may already have committed.
+        Some(TRANSACTION) => EngineError::TransactionControl(owned()),
         _ => EngineError::Engine(m.to_string()),
     }
 }
 
 /// The class prefix this message leads with, if it is one we key on.
+///
+/// **What is deliberately NOT here, and why** — the point being that the
+/// remainder is a decision rather than a default:
+/// - `Internal` / `FATAL` — ours. `internal` + "report to your operator" is
+///   exactly right, and is the only thing it is right for.
+/// - `Out of Memory` — the deployment's ceiling, not a property of the
+///   statement: it is raised by the pond's memory cap, and a retry under less
+///   load can succeed where an identical retry after a `Parser Error` never
+///   can. Stays `internal`/`as_is`, which is what that advice means.
+/// - `INTERRUPT` — normalized to `Cancelled` by `run_with_abort`, which only
+///   inspects `Engine`, so keying on it here would break cancellation.
+/// - `Dependency`, `Permission`, `Serialization` — we could not raise any of
+///   them through a pond. The objects that create dependencies (indexes,
+///   sequences, CHECK constraints) are themselves `Not implemented` in
+///   DuckLake, every statement runs as the one local process that owns the
+///   catalog, and writes are serialized by the pond's writer mutex before they
+///   reach DuckDB. A mapping for a class nothing can raise is a mapping nothing
+///   tests; add one the day a statement produces it.
 fn class_of(msg: &str) -> Option<&'static str> {
-    [PARSER, CATALOG, BINDER, CONVERSION, CONSTRAINT, IO, HTTP]
-        .into_iter()
-        .find(|c| is_class_prefix(msg, c))
+    [
+        PARSER,
+        SYNTAX,
+        CATALOG,
+        BINDER,
+        CONVERSION,
+        CONSTRAINT,
+        IO,
+        HTTP,
+        NOT_IMPLEMENTED,
+        INVALID_INPUT,
+        OUT_OF_RANGE,
+        TRANSACTION,
+    ]
+    .into_iter()
+    .find(|c| is_class_prefix(msg, c))
+}
+
+/// The feature DuckDB named as unsupported, in ITS words, or `None`.
+///
+/// The value goes into the envelope's `facts` so a client can branch on
+/// `feature == "indexes"` instead of matching a sentence (invariant 13). It is
+/// therefore only ever lifted out of the engine's own message — never composed
+/// by us — and the two shapes DuckLake uses are the two matched here:
+/// `"PRIMARY KEY/UNIQUE constraints are not supported in DuckLake"` and
+/// `"DuckLake does not support indexes"`. Anything else yields no fact at all,
+/// because a fact we guessed at is worse than one we did not publish.
+fn unsupported_feature(line: &str) -> Option<String> {
+    let detail = line
+        .split_once(':')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(line);
+    let trim = |s: &str| {
+        let s = s.trim().trim_end_matches(['.', '!']).trim();
+        (!s.is_empty()).then(|| s.to_string())
+    };
+    if let Some((_, feature)) = detail.split_once(" does not support ") {
+        return trim(feature);
+    }
+    for marker in [" are not supported", " is not supported"] {
+        if let Some((feature, _)) = detail.split_once(marker) {
+            return trim(feature);
+        }
+    }
+    None
 }
 
 /// `"<Class>:"` at the head of the message. The colon is required so a message
@@ -116,6 +211,9 @@ mod tests {
             EngineError::Conversion(_) => "Conversion",
             EngineError::Constraint(_) => "Constraint",
             EngineError::SourceIo(_) => "SourceIo",
+            EngineError::Unsupported { .. } => "Unsupported",
+            EngineError::InvalidInput(_) => "InvalidInput",
+            EngineError::TransactionControl(_) => "TransactionControl",
             EngineError::Engine(_) => "Engine",
             EngineError::ReadOnlyViolation => "ReadOnlyViolation",
             EngineError::Cancelled => "Cancelled",
@@ -151,8 +249,28 @@ mod tests {
                 "HTTP Error: HTTP GET error on 'https://x' (404)",
                 "SourceIo",
             ),
-            // Not a class we have decided an action for: it stays internal
-            // rather than borrowing someone else's advice.
+            (
+                "Not implemented Error: PRIMARY KEY/UNIQUE constraints are not supported in \
+                 DuckLake",
+                "Unsupported",
+            ),
+            (
+                "Invalid Input Error: No magic bytes found at end of file 'x.parquet'",
+                "InvalidInput",
+            ),
+            (
+                "Out of Range Error: Overflow in addition of INT64 (9223372036854775807 + 1)!",
+                "InvalidInput",
+            ),
+            (
+                "TransactionContext Error: cannot start a transaction within a transaction",
+                "TransactionControl",
+            ),
+            ("Syntax Error: Must have at least 1 thread!", "Parse"),
+            // Not a class we have decided a CALLER action for: the deployment's
+            // memory ceiling is not something a different statement is
+            // guaranteed to dodge, and a retry under less load can work. It
+            // stays internal rather than borrowing someone else's advice.
             ("Out of Memory Error: failed to allocate", "Engine"),
             // The interrupt is normalized to `Cancelled` by `run_with_abort`,
             // which only inspects `Engine` — so it must land there.
@@ -161,6 +279,49 @@ mod tests {
         for (msg, want) in cases {
             assert_eq!(variant(&classify_message(msg)), want, "{msg}");
         }
+    }
+
+    /// The `feature` fact exists so a client branches on a value rather than on
+    /// a sentence — so it must be the engine's own noun, and must be absent
+    /// when the engine did not give us one. The four DuckLake messages below
+    /// are real (see the e2e pin); the last two are the honest-`None` cases.
+    #[test]
+    fn error_contract_the_unsupported_feature_fact_is_lifted_never_invented() {
+        let feature = |msg: &str| match classify_message(msg) {
+            EngineError::Unsupported { feature, .. } => feature,
+            other => panic!("{msg} did not classify as unsupported: {other:?}"),
+        };
+        assert_eq!(
+            feature(
+                "Not implemented Error: PRIMARY KEY/UNIQUE constraints are not supported in \
+                 DuckLake"
+            )
+            .as_deref(),
+            Some("PRIMARY KEY/UNIQUE constraints")
+        );
+        assert_eq!(
+            feature("Not implemented Error: CHECK constraints are not supported in DuckLake")
+                .as_deref(),
+            Some("CHECK constraints")
+        );
+        assert_eq!(
+            feature("Not implemented Error: DuckLake does not support indexes").as_deref(),
+            Some("indexes")
+        );
+        assert_eq!(
+            feature("Not implemented Error: DuckLake does not support generated columns")
+                .as_deref(),
+            Some("generated columns")
+        );
+        // A message in neither shape publishes NO fact: a value we made up
+        // would be a value a client could branch on and be wrong about.
+        assert_eq!(feature("Not implemented Error: unsupported type"), None);
+        // …and the classification still happens, so the agent keeps the
+        // agent-facing kind even where the fact is missing.
+        assert!(matches!(
+            classify_message("Not implemented Error: unsupported type"),
+            EngineError::Unsupported { feature: None, .. }
+        ));
     }
 
     #[test]
