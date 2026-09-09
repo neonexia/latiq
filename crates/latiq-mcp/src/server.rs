@@ -70,7 +70,7 @@ use std::sync::Arc;
 #[schemars(crate = "rmcp::schemars")]
 pub struct AllocateArgs {
     #[schemars(
-        description = "Optional pond name; Latiq generates one (a uuid) if omitted. It becomes the pond's SQL catalog name, so it must be 1-64 characters of letters, digits, `_` or `-` — anything else is rejected rather than mangled. An empty string is NOT 'generate one for me': omit the field for that."
+        description = "Optional pond name; Latiq generates a uuid if omitted. It becomes the pond's SQL catalog name: 1-64 characters of letters, digits, `_` or `-`, anything else rejected rather than mangled. An empty string is NOT 'generate one for me' — omit the field for that."
     )]
     pub name: Option<String>,
     #[schemars(
@@ -83,7 +83,7 @@ pub struct AllocateArgs {
     )]
     pub extensions: Option<Vec<String>>,
     #[schemars(
-        description = "Record OpenLineage provenance for every query on this pond, readable with get_lineage (default false). Chosen here and FIXED for the pond's lifetime — no RPC turns it on later, so a pond allocated without it can never explain its own history; the only recovery is a new pond. It costs disk and a little per-query time, so ask for it when you need to answer 'where did this data come from?'. See latiq://recipes/lineage."
+        description = "Record OpenLineage provenance for every query on this pond, readable with get_lineage (default false). FIXED at allocation: nothing turns it on later, so a pond without it can never explain its own history and the only recovery is a new pond. See latiq://recipes/lineage."
     )]
     pub lineage: Option<bool>,
 }
@@ -106,7 +106,7 @@ pub struct DropArgs {
     /// NO description at all — an agent could only learn what it was for by
     /// being refused once.
     #[schemars(
-        description = "Must be `true` for the drop to happen. There is no undo: the pond's tables, history and lineage are deleted, and re-allocating the same name gives you an empty pond, not this one. Omitted or `false` is refused with an error and NOTHING is deleted — that refusal is the safety net, so do not set `true` speculatively. Set it only when you have confirmed this pond is finished with; other agents may be working in it (list_ponds shows who owns it)."
+        description = "Must be `true` for the drop to happen; omitted or `false` deletes NOTHING and is refused — that refusal is the safety net, so don't set `true` speculatively. There is no undo: tables, history and lineage go, and re-allocating the same name gives you an empty pond, not this one."
     )]
     pub confirm: Option<bool>,
 }
@@ -120,7 +120,7 @@ pub struct QueryArgs {
     #[schemars(description = "SQL statement")]
     pub sql: String,
     #[schemars(
-        description = "How long this statement may run, in milliseconds. Omit for the node's default. Must be at least 1 — `0` is rejected, not read as 'no timeout' and not read as 'use the default'; omit the field for the default. Asking for MORE than the node allows is not an error — it is clamped to the node's maximum and the query runs at that ceiling, so always read `_meta.timeout_ms` for what was actually applied. On expiry you get a `query_timeout` error naming both numbers."
+        description = "How long this statement may run, in milliseconds. Omit for the node's default; `0` is rejected, never read as 'no timeout' or 'use the default'. More than the node allows is not an error — it is clamped to the node's maximum, so read `_meta.timeout_ms` for what was actually applied. See latiq://troubleshooting/timeouts."
     )]
     pub timeout_ms: Option<u64>,
 }
@@ -201,15 +201,15 @@ pub struct LineageArgs {
     #[schemars(description = "Pond id or name")]
     pub pond: String,
     #[schemars(
-        description = "How many events to return, newest first (default 50). Two events are recorded per operation. Must be at least 1 — `0` is rejected, not read as 'no limit'. Above the maximum of 500 it is CLAMPED rather than refused, and the response's `limit_applied` reports the value actually used — read it before concluding a pond has only that many events."
+        description = "How many events to return, newest first (default 50). Must be at least 1 — `0` is rejected, never read as 'no limit'. Above the maximum of 500 it is CLAMPED rather than refused, and `limit_applied` reports the value actually used."
     )]
     pub limit: Option<u32>,
     #[schemars(
-        description = "Only events at or after this RFC-3339 instant, INCLUSIVE, e.g. `2026-08-14T10:00:00Z`. For catching up: pass the newest `eventTime` you already have to see what happened since (that one event comes back again, because the bound includes its own instant)."
+        description = "Only events at or after this RFC-3339 instant, INCLUSIVE, e.g. `2026-08-14T10:00:00Z` — the catch-up bound: pass the newest `eventTime` you already have. See latiq://recipes/lineage."
     )]
     pub since: Option<String>,
     #[schemars(
-        description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE. This is the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it to get the next older page. Pages are cut on a timestamp boundary, so this never repeats or skips an event — except for a FULL page whose events ALL share one `eventTime`, which is returned uncut, so a cursor from it skips the rest of that millisecond; raise `limit` if that happens."
+        description = "Only events strictly BEFORE this RFC-3339 instant, EXCLUSIVE — the backward-paging cursor: when a page comes back `truncated`, call again with `before` set to the OLDEST `eventTime` in it. See latiq://recipes/lineage for the one case that skips events."
     )]
     pub before: Option<String>,
 }
@@ -582,14 +582,8 @@ impl LatiqServer {
     /// Returns the pond_id and pond_name. Use list_ponds to discover existing ponds.
     #[tool(
         output_schema = output_schema::<latiq_agent_core::AllocateResult>(),
-        description = "Allocate a new pond — a private DuckLake workspace you can write to and query with SQL. \
-Optionally pass a `name` (Latiq generates one if omitted). Returns `pond_id` + `pond_name`. \
-Use this first when you have a task that needs its own data space; use list_ponds to find or join an existing one. \
-Then write_query to create tables and load data, and read_query to query. \
-DECIDE `lineage` NOW: provenance recording is set here and can never be turned on later — if this pond's work may have to explain where its data came from, pass `lineage: true`, because the only recovery is starting over in a new pond. \
-The pond's storage is created on its node BEFORE this returns, so success means a pond you can write to immediately — and on a clustered deployment that costs one extra hop and can fail if that node is down. \
-Such a failure says the pond was NOT created and the assignment was rolled back: the name is free, so retry. \
-See latiq://guidance.",
+        description = "Allocate a pond — a private DuckLake SQL workspace. Optional `name`; returns `pond_id` + `pond_name`. \
+Decide `lineage` NOW: it is fixed at allocation and can never be turned on later. See latiq://guidance.",
         annotations(
             title = "Allocate pond",
             read_only_hint = false,
@@ -665,10 +659,8 @@ See latiq://guidance.",
     /// Describe a pond: its metadata + a summary of its tables. Pass pond id or name.
     #[tool(
         output_schema = output_schema::<latiq_agent_core::DescribeResult>(),
-        description = "Describe a pond: its metadata (name, owner, created_at, tier) plus every table with its COLUMNS (name + type, in declaration order), a row-count estimate and the table's stored comment. \
-Pass `pond` as the id or name. Call this after list_ponds to decide whether to join a pond, or to recall a pond's schema before querying — it is one call for the whole pond, where SHOW TABLES + DESCRIBE is one per table. \
-The response's `lineage` flag says whether this pond records provenance — check it before get_lineage, and before you rely on a pond to be explainable later (it cannot be switched on). \
-To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table>`, or `SELECT column_name, comment FROM duckdb_columns() WHERE table_name='<table>'` for the authors' column comments.",
+        description = "A pond's metadata plus every table with its columns, row estimate and comment — the whole pond in one call. \
+Pass `pond` (id or name). See latiq://guidance.",
         annotations(
             title = "Describe pond",
             read_only_hint = true,
@@ -695,9 +687,7 @@ To discover tables/columns in detail, read_query `SHOW TABLES`, `DESCRIBE <table
     /// List all ponds in the deployment.
     #[tool(
         output_schema = output_schema::<ListPondsResponse>(),
-        description = "List all ponds in the deployment (id, name, owner). \
-Use this to discover existing work before allocating a new pond — multiple agents often collaborate in one pond. \
-Follow with describe_pond on a candidate to inspect its tables.",
+        description = "List the deployment's ponds (id, name, owner). Ponds are shared — look here before allocating, then describe_pond a candidate.",
         annotations(
             title = "List ponds",
             read_only_hint = true,
@@ -723,8 +713,8 @@ Follow with describe_pond on a candidate to inspect its tables.",
     /// Drop a pond and reclaim its storage. Destructive.
     #[tool(
         output_schema = output_schema::<DropPondResponse>(),
-        description = "Drop a pond and reclaim its storage. DESTRUCTIVE and not reversible — all tables and data in the pond are removed, and its lineage trail goes with them (the deployment's access log is preserved). Read what you still need from get_lineage BEFORE dropping. \
-Only drop a pond when its work is finished. Do NOT drop a pond other agents may still be using; check list_ponds first.",
+        description = "Delete a pond and everything in it — tables, history and lineage — irreversibly. Requires `confirm: true`. \
+Others may be working in it — check list_ponds first.",
         annotations(
             title = "Drop pond",
             read_only_hint = false,
@@ -759,11 +749,9 @@ Only drop a pond when its work is finished. Do NOT drop a pond other agents may 
     /// For writes/DDL use write_query. Results are bounded by the inline cap.
     #[tool(
         output_schema = output_schema::<QueryResponse>(),
-        description = "Run a read-only SQL query (SELECT, or read-only metadata like SHOW/DESCRIBE) against a pond. \
-For INSERT/UPDATE/DELETE/DDL use write_query instead — those are rejected here, as is transaction control (BEGIN/COMMIT/ROLLBACK): Latiq manages the transaction. \
-Latiq prefers ANSI SQL; DuckDB extensions are tolerated. Discover tables with `SHOW TABLES` (or `information_schema.tables`/`information_schema.columns`) first. \
-Do: add WHERE/LIMIT on selective columns and call explain_query if unsure of cost. Don't: unbounded `SELECT *` on large tables — results are capped (~10k rows); narrow, aggregate, or materialize with CREATE TABLE AS SELECT. \
-Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correct. See latiq://recipes/large-results.",
+        description = "Run a read-only SQL statement (SELECT, SHOW, DESCRIBE) on a pond. \
+Writes, DDL and transaction control belong in write_query. \
+Results are capped (~10k rows): latiq://recipes/large-results.",
         annotations(
             title = "Read query",
             read_only_hint = true,
@@ -804,12 +792,9 @@ Returns `{columns, rows, statement, status, _meta}`; read `_meta` to self-correc
     /// BEGIN/COMMIT/ROLLBACK.
     #[tool(
         output_schema = output_schema::<QueryResponse>(),
-        description = "Run a write or DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE TABLE AS SELECT) against a pond. \
-Your writes are attributed to your agent identity (queryable via `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` — `commit_extra_info` carries the verified-vs-claimed evidence). \
-Latiq runs your statement inside its OWN transaction and records the author just before committing, so send plain statements — several are fine, but do NOT include BEGIN/COMMIT/ROLLBACK/START TRANSACTION. Your own COMMIT ends Latiq's transaction before the author is written, and the change lands in the pond's history with NO author. \
-Marked destructive because it CAN delete data; clients may require approval. \
-Load external files directly: `CREATE TABLE t AS SELECT * FROM read_csv('https://…')` or `… FROM 's3://bucket/f.parquet'`. Latiq attaches no credentials to those reads, so an authenticated source needs pull_catalog instead; and it does not allow-list the address either, so name only sources you were asked to use (issue #79). \
-Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements after the CREATE — a `--` comment inside the DDL is discarded by the parser and stores nothing. See latiq://recipes/schema-design and latiq://recipes/data-ingestion-m1.",
+        description = "Run a write or DDL SQL statement on a pond; attributed to your agent identity. \
+Send plain statements — several are fine, but NEVER BEGIN/COMMIT/ROLLBACK/START TRANSACTION: your own COMMIT ends Latiq's transaction before the author is recorded, and the change lands in history with NO author. \
+Documenting tables: latiq://recipes/schema-design. External files: latiq://recipes/data-ingestion-m1.",
         annotations(
             title = "Write query",
             read_only_hint = false,
@@ -846,15 +831,8 @@ Do: document your tables with `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements 
     /// reason about scan size; refine, then run.
     #[tool(
         output_schema = output_schema::<latiq_engine::ExplainResult>(),
-        description = "Plan a query WITHOUT running it, and get the planner's cost estimates. \
-Returns `estimated_rows` (how many rows the query would RETURN — compare it against the ~10k inline cap), \
-`scan_operations` (one entry per table read: `table`, `scan_type` full_scan/filtered_scan, `estimated_rows_scanned`, `source`), \
-`warnings` + `suggestions` (named, actionable — e.g. a large table read with no filter), and `raw_plan` (the full plan, when you want to read it yourself). \
-Use it before an expensive read_query/write_query: read the estimates, refine (add a WHERE on a selective column, a LIMIT, or pre-aggregate), then run. \
-THESE ARE ESTIMATES, not measurements — nothing is executed, and the planner's row counts are often wrong on multi-way joins. \
-Treat them as an order of magnitude: a scan estimated at 5M rows is a real warning, 900 vs 1100 is noise. \
-There is deliberately no time or byte estimate — the planner predicts neither. \
-Read-only and side-effect-free.",
+        description = "Plan a statement WITHOUT running it: `estimated_rows`, `scan_operations`, `warnings`/`suggestions`, `raw_plan`. \
+Planner ESTIMATES, not measurements, and rows never time. See latiq://recipes/large-results.",
         annotations(
             title = "Explain query",
             read_only_hint = true,
@@ -881,10 +859,8 @@ Read-only and side-effect-free.",
     /// Discover curated datasets (simple public files) you can copy into a pond.
     #[tool(
         output_schema = output_schema::<ListDatasetsResponse>(),
-        description = "Browse the catalog of curated DATASETS — simple public files (parquet/CSV) an operator registered. \
-Returns each dataset's `name`, `tables`, `tags`, and `description`. \
-Use this BEFORE load_dataset to find what's available; pass `query` to filter (`#tag`, a `name*` glob, or a substring). \
-Datasets are for ready-made files; for an external database/lakehouse use list_catalogs + pull_catalog instead. See latiq://recipes/external-data.",
+        description = "Browse curated DATASETS — public files an operator registered — then load_dataset one into a pond. \
+See latiq://recipes/external-data.",
         annotations(
             title = "List datasets",
             read_only_hint = true,
@@ -919,10 +895,8 @@ Datasets are for ready-made files; for an external database/lakehouse use list_c
     /// Copy a dataset's tables into a pond, under a schema named after the dataset. Pick a name from list_datasets.
     #[tool(
         output_schema = output_schema::<latiq_agent_core::LoadDatasetResult>(),
-        description = "Copy a DATASET's tables into a pond — materialized into the pond's DuckLake under a SCHEMA named after the dataset. \
-Pass `dataset` (a name from list_datasets) and the target `pond`. The response returns `schema` and schema-qualified `tables`; \
-query them as `<dataset>.<table>` with read_query (e.g. `SELECT * FROM tpch.lineitem`). \
-This is a WRITE (it creates a schema + tables, attributed to you). For an external database/lakehouse, use pull_catalog instead. See latiq://recipes/external-data.",
+        description = "Copy a dataset's tables into a pond, under a SCHEMA named after it — query them as `<dataset>.<table>`. \
+A write. See latiq://recipes/external-data.",
         annotations(
             title = "Load dataset",
             read_only_hint = false,
@@ -949,10 +923,8 @@ This is a WRITE (it creates a schema + tables, attributed to you). For an extern
     /// Discover registered external catalogs (iceberg/…) you can pull data from.
     #[tool(
         output_schema = output_schema::<ListCatalogsResponse>(),
-        description = "Browse registered external CATALOGS — databases/lakehouses (iceberg today) an operator registered. \
-Returns each catalog's `name`, `type`, `tags`, and `description`. \
-You don't know a catalog's tables until you look: call describe_catalog next. Then pull_catalog to copy a subset into a pond. \
-Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sources; for ready-made files use list_datasets. See latiq://recipes/external-data.",
+        description = "Browse registered external CATALOGS (iceberg today), then describe_catalog its tables and pull_catalog a subset into a pond. \
+See latiq://recipes/external-data.",
         annotations(
             title = "List catalogs",
             read_only_hint = true,
@@ -985,10 +957,8 @@ Pass `query` to filter (`#tag`, glob, substring). Catalogs are for external sour
     /// List an external catalog's tables (transient attach on a pond). Pass creds via `set`.
     #[tool(
         output_schema = output_schema::<DescribeCatalogResponse>(),
-        description = "List an external catalog's tables/columns — Latiq transiently attaches it on `pond`, reads its metadata, and detaches. \
-Returns `{catalog, tables:[{schema, table}]}`. Use this to learn what to SELECT before pull_catalog. \
-Credentials and config go in `set` (e.g. {\"token\":\"<bearer>\"}); they're used for this call only and never stored. \
-If a credential is missing the attach fails with a clear error — read it and retry with the right `set`. See latiq://recipes/external-data.",
+        description = "List an external catalog's tables — attached on `pond` transiently, then detached. \
+Credentials in `set`, used once. See latiq://recipes/external-data.",
         annotations(
             title = "Describe catalog",
             read_only_hint = true,
@@ -1026,10 +996,8 @@ If a credential is missing the attach fails with a clear error — read it and r
     /// Pull a subset of an external catalog into a pond: transient attach → your query → detach.
     #[tool(
         output_schema = output_schema::<latiq_agent_core::PullResult>(),
-        description = "Pull data from an external catalog INTO a pond in one shot: Latiq attaches the catalog (with your creds), runs your `query`, then detaches. \
-External catalogs are never queried live — you pull what you need into the pond, then work there. \
-Write `query` as a CREATE TABLE that names the catalog, e.g. `CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region='us'` — DuckDB downloads only the columns/rows you select. \
-Use describe_catalog first to learn the table names. Put credentials in `set` (e.g. {\"token\":\"<bearer>\"}) — used once, never stored. This is a WRITE (creates a table in the pond). See latiq://recipes/external-data.",
+        description = "Copy a subset of an external catalog INTO a pond: attach → your `query` (a CREATE TABLE naming the catalog) → detach. \
+Credentials in `set`, used once. A write. See latiq://recipes/external-data.",
         annotations(
             title = "Pull from catalog",
             read_only_hint = false,
@@ -1061,18 +1029,9 @@ Use describe_catalog first to learn the table names. Put credentials in `set` (e
     /// Read the pond's OpenLineage trail — canonical events, newest first.
     #[tool(
         output_schema = output_schema::<latiq_agent_core::LineagePage>(),
-        description = "Read a pond's PROVENANCE — the OpenLineage events Latiq recorded for every query on it, NEWEST FIRST. \
-Use it to answer 'where did this table come from?', 'who wrote it, and was that identity verified?', 'what did that run read?'. \
-Only ponds allocated with `lineage: true` record anything; asking a pond that does not returns an error saying so — that is deliberately \
-distinct from an empty list, so you can tell 'we were not recording' from 'nothing happened'. \
-Each operation contributes a START and a terminal (COMPLETE/FAIL/ABORT) event sharing one `run.runId`; the identity, SQL shape, datasets read/written and the DuckLake snapshot ride the facets. \
-Bounded on purpose — `limit` defaults to 50 (max 500) and a page also stops at ~256 KB — so a busy pond cannot flood your context. \
-PAGING: `truncated` true means OLDER events remain — page backwards with `before`, catch up with `since` (both documented on the arguments). \
-Read `malformed_lines` / `unreadable_files`: non-zero means this page is missing events that were recorded. \
-Events are returned verbatim: valid OpenLineage 2-0-2, replayable into any OpenLineage consumer unchanged. \
-To FILTER or AGGREGATE the whole trail instead of paging it, read_query over the returned `lineage_dir`: \
-`SELECT * FROM read_json_auto('<lineage_dir>/*.jsonl')` — facets differ per event, so the inferred schema can shift between queries; SELECT the fields you need. \
-A record, not proof: these are files in the pond, reachable by anything that can write SQL there. See latiq://recipes/lineage.",
+        description = "Read a pond's OpenLineage provenance, newest first. Only a pond allocated with `lineage: true` records any — \
+one without it errors rather than returning an empty page. `truncated`/`malformed_lines` mean the page is incomplete. \
+See latiq://recipes/lineage.",
         annotations(
             title = "Get lineage",
             read_only_hint = true,
@@ -1375,6 +1334,272 @@ mod tests {
              scan must be finding them, or this guard checks nothing",
             named.len()
         );
+    }
+
+    /// **A resource must not teach a tool this build does not serve.**
+    ///
+    /// The repo has already shipped one that did, and the cost lands on the
+    /// agent: it reads the page a `see` routed it to, calls what the page names,
+    /// and gets `unknown tool`. The guard above holds the server `instructions`
+    /// to this; the resources are the other half, and they carry far more tool
+    /// names — the more so now that the descriptions are lean and the teaching
+    /// lives there.
+    ///
+    /// The scan is restricted to words starting with a prefix of a tool this
+    /// server really advertises (`read_`, `list_`, `pull_`, …), computed from the
+    /// router rather than written down. That keeps it from drowning in the
+    /// snake_case that is NOT a tool call — `commit_extra_info`,
+    /// `estimated_rows_scanned`, `information_schema` — while still catching the
+    /// case it exists for: a name that stopped being a tool.
+    #[test]
+    fn mcp_resources_name_only_tools_this_server_advertises() {
+        let tools = advertised_tools();
+        assert!(tools.len() >= 13, "the router advertises {tools:?}");
+        // `read_query` -> `read_`. The prefixes come from the tools themselves,
+        // so a renamed tool renames the scan with it.
+        let prefixes: Vec<String> = tools
+            .iter()
+            .filter_map(|t| t.split_once('_').map(|(head, _)| format!("{head}_")))
+            .collect();
+        // The only tool-prefixed words in these bodies that are NOT calls:
+        // DuckDB table functions, and the error kinds (`read_only_violation`).
+        // Kinds come from the enum so the list cannot fall behind it.
+        let sql_functions = ["read_csv", "read_json_auto", "read_parquet"];
+        let mut found: Vec<String> = Vec::new();
+        for (uri, body) in crate::resources::all_bodies() {
+            let words = body.split(|c: char| !(c.is_ascii_lowercase() || c == '_'));
+            for word in words {
+                if word.is_empty()
+                    || !prefixes.iter().any(|p| word.starts_with(p.as_str()))
+                    || sql_functions.contains(&word)
+                    || latiq_common::ErrorKind::ALL
+                        .iter()
+                        .any(|k| k.as_str() == word)
+                {
+                    continue;
+                }
+                assert!(
+                    tools.iter().any(|t| t == word),
+                    "{uri} names `{word}`, which is not a tool this server advertises \
+                     ({tools:?}) — an agent following this page calls a tool nobody serves"
+                );
+                if !found.contains(&word.to_string()) {
+                    found.push(word.to_string());
+                }
+            }
+        }
+        // Anti-vacuity: a prefix scan matching nothing would pass perfectly.
+        assert!(
+            found.len() >= 8,
+            "the scan found only {found:?} tool names across every resource — it is not \
+             finding them, so it is guarding nothing"
+        );
+    }
+
+    /// The tool descriptions this server advertises, `(name, description)`.
+    fn tool_descriptions() -> Vec<(String, String)> {
+        LatiqServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| {
+                let d = t
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| panic!("{} has no description", t.name));
+                (t.name.to_string(), d.to_string())
+            })
+            .collect()
+    }
+
+    /// **The context budget, pinned — this is the experiment.**
+    ///
+    /// A client in a large tool belt DEFERS tool descriptions and evicts them
+    /// under context pressure, then re-fetches them. Nexus measured an agent
+    /// doing real work against this server spend 15 `ToolSearch` round trips
+    /// re-fetching our schemas for 22 `read_query` calls, because the
+    /// descriptions were written as mini-tutorials (9,390 chars, ~2.3k tokens
+    /// across 13 tools) and were expensive to hold.
+    ///
+    /// So the teaching lives in `latiq://` resources — fetched once, by an agent
+    /// that decided it needed them — and a description carries only the
+    /// contract: what the tool does, its arguments, any rule whose omission
+    /// SILENTLY costs something (write_query's transaction rule), and the
+    /// resource with the rest. The budget is the whole point of the change, so
+    /// it is asserted rather than hoped for.
+    #[test]
+    fn mcp_tool_descriptions_stay_within_the_context_budget() {
+        const TOTAL: usize = 2_500;
+        const PER_TOOL: usize = 400;
+        let tools = tool_descriptions();
+        assert!(
+            tools.len() >= 13,
+            "the router advertises {} tools — the budget below would be measuring \
+             almost nothing",
+            tools.len()
+        );
+        let mut total = 0;
+        for (name, d) in &tools {
+            // Anti-vacuity in the other direction: a description trimmed to
+            // nothing satisfies a byte budget and tells the model nothing.
+            assert!(
+                d.len() >= 60,
+                "{name}'s description ({} chars) is too short to be a contract: {d:?}",
+                d.len()
+            );
+            assert!(
+                d.len() <= PER_TOOL,
+                "{name}'s description is {} chars (max {PER_TOOL}) — move the teaching \
+                 into a latiq:// resource and point at it",
+                d.len()
+            );
+            total += d.len();
+        }
+        assert!(
+            total <= TOTAL,
+            "the 13 tool descriptions total {total} chars (~{} tokens), over the {TOTAL} \
+             budget: every client that defers and re-fetches them pays this repeatedly",
+            total / 4
+        );
+    }
+
+    /// **A resolving link is not a working one.**
+    ///
+    /// Each description now ends in a pointer instead of the paragraph it used
+    /// to carry, so the pointer has to land on a body that actually says the
+    /// thing. Two assertions: every `latiq://` URI in a description RESOLVES,
+    /// and each relocated rule is FOUND in the resource its tool now sends the
+    /// agent to. Without the second half this passes for a link to a page about
+    /// something else — which is exactly how content gets lost in a move.
+    #[test]
+    fn mcp_tool_descriptions_point_at_resources_that_carry_what_they_promise() {
+        // (tool, the resource it points at, a phrase that must be IN that body).
+        // Each row is a sentence that used to live in the tool description.
+        let promises: &[(&str, &str, &str)] = &[
+            // "provenance is fixed at allocation" — the rest of the story.
+            (
+                "allocate_pond",
+                "latiq://guidance",
+                "CANNOT be turned on later",
+            ),
+            // the SHOW TABLES / DESCRIBE / duckdb_columns teaching.
+            (
+                "describe_pond",
+                "latiq://guidance",
+                "describe_pond is one call",
+            ),
+            // the ~10k cap and what to do about it.
+            (
+                "read_query",
+                "latiq://recipes/large-results",
+                "Aggregate server-side",
+            ),
+            // COMMENT ON, and the `--` form that stores nothing (issue #95).
+            ("write_query", "latiq://recipes/schema-design", "COMMENT ON"),
+            (
+                "write_query",
+                "latiq://recipes/schema-design",
+                "stores NOTHING",
+            ),
+            // read_csv/s3 loading, and the #79 allow-list caveat.
+            (
+                "write_query",
+                "latiq://recipes/data-ingestion-m1",
+                "read_csv",
+            ),
+            ("write_query", "latiq://recipes/data-ingestion-m1", "#79"),
+            // the field-by-field explain walkthrough.
+            ("explain_query", "latiq://recipes/large-results", "raw_plan"),
+            (
+                "explain_query",
+                "latiq://recipes/large-results",
+                "no time or byte estimate",
+            ),
+            // dataset vs catalog, the credential rule, the pull shape.
+            ("list_datasets", "latiq://recipes/external-data", "Datasets"),
+            (
+                "load_dataset",
+                "latiq://recipes/external-data",
+                "<dataset>.<table>",
+            ),
+            ("list_catalogs", "latiq://recipes/external-data", "Catalogs"),
+            (
+                "describe_catalog",
+                "latiq://recipes/external-data",
+                "never stored",
+            ),
+            (
+                "pull_catalog",
+                "latiq://recipes/external-data",
+                "never queried live",
+            ),
+            // paging, the page bounds, the facets, and read_json_auto.
+            ("get_lineage", "latiq://recipes/lineage", "limit_applied"),
+            ("get_lineage", "latiq://recipes/lineage", "256 KB"),
+            ("get_lineage", "latiq://recipes/lineage", "read_json_auto"),
+            (
+                "get_lineage",
+                "latiq://recipes/lineage",
+                "OpenLineage 2-0-2",
+            ),
+        ];
+
+        let tools = tool_descriptions();
+        let description_of = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} is not a tool this server advertises"))
+                .1
+                .clone()
+        };
+
+        for (tool, uri, needle) in promises {
+            let d = description_of(tool);
+            assert!(
+                d.contains(uri),
+                "{tool}'s description no longer points at {uri}, which is where its \
+                 {needle:?} was moved: {d:?}"
+            );
+            let body = crate::resources::all_bodies()
+                .find(|(u, _)| u == uri)
+                .unwrap_or_else(|| panic!("{uri} is not served"))
+                .1;
+            assert!(
+                body.contains(needle),
+                "{tool} sends the agent to {uri} for {needle:?}, and that body does not \
+                 contain it — the sentence was dropped, not relocated"
+            );
+        }
+
+        // …and nothing points anywhere else. Every URI mentioned by a
+        // description OR by an argument's own description (they ride in the same
+        // `tools/list` payload and moved teaching out the same way) must resolve.
+        let mut linked = 0;
+        for tool in LatiqServer::tool_router().list_all() {
+            let name = tool.name.to_string();
+            let schema = serde_json::to_string(&tool.input_schema).expect("a JSON schema");
+            for text in [tool.description.unwrap_or_default().to_string(), schema] {
+                for (at, _) in text.match_indices("latiq://") {
+                    let uri: String = text[at..]
+                        .chars()
+                        .take_while(|c| !c.is_whitespace() && !"`,\"\\".contains(*c))
+                        .collect();
+                    let uri = uri.trim_end_matches('.');
+                    assert!(
+                        crate::resources::read_resource(uri).is_some(),
+                        "{name} points at {uri}, which this server does not serve"
+                    );
+                    linked += 1;
+                }
+            }
+        }
+        // Anti-vacuity for both loops.
+        assert!(
+            linked >= 12,
+            "only {linked} latiq:// links across all descriptions — with the teaching \
+             moved out, a description without a pointer strands the agent"
+        );
+        assert!(promises.len() >= 15, "the relocation table has shrunk");
     }
 
     #[test]

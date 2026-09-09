@@ -38,12 +38,12 @@ const RESOURCES: &[Res] = &[
 - **Self-describing schemas:** after you CREATE TABLE, send `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements. A `--` comment inside the DDL is lexical — the parser discards it and nothing is stored, so the next agent sees nothing. See latiq://recipes/schema-design.\n\
 - **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')`. `author` is the identity; `commit_extra_info` carries the evidence for it (issuer/subject when the caller was verified) — read BOTH, because an unverified caller can claim any author.\n\
 - **Latiq owns the transaction:** send plain statements — multi-statement SQL is fine, but never `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`. Latiq commits your write itself and records the author just before committing; your own `COMMIT` ends that transaction first, so the change lands in history with NO author.\n\
-- **Discover:** `SHOW TABLES` lists tables, `DESCRIBE <table>` its columns and types, and `SELECT column_name, comment FROM duckdb_columns() WHERE table_name='<table>'` the column comments; list_ponds + describe_pond find existing work to join.\n\
+- **Discover:** describe_pond is one call for the WHOLE pond — its metadata plus every table with its columns, a row estimate, the stored comment and the pond's `lineage` flag — where `SHOW TABLES` + `DESCRIBE` is one call per table. In SQL: `SHOW TABLES` lists tables, `DESCRIBE <table>` its columns and types, and `SELECT column_name, comment FROM duckdb_columns() WHERE table_name='<table>'` the column comments. list_ponds + describe_pond find existing work to join.\n\
 - **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
 - **Identity:** who you are arrives in the TRANSPORT, never in a tool argument — no tool takes an agent id, so don't try to set one. The `Authorization: Bearer` token is the verified principal (`subject` + `issuer`); the `latiq-agent-id` header is a CLAIM and carries no authority. On a deployment with no issuer configured nothing is verified: you get `verified: false` and a null `subject` wherever identity is reported. Read that as \"nobody proved it\", not \"nobody did it\".\n\
 - **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first), and check the `lineage` flag in describe_pond to know whether a pond has it. It is chosen at allocation and CANNOT be turned on later, so ask for it when you allocate. It is a working record, not tamper-proof evidence — the events are files in the pond, and dropping the pond destroys them. See latiq://recipes/lineage.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
-- **Plan first:** call explain_query before an expensive query. It returns `estimated_rows` (the result size — compare it to the ~10k cap), a `scan_operations` entry per table read, and named `warnings`/`suggestions`. They are PLANNER ESTIMATES, not measurements: act on orders of magnitude, not on small differences.\n\
+- **Plan first:** call explain_query before an expensive query — it plans without executing, so it costs nothing. It returns `estimated_rows` (the result size — compare it to the ~10k cap), a `scan_operations` entry per table read (`table`, `scan_type` full_scan/filtered_scan, `estimated_rows_scanned`, `source`), named `warnings`/`suggestions`, and `raw_plan` if you want to read the plan yourself. They are PLANNER ESTIMATES, not measurements: act on orders of magnitude, not on small differences. It estimates ROWS only — there is deliberately no time or byte estimate, because the planner predicts neither.\n\
 - **Collaboration:** multiple agents in one pond is the common case. Writes serialize; conflicts auto-retry. See latiq://troubleshooting/conflicts.\n\n\
 ## Reading an error\n\n\
 Every failed call returns one envelope, and it carries **machine-readable fields alongside the prose**. Read them before deciding what to do next: they are AUTHORITATIVE over the sentence, and they are the fields to branch on.\n\
@@ -107,7 +107,7 @@ Send it as one write_query — several plain statements in one call are fine, an
         desc: "Handling results larger than the inline cap",
         body: "# Recipe — large results\n\n\
 **When:** a read_query returns `result_cap_exceeded` or you expect many rows.\n\n\
-**First, plan it:** call **explain_query** on the statement. It does not execute, so it costs you nothing. Read `estimated_rows` — that is the size of the RESULT, so if it is well over ~10k this read will be capped whatever you do next. Then read `scan_operations` for the table that is heavy (`scan_type` `full_scan` with a big `estimated_rows_scanned` is the one to fix) and the `warnings`/`suggestions`, which name it for you. These are estimates and are routinely wrong on joins — believe the order of magnitude, not the digits.\n\n\
+**First, plan it:** call **explain_query** on the statement. It does not execute, so it costs you nothing. Read `estimated_rows` — that is the size of the RESULT, so if it is well over ~10k this read will be capped whatever you do next. Then read `scan_operations` for the table that is heavy (one entry per table read: `table`, `scan_type` `full_scan`/`filtered_scan`, `estimated_rows_scanned`, `source` — a `full_scan` with a big `estimated_rows_scanned` is the one to fix) and the `warnings`/`suggestions`, which name it for you. `raw_plan` carries the planner's own output when you want to read it yourself. These are estimates and are routinely wrong on joins — believe the order of magnitude, not the digits, and note that explain estimates ROWS only: there is no time or byte estimate, because the planner predicts neither.\n\n\
 **Then (pick one):**\n\
 1. **Narrow:** add a WHERE on a selective column and/or LIMIT.\n\
 2. **Aggregate server-side:** `SELECT severity, count(*) FROM events GROUP BY severity`.\n\
@@ -167,6 +167,8 @@ Use this to coordinate: see who created a table before extending it.\n\
 `describe_pond` reports `lineage`. Calling get_lineage on a pond without it returns an error, not an empty list — 'we were not recording' and 'nothing happened' are different answers, and only one of them means the data appeared from nowhere.\n\n\
 **Read it, newest first:**\n\
 ```\nget_lineage {pond:'audited'}                 # the newest 50 events\n```\n\
+**A page is bounded on purpose**, so a busy pond cannot flood your context: `limit` defaults to 50 and is CLAMPED at 500 rather than refused — `limit_applied` reports the value actually used — and a page also stops at ~256 KB. `truncated` is how you learn older events remain; never read a short page as the whole trail.\n\
+Each operation records TWO events (a START and a terminal one), so 50 events is roughly 25 operations.\n\
 **Page backwards** while `truncated` is true, using the OLDEST `eventTime` you received as the next `before` (exclusive — it never repeats or skips an event, because a page is cut on a timestamp boundary; the one exception is a FULL page whose events all share a single `eventTime`, which is returned uncut, so raise `limit` if a pond records more than that in one millisecond):\n\
 ```\nget_lineage {pond:'audited', limit:50}\nget_lineage {pond:'audited', limit:50, before:'<oldest eventTime from the last page>'}\n... until truncated is false\n```\n\
 **Catch up** instead with `since`, which is the opposite bound and is INCLUSIVE — pass the newest `eventTime` you already have and that one event comes back with anything newer:\n\
@@ -364,6 +366,14 @@ pub fn list_resources() -> Vec<Resource> {
             raw.no_annotation()
         })
         .collect()
+}
+
+/// Every served resource as `(uri, body)`. Test-only: the guards here and in
+/// `server.rs` check the bodies against what the tool descriptions promise
+/// they carry, which needs the text rather than a `ReadResourceResult`.
+#[cfg(test)]
+pub(crate) fn all_bodies() -> impl Iterator<Item = (&'static str, &'static str)> {
+    RESOURCES.iter().map(|r| (r.uri, r.body))
 }
 
 pub fn read_resource(uri: &str) -> Option<ReadResourceResult> {

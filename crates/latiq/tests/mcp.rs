@@ -1182,8 +1182,9 @@ mod lineage {
         // `since`, an INCLUSIVE LOWER bound — which returns the same newest page
         // for ever. Not redundant with the reader's unit tests: this walks the
         // surface an agent actually drives, where the wrong bound lived.
-        // THE paging contract, walked the way the tool description tells an
-        // agent to walk it: `before` = the oldest eventTime received, exclusive,
+        // THE paging contract, walked the way the `before` argument and
+        // latiq://recipes/lineage tell an agent to walk it: `before` = the
+        // oldest eventTime received, exclusive,
         // until `truncated` is false. It must terminate, cover every event, and
         // repeat none — the three ways paging silently breaks.
         let s = start_stack().await;

@@ -566,7 +566,9 @@ The MCP surface is the product. Agents are LLMs reasoning over tool calls and re
 
 ### Principle 1 — Tool descriptions are mini-tutorials, not API docs
 
-> **Corrected after measurement (2026, Nexus agent-readiness harness).** This principle holds for *teaching* and is wrong if read as *discovery*. In a realistic 47-tool belt the client advertised our thirteen tools by NAME and deferred their descriptions, so every agent read a description only after it had already decided to look at Latiq. **Discovery is carried by the tool name and by the server `instructions`** (sent at `initialize`, never deferred); a description teaches a tool that has already been selected. Keep them rich — just do not expect them to win the selection. See `crates/latiq-mcp/CLAUDE.md`.
+> **Corrected after measurement (2026, Nexus agent-readiness harness).** This principle holds for *teaching* and is wrong if read as *discovery*. In a realistic 47-tool belt the client advertised our thirteen tools by NAME and deferred their descriptions, so every agent read a description only after it had already decided to look at Latiq. **Discovery is carried by the tool name and by the server `instructions`** (sent at `initialize`, never deferred); a description teaches a tool that has already been selected. See `crates/latiq-mcp/CLAUDE.md`.
+>
+> **Corrected again (`experiment/lean-tool-descriptions`).** "Keep them rich" was also wrong: the same client evicts deferred descriptions under context pressure and re-fetches them (Nexus: 15 `ToolSearch` round trips for one agent's session). The teaching below now lives in `latiq://` resources, and a tool description carries the contract only — what it does, its arguments, any rule whose omission silently costs something, and the resource with the rest, under a budget pinned by a test. This is an experiment and is designed to be reverted if Nexus measures a regression.
 
 A tool description should teach an LLM how to use the tool well in one read, not just enumerate parameters. Every tool description includes:
 
