@@ -4,8 +4,12 @@
 #
 #   docker build -f deploy/Dockerfile -t ghcr.io/neonexia/latiq:dev .
 #
-# The runtime stage bakes the DuckDB extensions (ducklake/httpfs/iceberg/…) into
-# the image's cache via `latiq warm-extensions`, so nodes start without network.
+# The runtime stage bakes the DuckDB extensions into the image's cache via
+# `latiq warm-extensions`, so nodes start without network. That covers all three
+# sets in `latiq_common::extensions`: the standard ones every pond loads
+# (ducklake/httpfs/icu), the ones a pond may request (spatial/fts/inet), and the
+# ones a catalog type needs (iceberg — plus `avro`, which DuckDB autoinstalls
+# when iceberg LOADs and which this comment used to leave to chance).
 
 # ---- builder ---------------------------------------------------------------
 FROM rust:1-bookworm AS builder

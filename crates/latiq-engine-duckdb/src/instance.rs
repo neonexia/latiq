@@ -42,15 +42,27 @@ pub fn ensure_standard_extensions() -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Best-effort: install the **optional** allowlist into the local cache so
-/// per-pond `LOAD`s don't download. Run once at node startup — the dev stand-in
-/// for image-baking. Failures (offline, already present) are non-fatal; a pond
-/// requesting an extension that didn't warm simply fails fast on open.
+/// Best-effort: install every non-standard extension we ship into the local
+/// cache so a later `LOAD` doesn't download. Run once at node startup — the dev
+/// stand-in for image-baking. Two sets, for two different `LOAD` sites:
+///
+/// - `OPTIONAL` — what a pond may request; `PondInstance::open` `LOAD`s it with
+///   autoinstall **off**, so a cache miss fails the pond rather than downloading.
+/// - `CATALOG_DRIVEN` — what a *catalog type* needs (`iceberg`); `attachers.rs`
+///   `LOAD`s it for the transient attach behind `pull_catalog`. That site does
+///   `INSTALL` first, so a cache miss there is a network round trip at exactly
+///   the moment an agent is waiting — which is why it is warmed here too.
+///
+/// Failures (offline, already present) are non-fatal; the two `LOAD` sites are
+/// where a miss is reported, each with its own message.
 pub fn warm_optional_extensions() {
     let Ok(conn) = Connection::open_in_memory() else {
         return;
     };
-    for ext in latiq_common::extensions::OPTIONAL {
+    for ext in latiq_common::extensions::OPTIONAL
+        .iter()
+        .chain(latiq_common::extensions::CATALOG_DRIVEN.iter())
+    {
         let _ = conn.execute_batch(&format!("INSTALL {ext};"));
     }
 }
@@ -113,9 +125,19 @@ impl PondInstance {
                 .map_err(|e| EngineError::Engine(e.to_string()))?;
             for ext in &loc.extensions {
                 conn.execute_batch(&format!("LOAD {ext};")).map_err(|e| {
+                    // Autoinstall is off here, so this is "not in the node's
+                    // extension cache" and no retry will change that. The
+                    // message has to name the extension AND the operator action
+                    // for both deployments we ship: the image bakes extensions
+                    // at build time (`latiq warm-extensions`), while a
+                    // `pip install latiq` node warms them at startup and cannot
+                    // if that first start had no network.
                     EngineError::Engine(format!(
-                        "extension '{ext}' is not available on this node — bake it \
-                         into the deployment image and upgrade Latiq ({e})"
+                        "extension '{ext}' is not cached on this node, so the pond cannot be \
+                         opened. Nothing the caller sends changes this. An operator restores it \
+                         by running `latiq warm-extensions` on the node with network access (the \
+                         container image bakes the same step in at build time), then restarting \
+                         the node. Underlying error: {e}"
                     ))
                 })?;
             }
@@ -240,6 +262,41 @@ mod tests {
         assert!(loaded, "inet should be LOADed on the pond");
     }
 
+    /// **The offline claim, tested where it is made.** `deploy/Dockerfile` bakes
+    /// extensions with `latiq warm-extensions` "so nodes start without network",
+    /// and `attachers.rs` LOADs `iceberg` for the transient attach behind
+    /// `pull_catalog`. Warming `iceberg` alone does not deliver that: DuckDB
+    /// autoinstalls `avro` when iceberg LOADs, so the first `pull_catalog` on a
+    /// freshly-built node still reached for the network — and on a pond that had
+    /// requested any extension (autoinstall off on that connection) it could not
+    /// reach for it at all.
+    ///
+    /// So: warm, then LOAD with autoinstall **off**, which is the only way to
+    /// prove nothing downloaded. This asserts OUR warm set is complete, not
+    /// DuckDB's dependency resolution (invariant 10).
+    #[test]
+    fn warmed_node_loads_every_catalog_extension_without_the_network() {
+        warm_optional_extensions();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("SET autoinstall_known_extensions=false;")
+            .unwrap();
+        let mut checked = 0;
+        for t in latiq_common::catalog::TYPES {
+            for ext in t.required_extensions {
+                conn.execute_batch(&format!("LOAD {ext};"))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "catalog type '{}' needs '{ext}', which warm-extensions did not leave \
+                         loadable offline: {e}",
+                            t.name
+                        )
+                    });
+                checked += 1;
+            }
+        }
+        assert!(checked >= 4, "the loop skipped: only {checked} checked");
+    }
+
     #[test]
     fn pond_session_timezone_is_utc() {
         // Results must be deterministic regardless of the host OS timezone.
@@ -281,10 +338,20 @@ mod tests {
             Ok(_) => panic!("expected open to fail for a missing extension"),
             Err(e) => e,
         };
+        // An operator, not the caller, is the only one who can fix this — so the
+        // message must name the extension, say it is the NODE's cache that is
+        // missing it, and name the command that fixes it. A bare DuckDB
+        // "Extension ... not found" leaves whoever reads it with nothing to do.
         let msg = format!("{err:?}");
-        assert!(
-            msg.contains("not available") || msg.contains("definitely_not_an_extension_xyz"),
-            "expected a fail-fast extension error, got: {msg}"
-        );
+        for needle in [
+            "definitely_not_an_extension_xyz",
+            "not cached on this node",
+            "latiq warm-extensions",
+        ] {
+            assert!(
+                msg.contains(needle),
+                "the missing-extension error must be actionable — no {needle:?} in: {msg}"
+            );
+        }
     }
 }

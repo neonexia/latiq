@@ -125,7 +125,10 @@ this harness). See [`iceberg-minio/README.md`](iceberg-minio/README.md).
 - **`Dockerfile`** → `ghcr.io/neonexia/latiq`. The single binary, all roles.
   DuckDB compiles from source the first time (slow); the runtime stage bakes the
   DuckDB extensions in with `latiq warm-extensions` so nodes start without
-  network. Build from the **repo root**:
+  network — the standard set every pond loads, the set a pond may request
+  (`spatial`/`fts`/`inet`), and what a catalog type needs (`iceberg` + its
+  `avro` dependency). `latiq_common::extensions` is the list. Build from the
+  **repo root**:
   `docker build -f deploy/Dockerfile -t ghcr.io/neonexia/latiq:dev .`
 - **`gateway.Dockerfile`** → `ghcr.io/neonexia/latiq-gateway`. nginx with
   `cluster/nginx.conf` baked in — the one gateway-config source of truth. It

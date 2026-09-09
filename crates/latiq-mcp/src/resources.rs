@@ -12,28 +12,101 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Static MCP resources (`latiq://…` guidance/recipes/troubleshooting) and the
-//! prompt SOPs. These exist so a frontier agent can read patterns directly and
-//! so error `see` links resolve to a real body. Prose is written for LLMs.
+//! MCP resources (`latiq://…` guidance/recipes/troubleshooting) and the prompt
+//! SOPs. These exist so a frontier agent can read patterns directly and so error
+//! `see` links resolve to a real body. Prose is written for LLMs.
+//!
+//! Bodies are static text with one exception: `latiq://dialect` has its
+//! capability section **generated from `latiq_common::extensions::EXTENSIONS`**
+//! ([`capabilities`]). A hand-written list of what a pond can read is a second
+//! copy of the shipped set, and a second copy is how an agent gets told a
+//! capability exists that nobody installed — or, worse, never hears about one
+//! that does.
 use rmcp::model::{
     AnnotateAble, GetPromptResult, Prompt, PromptArgument, PromptMessage, PromptMessageRole,
     RawResource, ReadResourceResult, Resource, ResourceContents,
 };
 use serde_json::{Map, Value};
+use std::sync::LazyLock;
 
 struct Res {
     uri: &'static str,
     name: &'static str,
     desc: &'static str,
-    body: &'static str,
+    /// The static half of the body. Empty for a resource that is entirely
+    /// generated; read it through [`Res::body`], never directly.
+    static_body: &'static str,
+    /// Text appended to `static_body` at read time, rendered from the code it
+    /// describes. `None` for the static majority.
+    generated: Option<&'static LazyLock<String>>,
+}
+
+impl Res {
+    fn body(&self) -> &'static str {
+        match self.generated {
+            // The `LazyLock` is a `static`, so its contents outlive the process
+            // and this borrow is genuinely `'static`.
+            Some(g) => g.as_str(),
+            None => self.static_body,
+        }
+    }
+}
+
+/// The `latiq://dialect` body: the hand-written contract, then the generated
+/// capability section, then the hand-written "what a pond does NOT have".
+static DIALECT_BODY: LazyLock<String> =
+    LazyLock::new(|| format!("{DIALECT_HEAD}{}{DIALECT_TAIL}", capabilities()));
+
+/// Render "what this pond can already read and reach", grouped by bucket, from
+/// the shipped extension table. This is the **positive half** of the dialect
+/// page — the negative half (`## What a pond does NOT have`) is hand-written
+/// below, because it is about DuckLake's DDL rather than about extensions.
+///
+/// Three states, and an agent has to be able to tell them apart, because the
+/// action is different for each: always there, ask for it at `allocate_pond`
+/// (and you cannot add it later), or reached through `pull_catalog`.
+fn capabilities() -> String {
+    use latiq_common::extensions::{in_bucket, Bucket, CATALOG_DRIVEN, OPTIONAL};
+    let mut out = String::from(
+        "## What this pond can already read and reach\n\n\
+         No operator step and no install: this is what a Latiq deployment ships with. \
+         **CSV** is DuckDB's own core reader (`read_csv`) and is always available — everything \
+         below is an extension we ship. Three states, and the difference is what YOU have to do: \
+         *always loaded* is simply there; *ask at allocation* has to be requested in \
+         `allocate_pond { extensions: [...] }` and **cannot be added to a pond that already \
+         exists**, so decide before you allocate; *via `pull_catalog`* is reached through the \
+         catalog tools, not by requesting an extension.\n\n",
+    );
+    for bucket in Bucket::ALL {
+        out.push_str(&format!("**{}**\n", bucket.title()));
+        for e in in_bucket(*bucket) {
+            let how = if OPTIONAL.contains(&e.name) {
+                format!(" *(ask at allocation: `extensions: [\"{}\"]`)*", e.name)
+            } else if CATALOG_DRIVEN.contains(&e.name) {
+                " *(via list_catalogs → describe_catalog → pull_catalog)*".to_string()
+            } else {
+                " *(always loaded)*".to_string()
+            };
+            out.push_str(&format!("- `{}` — {}{}\n", e.name, e.what, how));
+        }
+        out.push('\n');
+    }
+    out.push_str(
+        "Read a remote file straight from SQL — `SELECT * FROM \
+         read_csv('https://…/x.csv')`, `… FROM 's3://bucket/x.parquet'` — or bring it in with \
+         load_dataset / pull_catalog. See latiq://recipes/data-ingestion-m1 and \
+         latiq://recipes/external-data.\n\n",
+    );
+    out
 }
 
 const RESOURCES: &[Res] = &[
     Res {
+        generated: None,
         uri: "latiq://guidance",
         name: "Latiq guidance",
         desc: "Top-level guidance for working in a pond",
-        body: "# Working in a Latiq pond\n\n\
+        static_body: "# Working in a Latiq pond\n\n\
 - **SQL dialect:** Latiq speaks ANSI SQL on DuckDB. DuckDB-specific functions work but reduce portability — prefer ANSI when other agents will read your code.\n\
 - **Self-describing schemas:** after you CREATE TABLE, send `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements. A `--` comment inside the DDL is lexical — the parser discards it and nothing is stored, so the next agent sees nothing. See latiq://recipes/schema-design.\n\
 - **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')`. `author` is the identity; `commit_extra_info` carries the evidence for it (issuer/subject when the caller was verified) — read BOTH, because an unverified caller can claim any author.\n\
@@ -57,31 +130,17 @@ Every failed call returns one envelope, and it carries **machine-readable fields
 And the three you already read: `kind` (what went wrong — a closed set, classified by the failure, never by which call raised it), `message` (one sentence) and `see` (a latiq:// resource about that kind). Start at latiq://troubleshooting.",
     },
     Res {
+        // The one generated body: its capability section is rendered from
+        // `latiq_common::extensions` so the advertisement cannot fall behind
+        // what the node installs. See `DIALECT_BODY` above.
+        generated: Some(&DIALECT_BODY),
         uri: "latiq://dialect",
         name: "SQL dialect",
-        desc: "The SQL contract Latiq exposes",
-        body: "# Latiq SQL dialect\n\n\
-Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
-- **read_query** accepts SELECT and read-only metadata (SHOW/DESCRIBE). Writes are rejected — use write_query.\n\
-- **write_query** accepts INSERT/UPDATE/DELETE and DDL (CREATE/DROP/ALTER, CREATE TABLE AS SELECT).\n\
-- **Transaction control is Latiq's.** Don't send `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`: read_query rejects them, and in write_query they cut short the transaction Latiq attributes your write in (nothing rejects them there — it silently costs you the author). Several plain statements in one call are fine; they commit together as one snapshot.\n\
-- Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
-- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` (`commit_extra_info` is where verified-vs-claimed shows up). List tables/columns with `SHOW TABLES` / `DESCRIBE <table>` / `information_schema.columns`; a column's stored COMMENT comes back from `duckdb_columns()`.\n\
-- Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.\n\n\
-## Values, types and constraints\n\n\
-An `invalid_value` error is about the DATA in your statement, not its syntax — the statement parsed and the names resolved.\n\
-- **Type conversion:** a literal or column is not convertible to the type it is used as (`Conversion Error: Could not convert string 'notanint' to INT32`). Quoted text is not coerced into a numeric column because it looks numeric. Check the target with `DESCRIBE <table>` and pass the right type, or CAST explicitly: `CAST('7' AS INTEGER)`.\n\
-- **Constraints:** the value is well-typed but breaks a rule on the table — primary key, unique, not null, check (`Constraint Error: Duplicate key …`). Read the conflicting row first (`SELECT * FROM t WHERE <key> = <value>`), then correct the value, UPDATE the existing row, or use `INSERT OR REPLACE` / `ON CONFLICT`.\n\n\
-Neither is fixed by retrying the same statement, and neither is a `parse_error`: if your statement had a syntax problem you would have been told `parse_error` with DuckDB's `Parser Error` text.\n\n\
-## What a pond does NOT have (`unsupported_feature`)\n\n\
-A pond is DuckLake storage, and DuckLake implements a subset of DuckDB's DDL. These parse, and are then REFUSED — `unsupported_feature`, `audience: agent`, `retryable: after_change`, with the rejected thing in `facts.feature`:\n\
-- **`PRIMARY KEY` / `UNIQUE` constraints** — `CREATE TABLE t(id INTEGER PRIMARY KEY)` fails. Declare `id INTEGER` and check uniqueness with a query when you need to: `SELECT id, count(*) FROM t GROUP BY id HAVING count(*) > 1`.\n\
-- **`CHECK` constraints** — validate in the INSERT (`WHERE`) or with a read afterwards.\n\
-- **Indexes** (`CREATE INDEX`), **sequences** (`CREATE SEQUENCE`, `nextval`) and **generated columns**. For a surrogate key, generate the value in the INSERT — `row_number() OVER ()`, a hash, or a UUID.\n\
-- **Transaction control** — `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`, for the reason above: the transaction is Latiq's. If one of yours reached write_query, part of the statement may already have committed — check the table before re-sending.\n\
-`NOT NULL` and `DEFAULT` **are** supported, and `NOT NULL` is enforced (a violation is `invalid_value`, not this). The fix for `unsupported_feature` is always the same shape: delete the clause the message names and re-send. The identical statement can never succeed, so do not retry it unchanged.",
+        desc: "What a pond can read and reach, and the SQL contract Latiq exposes",
+        static_body: "",
     },
     Res {
+        generated: None,
         uri: "latiq://recipes/schema-design",
         name: "Recipe: schema design",
         desc: "Authoring tables other agents can collaborate on",
@@ -91,7 +150,7 @@ A pond is DuckLake storage, and DuckLake implements a subset of DuckDB's DDL. Th
         // readable afterwards. It taught the `-- …` form for months; that form
         // stores nothing, and four documents repeated the claim because nobody
         // ran it. Keep the block runnable as-is.
-        body: "# Recipe — schema design for collaboration\n\n\
+        static_body: "# Recipe — schema design for collaboration\n\n\
 **When:** you're the first agent creating tables in a pond.\n\n\
 **Pattern:**\n```sql\nCREATE TABLE events (\n  id INTEGER,\n  severity VARCHAR,\n  occurred_at TIMESTAMP\n);\nCOMMENT ON TABLE events IS 'One row per observed event.';\nCOMMENT ON COLUMN events.id IS 'event primary key';\nCOMMENT ON COLUMN events.severity IS 'one of: low, medium, high, critical';\nCOMMENT ON COLUMN events.occurred_at IS 'event time in UTC';\n```\n\
 Send it as one write_query — several plain statements in one call are fine, and they commit as one snapshot.\n\
@@ -102,10 +161,11 @@ Send it as one write_query — several plain statements in one call are fine, an
 **Watch for:** vague table/column names; a CREATE TABLE with no COMMENT ON statements after it; types that don't match the domain.",
     },
     Res {
+        generated: None,
         uri: "latiq://recipes/large-results",
         name: "Recipe: large results",
         desc: "Handling results larger than the inline cap",
-        body: "# Recipe — large results\n\n\
+        static_body: "# Recipe — large results\n\n\
 **When:** a read_query returns `result_cap_exceeded` or you expect many rows.\n\n\
 **First, plan it:** call **explain_query** on the statement. It does not execute, so it costs you nothing. Read `estimated_rows` — that is the size of the RESULT, so if it is well over ~10k this read will be capped whatever you do next. Then read `scan_operations` for the table that is heavy (one entry per table read: `table`, `scan_type` `full_scan`/`filtered_scan`, `estimated_rows_scanned`, `source` — a `full_scan` with a big `estimated_rows_scanned` is the one to fix) and the `warnings`/`suggestions`, which name it for you. `raw_plan` carries the planner's own output when you want to read it yourself. These are estimates and are routinely wrong on joins — believe the order of magnitude, not the digits, and note that explain estimates ROWS only: there is no time or byte estimate, because the planner predicts neither.\n\n\
 **Then (pick one):**\n\
@@ -119,10 +179,11 @@ Send it as one write_query — several plain statements in one call are fine, an
         // anyway: a served URI is a link agents and error `see` fields hold, and
         // renaming it would 404 for them. The heading and body are current; only
         // the URI is historical.
+        generated: None,
         uri: "latiq://recipes/data-ingestion-m1",
         name: "Recipe: data ingestion",
         desc: "Loading data into a pond with SQL",
-        body: "# Recipe — ingest data with SQL\n\n\
+        static_body: "# Recipe — ingest data with SQL\n\n\
 **Files by URL:** read CSV/Parquet/JSON straight into a table from write_query:\n```sql\nCREATE TABLE raw AS SELECT * FROM read_csv('https://example.com/data.csv');\nINSERT INTO raw SELECT * FROM 's3://public-bucket/more.parquet';\n```\n\
 **No credentials are attached to these reads.** A source that needs authentication will fail as `source_unavailable` — for those use pull_catalog, whose `set:{…}` credentials are used once and never stored (latiq://recipes/external-data). \
 **And the address is not restricted.** Latiq does not inspect or allow-list the path in your SQL, so the node will read whatever it can reach — including its own local files. That is a known gap (issue #79), not a sandbox: name only sources you were asked to use, and never read that a path worked as permission to read it.\n\
@@ -130,10 +191,11 @@ For curated/registered sources (incl. external lakehouses like iceberg) use list
 **Own data:** `INSERT INTO t VALUES (...)` or `CREATE TABLE t AS SELECT ...`.",
     },
     Res {
+        generated: None,
         uri: "latiq://recipes/external-data",
         name: "Recipe: external data (datasets & catalogs)",
         desc: "Bring outside data into a pond — curated files or external catalogs",
-        body: "# Recipe — bring external data into a pond\n\n\
+        static_body: "# Recipe — bring external data into a pond\n\n\
 Latiq has two paths. Everything ends up as tables IN your pond — external catalogs are never queried live.\n\n\
 ## Datasets — curated public files (copy in)\n\
 A dataset loads into a SCHEMA named after it — query its tables as `<dataset>.<table>`.\n\
@@ -146,10 +208,11 @@ Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB download
 **Don't** try to query `lake.…` outside a pull — attach is transient. **Do** describe_catalog first so you SELECT real table names.",
     },
     Res {
+        generated: None,
         uri: "latiq://recipes/attribution-lookup",
         name: "Recipe: attribution lookup",
         desc: "Who wrote what in a pond",
-        body: "# Recipe — attribution lookup\n\n\
+        static_body: "# Recipe — attribution lookup\n\n\
 Every write is tagged with the writing agent's identity (native DuckLake commit metadata).\n```sql\nSELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;\n```\n\
 Use this to coordinate: see who created a table before extending it.\n\
 **How a write loses its author:** Latiq brackets your statement in its own transaction and records the author immediately before committing. SQL that does its own `COMMIT` (or `BEGIN`/`ROLLBACK`/`START TRANSACTION`) ends that bracket first, so the snapshot appears here with no author and nobody can tell who made the change. Nothing stops you — just send plain statements.\n\
@@ -157,10 +220,11 @@ Use this to coordinate: see who created a table before extending it.\n\
 **You cannot choose the identity you write under.** It comes from the transport — the bearer token (verified `subject`/`issuer`) and the `latiq-agent-id` header (a claimed leaf) — and no tool takes it as an argument.",
     },
     Res {
+        generated: None,
         uri: "latiq://recipes/lineage",
         name: "Recipe: lineage lookup",
         desc: "Where a table came from — the pond's OpenLineage trail",
-        body: "# Recipe — lineage lookup\n\n\
+        static_body: "# Recipe — lineage lookup\n\n\
 **When:** you need the provenance of a table: what a run read, what it wrote, who ran it, and which snapshot it produced.\n\n\
 **First, the pond must be recording.** Lineage is opt-in at allocation and FIXED for the pond's lifetime:\n\
 ```\nallocate_pond {name:'audited', lineage:true}\n```\n\
@@ -195,10 +259,11 @@ The events are canonical OpenLineage 2-0-2: hand them to any OpenLineage consume
         // `dataset_not_found`'s `see` has always pointed here, and until the
         // guard below existed, nothing served it: an agent that followed the
         // link got `resource_not_found` and spent a call learning nothing.
+        generated: None,
         uri: "latiq://datasets",
         name: "Datasets",
         desc: "The curated public files this deployment can load into a pond",
-        body: "# Datasets\n\n\
+        static_body: "# Datasets\n\n\
 A **dataset** is a curated file this deployment already knows how to fetch — you name it, Latiq loads it into your pond. Nothing is queried live: `load_dataset` copies the data in, and from then on it is ordinary pond data.\n\n\
 ```\nlist_datasets {}                        # everything registered here\nlist_datasets {query:'tpch'}            # filter by name/tag; '#sample' finds the small ones\nload_dataset {pond:'p', dataset:'tpch'} # -> a SCHEMA named after the dataset\nread_query {pond:'p', sql:'SELECT count(*) FROM tpch.orders'}\n```\n\n\
 **A dataset lands in its own schema**, so its tables are `<dataset>.<table>` — `tpch.orders`, not `orders`. `describe_pond` shows them after the load.\n\n\
@@ -208,10 +273,11 @@ A **dataset** is a curated file this deployment already knows how to fetch — y
 - For an external database or lakehouse, that is a **catalog**, not a dataset: list_catalogs → describe_catalog → pull_catalog (latiq://recipes/external-data).",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting",
         name: "Troubleshooting index",
         desc: "Problem-keyed recovery guides",
-        body: "# Troubleshooting\n\n\
+        static_body: "# Troubleshooting\n\n\
 Every page here is keyed by the `kind` on the error envelope you received — match the kind, don't browse.\n\n\
 **Before you pick a page, read the envelope's machine-readable fields** — they are authoritative over the prose and usually decide the next move on their own: `retryable` (`as_is` = re-send unchanged, `after_change` = fix the arguments first, `never` = this call cannot work and `suggest` names the different call that can), `audience` (`operator` = report it and stop) and `facts` (branch on the values; don't parse numbers out of `message`). The full contract is in latiq://guidance.\n\n\
 - latiq://troubleshooting/pond-not-found — `pond_not_found`: the pond id/name doesn't resolve.\n\
@@ -226,10 +292,11 @@ Every page here is keyed by the `kind` on the error envelope you received — ma
 - latiq://troubleshooting/read-only-violation — `read_only_violation`: a write was sent to read_query.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/catalog-error",
         name: "Troubleshooting: catalog error",
         desc: "A name in your SQL doesn't resolve — or already exists",
-        body: "# Catalog error (`catalog_error`)\n\n\
+        static_body: "# Catalog error (`catalog_error`)\n\n\
 Your statement is valid SQL. A **name** in it does not match this pond: a table, column, schema or function that isn't there — or one that is there when you asked to create it.\n\n\
 ## The name doesn't exist\n\
 `Catalog Error: Table with name nope does not exist!`, `Binder Error: Referenced column \"qty\" not found`.\n\
@@ -246,10 +313,11 @@ Your statement is valid SQL. A **name** in it does not match this pond: a table,
 This is never a syntax problem (that arrives as `parse_error`) and never something an operator can fix for you.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/source-unavailable",
         name: "Troubleshooting: source unavailable",
         desc: "A URL or path in your SQL could not be read",
-        body: "# Source unavailable (`source_unavailable`)\n\n\
+        static_body: "# Source unavailable (`source_unavailable`)\n\n\
 The statement named a data source outside the pond — a URL, an object-store path, a file — and the engine could not read it: `IO Error: Could not connect to server …`, `HTTP Error: … (404)`.\n\n\
 **Nothing in Latiq is broken, and this is not the pond's storage.** The address is yours, in your SQL, so the fix is too:\n\
 1. **Check the address** — spelling, scheme, host, bucket, the file actually being there. `read_csv('http://127.0.0.1:9/none.csv')` fails for the obvious reason.\n\
@@ -259,20 +327,22 @@ The statement named a data source outside the pond — a URL, an object-store pa
 Once the data is in the pond it can't fail this way again: `CREATE TABLE raw AS SELECT * FROM read_csv('<url>')` copies it in, and later queries read the pond.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/pond-not-found",
         name: "Troubleshooting: pond not found",
         desc: "Recover from a missing pond",
-        body: "# Pond not found (`pond_not_found`)\n\n\
+        static_body: "# Pond not found (`pond_not_found`)\n\n\
 The pond id or name doesn't exist in this deployment.\n\
 - Call **list_ponds** to see what exists (names + ids).\n\
 - Call **allocate_pond** to create a new one.\n\
 - Check spelling; pond refs accept either the UUID or the human name.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/pond-unavailable",
         name: "Troubleshooting: pond unavailable",
         desc: "The pond exists but no node is serving it",
-        body: "# Pond unavailable (`pond_unavailable`)\n\n\
+        static_body: "# Pond unavailable (`pond_unavailable`)\n\n\
 The pond is still in the registry — its name resolves and list_ponds shows it — but the node that owns it is no longer registered, so nothing can reach its files. This is NOT the same as a missing pond, and it is not something you can fix from here:\n\
 - **Do not** allocate a replacement under the same intent and assume the data moved. It did not; the old pond's tables are on a node this deployment cannot see.\n\
 - An empty answer would have been a plausible lie, which is why you get an error instead.\n\
@@ -285,19 +355,21 @@ Allocation is eager: the control plane picks a node, and that node must create t
 You are not seeing a half-created pond either way. The eagerness is the point: the alternative is a pond id that works until your first write.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/large-results",
         name: "Troubleshooting: large results",
         desc: "Results exceeded the inline cap",
-        body: "# Result cap exceeded (`result_cap_exceeded`)\n\n\
+        static_body: "# Result cap exceeded (`result_cap_exceeded`)\n\n\
 Your read returned more rows than the inline cap (~10k). Narrow with WHERE/LIMIT, aggregate server-side (GROUP BY/count/sum), or materialize with CREATE TABLE AS SELECT and query the smaller table.\n\n\
 **Read the message carefully — it comes in two forms, and only one of them names a row count you can size from.** `Result has N rows` is the true total: the whole result was built before the cap was checked, so N is exact. `Result has more than N rows` means collection STOPPED at the cap and the total is genuinely unknown — N is the cap, not a measurement, and a result of 20 000 rows and one of a billion both say it. Never narrow by a little on the strength of that number; get a real one from `SELECT count(*)` or explain_query's `estimated_rows` first.\n\n\
 **Size it first with explain_query**, so the next attempt is not another guess. In its response: `estimated_rows` is how many rows the query would return — if that is still far over ~10k, narrowing is not enough and you want an aggregate or a CREATE TABLE AS SELECT. `scan_operations` names each table read and whether it was a `full_scan`, and `warnings`/`suggestions` point at the table to filter. All of it is the planner ESTIMATING, not measuring — use it to choose between approaches, not to predict an exact row count. See latiq://recipes/large-results.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/timeouts",
         name: "Troubleshooting: timeouts",
         desc: "Break up slow queries",
-        body: "# Query stopped (`query_timeout`, `query_cancelled`)\n\n\
+        static_body: "# Query stopped (`query_timeout`, `query_cancelled`)\n\n\
 Your statement ran past the timeout in effect for it and was stopped. The error names two numbers: the timeout that was APPLIED, and the maximum this node allows.\n\n\
 **How the timeout is decided.** `read_query` and `write_query` take an optional `timeout_ms`. Omit it and the node's default applies. Ask for more than the node's maximum and you are CLAMPED to that maximum — the query still runs, it is never refused — so read `_meta.timeout_ms` on every successful result to see what was actually in effect.\n\n\
 **Three levers, in order of cost:**\n\
@@ -309,20 +381,22 @@ Your statement ran past the timeout in effect for it and was stopped. The error 
 Someone sent `notifications/cancelled` for that request, or the client that issued it went away. The query really was stopped — a partial result was not returned and a write was rolled back, so nothing half-done is in the pond. **Do not automatically retry it:** a cancel is a decision, and re-issuing the same statement overrides it. Re-issue only if you still need the result and nothing has since told you to stop.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/conflicts",
         name: "Troubleshooting: write conflicts",
         desc: "Concurrent writes that conflict",
-        body: "# Write conflicts\n\n\
+        static_body: "# Write conflicts\n\n\
 Multiple agents write through DuckLake's transactional model. Conflicting writes auto-retry against the latest snapshot; expect occasional snapshot bumps. If you need strict ordering, coordinate at the application layer (e.g. read `ducklake_snapshots('<pond>')` to see the latest writer before extending a table).",
     },
     Res {
         // `unauthenticated` used to point at the troubleshooting INDEX, which
         // says nothing about tokens: the one kind an agent cannot debug from
         // its SQL got the page with the least to say about it.
+        generated: None,
         uri: "latiq://troubleshooting/unauthenticated",
         name: "Troubleshooting: unauthenticated",
         desc: "Your token was missing, expired or rejected",
-        body: "# Unauthenticated (`unauthenticated`)\n\n\
+        static_body: "# Unauthenticated (`unauthenticated`)\n\n\
 This deployment verifies callers, and your request did not carry a token it accepts. The transport answered before any SQL ran, so nothing happened in any pond.\n\n\
 **Identity arrives in the TRANSPORT, never in a tool argument.** There is no tool that takes a token or an agent id, so no retry with different arguments can fix this — the `Authorization: Bearer` header is the verified principal and the `latiq-agent-id` header is a claim carrying no authority.\n\n\
 1. **The token is your client's to supply, not yours to construct.** If it expired, your client refreshes it and re-sends; ask it to, or stop and report that you have no valid credential. Do not invent, edit or reuse a token from a resource or a table.\n\
@@ -334,10 +408,11 @@ If you were working without a token until now, the deployment has an issuer conf
         // `internal` + `storage`: the two envelopes an agent can do least
         // about, which is exactly why the page has to say so plainly instead
         // of leaving them on the index to browse.
+        generated: None,
         uri: "latiq://troubleshooting/internal",
         name: "Troubleshooting: internal / storage failure",
         desc: "Latiq itself failed — what is and isn't yours to fix",
-        body: "# Internal (`internal`) and storage (`storage`) failures\n\n\
+        static_body: "# Internal (`internal`) and storage (`storage`) failures\n\n\
 **This one is ours, not yours.** `internal` is a failure Latiq could not classify; `storage` is the pond's own files or catalog failing underneath it (a full disk, a missing data directory, an unreadable catalog). Neither is a statement you can rewrite into working. If your SQL had been the problem you would have a kind that names it — `parse_error`, `catalog_error`, `invalid_value`, `source_unavailable`.\n\n\
 **What to do, in order:**\n\
 1. **Retry once.** Some are transient. A second identical failure is not, and a third is noise.\n\
@@ -347,14 +422,43 @@ If you were working without a token until now, the deployment has an issuer conf
 **Do not** treat this as a permissions or a not-found answer. `internal` never means \"you may not\" and never means \"it isn't there\"; assuming either is how an agent talks itself into recreating data that still exists.",
     },
     Res {
+        generated: None,
         uri: "latiq://troubleshooting/read-only-violation",
         name: "Troubleshooting: read-only violation",
         desc: "A write was sent to read_query",
-        body: "# Read-only violation (`read_only_violation`)\n\n\
+        static_body: "# Read-only violation (`read_only_violation`)\n\n\
 read_query only runs SELECT and read-only metadata statements. For INSERT/UPDATE/DELETE/DDL, use **write_query** — your writes there are attributed to your identity.\n\n\
 You get this error only for a statement that really is recognisable as a write (including a hidden one: `WITH … INSERT`, `EXPLAIN ANALYZE`, a second statement after a `;`, or `BEGIN`/`COMMIT`/`ROLLBACK`, which Latiq owns). A statement it cannot recognise at all is NOT reported here — it goes to the parser and comes back as `parse_error` — so if you see this kind, re-read your SQL for a write rather than assuming a typo.",
     },
 ];
+
+/// `latiq://dialect`, part 1 of 3 — the SQL contract. Held as a `const` rather
+/// than inline because the served body is assembled at read time (part 2 is
+/// [`capabilities`], generated from the shipped extension table).
+const DIALECT_HEAD: &str = "# Latiq SQL dialect\n\n\
+Latiq runs ANSI SQL on a DuckDB engine over DuckLake storage.\n\n\
+- **read_query** accepts SELECT and read-only metadata (SHOW/DESCRIBE). Writes are rejected — use write_query.\n\
+- **write_query** accepts INSERT/UPDATE/DELETE and DDL (CREATE/DROP/ALTER, CREATE TABLE AS SELECT).\n\
+- **Transaction control is Latiq's.** Don't send `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`: read_query rejects them, and in write_query they cut short the transaction Latiq attributes your write in (nothing rejects them there — it silently costs you the author). Several plain statements in one call are fine; they commit together as one snapshot.\n\
+- Your tables live in the pond's default schema; query them directly (you can also `CREATE SCHEMA` for more).\n\
+- Snapshots/history/attribution are native DuckLake — `SELECT snapshot_id, author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')` (`commit_extra_info` is where verified-vs-claimed shows up). List tables/columns with `SHOW TABLES` / `DESCRIBE <table>` / `information_schema.columns`; a column's stored COMMENT comes back from `duckdb_columns()`.\n\
+- Prefer ANSI constructs; DuckDB extensions are tolerated but reduce portability.\n\n";
+
+/// `latiq://dialect`, part 3 of 3 — the negative half. Hand-written, and it
+/// stays that way: it is about DuckLake's DDL subset, not about extensions, so
+/// there is no constant to derive it from.
+const DIALECT_TAIL: &str = "## Values, types and constraints\n\n\
+An `invalid_value` error is about the DATA in your statement, not its syntax — the statement parsed and the names resolved.\n\
+- **Type conversion:** a literal or column is not convertible to the type it is used as (`Conversion Error: Could not convert string 'notanint' to INT32`). Quoted text is not coerced into a numeric column because it looks numeric. Check the target with `DESCRIBE <table>` and pass the right type, or CAST explicitly: `CAST('7' AS INTEGER)`.\n\
+- **Constraints:** the value is well-typed but breaks a rule on the table — primary key, unique, not null, check (`Constraint Error: Duplicate key …`). Read the conflicting row first (`SELECT * FROM t WHERE <key> = <value>`), then correct the value, UPDATE the existing row, or use `INSERT OR REPLACE` / `ON CONFLICT`.\n\n\
+Neither is fixed by retrying the same statement, and neither is a `parse_error`: if your statement had a syntax problem you would have been told `parse_error` with DuckDB's `Parser Error` text.\n\n\
+## What a pond does NOT have (`unsupported_feature`)\n\n\
+A pond is DuckLake storage, and DuckLake implements a subset of DuckDB's DDL. These parse, and are then REFUSED — `unsupported_feature`, `audience: agent`, `retryable: after_change`, with the rejected thing in `facts.feature`:\n\
+- **`PRIMARY KEY` / `UNIQUE` constraints** — `CREATE TABLE t(id INTEGER PRIMARY KEY)` fails. Declare `id INTEGER` and check uniqueness with a query when you need to: `SELECT id, count(*) FROM t GROUP BY id HAVING count(*) > 1`.\n\
+- **`CHECK` constraints** — validate in the INSERT (`WHERE`) or with a read afterwards.\n\
+- **Indexes** (`CREATE INDEX`), **sequences** (`CREATE SEQUENCE`, `nextval`) and **generated columns**. For a surrogate key, generate the value in the INSERT — `row_number() OVER ()`, a hash, or a UUID.\n\
+- **Transaction control** — `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`, for the reason above: the transaction is Latiq's. If one of yours reached write_query, part of the statement may already have committed — check the table before re-sending.\n\
+`NOT NULL` and `DEFAULT` **are** supported, and `NOT NULL` is enforced (a violation is `invalid_value`, not this). The fix for `unsupported_feature` is always the same shape: delete the clause the message names and re-send. The identical statement can never succeed, so do not retry it unchanged.";
 
 pub fn list_resources() -> Vec<Resource> {
     RESOURCES
@@ -373,14 +477,14 @@ pub fn list_resources() -> Vec<Resource> {
 /// they carry, which needs the text rather than a `ReadResourceResult`.
 #[cfg(test)]
 pub(crate) fn all_bodies() -> impl Iterator<Item = (&'static str, &'static str)> {
-    RESOURCES.iter().map(|r| (r.uri, r.body))
+    RESOURCES.iter().map(|r| (r.uri, r.body()))
 }
 
 pub fn read_resource(uri: &str) -> Option<ReadResourceResult> {
     RESOURCES
         .iter()
         .find(|r| r.uri == uri)
-        .map(|r| ReadResourceResult::new(vec![ResourceContents::text(r.body, r.uri)]))
+        .map(|r| ReadResourceResult::new(vec![ResourceContents::text(r.body(), r.uri)]))
 }
 
 struct PromptDef {
@@ -582,13 +686,85 @@ mod tests {
         }
     }
 
+    /// **The positive half of the dialect page is generated, and this is what
+    /// keeps it honest in both directions.**
+    ///
+    /// `latiq://dialect` told agents at length what a pond does NOT have (#115)
+    /// and nothing at all about what it *does*: nine extensions ship, an agent
+    /// could discover none of them, and `spatial`/`fts`/`inet` have to be asked
+    /// for at `allocate_pond` — a choice that cannot be made later, by an agent
+    /// that never learned it existed. So the section is rendered from
+    /// `latiq_common::extensions::EXTENSIONS`, and this asserts the rendering
+    /// actually reaches the SERVED body: every shipped extension is named, with
+    /// its blurb and with the state that decides what the agent must do about
+    /// it.
+    ///
+    /// The other direction matters as much: a page that advertises a capability
+    /// the node never installed sends an agent to a `LOAD` that fails. The
+    /// hand-written halves are checked against a list of plausible neighbours we
+    /// deliberately do NOT ship.
+    #[test]
+    fn mcp_resources_the_dialect_page_advertises_every_shipped_extension() {
+        use latiq_common::extensions::{Bucket, CATALOG_DRIVEN, EXTENSIONS, OPTIONAL};
+        let dialect = body_of("latiq://dialect");
+        for e in EXTENSIONS {
+            assert!(
+                dialect.contains(&format!("`{}`", e.name)),
+                "latiq://dialect never names the shipped extension `{}`",
+                e.name
+            );
+            assert!(
+                dialect.contains(e.what),
+                "`{}` is named but not explained — its `what` is the advertisement",
+                e.name
+            );
+            // The state is the ACTION: always there / ask at allocation / go
+            // through pull_catalog. A name with no state tells an agent nothing
+            // it can do.
+            let state = if OPTIONAL.contains(&e.name) {
+                format!("extensions: [\"{}\"]", e.name)
+            } else if CATALOG_DRIVEN.contains(&e.name) {
+                "pull_catalog".to_string()
+            } else {
+                "always loaded".to_string()
+            };
+            assert!(
+                dialect.contains(&state),
+                "`{}` is advertised without saying how to get it (expected {state:?})",
+                e.name
+            );
+        }
+        for b in Bucket::ALL {
+            assert!(
+                dialect.contains(b.title()),
+                "the bucket heading {:?} is missing — the page is meant to answer \
+                 'what can I read' and 'what can I reach' separately",
+                b.title()
+            );
+        }
+        // CSV is DuckDB core, not an extension, so it is in no constant and
+        // would be advertised nowhere if the prose did not name it.
+        assert!(dialect.contains("CSV"), "CSV is readable and unadvertised");
+        // Anti-vacuity: the loop above passes perfectly over an empty table.
+        assert!(EXTENSIONS.len() >= 9, "only {} shipped?", EXTENSIONS.len());
+        // …and nothing we do not ship. These four are real, core-signed DuckDB
+        // extensions that Latiq deliberately does not install today; naming one
+        // in the prose would send an agent to a `LOAD` that fails.
+        for absent in ["delta", "postgres_scanner", "azure", "excel"] {
+            assert!(
+                !dialect.contains(absent),
+                "latiq://dialect advertises `{absent}`, which no node installs"
+            );
+        }
+    }
+
     /// The body of a resource this server serves, or a panic naming the URI.
     fn body_of(uri: &str) -> &'static str {
         RESOURCES
             .iter()
             .find(|r| r.uri == uri)
             .unwrap_or_else(|| panic!("{uri} is not served"))
-            .body
+            .body()
     }
 
     /// **Every `retryable` and `audience` value must be explained where agents
@@ -678,7 +854,7 @@ mod tests {
                 .iter()
                 .find(|r| r.uri == see)
                 .unwrap_or_else(|| panic!("{see} is not served"))
-                .body;
+                .body();
             for phrase in must_say {
                 assert!(
                     body.contains(phrase),
@@ -723,7 +899,7 @@ mod tests {
             .iter()
             .find(|r| r.uri == "latiq://troubleshooting")
             .expect("the index is served")
-            .body;
+            .body();
         let pages: Vec<&str> = RESOURCES
             .iter()
             .map(|r| r.uri)
@@ -784,7 +960,7 @@ mod tests {
                 .iter()
                 .find(|r| r.uri == see)
                 .unwrap_or_else(|| panic!("{see} is not served"))
-                .body;
+                .body();
             assert!(
                 body.contains(kind.as_str()),
                 "{see} never mentions `{}` — it resolves but does not cover the kind that lands there",
