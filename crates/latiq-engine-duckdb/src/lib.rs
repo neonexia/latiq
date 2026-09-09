@@ -21,4 +21,6 @@ pub mod exec;
 pub mod explain;
 pub mod instance;
 pub use duck_engine::DuckEngine;
-pub use instance::{ensure_standard_extensions, warm_optional_extensions};
+pub use instance::{
+    ensure_standard_extensions, warm_extension_cache, warmable_extensions, WarmReport,
+};

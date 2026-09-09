@@ -14,9 +14,26 @@
 
 //! One DuckDB instance per pond: loads extensions, ATTACHes the pond's DuckLake
 //! catalog as `pond`. The instance owns exactly this pond's catalog (no cross-pond).
+//!
+//! **No `INSTALL` on a request path.** Downloading an extension is an unbounded
+//! wait on an external host, and every path that reaches DuckDB from a caller —
+//! opening a pond, the transient attach behind `pull_catalog` — is a path where
+//! an agent is sitting on the call. So there are exactly two places an `INSTALL`
+//! may run, and both are before the node serves anything:
+//!
+//! - [`ensure_standard_extensions`] — once per process, memoized, at node
+//!   startup (`run_pond_node_until` awaits it before registering).
+//! - [`warm_extension_cache`] — `latiq warm-extensions` at image-build time, and
+//!   the node's background warm at startup.
+//!
+//! Everywhere else `autoinstall_known_extensions` is **off** and the SQL is
+//! `LOAD` only, so a cache miss is an immediate, actionable failure naming
+//! `latiq warm-extensions` instead of a silent download mid-query.
 use duckdb::Connection;
 use latiq_engine::EngineError;
 use latiq_storage::PondLocation;
+use std::path::Path;
+use std::sync::OnceLock;
 
 /// **Required** standard extensions, loaded on every pond. The whole of Latiq is
 /// built on these — `ducklake` is the catalog format, `httpfs` reads remote
@@ -31,40 +48,203 @@ const STANDARD_LOAD: &[&str] = &["ducklake", "httpfs", "icu"];
 /// Ensure the required standard extensions ([`STANDARD_LOAD`]) install and load.
 /// The node calls this at **startup** and refuses to serve if it fails — Latiq is
 /// useless without ducklake/httpfs, so this is a hard, fail-fast check rather than
-/// a per-pond surprise. `INSTALL` may hit the network on a cold cache (in
-/// production the image is pre-baked, making it a no-op).
+/// a per-pond surprise.
+///
+/// **This is the one place an `INSTALL` may reach the network in a serving
+/// process, and it is deliberate.** It runs before the node registers or serves,
+/// which is the acceptable moment to download: bounded, once, with nobody
+/// waiting on a query. It is kept as `INSTALL; LOAD` rather than a bare verify
+/// because `pip install latiq` (SDK / `LocalCluster` / `dev.sh`) has no baked
+/// image to verify against — refusing to download here would mean a wheel that
+/// cannot start a node at all. A pre-baked image makes it a local no-op.
+///
+/// The result is **memoized**: `PondInstance::open` calls it so a fresh process
+/// (a test, an embedded cluster) still bootstraps itself once, and on a node
+/// that started properly the per-pond call is then a boolean check — never an
+/// `INSTALL` on a request path.
 pub fn ensure_standard_extensions() -> Result<(), EngineError> {
-    let conn = Connection::open_in_memory().map_err(|e| EngineError::Engine(e.to_string()))?;
-    for ext in STANDARD_LOAD {
-        conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
-            .map_err(|e| EngineError::Engine(format!("required extension '{ext}': {e}")))?;
-    }
-    Ok(())
+    static STANDARD_READY: OnceLock<Result<(), String>> = OnceLock::new();
+    STANDARD_READY
+        .get_or_init(|| {
+            let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+            for ext in STANDARD_LOAD {
+                conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
+                    .map_err(|e| format!("required extension '{ext}': {e}"))?;
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(EngineError::Engine)
 }
 
-/// Best-effort: install every non-standard extension we ship into the local
-/// cache so a later `LOAD` doesn't download. Run once at node startup — the dev
-/// stand-in for image-baking. Two sets, for two different `LOAD` sites:
+/// Every extension a `LOAD` site in this crate can reach for, in one list —
+/// what a complete node cache has to contain:
 ///
-/// - `OPTIONAL` — what a pond may request; `PondInstance::open` `LOAD`s it with
-///   autoinstall **off**, so a cache miss fails the pond rather than downloading.
-/// - `CATALOG_DRIVEN` — what a *catalog type* needs (`iceberg`); `attachers.rs`
-///   `LOAD`s it for the transient attach behind `pull_catalog`. That site does
-///   `INSTALL` first, so a cache miss there is a network round trip at exactly
-///   the moment an agent is waiting — which is why it is warmed here too.
+/// - [`STANDARD_LOAD`] — loaded into every pond by [`PondInstance::open`].
+/// - `OPTIONAL` — what a pond may request; `open` `LOAD`s it with autoinstall
+///   **off**, so a cache miss fails the pond rather than downloading.
+/// - `CATALOG_DRIVEN` — what a *catalog type* needs (`iceberg`, plus the `avro`
+///   DuckDB pulls in when iceberg loads); `attachers.rs` `LOAD`s it for the
+///   transient attach behind `pull_catalog`.
 ///
-/// Failures (offline, already present) are non-fatal; the two `LOAD` sites are
-/// where a miss is reported, each with its own message.
-pub fn warm_optional_extensions() {
-    let Ok(conn) = Connection::open_in_memory() else {
-        return;
-    };
+/// `parquet`/`json` are statically linked into the binary and need no cache.
+pub fn warmable_extensions() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = STANDARD_LOAD.to_vec();
     for ext in latiq_common::extensions::OPTIONAL
         .iter()
         .chain(latiq_common::extensions::CATALOG_DRIVEN.iter())
     {
-        let _ = conn.execute_batch(&format!("INSTALL {ext};"));
+        if !out.contains(ext) {
+            out.push(ext);
+        }
     }
+    out
+}
+
+/// What [`warm_extension_cache`] tried, and what it could not deliver.
+///
+/// The warm used to be `let _ = INSTALL …` — right for a node that is merely
+/// topping up its cache, but it made a gap invisible until some pond or
+/// `pull_catalog` failed much later, far from the cause. The report is what lets
+/// the node **warn** with the names and the build-time command **fail**.
+#[derive(Debug, Default, Clone)]
+pub struct WarmReport {
+    /// Every extension the warm was supposed to deliver ([`warmable_extensions`]).
+    pub attempted: Vec<&'static str>,
+    /// `(extension, why)` for each one that could not be installed, or that
+    /// still would not `LOAD` from the cache afterwards.
+    pub failed: Vec<(&'static str, String)>,
+}
+
+impl WarmReport {
+    /// Every warmable extension is installed **and** loads offline.
+    ///
+    /// An empty `attempted` is deliberately **not** complete: a warm that
+    /// examined nothing has proved nothing, and would otherwise let a build
+    /// whose extension list evaporated report success.
+    pub fn is_complete(&self) -> bool {
+        !self.attempted.is_empty() && self.failed.is_empty()
+    }
+
+    /// One line naming what is missing and why — the text the node warns with
+    /// and `latiq warm-extensions` fails with.
+    pub fn failure_summary(&self) -> String {
+        if self.attempted.is_empty() {
+            return "warmed 0 extensions: there was nothing to warm, which cannot be right — \
+                    a node with an empty extension cache cannot open a pond"
+                .to_string();
+        }
+        let what = self
+            .failed
+            .iter()
+            .map(|(ext, why)| format!("{ext} ({why})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "{} of {} DuckDB extensions are not usable offline on this node: {what}. \
+             Every LOAD site runs with autoinstall off, so these will fail the pond or the \
+             catalog attach that needs them rather than downloading. Re-run \
+             `latiq warm-extensions` with network access (the container image bakes the same \
+             step in at build time).",
+            self.failed.len(),
+            self.attempted.len(),
+        )
+    }
+}
+
+/// Install every extension in [`warmable_extensions`] into the local DuckDB
+/// cache, then **prove** each one loads back out of it with autoinstall off.
+///
+/// This is the only warm path: `latiq warm-extensions` at image-build time (which
+/// fails the build on an incomplete report) and the node's background warm at
+/// startup (which warns). Installing hits the network here, on purpose — that is
+/// the whole point of doing it here and not on a request path.
+///
+/// The verify pass is not a formality. `INSTALL iceberg` installs *only*
+/// `iceberg`; `LOAD iceberg` then pulls in `avro` — so "the install succeeded"
+/// never meant "the node can load it offline", which is exactly how an image
+/// shipped claiming extensions it did not have.
+///
+/// `extension_directory` overrides DuckDB's default cache location
+/// (`~/.duckdb/extensions/…`). Production passes `None`; the guard test passes a
+/// scratch directory so the ambient cache cannot mask a miss.
+pub fn warm_extension_cache(extension_directory: Option<&Path>) -> WarmReport {
+    let attempted = warmable_extensions();
+    let mut failed: Vec<(&'static str, String)> = Vec::new();
+
+    let open = |autoinstall: bool| -> Result<Connection, String> {
+        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        if let Some(dir) = extension_directory {
+            conn.execute_batch(&format!(
+                "SET extension_directory='{}';",
+                dir.display().to_string().replace('\'', "''")
+            ))
+            .map_err(|e| e.to_string())?;
+        }
+        if !autoinstall {
+            conn.execute_batch("SET autoinstall_known_extensions=false;")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(conn)
+    };
+
+    // Install pass — the network one.
+    let installer = match open(true) {
+        Ok(c) => c,
+        Err(e) => {
+            return WarmReport {
+                failed: attempted.iter().map(|ext| (*ext, e.clone())).collect(),
+                attempted,
+            }
+        }
+    };
+    for ext in &attempted {
+        if let Err(e) = installer.execute_batch(&format!("INSTALL {ext};")) {
+            failed.push((ext, format!("INSTALL failed: {e}")));
+        }
+    }
+
+    // Verify pass — a fresh connection with autoinstall OFF, i.e. the same
+    // conditions every LOAD site runs under. Anything that only worked because
+    // DuckDB reached out is a failure here.
+    match open(false) {
+        Ok(verifier) => {
+            for ext in &attempted {
+                if failed.iter().any(|(f, _)| f == ext) {
+                    continue;
+                }
+                if let Err(e) = verifier.execute_batch(&format!("LOAD {ext};")) {
+                    failed.push((ext, format!("installed, but will not LOAD offline: {e}")));
+                }
+            }
+        }
+        Err(e) => failed.push((
+            "<verify>",
+            format!("could not open a verify connection: {e}"),
+        )),
+    }
+
+    WarmReport { attempted, failed }
+}
+
+/// The error every `LOAD` site raises on a cache miss. Autoinstall is off there,
+/// so this is "not in the node's extension cache" and no retry changes it: the
+/// message has to name the extension AND the operator action for both
+/// deployments we ship — the image bakes extensions at build time
+/// (`latiq warm-extensions`), while a `pip install latiq` node warms them at
+/// startup and cannot if that first start had no network.
+///
+/// (The `kind` this maps to is still `internal`, so the envelope's `retryable`
+/// says `as_is` — advice that can never work for an operator-only fix. Fixing
+/// that needs a new `ErrorKind`; until then the message carries the whole
+/// burden, which is why it is one string shared by every site.)
+pub fn extension_not_cached(what: &str, err: &dyn std::fmt::Display) -> EngineError {
+    EngineError::Engine(format!(
+        "{what} is not cached on this node, and nothing the caller sends changes this — \
+         extension downloads are disabled while serving requests. An operator restores it by \
+         running `latiq warm-extensions` on the node with network access (the container image \
+         bakes the same step in at build time), then restarting the node. Underlying error: {err}"
+    ))
 }
 
 /// One pond's open DuckDB database, with its DuckLake catalog attached and its
@@ -99,11 +279,20 @@ impl PondInstance {
             ))
             .map_err(|e| EngineError::Engine(format!("set resource limits: {e}")))?;
         }
-        // Standard set: required, self-healing (INSTALL is a no-op once cached;
-        // parquet/json are statically linked, so they're omitted here).
+        // Opening a pond is a REQUEST path (materialize, first query), so nothing
+        // from here on may download: autoinstall off before the first LOAD, for
+        // every pond, not just one that requested extensions. It is a global
+        // DuckDB setting, so `clone_for_read` connections inherit it, and it is
+        // what lets `attachers.rs` emit LOAD-only SQL.
+        conn.execute_batch("SET autoinstall_known_extensions=false;")
+            .map_err(|e| EngineError::Engine(format!("disable extension autoinstall: {e}")))?;
+        // The standard set comes out of the node's cache. The memoized startup
+        // check is what put it there (a no-op after the node's own call at
+        // startup; the bootstrap for a fresh process that never made one).
+        ensure_standard_extensions()?;
         for ext in STANDARD_LOAD {
-            conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
-                .map_err(|e| EngineError::Engine(format!("load {ext}: {e}")))?;
+            conn.execute_batch(&format!("LOAD {ext};"))
+                .map_err(|e| extension_not_cached(&format!("required extension '{ext}'"), &e))?;
         }
         // Pin the session timezone. With icu loaded, DuckDB otherwise defaults the
         // TimeZone setting to the HOST OS zone, making TIMESTAMPTZ rendering and
@@ -118,29 +307,12 @@ impl PondInstance {
         // file download is correct for the small curated-dataset/pull sources.
         conn.execute_batch("SET force_download=true;")
             .map_err(|e| EngineError::Engine(format!("set force_download: {e}")))?;
-        // Per-pond optional extensions: LOAD-only from the image. autoinstall off
-        // so a missing one fails fast — never a download in the pond path.
-        if !loc.extensions.is_empty() {
-            conn.execute_batch("SET autoinstall_known_extensions=false;")
-                .map_err(|e| EngineError::Engine(e.to_string()))?;
-            for ext in &loc.extensions {
-                conn.execute_batch(&format!("LOAD {ext};")).map_err(|e| {
-                    // Autoinstall is off here, so this is "not in the node's
-                    // extension cache" and no retry will change that. The
-                    // message has to name the extension AND the operator action
-                    // for both deployments we ship: the image bakes extensions
-                    // at build time (`latiq warm-extensions`), while a
-                    // `pip install latiq` node warms them at startup and cannot
-                    // if that first start had no network.
-                    EngineError::Engine(format!(
-                        "extension '{ext}' is not cached on this node, so the pond cannot be \
-                         opened. Nothing the caller sends changes this. An operator restores it \
-                         by running `latiq warm-extensions` on the node with network access (the \
-                         container image bakes the same step in at build time), then restarting \
-                         the node. Underlying error: {e}"
-                    ))
-                })?;
-            }
+        // Per-pond optional extensions: LOAD-only from the node's cache, under
+        // the autoinstall-off setting applied above.
+        for ext in &loc.extensions {
+            conn.execute_batch(&format!("LOAD {ext};")).map_err(|e| {
+                extension_not_cached(&format!("the pond requested extension '{ext}', which"), &e)
+            })?;
         }
         // ATTACH the pond's DuckLake catalog under the pond's name, so callers
         // query `<pond>.snapshots()` / `<pond>.main.<table>`. The alias is quoted
@@ -262,39 +434,121 @@ mod tests {
         assert!(loaded, "inet should be LOADed on the pond");
     }
 
-    /// **The offline claim, tested where it is made.** `deploy/Dockerfile` bakes
-    /// extensions with `latiq warm-extensions` "so nodes start without network",
-    /// and `attachers.rs` LOADs `iceberg` for the transient attach behind
-    /// `pull_catalog`. Warming `iceberg` alone does not deliver that: DuckDB
-    /// autoinstalls `avro` when iceberg LOADs, so the first `pull_catalog` on a
-    /// freshly-built node still reached for the network — and on a pond that had
-    /// requested any extension (autoinstall off on that connection) it could not
-    /// reach for it at all.
+    /// **The offline claim, tested where it is made, against a cache that cannot
+    /// be lying.** `deploy/Dockerfile` bakes extensions with
+    /// `latiq warm-extensions` "so nodes start without network", and every LOAD
+    /// site — `PondInstance::open`'s standard set, a pond's requested
+    /// extensions, `attachers.rs` for the transient attach behind
+    /// `pull_catalog` — now runs with autoinstall **off**. So the whole
+    /// deployment claim reduces to: after a warm, does every warmable extension
+    /// load with no network?
     ///
-    /// So: warm, then LOAD with autoinstall **off**, which is the only way to
-    /// prove nothing downloaded. This asserts OUR warm set is complete, not
-    /// DuckDB's dependency resolution (invariant 10).
+    /// The warm goes into a **scratch `extension_directory`** rather than the
+    /// developer's `~/.duckdb`: against the ambient cache, an extension the warm
+    /// forgot still loads (someone installed it months ago) and the test passes
+    /// while a fresh image ships broken. That is the failure #120 found for
+    /// `avro` — DuckDB autoinstalls it when `iceberg` LOADs, so "INSTALL
+    /// iceberg succeeded" never meant "iceberg loads offline".
+    ///
+    /// This asserts OUR warm set is complete, not DuckDB's dependency
+    /// resolution (invariant 10). It needs the network, once, like the image
+    /// build it stands in for.
     #[test]
-    fn warmed_node_loads_every_catalog_extension_without_the_network() {
-        warm_optional_extensions();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("SET autoinstall_known_extensions=false;")
-            .unwrap();
-        let mut checked = 0;
+    fn a_warmed_cache_loads_every_extension_we_ever_load_without_the_network() {
+        let scratch = tempfile::tempdir().unwrap();
+        let report = warm_extension_cache(Some(scratch.path()));
+
+        // Nothing may be missing — and a warm that examined nothing is not a
+        // pass. `warm_extension_cache` verifies with autoinstall off in a fresh
+        // connection, which is the only way to prove nothing downloaded.
+        assert!(
+            report.is_complete(),
+            "a scratch cache warmed by `latiq warm-extensions` is incomplete: {}",
+            report.failure_summary()
+        );
+
+        // The set really is every LOAD site's needs, not an empty list that
+        // trivially satisfies the assertion above.
+        for required in ["ducklake", "httpfs", "icu", "iceberg", "avro"] {
+            assert!(
+                report.attempted.contains(&required),
+                "'{required}' is LOADed somewhere but is not warmed: {:?}",
+                report.attempted
+            );
+        }
         for t in latiq_common::catalog::TYPES {
             for ext in t.required_extensions {
-                conn.execute_batch(&format!("LOAD {ext};"))
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "catalog type '{}' needs '{ext}', which warm-extensions did not leave \
-                         loadable offline: {e}",
-                            t.name
-                        )
-                    });
-                checked += 1;
+                assert!(
+                    report.attempted.contains(ext),
+                    "catalog type '{}' needs '{ext}', which the warm does not cover",
+                    t.name
+                );
             }
         }
-        assert!(checked >= 4, "the loop skipped: only {checked} checked");
+        for ext in latiq_common::extensions::OPTIONAL.iter() {
+            assert!(
+                report.attempted.contains(ext),
+                "a pond may request '{ext}', which the warm does not cover"
+            );
+        }
+        assert!(
+            report.attempted.len() >= 6,
+            "the warm covered only {:?}",
+            report.attempted
+        );
+    }
+
+    /// A report is a claim about work done, so "nothing attempted" must not read
+    /// as success — that is what would let a build whose extension list
+    /// evaporated pass `latiq warm-extensions` and ship an empty cache.
+    #[test]
+    fn an_empty_warm_is_not_a_successful_one() {
+        assert!(!WarmReport::default().is_complete());
+        assert!(
+            WarmReport::default().failure_summary().contains("0"),
+            "the summary must say nothing was warmed: {}",
+            WarmReport::default().failure_summary()
+        );
+        let one_failed = WarmReport {
+            attempted: vec!["spatial", "fts"],
+            failed: vec![("spatial", "INSTALL failed: offline".into())],
+        };
+        assert!(!one_failed.is_complete());
+        let msg = one_failed.failure_summary();
+        assert!(
+            msg.contains("spatial") && msg.contains("latiq warm-extensions"),
+            "a warm failure must name the extension and the fix: {msg}"
+        );
+        assert!(WarmReport {
+            attempted: vec!["spatial"],
+            failed: vec![],
+        }
+        .is_complete());
+    }
+
+    /// The property the whole change rests on: a pond's connection cannot
+    /// download, whatever SQL later runs on it. `attachers.rs` emits LOAD-only
+    /// statements *because* of this setting, and DuckDB would otherwise
+    /// autoinstall a known extension from a plain query.
+    #[test]
+    fn a_pond_connection_can_never_download_an_extension() {
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+        let read = inst.clone_for_read().unwrap();
+        for conn in [&inst.conn, &read.conn] {
+            let autoinstall: String = conn
+                .query_row(
+                    "SELECT current_setting('autoinstall_known_extensions')::VARCHAR",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                autoinstall, "false",
+                "a pond connection would download an extension mid-query"
+            );
+        }
     }
 
     #[test]

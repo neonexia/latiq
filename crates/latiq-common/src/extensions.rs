@@ -196,10 +196,13 @@ pub static OPTIONAL: LazyLock<Vec<&'static str>> =
 /// ([`crate::catalog::TYPES`]), not because a pond can request them.
 ///
 /// They are warmed at node startup for the same reason [`OPTIONAL`] is:
-/// `attachers.rs` emits `INSTALL <ext>; LOAD <ext>;` for the transient attach a
-/// `pull_catalog` performs, and on a cold cache that `INSTALL` reaches for the
-/// network at exactly the moment an agent is waiting on the call. Before this,
-/// `iceberg` was only ever installed by the first attach that needed it —
+/// `attachers.rs` emits `LOAD <ext>;` for the transient attach a `pull_catalog`
+/// performs, with autoinstall **off**, so an extension that was not warmed does
+/// not download at exactly the moment an agent is waiting on the call — it
+/// fails the call, naming `latiq warm-extensions`. (That site used to emit
+/// `INSTALL <ext>; LOAD <ext>;`, which is precisely the download this list
+/// exists to prevent.) Before this, `iceberg` was only ever installed by the
+/// first attach that needed it —
 /// present on a long-lived dev node by accident, absent on a fresh one — while
 /// the image's own comment claimed it was baked in.
 ///
@@ -207,11 +210,13 @@ pub static OPTIONAL: LazyLock<Vec<&'static str>> =
 /// against the pinned DuckDB: `INSTALL iceberg` installs *only* `iceberg`, and
 /// `LOAD iceberg` then autoinstalls `avro` — over the network, at load time. So
 /// a node that warmed `iceberg` alone still downloads on its first
-/// `pull_catalog`, and a pond that requested any extension at all (which turns
-/// `autoinstall_known_extensions` **off** on its connection) could not load
-/// iceberg there. Warming the closure is what makes the offline claim true; the
-/// guard is `latiq-engine-duckdb`'s
-/// `warmed_node_loads_every_catalog_extension_without_the_network`.
+/// `pull_catalog`, and (now that `autoinstall_known_extensions` is **off** on
+/// every pond connection) could not load iceberg there at all. Warming the
+/// closure is what makes the offline claim true; the guard is
+/// `latiq-engine-duckdb`'s
+/// `a_warmed_cache_loads_every_extension_we_ever_load_without_the_network`,
+/// which warms into a scratch `extension_directory` so the ambient cache cannot
+/// hide a gap.
 pub static CATALOG_DRIVEN: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     let mut out: Vec<&'static str> = Vec::new();
     for t in crate::catalog::TYPES {

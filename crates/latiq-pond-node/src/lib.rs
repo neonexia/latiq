@@ -92,13 +92,22 @@ pub struct PondNodeConfig {
     pub timeouts: QueryTimeouts,
 }
 
-/// Install the standard + optional DuckDB extensions into the local cache so a
-/// node can run offline. Used to **bake** extensions into the container image at
-/// build time (`latiq warm-extensions`): INSTALL hits the network here, once, so
-/// the runtime node never needs it. Errors if a required extension can't install.
+/// Install **every** DuckDB extension a `LOAD` site can ask for into the local
+/// cache, and prove each one loads back out of it offline. Used to **bake**
+/// extensions into the container image at build time (`latiq warm-extensions`):
+/// INSTALL hits the network here, once, so the runtime node never needs it.
+///
+/// **Strict, on purpose.** It used to install the required set fatally and the
+/// rest best-effort, so `deploy/Dockerfile` could build an image "successfully"
+/// while missing extensions the image's own comment claimed it had — the gap
+/// then surfaced as a failed pond or a failed `pull_catalog` in production, far
+/// from the build that caused it. Any extension that cannot be installed, or
+/// that will not load offline afterwards, fails the command (and so the build).
 pub fn warm_extensions() -> Result<(), Box<dyn std::error::Error>> {
-    latiq_engine_duckdb::ensure_standard_extensions()?;
-    latiq_engine_duckdb::warm_optional_extensions();
+    let report = latiq_engine_duckdb::warm_extension_cache(None);
+    if !report.is_complete() {
+        return Err(report.failure_summary().into());
+    }
     Ok(())
 }
 
@@ -300,12 +309,30 @@ pub async fn run_pond_node_until(
     )
     .await?;
 
-    // Warm the OPTIONAL extension cache once, in the background — the dev stand-in
-    // for image-baking (a no-op when the image is pre-baked). Best-effort: keeps
-    // per-pond LOADs download-free without blocking serving or the create path.
+    // Warm the extension cache once, in the background — the dev stand-in for
+    // image-baking (a no-op when the image is pre-baked). It cannot be fatal
+    // here (a node whose cache is merely incomplete still serves every pond that
+    // needs nothing from the gap) and it must not block serving or the create
+    // path — but it must not be SILENT either: every LOAD site now refuses to
+    // download, so a gap left here is a pond or a `pull_catalog` that fails
+    // later, with nothing at startup to connect it to. Name what is missing, at
+    // the moment we find out.
     tokio::task::spawn_blocking(|| {
-        tracing::info!("warming optional DuckDB extension cache");
-        latiq_engine_duckdb::warm_optional_extensions();
+        tracing::info!("warming the DuckDB extension cache");
+        let report = latiq_engine_duckdb::warm_extension_cache(None);
+        if report.is_complete() {
+            tracing::info!(
+                extensions = report.attempted.len(),
+                "DuckDB extension cache is complete (every extension loads offline)"
+            );
+        } else {
+            tracing::warn!(
+                extensions = report.attempted.len(),
+                missing = report.failed.len(),
+                "{}",
+                report.failure_summary()
+            );
+        }
     });
 
     // Prometheus /metrics + the gauge collector (if a metrics port is configured).

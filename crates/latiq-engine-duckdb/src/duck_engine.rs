@@ -764,9 +764,23 @@ fn attach_catalog_inner(
     conn: &duckdb::Connection,
     plan: &crate::attachers::AttachPlan,
 ) -> Result<(), EngineError> {
+    // This runs while a caller waits on `pull_catalog`, so it must not download:
+    // the plan is LOAD-only (`attachers::AttachPlan::load`) and autoinstall is
+    // off. `PondInstance::open` already turns it off globally on this
+    // connection; re-asserting it here keeps the property with the site that
+    // depends on it rather than with whoever built the connection.
+    conn.execute_batch("SET autoinstall_known_extensions=false;")
+        .map_err(|e| EngineError::Engine(format!("disable extension autoinstall: {e}")))?;
     for s in &plan.load {
-        conn.execute_batch(s)
-            .map_err(|e| EngineError::Engine(format!("catalog extensions: {e}")))?;
+        conn.execute_batch(s).map_err(|e| {
+            crate::instance::extension_not_cached(
+                &format!(
+                    "this catalog type needs `{}`, which",
+                    s.trim_end_matches(';')
+                ),
+                &e,
+            )
+        })?;
     }
     for (_, sql) in &plan.secrets {
         conn.execute_batch(sql)
