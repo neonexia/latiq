@@ -2456,6 +2456,71 @@ mod lineage {
     }
 
     #[tokio::test]
+    async fn attribution_trace_id_joins_the_snapshot_to_its_lineage_events() {
+        // THE join this whole mechanism exists for, asserted where both records
+        // are produced by the real path: one traced write emits OpenLineage
+        // events carrying `traceId`, and commits a DuckLake snapshot whose
+        // `commit_extra_info` carries `trace_id`. If those two are not equal, an
+        // operator holding a suspicious snapshot has no way to reach the run
+        // that produced it or the datasets that run read — which is exactly the
+        // gap the two systems had while they sat side by side.
+        let (ops, storage) = ops_with_storage();
+        let id = Identity::claimed(Some("agent-a"));
+        let ctx = latiq_agent_core::TraceContext::new();
+        let trace_id = ctx.trace_id().to_string();
+        let pond = latiq_agent_core::with_trace(ctx, async {
+            let pond = ops
+                .allocate_pond(&id, Some("joined".into()), "{}", "medium", &[], true)
+                .await
+                .unwrap();
+            ops.write_query(&id, "joined", "CREATE TABLE t AS SELECT 1 AS i")
+                .await
+                .unwrap();
+            pond
+        })
+        .await;
+        ops.flush_lineage();
+
+        // The lineage half. The `latiq_query` facet — and so `traceId` — rides
+        // the TERMINAL event only; the START one is emitted before the outcome
+        // is known.
+        let events = events_in(&storage, &pond.pond_id);
+        let pair = events_for_op(&events, "joined.write_query");
+        assert_eq!(pair.len(), 2, "one START/terminal pair: {events:#?}");
+        let emitted: BTreeSet<&str> = pair
+            .iter()
+            .filter_map(|e| facet(e, "run", "latiq_query")["traceId"].as_str())
+            .collect();
+        assert_eq!(
+            emitted,
+            BTreeSet::from([trace_id.as_str()]),
+            "the write's terminal event must name the caller's trace: {events:#?}"
+        );
+
+        // The attribution half, read the native DuckLake way.
+        let snap = ops
+            .read_collected(
+                &id,
+                "joined",
+                "SELECT commit_extra_info FROM joined.snapshots() \
+                 ORDER BY snapshot_id DESC LIMIT 1",
+            )
+            .await
+            .unwrap();
+        let extra: Value = serde_json::from_str(
+            snap.rows[0][0]
+                .as_str()
+                .expect("commit_extra_info is the JSON we wrote"),
+        )
+        .unwrap();
+        assert_eq!(
+            extra["trace_id"],
+            json!(trace_id),
+            "the snapshot must be joinable to the events above: {extra}"
+        );
+    }
+
+    #[tokio::test]
     async fn lineage_read_is_recorded_once_as_the_op_the_caller_invoked() {
         // `read_collected` runs `read_arrow_local`, so an emitter placed in the
         // local halves rather than the public methods would record this read

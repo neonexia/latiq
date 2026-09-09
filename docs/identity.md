@@ -290,6 +290,11 @@ FROM ducklake_snapshots('<pond>') ORDER BY snapshot_id DESC;
 **Read both columns.** `author` alone cannot distinguish a verified writer from
 one merely claiming that name.
 
+`commit_extra_info` also carries the request's **`trace_id`** — the join key from
+a snapshot to that request's lineage events and `latiq::access` records (see
+[`obs.md`](obs.md#the-two-provenance-records-and-why-both)). The key is **absent**
+where the write had no trace scope; it is never filled with a placeholder.
+
 The author is recorded *inside the transaction Latiq owns*, immediately before
 the commit. Caller SQL that does its own `COMMIT` (or `BEGIN`/`ROLLBACK`/`START
 TRANSACTION`) closes that transaction first, and the snapshot lands with no

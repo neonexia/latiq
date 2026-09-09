@@ -140,6 +140,42 @@ Start from an id you were handed: `_meta.trace_id` on a slow result, or
 OTLP export to a collector (Jaeger/Tempo) is a planned add-on; today the trace id
 lives in the structured logs.
 
+### The two provenance records, and why both
+
+Latiq records provenance twice, and the difference is not redundancy — the two
+answer different questions, and neither can be dropped for the other.
+
+| | **DuckLake commit attribution** | **OpenLineage** |
+|---|---|---|
+| On | **always** | **opt-in per pond** (`allocate_pond(lineage=true)`) |
+| Lives | *inside the data* — DuckLake's own `snapshots()`, so it travels with a copied pond | JSONL in the pond's `lineage/` dir, and/or pushed to a collector |
+| Records | **writes only** — who committed which snapshot | **reads and writes**, plus the dataset graph |
+| Guarantee | part of the write's transaction: no attribution, no commit | **best-effort by design** — a lineage failure never reaches a query |
+| Read with | `SELECT author, commit_extra_info FROM <pond>.snapshots()` | `get_lineage`, or your collector |
+
+So: attribution is the record that is always there and survives the pond being
+copied elsewhere, but it knows nothing about what a write *read*. Lineage has the
+graph, and is exactly the thing an operator may have turned off.
+
+**They are joined by the trace id.** `commit_extra_info` carries `trace_id`
+beside `agent_id`/`issuer`/`verified`; every lineage event carries the same id at
+`run.facets.latiq_query.traceId`, and so does every `latiq::access` record and
+the `_meta.trace_id` the caller got back. That is the path from *"snapshot 47
+looks wrong"* to *"which agent run produced it, and what did that run read"*:
+
+```sql
+SELECT snapshot_id, author, commit_extra_info FROM mypond.snapshots();
+-- commit_extra_info → {"agent_id":…,"issuer":…,"verified":…,"trace_id":"4bf92f…"}
+```
+
+then filter the access trail and the pond's lineage events on that id.
+
+The key is the **bare** trace id, not a `traceparent` — that is the spelling the
+lineage event and the access record use, so the join is an equality. A write with
+no ambient trace scope records **no `trace_id` key at all**: an absent key says
+the write was untraced, where a placeholder would be joined against for ever and
+never match. See [`lineage.md`](lineage.md) for what the events contain.
+
 ## 3. Metrics (Prometheus)
 
 Each process serves `GET /metrics` (Prometheus text) on **its main port + 1000**

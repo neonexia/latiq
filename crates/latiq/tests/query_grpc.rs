@@ -350,6 +350,82 @@ async fn attribution_records_the_writer_identity() {
 }
 
 #[tokio::test]
+async fn attribution_trace_id_the_caller_was_given_is_the_one_the_pond_recorded() {
+    // The join between Latiq's two provenance records, end to end. Both halves
+    // are produced by the real path and nothing else: the caller's half is the
+    // `traceparent` the write response carried back, the pond's half is read out
+    // of DuckLake's own `snapshots()`. Constructing an `extra_info` and parsing
+    // it back would prove only that serde works — the claim here is that two
+    // independently-produced values AGREE, which is what makes "snapshot 47 was
+    // written by which agent run, and what did that run read" answerable.
+    let s = start_stack().await;
+    let mut c = client(&s.data_endpoint).await;
+    c.allocate_pond(req(alloc("p"), "alice")).await.unwrap();
+
+    let w: serde_json::Value = serde_json::from_str(
+        &c.write_query(req(q("p", "CREATE TABLE t(id INTEGER)"), "bob"))
+            .await
+            .unwrap()
+            .into_inner()
+            .json,
+    )
+    .unwrap();
+    assert_eq!(w["statement"], "write_query", "this must BE a write");
+    // What the caller got: `00-<trace-id>-<span-id>-<flags>`. The id is what
+    // joins; the span is this call's and deliberately is not recorded.
+    let traceparent = w["_meta"]["traceparent"]
+        .as_str()
+        .expect("a write response carries the traceparent of the span that ran it");
+    let expected = traceparent
+        .split('-')
+        .nth(1)
+        .expect("a well-formed traceparent");
+    assert_eq!(
+        expected.len(),
+        32,
+        "the trace id is 32 hex chars: {traceparent}"
+    );
+    assert_eq!(
+        w["_meta"]["trace_id"],
+        serde_json::json!(expected),
+        "the two spellings in one response must name one trace"
+    );
+
+    let r: serde_json::Value = serde_json::from_str(
+        &c.read_query(req(
+            q(
+                "p",
+                "SELECT author, commit_extra_info FROM ducklake_snapshots('p') \
+                 ORDER BY snapshot_id DESC LIMIT 1",
+            ),
+            "viewer",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .json,
+    )
+    .unwrap();
+    let row = &r["rows"][0];
+    assert_eq!(
+        row[0],
+        serde_json::json!("bob"),
+        "the snapshot read back must be the one the write above produced"
+    );
+    let extra: serde_json::Value = serde_json::from_str(
+        row[1]
+            .as_str()
+            .expect("commit_extra_info is the JSON we wrote"),
+    )
+    .unwrap();
+    assert_eq!(
+        extra["trace_id"],
+        serde_json::json!(expected),
+        "the pond's own history must carry the trace id the caller was handed: {extra}"
+    );
+}
+
+#[tokio::test]
 async fn result_encoding_carries_meta() {
     let s = start_stack().await;
     let mut c = client(&s.data_endpoint).await;

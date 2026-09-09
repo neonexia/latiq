@@ -1632,10 +1632,16 @@ impl AgentOps {
         let loc2 = loc.clone();
         let sql2 = sql.to_string();
         let identity2 = identity.clone();
+        // Captured HERE, before `spawn_blocking`: the trace scope is a
+        // task-local, and the blocking pool's thread is not in it. This is the
+        // same id `QueryMeta::trace_id`, the access record and the lineage
+        // events carry, which is the whole point — it is what joins a DuckLake
+        // snapshot's `commit_extra_info` to them.
+        let trace_id = crate::trace::current_trace_id();
         let t0 = Instant::now();
         let out = tokio::task::spawn_blocking(move || {
             let res = if write {
-                engine.write_query(&loc2, &sql2, &identity2, token)
+                engine.write_query(&loc2, &sql2, &identity2, trace_id.as_deref(), token)
             } else {
                 engine.read_query(&loc2, &sql2, token)
             };

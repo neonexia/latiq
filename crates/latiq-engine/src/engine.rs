@@ -133,11 +133,19 @@ pub trait QueryEngine: Send + Sync {
         sink: &mut dyn ArrowSink,
     ) -> Result<latiq_common::QueryMeta, EngineError>;
     /// Run a write/DDL query, transaction-wrapped with native attribution.
+    ///
+    /// `trace_id` is the calling request's ambient trace id, recorded alongside
+    /// the identity so a snapshot can be joined to that request's lineage events
+    /// and `latiq::access` records. It is passed rather than read here because
+    /// engine calls run on a blocking thread, where the ambient trace scope (a
+    /// task-local) is not visible. `None` means "no trace scope" and is recorded
+    /// as an absent key, never as a placeholder.
     fn write_query(
         &self,
         loc: &PondLocation,
         sql: &str,
         identity: &Identity,
+        trace_id: Option<&str>,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError>;
     /// Plan a query without executing it.

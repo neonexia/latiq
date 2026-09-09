@@ -40,6 +40,15 @@ The access trail is unchanged: a structured trace, no audit table, no audit RPC,
 as `product.md` describes. Lineage does not replace it and does not make it a
 store — different reader, different question.
 
+**Nor is it the commit attribution** — the third record, and the one people ask
+about first ("isn't lineage enough?"). It is not: DuckLake attribution is always
+on, lives *inside* the data so it survives copying the pond anywhere, and records
+writes only with no dataset graph; lineage is opt-in, best-effort by design, and
+carries reads, writes and the graph. **The two are joined by the trace id** —
+`commit_extra_info.trace_id` on a snapshot equals `run.facets.latiq_query.traceId`
+on the events of the request that wrote it. The full comparison and the query to
+follow it live in [`obs.md` § the two provenance records](obs.md#the-two-provenance-records-and-why-both).
+
 ---
 
 ## What shipped
