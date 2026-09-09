@@ -32,8 +32,8 @@
 //! (`Pond::lock_writer`), because an interrupt has nothing to act on there.
 use crate::abort::AbortWatcher;
 use crate::exec::{
-    annotate_schemas, in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow,
-    run_write,
+    annotate_schemas, in_read_txn, in_write_txn, referenced_tables, run_explain, run_read,
+    run_read_arrow, run_write,
 };
 use crate::instance::PondInstance;
 use latiq_common::{DatasetRef, Identity, QueryMeta};
@@ -637,6 +637,8 @@ impl QueryEngine for DuckEngine {
         alias: &str,
         params: &std::collections::BTreeMap<String, String>,
         query: &str,
+        identity: &Identity,
+        trace_id: Option<&str>,
     ) -> Result<QueryMeta, EngineError> {
         // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
         // write into the pond — must run on the writer connection, not a pooled
@@ -651,22 +653,44 @@ impl QueryEngine for DuckEngine {
         // on the pond's lineage flag like every other path, so a pond that did
         // not opt in pays nothing for the second bind.
         let mut datasets = plan_datasets(loc, &guard, query);
-        // Run the pull query (a CREATE TABLE … in the pond's default catalog),
-        // then tear the attachment down regardless of the outcome.
-        let ran = guard
-            .conn
-            .execute_batch(query)
-            // The pull query is the CALLER's SQL, so it is classified like any
-            // other caller SQL. Wrapping it as `Engine` put a mistyped table
-            // name in a pull behind "Retry; if it persists, report to your
-            // operator", and dropped DuckDB's class prefix on the way.
-            .map_err(|e| crate::errclass::classify(&e));
+        // Run the pull query (a CREATE TABLE … in the pond's default catalog)
+        // through the SAME attribution bracket as `write_query` — a pull is a
+        // write into the pond, and without this its snapshot landed with a null
+        // author and a null commit message. The ATTACH sits outside the
+        // transaction (it is session state, not catalog state) and the DETACH
+        // below runs after the bracket has closed, so the transaction never
+        // ends with the external catalog still in it.
+        let ran = in_write_txn(
+            &guard,
+            identity,
+            trace_id,
+            &loc.catalog_name,
+            "pull_catalog",
+            |i| {
+                i.conn
+                    .execute_batch(query)
+                    // The pull query is the CALLER's SQL, so it is classified
+                    // like any other caller SQL. Wrapping it as `Engine` put a
+                    // mistyped table name in a pull behind "Retry; if it
+                    // persists, report to your operator", and dropped DuckDB's
+                    // class prefix on the way.
+                    .map_err(|e| crate::errclass::classify(&e))
+            },
+        );
+        // Regardless of the outcome — including a rolled-back pull, which must
+        // still leave no attachment and no secret behind.
         teardown_catalog(&guard.conn, &plan);
-        ran?;
+        let ((), snapshot_id) = ran?;
         // The pull's own target is a pond table, and it exists now. The source
         // side is external and is skipped, exactly as an `s3://` input is.
         annotate(loc, &guard, &mut datasets);
-        let mut meta = QueryMeta::default();
+        let mut meta = QueryMeta {
+            // The snapshot this pull published, or `None` for a pull that wrote
+            // nothing — the same authoritative "did anything change?" answer
+            // `write_query` reports, read from DuckLake rather than guessed.
+            snapshot_id,
+            ..QueryMeta::default()
+        };
         apply_datasets(
             &mut meta,
             datasets.map(|(inputs, outputs)| {

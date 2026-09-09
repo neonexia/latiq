@@ -1006,7 +1006,9 @@ impl AgentOps {
                 .await;
         }
         let started = Instant::now();
-        let res = self.catalog_pull_local(&info, catalog, query, params).await;
+        let res = self
+            .catalog_pull_local(identity, &info, catalog, query, params)
+            .await;
         let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
@@ -1042,6 +1044,7 @@ impl AgentOps {
     /// emitter cannot go looking for them afterwards.
     async fn catalog_pull_local(
         &self,
+        identity: &Identity,
         info: &PondInfo,
         catalog: &str,
         query: &str,
@@ -1050,8 +1053,23 @@ impl AgentOps {
         let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
         let engine = self.engine.clone();
         let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
+        let identity = identity.clone();
+        // Captured HERE, before `spawn_blocking`, for the same reason as in
+        // `run_query`: the trace scope is a task-local and the blocking pool's
+        // thread is not in it. It is the same `current_trace_id()` that stamps
+        // `QueryMeta`, so the id in the pull's DuckLake commit and the id the
+        // caller was handed agree by construction rather than by coincidence.
+        let trace_id = crate::trace::current_trace_id();
         let meta = tokio::task::spawn_blocking(move || {
-            engine.pull_catalog(&loc, &ty, &alias, &merged, &q)
+            engine.pull_catalog(
+                &loc,
+                &ty,
+                &alias,
+                &merged,
+                &q,
+                &identity,
+                trace_id.as_deref(),
+            )
         })
         .await
         .map_err(|e| AgentError::internal(format!("join: {e}")))??;
