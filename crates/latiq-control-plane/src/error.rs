@@ -75,20 +75,57 @@ impl ControlPlaneError {
             ),
             // No node available to host the pond is an availability/precondition
             // failure, not a missing pond — so it is NOT PondNotFound (review #13).
-            ControlPlaneError::NoNodeAvailable(m) => ErrorEnvelope::new(
+            //
+            // The KIND is still `internal`, and that is an open question rather
+            // than an endorsement: nothing of ours crashed, so `internal`'s "a
+            // fault of ours" reading is not strictly true. But no shipped kind
+            // fits either — `pond_unavailable` is about a pond that EXISTS (none
+            // does here), and `capability_unavailable` is explicitly scoped to a
+            // provisioned capability and carries `latiq warm-extensions` advice
+            // that would be wrong. Its two control fields are already right for
+            // this failure (`operator` fixes it; `as_is` is honest, because a
+            // node registering a moment later makes the identical call succeed),
+            // so re-kinding it is a decision to take deliberately, not in passing.
+            //
+            // What DID change: the operator-facing instruction moved from
+            // `suggest` into `message`. An `internal` envelope carrying bespoke
+            // advice is an envelope whose four control fields disagree with its
+            // prose (see `assert_opaque_kinds_keep_canonical_guidance`), and the
+            // advice loses nothing by being prose — it was never a *next call*,
+            // which is what `suggest` is for. The old `see` pointed at
+            // `latiq://troubleshooting`, the index, which taught nothing.
+            ControlPlaneError::NoNodeAvailable(m) => ErrorEnvelope::for_kind(
                 ErrorKind::Internal,
-                format!("No pond node is available: {m}"),
-                "Ensure a pond node is registered and healthy with the control plane, then retry.",
-                "latiq://troubleshooting",
+                format!(
+                    "No pond node is available to host a pond: {m}. A pond node must be \
+                     registered and heartbeating with this control plane before one can be \
+                     created — `latiq node list` shows which are registered."
+                ),
             ),
-            // A node-lookup miss (e.g. `node describe <bad-id>`) — the node simply
-            // isn't registered; this is a not-found, not an outage.
+            // A node-lookup miss (e.g. `node describe <bad-id>`) — the node
+            // simply isn't registered; this is a not-found, not an outage.
+            //
+            // Deliberately NOT `Internal`, which it was. Nothing of ours failed:
+            // the caller named a node id that does not exist, and the fix is a
+            // different id. `internal` made the envelope contradict itself —
+            // `audience: operator` and `retryable: as_is` (re-send the identical
+            // wrong id, then wake somebody) sitting next to a `suggest` that
+            // names a call the CALLER makes to find the right one. `InvalidValue`
+            // is `agent` + `after_change`, which is what the suggest below has
+            // always described. There is no `node_not_found` kind and this does
+            // not earn one: the value is wrong and the caller corrects it, which
+            // is the whole of what `invalid_value` means.
+            //
+            // The gRPC code is unchanged (`code()` still says `NotFound`) — that
+            // is the transport's answer to "was there a record", a different
+            // question from "who fixes this".
             ControlPlaneError::NodeNotFound(n) => ErrorEnvelope::rendered_with(
-                ErrorKind::Internal,
-                "Node '{node_id}' is not registered.",
+                ErrorKind::InvalidValue,
+                "Node '{node_id}' is not registered with this control plane.",
                 facts! { "node_id" => n.as_str() },
-                "Run `latiq node list` to see registered nodes.",
-                "latiq://troubleshooting",
+                "Run `latiq node list` to see the registered nodes, then retry with an id from \
+                 that list.",
+                ErrorKind::InvalidValue.default_see(),
             ),
             ControlPlaneError::DatasetNotFound(r) => ErrorEnvelope::rendered(
                 ErrorKind::DatasetNotFound,
@@ -257,5 +294,166 @@ mod tests {
         assert_eq!(st.code(), Code::NotFound);
         let env: ErrorEnvelope = serde_json::from_slice(st.details()).unwrap();
         assert!(env.message.contains("'bad-id' is not registered"));
+    }
+
+    /// Every `ControlPlaneError`, once — the list this file's other tests
+    /// spot-check three of.
+    ///
+    /// The three `internal` defects this repo has shipped were all found by a
+    /// person, never by a guard, and the reason is structural: every existing
+    /// `error_contract_*` guard iterates `ErrorKind::ALL` and inspects the KIND
+    /// TABLE (`default_suggest`, `audience`, `retryable`). None of them looks at
+    /// a constructed envelope. But a construction site chooses its own kind and
+    /// may override `suggest`/`see`, so the entire class of bug — an envelope
+    /// whose control fields contradict its own prose — is invisible to a guard
+    /// over the taxonomy. `NodeNotFound` sat here as `internal` (`operator`,
+    /// `as_is`) beside a `suggest` naming a call the CALLER makes, and every
+    /// kind-table guard was green the whole time.
+    ///
+    /// So this drives the real `envelope()` for every variant and asserts the
+    /// coherence rules the kind table is already held to, at the layer where
+    /// they can actually be broken.
+    #[test]
+    fn error_contract_every_control_plane_error_builds_a_coherent_envelope() {
+        use latiq_common::{Audience, Retryable};
+
+        let cases = [
+            ControlPlaneError::NameConflict("taken".into()),
+            ControlPlaneError::PondNotFound("ridex".into()),
+            ControlPlaneError::NodeNotFound("bad-id".into()),
+            ControlPlaneError::NoNodeAvailable("no active nodes".into()),
+            ControlPlaneError::DatasetNotFound("tpch".into()),
+            ControlPlaneError::CatalogNotFound("lake".into()),
+            ControlPlaneError::PondStillOwned {
+                pond: "p1".into(),
+                node_id: "n1".into(),
+            },
+            ControlPlaneError::AllocationNotMaterialized {
+                name: "p1".into(),
+                owner: "http://n1:7002".into(),
+                cause: "connect error".into(),
+                compensated: true,
+            },
+            ControlPlaneError::AllocationNotMaterialized {
+                name: "p1".into(),
+                owner: "http://n1:7002".into(),
+                cause: "connect error".into(),
+                compensated: false,
+            },
+            ControlPlaneError::Invalid("tier 'huge' is not one of small/medium/large".into()),
+            ControlPlaneError::Storage("disk full".into()),
+        ];
+        // Anti-vacuity: every variant is driven (both `compensated` shapes,
+        // because they build different envelopes). A variant added without a
+        // guidance decision fails here rather than shipping.
+        assert_eq!(cases.len(), 11, "a ControlPlaneError variant is undriven");
+
+        let mut operator = 0;
+        let mut agent = 0;
+        for e in cases {
+            let label = format!("{e:?}");
+            let env = e.envelope();
+
+            // 1. `audience` must agree with the advice actually attached to THIS
+            //    envelope — not with the advice its kind would have defaulted to.
+            match env.audience {
+                Audience::Operator => {
+                    operator += 1;
+                    assert!(
+                        env.suggest.contains("operator"),
+                        "{label}: nobody the caller can reach fixes this, so the advice must \
+                         name who does: {}",
+                        env.suggest
+                    );
+                }
+                Audience::Agent => {
+                    agent += 1;
+                    assert!(
+                        !env.suggest.starts_with("Retry; if it persists"),
+                        "{label}: this is the caller's to fix, so the advice must not be the \
+                         operator hand-off: {}",
+                        env.suggest
+                    );
+                }
+            }
+
+            // 2. An unclassified failure may not carry classified advice. This is
+            //    the funnel invariant (`latiq-common`'s
+            //    `assert_opaque_kinds_keep_canonical_guidance`) restated where a
+            //    reader of this file will meet it: `internal` means we do not
+            //    know, and a site that knows the next step has classified the
+            //    failure and owes it a kind.
+            if env.kind == ErrorKind::Internal {
+                assert_eq!(
+                    env.suggest,
+                    ErrorKind::Internal.default_suggest(),
+                    "{label}"
+                );
+                assert_eq!(env.retryable, Retryable::AsIs, "{label}");
+                assert_eq!(env.audience, Audience::Operator, "{label}");
+            }
+
+            // 3. `see` must teach about THIS failure. `latiq://troubleshooting`
+            //    is the index: it resolves, so a "does the resource exist" guard
+            //    stays green while the reader lands on a menu of other agents'
+            //    problems. Both former `internal` envelopes here pointed at it.
+            assert!(env.see.starts_with("latiq://"), "{label}: {}", env.see);
+            assert_ne!(
+                env.see, "latiq://troubleshooting",
+                "{label}: the index is not a page about this failure"
+            );
+
+            // 4. An actionable with nothing to read or no next call is not one.
+            assert!(
+                !env.message.is_empty() && !env.suggest.is_empty(),
+                "{label}"
+            );
+            for text in [&env.message, &env.suggest] {
+                assert!(
+                    !text.contains('{'),
+                    "{label}: an unresolved placeholder reached the caller: {text}"
+                );
+            }
+        }
+        // Anti-vacuity for the branch counters: both arms ran, so neither
+        // assertion above passed by never being reached.
+        assert_eq!(operator, 4, "NoNodeAvailable, Storage, both AllocationNot…");
+        assert_eq!(agent, 7);
+    }
+
+    /// Regression pin for the audit. `NodeNotFound` is a node id the caller got
+    /// wrong; it is not a fault of ours, and every control field now says so.
+    ///
+    /// It shipped as `internal`: `audience: operator` (nobody for the caller to
+    /// reach), `retryable: as_is` (re-send the identical wrong id) — next to a
+    /// `suggest` telling the caller to go and look the right one up. Three
+    /// fields saying stop, one saying carry on.
+    #[test]
+    fn error_contract_an_unknown_node_id_is_the_callers_to_correct() {
+        use latiq_common::{Audience, Retryable};
+        let env = ControlPlaneError::NodeNotFound("bad-id".into()).envelope();
+        assert_eq!(env.kind, ErrorKind::InvalidValue);
+        assert_eq!(env.audience, Audience::Agent);
+        assert_eq!(
+            env.retryable,
+            Retryable::AfterChange,
+            "the id is what was wrong, so the same call with a different one is the fix"
+        );
+        assert!(
+            env.suggest.contains("latiq node list"),
+            "and the advice must name how to find a real one: {}",
+            env.suggest
+        );
+        // The id rides as a VALUE, not only inside the sentence.
+        assert_eq!(
+            env.facts.get("node_id"),
+            Some(&latiq_common::Fact::Text("bad-id".into()))
+        );
+        // The transport's answer is unchanged: "was there a record" is a
+        // different question from "who fixes this".
+        assert_eq!(
+            to_status(ControlPlaneError::NodeNotFound("bad-id".into())).code(),
+            Code::NotFound
+        );
     }
 }

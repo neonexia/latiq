@@ -780,12 +780,32 @@ fn attach_catalog_inner(
             )
         })?;
     }
+    // Both of the remaining statements are built from the CALLER's catalog
+    // parameters — the endpoint, the warehouse, the credentials registered with
+    // `latiq catalog add` — so a failure in one is usually the caller's address
+    // or the far side being down, not a fault of ours. Wrapping them in
+    // `EngineError::Engine` put every mistyped REST URL and every unreachable
+    // warehouse into `internal` + "Retry; if it persists, report to your
+    // operator", with DuckDB's own `HTTP Error: … (404)` inside the message —
+    // the exact tell of Nexus finding 8.
+    //
+    // `classify` reads DuckDB's error CLASS, so an `IO`/`HTTP Error` becomes
+    // `source_unavailable` ("check the path or URL … it must be reachable from
+    // the node"), which is the true next move. Nothing is lost by doing this:
+    // `classify`'s catch-all is `EngineError::Engine`, so a class we do not
+    // recognise still reaches the caller as `internal`, exactly as before.
+    //
+    // Note this is the EXTERNAL catalog's attach, not the pond's own
+    // (`instance::PondInstance::open`). That one stays unclassified on purpose:
+    // its path is ours, not the caller's, and `source_unavailable`'s advice
+    // ("check the path or URL in the statement") names a statement the caller
+    // never wrote.
     for (_, sql) in &plan.secrets {
         conn.execute_batch(sql)
-            .map_err(|e| EngineError::Engine(format!("catalog secret: {e}")))?;
+            .map_err(|e| crate::errclass::classify(&e))?;
     }
     conn.execute_batch(&plan.attach)
-        .map_err(|e| EngineError::Engine(format!("attach: {e}")))?;
+        .map_err(|e| crate::errclass::classify(&e))?;
     Ok(())
 }
 
@@ -838,6 +858,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0, "secret must not survive a failed attach");
+    }
+
+    /// Regression pin for the `internal` audit: the EXTERNAL catalog's attach
+    /// is built from the caller's own parameters, so its failure is classified
+    /// like any other caller-facing engine error rather than swallowed.
+    ///
+    /// It used to be `EngineError::Engine(format!("attach: {e}"))` → `internal`
+    /// → `audience: operator`, `retryable: as_is`, "Retry; if it persists,
+    /// report to your operator" — with DuckDB's own `IO Error:` sentence inside
+    /// the message. That is the tell of Nexus finding 8 exactly: a mistyped REST
+    /// URL or an unreachable warehouse in a catalog the caller registered,
+    /// answered by telling an agent to keep re-sending it and then to wake
+    /// somebody who cannot fix a typo.
+    ///
+    /// Driven against the real engine on a real unreachable path — not a
+    /// fabricated `EngineError`, which is how a mapping stays green while the
+    /// production site produces something else entirely.
+    #[test]
+    fn error_contract_a_bad_external_catalog_address_is_not_our_failure() {
+        let fs = TempFs::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        let inst = PondInstance::open(&loc).unwrap();
+        let plan = crate::attachers::AttachPlan {
+            alias: "badaddr".into(),
+            namespace: "ducklake:/nonexistent_dir_xyz/meta.duckdb".into(),
+            load: vec![],
+            secrets: vec![],
+            attach: "ATTACH 'ducklake:/nonexistent_dir_xyz/meta.duckdb' AS badaddr \
+                     (DATA_PATH '/nonexistent_dir_xyz/data')"
+                .into(),
+        };
+        let Err(err) = attach_catalog(&inst.conn, &plan) else {
+            panic!("an attach under a non-existent directory must fail");
+        };
+        // The address is the caller's, so the failure is the caller's to act on.
+        // `Engine` here is the whole bug: it is the ONE variant that becomes
+        // `internal`.
+        let EngineError::SourceIo(msg) = &err else {
+            panic!(
+                "a catalog address that cannot be reached must be classified as a source \
+                 failure, not swallowed into the `internal` catch-all: {err:?}"
+            );
+        };
+        // And DuckDB's own words survive, unprefixed — the message is the most
+        // useful part for someone fixing an address.
+        assert!(
+            msg.contains("IO Error"),
+            "the engine's own sentence must reach the caller: {msg}"
+        );
     }
 
     #[test]

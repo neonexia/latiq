@@ -67,8 +67,23 @@ fn esc(v: &str) -> String {
     v.replace('\'', "''")
 }
 
-fn err(msg: impl Into<String>) -> EngineError {
-    EngineError::Engine(msg.into())
+/// A required catalog parameter the caller did not supply.
+///
+/// Every message passed here already NAMES the parameter and how to supply it
+/// (`--set endpoint=<rest-url>`), which is precisely why `EngineError::Engine`
+/// was the wrong home for it: that maps to `internal`, whose advice is "Retry;
+/// if it persists, report to your operator" — an identical retry that can never
+/// succeed, then an escalation to somebody with nothing to fix, for a mistake
+/// the caller is already holding the fix to. Nothing has reached DuckDB at this
+/// point; the plan was never built.
+fn missing(msg: impl Into<String>) -> EngineError {
+    EngineError::MissingParameter(msg.into())
+}
+
+/// A catalog parameter whose VALUE is not one we offer. Same reasoning as
+/// [`missing`]; a different edit, so a different kind.
+fn unsupported(msg: impl Into<String>) -> EngineError {
+    EngineError::UnsupportedParameter(msg.into())
 }
 
 /// Build the attach plan for a catalog `type_`, mounting it as `alias`, from the
@@ -89,7 +104,7 @@ pub fn plan(
     match type_ {
         "iceberg" => iceberg(alias, params, load),
         "ducklake" => ducklake(alias, params, load),
-        other => Err(err(format!(
+        other => Err(unsupported(format!(
             "unsupported catalog type '{other}' (supported: iceberg, ducklake)"
         ))),
     }
@@ -106,11 +121,11 @@ fn ducklake(
     let metadata = params
         .get("metadata_path")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| err("ducklake catalog requires --set metadata_path=<catalog-db>"))?;
+        .ok_or_else(|| missing("ducklake catalog requires --set metadata_path=<catalog-db>"))?;
     let data_path = params
         .get("data_path")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| err("ducklake catalog requires --set data_path=<data-dir-or-s3-uri>"))?;
+        .ok_or_else(|| missing("ducklake catalog requires --set data_path=<data-dir-or-s3-uri>"))?;
     let mut secrets: Vec<(String, String)> = Vec::new();
     if let Some(line) = s3_secret_line(alias, params) {
         secrets.push(line);
@@ -181,7 +196,7 @@ fn iceberg(
     let endpoint = params
         .get("endpoint")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| err("iceberg catalog requires --set endpoint=<rest-url>"))?;
+        .ok_or_else(|| missing("iceberg catalog requires --set endpoint=<rest-url>"))?;
     let warehouse = params
         .get("warehouse")
         .map(|s| s.as_str())
@@ -465,9 +480,87 @@ mod tests {
         );
     }
 
+    /// Regression pin for the `internal` audit, and Nexus finding 8's shape at
+    /// a second site.
+    ///
+    /// Every one of these came back as `EngineError::Engine` → `internal` →
+    /// `audience: operator`, `retryable: as_is`, "Retry; if it persists, report
+    /// to your operator" — while the message it carried said, verbatim,
+    /// *"requires --set endpoint=<rest-url>"*. The caller was handed the fix and
+    /// told to re-send the identical call instead, then to wake an operator who
+    /// had nothing to look at: no SQL had run, no node was unwell, the plan was
+    /// never built.
+    ///
+    /// This replaces a pair of bare `is_err()` assertions (tests/CLAUDE.md rule
+    /// 2) which passed throughout — they proved only that *something* failed,
+    /// which was never in doubt, and said nothing about what the caller was told.
     #[test]
-    fn missing_endpoint_errors_and_unknown_type_errors() {
-        assert!(plan("iceberg", "x", &params(&[])).is_err());
-        assert!(plan("snowflake", "x", &params(&[("endpoint", "y")])).is_err());
+    fn error_contract_a_missing_catalog_parameter_is_the_callers_to_supply() {
+        /// (catalog type, the params supplied, why this case is here).
+        type Case = (
+            &'static str,
+            &'static [(&'static str, &'static str)],
+            &'static str,
+        );
+        // Driven through the real `plan`, never fabricated: a fabricated
+        // `EngineError` asserts our mapping and would have stayed green while
+        // these sites produced `Engine`.
+        let cases: &[Case] = &[
+            ("iceberg", &[], "no endpoint at all"),
+            (
+                "iceberg",
+                &[("endpoint", "")],
+                "an EMPTY endpoint is 'not supplied', not a value to attach to",
+            ),
+            ("ducklake", &[("data_path", "/tmp/d")], "no metadata_path"),
+            (
+                "ducklake",
+                &[("metadata_path", "/tmp/c.db")],
+                "no data_path",
+            ),
+        ];
+        for (type_, p, why) in cases {
+            let Err(err) = plan(type_, "x", &params(p)) else {
+                panic!("{type_} must refuse: {why}");
+            };
+            let EngineError::MissingParameter(msg) = &err else {
+                panic!("{type_} ({why}) must be a missing parameter, got {err:?}");
+            };
+            // The message has to NAME what to supply, since the kind's own
+            // advice is only "Provide the required argument and retry."
+            assert!(
+                msg.contains("--set"),
+                "{type_} ({why}): the message is the whole instruction here: {msg}"
+            );
+        }
+        assert_eq!(cases.len(), 4, "every missing-parameter path was driven");
     }
+
+    /// The sibling edit: the value is present and is not one of the choices.
+    /// A different kind because it is a different fix — and, per invariant
+    /// 13(b), the refusal names the legal set rather than silently defaulting.
+    #[test]
+    fn error_contract_an_unknown_catalog_type_names_the_supported_set() {
+        let Err(err) = plan("snowflake", "x", &params(&[("endpoint", "y")])) else {
+            panic!("an unsupported catalog type must be refused");
+        };
+        let EngineError::UnsupportedParameter(msg) = &err else {
+            panic!("an unknown type is the caller's value to fix, got {err:?}");
+        };
+        assert!(msg.contains("snowflake"), "{msg}");
+        for supported in latiq_common::catalog::TYPES {
+            assert!(
+                msg.contains(supported.name),
+                "the refusal must name the legal set, and '{}' is missing: {msg}",
+                supported.name
+            );
+        }
+    }
+
+    // The envelope an agent finally receives for both of these — kind,
+    // audience, retryable and suggest — is asserted where the mapping lives, in
+    // `latiq-agent-core`'s
+    // `error_contract_every_engine_error_maps_to_a_kind_the_caller_can_act_on`.
+    // Re-driving it here would mean a dependency on the core purely to re-prove
+    // a table it already drives exhaustively (tests/CLAUDE.md rule 1).
 }
