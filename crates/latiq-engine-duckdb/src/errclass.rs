@@ -215,6 +215,10 @@ mod tests {
             EngineError::InvalidInput(_) => "InvalidInput",
             EngineError::TransactionControl(_) => "TransactionControl",
             EngineError::Engine(_) => "Engine",
+            // Never produced by `class_of`: a cache miss is raised at the LOAD
+            // site (`instance::extension_not_cached`), which knows which
+            // extension it asked for — DuckDB's message class does not.
+            EngineError::CapabilityUnavailable { .. } => "CapabilityUnavailable",
             EngineError::ReadOnlyViolation => "ReadOnlyViolation",
             EngineError::Cancelled => "Cancelled",
             EngineError::Timeout => "Timeout",

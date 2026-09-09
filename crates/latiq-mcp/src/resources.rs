@@ -123,8 +123,9 @@ Every failed call returns one envelope, and it carries **machine-readable fields
 - `retryable: as_is` — send the same call again, unchanged. The failure was timing, capacity or the world, not your request. Once; a second identical failure is not transient.\n\
 - `retryable: after_change` — the arguments are what failed. `suggest` says what to change. Do not re-send it unchanged.\n\
 - `retryable: never` — **this call** cannot be made to work, however you edit its arguments. That does NOT mean your goal is blocked: `suggest` names the different call that is the move. A write sent to read_query is `never` there and belongs in **write_query** — switch calls, don't abandon the task. Only when `audience` is `operator` is there nothing for you to do.\n\
+- `retryable: after_provisioning` — **your request was correct; this deployment is missing a capability it needs.** Nothing you can send fixes that, so do not retry and do not rewrite the call. Tell whoever is orchestrating you — the human in the loop, or the agent that dispatched you, which may be able to install it — what is missing: it is in `facts.capability`. Then stop, and re-send this call only once you are told the capability exists. Carry on with anything that does not depend on it in the meantime.\n\
 - `audience: agent` — yours to fix, from a call you can make.\n\
-- `audience: operator` — nothing you can call resolves it. Report it and stop; retrying only adds load to a deployment already unwell.\n\
+- `audience: operator` — nothing you can call resolves it. Report it and stop; retrying only adds load to a deployment already unwell. \"Operator\" is whoever runs this deployment: a human in the loop, or a higher-privilege agent orchestrating you. Surfacing it clearly IS your move here.\n\
 - `facts` — the numbers and names behind the sentence, **as values**. Branch on `facts.cap`; never parse a number out of `message`. A message we did not compose (an engine's own text) carries no facts rather than invented ones.\n\
 - `trace_id` / `traceparent` — the id of your own failed request. Quote it when you report anything; it is what joins your transcript to the node logs.\n\
 And the three you already read: `kind` (what went wrong — a closed set, classified by the failure, never by which call raised it), `message` (one sentence) and `see` (a latiq:// resource about that kind). Start at latiq://troubleshooting.",
@@ -279,7 +280,7 @@ A **dataset** is a curated file this deployment already knows how to fetch — y
         desc: "Problem-keyed recovery guides",
         static_body: "# Troubleshooting\n\n\
 Every page here is keyed by the `kind` on the error envelope you received — match the kind, don't browse.\n\n\
-**Before you pick a page, read the envelope's machine-readable fields** — they are authoritative over the prose and usually decide the next move on their own: `retryable` (`as_is` = re-send unchanged, `after_change` = fix the arguments first, `never` = this call cannot work and `suggest` names the different call that can), `audience` (`operator` = report it and stop) and `facts` (branch on the values; don't parse numbers out of `message`). The full contract is in latiq://guidance.\n\n\
+**Before you pick a page, read the envelope's machine-readable fields** — they are authoritative over the prose and usually decide the next move on their own: `retryable` (`as_is` = re-send unchanged, `after_change` = fix the arguments first, `never` = this call cannot work and `suggest` names the different call that can, `after_provisioning` = the call is right and the deployment is missing something, so escalate and stop), `audience` (`operator` = report it and stop) and `facts` (branch on the values; don't parse numbers out of `message`). The full contract is in latiq://guidance.\n\n\
 - latiq://troubleshooting/pond-not-found — `pond_not_found`: the pond id/name doesn't resolve.\n\
 - latiq://troubleshooting/pond-unavailable — `pond_unavailable`: the pond exists but no node is serving it, or allocate_pond could not create one on the node it was assigned to.\n\
 - latiq://troubleshooting/catalog-error — `catalog_error`: a table/column/function in your SQL doesn't exist, or already does.\n\
@@ -287,6 +288,7 @@ Every page here is keyed by the `kind` on the error envelope you received — ma
 - latiq://troubleshooting/large-results — `result_cap_exceeded`: results exceeded the inline cap.\n\
 - latiq://troubleshooting/timeouts — `query_timeout` and `query_cancelled`: a query was stopped before it finished.\n\
 - latiq://troubleshooting/unauthenticated — `unauthenticated`: your token was missing, expired or rejected.\n\
+- latiq://troubleshooting/capability-unavailable — `capability_unavailable`: your call was fine; this deployment has not installed something it needs.\n\
 - latiq://troubleshooting/internal — `internal` and `storage`: Latiq itself failed. Nothing in your SQL fixes it.\n\
 - latiq://troubleshooting/conflicts — concurrent writes conflicted. No error kind: Latiq retries these for you.\n\
 - latiq://troubleshooting/read-only-violation — `read_only_violation`: a write was sent to read_query.",
@@ -403,6 +405,27 @@ This deployment verifies callers, and your request did not carry a token it acce
 2. **Check the audience.** A token minted for another service is rejected here even when it is perfectly valid. `/.well-known/oauth-protected-resource` on this server names the issuers and the resource identifier this deployment accepts.\n\
 3. **Do not retry the same token in a loop.** Nothing about it changes between attempts, and a repeated rejection is worth reporting once, not fifty times.\n\n\
 If you were working without a token until now, the deployment has an issuer configured and relaxed identity does not apply here — that is a deployment's choice and an operator's to change, not yours.",
+    },
+    Res {
+        // The page `capability_unavailable` lands on. It exists because the
+        // envelope's advice has to be RELAYED rather than acted on, and an
+        // agent that has never been told that will either loop or give up on
+        // the whole task — the two failures `retryable: after_provisioning`
+        // was added to prevent.
+        generated: None,
+        uri: "latiq://troubleshooting/capability-unavailable",
+        name: "Troubleshooting: capability unavailable",
+        desc: "Your call was correct; this deployment is missing something it needs",
+        static_body: "# Capability unavailable (`capability_unavailable`)\n\n\
+**You did nothing wrong.** The call is well-formed, the pond is fine, and the SQL is fine. This deployment has simply not installed a capability the call needs — today that is always a DuckDB extension that is not in the node's cache. Nodes never download an extension while serving a request (an unbounded wait on an external host, and impossible where there is no egress), so a missing one fails immediately instead of hanging.\n\n\
+The envelope says exactly this in fields you can branch on: `audience: operator` and **`retryable: after_provisioning`** — a value that appears on no other kind. `facts.capability` names the missing extension.\n\n\
+## What to do\n\n\
+1. **Do not retry, and do not rewrite the call.** Neither changes anything: the same call will fail identically until somebody installs the capability, and there is nothing wrong with the call to correct.\n\
+2. **Report it upwards, and say what is missing.** Quote `facts.capability` and the `trace_id`. Your \"operator\" is whoever runs this deployment — a human in the loop, or the higher-privilege agent that dispatched you, which may be able to install it and re-dispatch. Surfacing it precisely IS your move; there is no approval channel for you to wait on, so do not block.\n\
+3. **Keep working on what does not need it.** A pond without that extension still reads CSV, Parquet and JSON, and every other tool still works. Report the blocked sub-goal; don't abandon the task.\n\
+4. **Re-send the same call, unchanged, only when you are told the capability is there.** That is the whole meaning of `after_provisioning`.\n\n\
+**What an operator does:** `latiq warm-extensions` on the node, with network access, then restart it (the container image bakes the same step in at build time). `latiq://dialect` lists what a deployment ships and which extensions must be asked for at allocate_pond — those are fixed for a pond's life, so a pond that never requested one cannot gain it later; a new pond with `extensions: [...]` is the way, once the node has it cached.\n\n\
+Not to be confused with `unsupported_feature` (the engine will NEVER have it — delete the clause), `internal`/`storage` (something of Latiq's broke) or `source_unavailable` (an address in your SQL could not be read).",
     },
     Res {
         // `internal` + `storage`: the two envelopes an agent can do least
@@ -673,7 +696,7 @@ mod tests {
         // shrink to nothing (or to the kinds that happen to pass).
         assert_eq!(
             ALL_KINDS.len(),
-            18,
+            19,
             "a kind was added or removed — add it to ALL_KINDS, with a `see` that resolves"
         );
         for kind in ALL_KINDS {
@@ -827,8 +850,105 @@ mod tests {
         }
 
         // Anti-vacuity: both loops ran over the whole enum.
-        assert_eq!(Retryable::ALL.len(), 3);
+        assert_eq!(Retryable::ALL.len(), 4);
         assert_eq!(Audience::ALL.len(), 2);
+    }
+
+    /// **The wording of `after_provisioning` is the feature.** The value only
+    /// works if an agent that receives it does three things: stops retrying,
+    /// tells whoever is orchestrating it, and does not treat the whole task as
+    /// blocked. So the guidance is asserted for each of them, not merely for the
+    /// literal value (which the drift guard above already covers).
+    ///
+    /// The failure this prevents is the mirror of audit finding 2: `never` read
+    /// as "give up", and a fourth value nobody explains reads as "give up"
+    /// twice over — or, worse, as `as_is`, which is the retry loop the field
+    /// exists to stop.
+    #[test]
+    fn error_contract_guidance_teaches_after_provisioning_as_escalate_and_stop() {
+        let guidance = body_of("latiq://guidance");
+        let bullet = guidance
+            .split("- `retryable: after_provisioning`")
+            .nth(1)
+            .expect("guidance must document the value")
+            .split("\n- ")
+            .next()
+            .expect("a bullet");
+        for (needle, why) in [
+            (
+                "correct",
+                "it must say the CALL was right, or it reads as the agent's mistake",
+            ),
+            (
+                "do not retry",
+                "the retry loop is the failure mode this value exists to stop",
+            ),
+            (
+                "orchestrating you",
+                "the escalation target is a human OR a higher-privilege agent — an agent \
+                 that thinks only humans can act will simply stop",
+            ),
+            (
+                "facts.capability",
+                "what is missing must be relayed as a VALUE, not paraphrased out of prose",
+            ),
+            (
+                "once you are told",
+                "the re-send condition has to be named, or the value collapses into `never`",
+            ),
+        ] {
+            assert!(
+                bullet.to_lowercase().contains(&needle.to_lowercase()),
+                "latiq://guidance's `after_provisioning` bullet is missing {needle:?} — {why}: \
+                 {bullet}"
+            );
+        }
+        // And `audience: operator` must not read as "find a human": the same
+        // orchestrating agent is often the one that can act.
+        let operator = guidance
+            .split("- `audience: operator`")
+            .nth(1)
+            .expect("documented")
+            .split("\n- ")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            operator.contains("agent orchestrating you"),
+            "`operator` must name the orchestrating agent as well as the human: {operator}"
+        );
+    }
+
+    /// A `see` that resolves is not a `see` that helps (the general guard next
+    /// door proves the body names its kind; this proves the body carries the
+    /// ACTIONS for the one kind whose action is "relay this and stop").
+    #[test]
+    fn error_contract_the_capability_page_says_escalate_not_retry() {
+        let kind = ErrorKind::CapabilityUnavailable;
+        let body = body_of(kind.default_see());
+        for phrase in [
+            kind.as_str(),
+            "after_provisioning",
+            "facts.capability",
+            "Do not retry",
+            // The operator's actual command, so the agent can relay something
+            // the operator can run rather than "install the extension".
+            "latiq warm-extensions",
+            // …and the half an agent gets wrong in the other direction.
+            "don't abandon the task",
+        ] {
+            assert!(
+                body.contains(phrase),
+                "latiq://troubleshooting/capability-unavailable is missing {phrase:?}"
+            );
+        }
+        // The kind's own `suggest` must agree with the page it points at: same
+        // action, same command, no retry.
+        let suggest = kind.default_suggest();
+        assert!(
+            suggest.contains("latiq warm-extensions")
+                && !suggest.to_lowercase().starts_with("retry"),
+            "{suggest}"
+        );
     }
 
     /// The two kinds added for the classification fix point at resources
@@ -1103,6 +1223,7 @@ mod tests {
         ErrorKind::ResultCapExceeded,
         ErrorKind::ReadOnlyViolation,
         ErrorKind::UnsupportedFeature,
+        ErrorKind::CapabilityUnavailable,
         ErrorKind::QueryTimeout,
         ErrorKind::QueryCancelled,
         ErrorKind::Unauthenticated,

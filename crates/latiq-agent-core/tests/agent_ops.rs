@@ -492,6 +492,70 @@ async fn error_contract_the_nexus_primary_key_statement_is_agent_fixable() {
     .expect("dropping the unsupported clause is the whole fix");
 }
 
+/// **The fourth `retryable` value, on the real condition that raises it.**
+///
+/// A pond opens with the extensions it was allocated with, LOADed from the
+/// node's cache with autoinstall off (#120/#121 — nothing downloads on a request
+/// path). When one is not cached, the call is CORRECT and the deployment is
+/// incomplete: the only failure in the system where that is true. It shipped as
+/// `internal` + `retryable: as_is` — "Retry; if it persists, report to your
+/// operator" — which is a loop on a call that cannot succeed until somebody
+/// installs an extension, plus the escalation that was the entire answer.
+///
+/// Driven through the ENGINE opening a real pond, not by fabricating an error
+/// value: a kind nobody can reach is not a feature. The extension name is one no
+/// cache can hold, which is the same cache miss a real `spatial` would be on a
+/// node whose warm never ran — `PondInstance::open` cannot tell the two apart,
+/// because autoinstall is off for both.
+#[tokio::test]
+async fn error_contract_an_uncached_extension_tells_the_agent_to_escalate_not_retry() {
+    use latiq_agent_core::AgentError;
+    use latiq_common::{Audience, Fact, PondId, Retryable};
+    use latiq_engine::QueryEngine;
+    use latiq_storage::PondStorage;
+
+    let fs = TempFs::new();
+    let mut loc = fs.create_pond(PondId::new(), false).unwrap();
+    loc.extensions = vec!["definitely_not_an_extension_xyz".to_string()];
+    let engine_err = DuckEngine::new()
+        .init_pond(&loc)
+        .expect_err("a pond cannot open with an extension the node has never cached");
+    let env = AgentError::from(engine_err).into_envelope();
+
+    assert_eq!(env.kind, latiq_common::ErrorKind::CapabilityUnavailable); // was `internal`
+    assert_eq!(env.audience, Audience::Operator);
+    assert_eq!(env.retryable, Retryable::AfterProvisioning); // was `as_is`
+    assert_eq!(
+        env.facts.get("capability"),
+        Some(&Fact::Text("definitely_not_an_extension_xyz".into())),
+        "the missing capability must be a value to relay, not a phrase to parse: {:?}",
+        env.facts
+    );
+    // The advice must be the escalation and the operator's actual command —
+    // never the retry, which is what `internal` used to say here.
+    assert!(
+        !env.suggest.to_lowercase().starts_with("retry"),
+        "{}",
+        env.suggest
+    );
+    for needle in ["operator", "latiq warm-extensions", "facts.capability"] {
+        assert!(
+            env.suggest.contains(needle),
+            "the advice must name the actor, the action and what to relay — no {needle:?} in: {}",
+            env.suggest
+        );
+    }
+    // And the sentence still names the extension, so a human reading the
+    // transcript sees it without opening `facts`.
+    assert!(
+        env.message.contains("definitely_not_an_extension_xyz")
+            && env.message.contains("not cached on this node"),
+        "{}",
+        env.message
+    );
+    assert_eq!(env.see, "latiq://troubleshooting/capability-unavailable");
+}
+
 #[tokio::test]
 async fn read_arrow_streams_rows_locally() {
     use tokio_stream::StreamExt;

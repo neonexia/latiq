@@ -234,17 +234,32 @@ pub fn warm_extension_cache(extension_directory: Option<&Path>) -> WarmReport {
 /// (`latiq warm-extensions`), while a `pip install latiq` node warms them at
 /// startup and cannot if that first start had no network.
 ///
-/// (The `kind` this maps to is still `internal`, so the envelope's `retryable`
-/// says `as_is` — advice that can never work for an operator-only fix. Fixing
-/// that needs a new `ErrorKind`; until then the message carries the whole
-/// burden, which is why it is one string shared by every site.)
-pub fn extension_not_cached(what: &str, err: &dyn std::fmt::Display) -> EngineError {
-    EngineError::Engine(format!(
-        "{what} is not cached on this node, and nothing the caller sends changes this — \
-         extension downloads are disabled while serving requests. An operator restores it by \
-         running `latiq warm-extensions` on the node with network access (the container image \
-         bakes the same step in at build time), then restarting the node. Underlying error: {err}"
-    ))
+/// It is [`EngineError::CapabilityUnavailable`], which reaches an agent as
+/// `capability_unavailable` / `audience: operator` / `retryable:
+/// after_provisioning`. It used to be `Engine` → `internal` → `as_is`, telling
+/// the caller to retry a call that cannot succeed until somebody installs the
+/// extension, and then to report it — the exact anti-pattern the `retryable`
+/// field exists to prevent.
+///
+/// `extension` is the missing extension, on its own, so it can ride the envelope
+/// as `facts.capability`; `context` is what this LOAD was for (the required set,
+/// a pond's request, a catalog type). Both halves of the sentence and the
+/// published value come from the one `extension` argument, so they cannot drift.
+pub fn extension_not_cached(
+    extension: &str,
+    context: &str,
+    err: &dyn std::fmt::Display,
+) -> EngineError {
+    EngineError::CapabilityUnavailable {
+        message: format!(
+            "The DuckDB extension '{extension}' ({context}) is not cached on this node, and \
+             nothing the caller sends changes this — extension downloads are disabled while \
+             serving requests. An operator restores it by running `latiq warm-extensions` on the \
+             node with network access (the container image bakes the same step in at build time), \
+             then restarting the node. Underlying error: {err}"
+        ),
+        capability: extension.to_string(),
+    }
 }
 
 /// One pond's open DuckDB database, with its DuckLake catalog attached and its
@@ -291,8 +306,9 @@ impl PondInstance {
         // startup; the bootstrap for a fresh process that never made one).
         ensure_standard_extensions()?;
         for ext in STANDARD_LOAD {
-            conn.execute_batch(&format!("LOAD {ext};"))
-                .map_err(|e| extension_not_cached(&format!("required extension '{ext}'"), &e))?;
+            conn.execute_batch(&format!("LOAD {ext};")).map_err(|e| {
+                extension_not_cached(ext, "required by every pond on this node", &e)
+            })?;
         }
         // Pin the session timezone. With icu loaded, DuckDB otherwise defaults the
         // TimeZone setting to the HOST OS zone, making TIMESTAMPTZ rendering and
@@ -311,7 +327,7 @@ impl PondInstance {
         // the autoinstall-off setting applied above.
         for ext in &loc.extensions {
             conn.execute_batch(&format!("LOAD {ext};")).map_err(|e| {
-                extension_not_cached(&format!("the pond requested extension '{ext}', which"), &e)
+                extension_not_cached(ext, "requested by this pond at allocation", &e)
             })?;
         }
         // ATTACH the pond's DuckLake catalog under the pond's name, so callers
@@ -592,6 +608,22 @@ mod tests {
             Ok(_) => panic!("expected open to fail for a missing extension"),
             Err(e) => e,
         };
+        // The CLASSIFICATION, not just the prose: this is the variant that
+        // reaches an agent as `capability_unavailable` / `after_provisioning`.
+        // It was `Engine` — i.e. `internal` + "retry, then report to your
+        // operator" — which asks the caller to repeat a call that cannot
+        // succeed until somebody installs the extension.
+        let capability = match &err {
+            EngineError::CapabilityUnavailable { capability, .. } => capability.clone(),
+            other => panic!(
+                "a cache miss must be CapabilityUnavailable, not {other:?} — the kind is what \
+                 decides whether the agent retries or escalates"
+            ),
+        };
+        // The missing extension travels as a VALUE, so a client (or an
+        // orchestrating agent that can install it) branches on it instead of
+        // parsing the sentence.
+        assert_eq!(capability, "definitely_not_an_extension_xyz");
         // An operator, not the caller, is the only one who can fix this — so the
         // message must name the extension, say it is the NODE's cache that is
         // missing it, and name the command that fixes it. A bare DuckDB

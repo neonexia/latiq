@@ -73,6 +73,23 @@ pub enum EngineError {
         message: String,
         feature: Option<String>,
     },
+    /// The statement (or the pond, or the catalog attach) needs a capability
+    /// this DEPLOYMENT has not provisioned — today, a DuckDB extension that is
+    /// not in the node's cache, with downloads disabled on every request path.
+    ///
+    /// Its own variant because no other one's advice is true here: nothing of
+    /// ours crashed (`Engine` → `internal` → "retry, then wake a human" is
+    /// advice to repeat a call that cannot succeed), nothing about the call is
+    /// wrong (so it is not `Unsupported`, whose fix is deleting a clause), and
+    /// the pond's own files are fine. The caller cannot fix it and must not
+    /// loop; an operator installs the capability.
+    ///
+    /// `capability` is the missing thing, NAMED — the extension, not a sentence
+    /// about it — so a client branches on the value. It and `message` are built
+    /// from one argument at one site (`instance::extension_not_cached`), so the
+    /// prose and the value cannot disagree.
+    #[error("capability unavailable: {message}")]
+    CapabilityUnavailable { message: String, capability: String },
     /// A value or argument in the statement is not acceptable to the engine —
     /// out of range for its type, or invalid for the function or file it was
     /// passed to. Distinct from [`Self::Conversion`], which is specifically

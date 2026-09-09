@@ -771,13 +771,11 @@ fn attach_catalog_inner(
     // depends on it rather than with whoever built the connection.
     conn.execute_batch("SET autoinstall_known_extensions=false;")
         .map_err(|e| EngineError::Engine(format!("disable extension autoinstall: {e}")))?;
-    for s in &plan.load {
+    for (ext, s) in &plan.load {
         conn.execute_batch(s).map_err(|e| {
             crate::instance::extension_not_cached(
-                &format!(
-                    "this catalog type needs `{}`, which",
-                    s.trim_end_matches(';')
-                ),
+                ext,
+                "required by this catalog type, for the transient attach behind pull_catalog",
                 &e,
             )
         })?;

@@ -201,6 +201,12 @@ pub(crate) fn to_status(e: AgentError) -> Status {
         // `Unavailable` (which invites a blind retry — only an operator can
         // resolve this), and emphatically not the `InvalidArgument` catch-all.
         ErrorKind::PondUnavailable => Code::FailedPrecondition,
+        // Same reading, one level down: the request is well-formed and the
+        // DEPLOYMENT is missing a capability it needs. `FailedPrecondition` is
+        // gRPC's own "do not retry until the system state is fixed", which is
+        // exactly what `retryable: after_provisioning` says on the envelope —
+        // and emphatically not `Internal`, which invites the blind retry.
+        ErrorKind::CapabilityUnavailable => Code::FailedPrecondition,
         // Named rather than left to the catch-all, because each says something
         // the catch-all does not. A name that doesn't resolve IS an invalid
         // argument (the statement is the argument), so it joins the group

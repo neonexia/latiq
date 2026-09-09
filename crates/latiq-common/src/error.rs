@@ -73,6 +73,25 @@ pub enum ErrorKind {
     /// 8). The fix is the caller's and is always the same shape: drop the
     /// clause the message names.
     UnsupportedFeature,
+    /// The call is correct and this DEPLOYMENT has not provisioned a capability
+    /// it needs — today, a DuckDB extension that is not in the node's cache
+    /// (`instance::extension_not_cached`; downloads are disabled while serving a
+    /// request, so a cache miss fails immediately).
+    ///
+    /// Deliberately NOT `Internal`: nothing of ours crashed, and its advice
+    /// ("Retry; if it persists, report to your operator") asks an agent to
+    /// repeat a call that cannot succeed until somebody installs something —
+    /// which is why this kind exists at all. Deliberately NOT
+    /// `UnsupportedFeature` either: that one is the caller's to fix by deleting
+    /// a clause, and nothing is wrong with a call that asks for a capability
+    /// this deployment could perfectly well have. And not `Storage`: the pond's
+    /// files are fine.
+    ///
+    /// It is the only kind carrying [`Retryable::AfterProvisioning`], because it
+    /// is the only failure where the CALL is right and the DEPLOYMENT is
+    /// incomplete. Other candidates exist (no auth issuer configured, an
+    /// unregistered catalog) and are deliberately not re-mapped here.
+    CapabilityUnavailable,
     QueryTimeout,
     QueryCancelled,
     /// The caller's credential was absent, expired, or refused. The one failure
@@ -164,13 +183,37 @@ pub enum Retryable {
     /// Send this call again only after changing it — the arguments are what
     /// failed. `suggest` says what to change.
     AfterChange,
+    /// **Your call was fine; this deployment has not provisioned something it
+    /// needs.** Do not retry it now, and do not rewrite it: nothing about the
+    /// arguments is wrong, and no edit provisions a capability. Report it to
+    /// whoever is orchestrating you — a human operator, or a higher-privilege
+    /// agent that can install the capability and re-dispatch — and stop.
+    ///
+    /// The fourth value exists because the other three all lie about this case.
+    /// `as_is` invites the loop `retryable` was added to stop (retrying now is
+    /// futile); `after_change` sends an agent rewriting a correct call for ever;
+    /// `never` says the goal is unreachable when it *will* work the moment
+    /// somebody acts. Always paired with [`Audience::Operator`], which already
+    /// names who that somebody is.
+    ///
+    /// **There is no callback, no polling and no approval channel behind this**,
+    /// deliberately: every surface here is request/response, and the
+    /// orchestration belongs in the agent graph. The envelope's whole job is to
+    /// say the right thing clearly enough to be relayed by the sub-agent that
+    /// received it.
+    AfterProvisioning,
 }
 
 impl Retryable {
     /// Every value, once. See [`Audience::ALL`] — same guard, same reason: the
     /// field is a control channel only while the agent surface explains it, and
     /// `latiq-mcp` asserts `latiq://guidance` names every value in this list.
-    pub const ALL: [Retryable; 3] = [Retryable::Never, Retryable::AsIs, Retryable::AfterChange];
+    pub const ALL: [Retryable; 4] = [
+        Retryable::Never,
+        Retryable::AsIs,
+        Retryable::AfterChange,
+        Retryable::AfterProvisioning,
+    ];
 
     /// The snake_case wire name (matches the serde `rename_all` serialization).
     pub fn as_str(self) -> &'static str {
@@ -178,6 +221,7 @@ impl Retryable {
             Retryable::Never => "never",
             Retryable::AsIs => "as_is",
             Retryable::AfterChange => "after_change",
+            Retryable::AfterProvisioning => "after_provisioning",
         }
     }
 }
@@ -359,7 +403,7 @@ impl ErrorKind {
     /// validation below, the audience/retryable partitions. Each of those used
     /// to carry its own hand-written copy of the list, which is how a kind gets
     /// added and covered by none of them.
-    pub const ALL: [ErrorKind; 18] = [
+    pub const ALL: [ErrorKind; 19] = [
         ErrorKind::PondNotFound,
         ErrorKind::DatasetNotFound,
         ErrorKind::NameConflict,
@@ -371,6 +415,7 @@ impl ErrorKind {
         ErrorKind::ResultCapExceeded,
         ErrorKind::ReadOnlyViolation,
         ErrorKind::UnsupportedFeature,
+        ErrorKind::CapabilityUnavailable,
         ErrorKind::QueryTimeout,
         ErrorKind::QueryCancelled,
         ErrorKind::Unauthenticated,
@@ -396,6 +441,7 @@ impl ErrorKind {
             ErrorKind::ResultCapExceeded => "result_cap_exceeded",
             ErrorKind::ReadOnlyViolation => "read_only_violation",
             ErrorKind::UnsupportedFeature => "unsupported_feature",
+            ErrorKind::CapabilityUnavailable => "capability_unavailable",
             ErrorKind::QueryTimeout => "query_timeout",
             ErrorKind::QueryCancelled => "query_cancelled",
             ErrorKind::Unauthenticated => "unauthenticated",
@@ -455,6 +501,22 @@ impl ErrorKind {
                  columns: declare the columns and their types, and enforce uniqueness with a query \
                  (read_query \"SELECT id, count(*) FROM t GROUP BY id HAVING count(*) > 1\") \
                  instead of a constraint. See latiq://dialect."
+            }
+            // Addressed to an OPERATOR — a human in the loop, or the agent
+            // orchestrating this one, which may hold the privilege to install
+            // it. It must not read as a retry: the whole point of the kind is
+            // that the same call is correct and cannot work yet.
+            ErrorKind::CapabilityUnavailable => {
+                "Stop and report this — you cannot provision anything from here, and the identical \
+                 call will keep failing until somebody does. Tell whoever is orchestrating you (a \
+                 human operator, or the agent that dispatched you) which capability is missing: it \
+                 is in `facts.capability`, and the message names it too. An operator installs a \
+                 missing DuckDB extension by running `latiq warm-extensions` on the node with \
+                 network access and restarting it — the container image bakes the same step in at \
+                 build time. Send this call again only once you are told the capability is there. \
+                 Meanwhile you can keep working on anything that does not need it: a pond \
+                 allocated without that extension still reads CSV/Parquet/JSON (latiq://dialect \
+                 says what is always loaded)."
             }
             ErrorKind::QueryTimeout => {
                 "Retry with a larger timeout_ms (up to the node's maximum), or narrow the query \
@@ -516,10 +578,12 @@ impl ErrorKind {
             // out of `internal`.
             | ErrorKind::SourceUnavailable => Audience::Agent,
             // Nothing the caller can call resolves these: a node has to come
-            // back, a disk has to work, a bug has to be fixed.
-            ErrorKind::PondUnavailable | ErrorKind::Storage | ErrorKind::Internal => {
-                Audience::Operator
-            }
+            // back, a disk has to work, a bug has to be fixed, a capability has
+            // to be installed.
+            ErrorKind::PondUnavailable
+            | ErrorKind::CapabilityUnavailable
+            | ErrorKind::Storage
+            | ErrorKind::Internal => Audience::Operator,
         }
     }
 
@@ -559,6 +623,11 @@ impl ErrorKind {
             // An operator has to bring the node back or forget the pond; a
             // client retry loop only adds load to a cluster already unwell.
             ErrorKind::PondUnavailable => Retryable::Never,
+            // The one kind where the CALL is right and the DEPLOYMENT is
+            // incomplete. `never` would be a lie (it works the moment the
+            // capability is installed), `as_is` the futile loop, `after_change`
+            // a rewrite of something already correct.
+            ErrorKind::CapabilityUnavailable => Retryable::AfterProvisioning,
         }
     }
 
@@ -579,6 +648,7 @@ impl ErrorKind {
             ErrorKind::CatalogError => "latiq://troubleshooting/catalog-error",
             ErrorKind::SourceUnavailable => "latiq://troubleshooting/source-unavailable",
             ErrorKind::PondUnavailable => "latiq://troubleshooting/pond-unavailable",
+            ErrorKind::CapabilityUnavailable => "latiq://troubleshooting/capability-unavailable",
             ErrorKind::NameConflict
             | ErrorKind::InvalidValue
             | ErrorKind::MissingArgument => "latiq://guidance",
@@ -712,7 +782,7 @@ mod tests {
 
     /// The vendored schema, read at COMPILE time: an `include_str!` cannot pass
     /// because a file was missing at runtime.
-    const SCHEMA: &str = include_str!("../spec/ErrorEnvelope-1-0-2.json");
+    const SCHEMA: &str = include_str!("../spec/ErrorEnvelope-1-0-3.json");
 
     fn validator() -> jsonschema::Validator {
         let schema: Value = serde_json::from_str(SCHEMA).expect("the vendored schema is JSON");
@@ -935,7 +1005,47 @@ mod tests {
             assert_eq!(serde_json::to_value(r).unwrap(), json!(r.as_str()));
         }
         assert_eq!(Audience::ALL.len(), 2);
-        assert_eq!(Retryable::ALL.len(), 3);
+        assert_eq!(Retryable::ALL.len(), 4);
+    }
+
+    /// The fourth `retryable` value, and the only kind that carries it.
+    ///
+    /// Three values collapsed two different failures into one: "your call was
+    /// wrong" (`after_change`) and "your call was fine, this deployment has not
+    /// provisioned something". The second had no honest value — the missing
+    /// DuckDB extension shipped as `internal`/`as_is`, advising a retry that can
+    /// never work — so this pins all four control fields together, since the
+    /// value is only meaningful paired with `audience: operator` and advice that
+    /// escalates instead of looping.
+    #[test]
+    fn error_contract_a_missing_capability_escalates_rather_than_retrying() {
+        let kind = ErrorKind::CapabilityUnavailable;
+        assert_eq!(kind.audience(), Audience::Operator);
+        assert_eq!(kind.retryable(), Retryable::AfterProvisioning);
+        // The wire name an agent branches on, and the one the guidance teaches.
+        assert_eq!(Retryable::AfterProvisioning.as_str(), "after_provisioning");
+        assert_eq!(kind.as_str(), "capability_unavailable");
+        let suggest = kind.default_suggest();
+        // Escalation, not a loop: it must not open with "Retry", and it must
+        // name both the actor and the action that actually fixes it.
+        assert!(!suggest.to_lowercase().starts_with("retry"), "{suggest}");
+        assert!(
+            suggest.contains("operator") && suggest.contains("latiq warm-extensions"),
+            "the advice must name who acts and what they run: {suggest}"
+        );
+        assert!(
+            suggest.contains("facts.capability"),
+            "the missing capability is a VALUE to relay, not a phrase to parse: {suggest}"
+        );
+        // And it is the ONLY kind on this value: `after_provisioning` says
+        // something specific, and a second kind reaching for it would be the
+        // decision to make deliberately, here.
+        let carriers: Vec<&str> = ErrorKind::ALL
+            .iter()
+            .filter(|k| k.retryable() == Retryable::AfterProvisioning)
+            .map(|k| k.as_str())
+            .collect();
+        assert_eq!(carriers, vec!["capability_unavailable"]);
     }
 
     /// The claim `latiq://guidance` makes about `never`, run rather than
@@ -1048,13 +1158,16 @@ mod tests {
             }
         }
         // Anti-vacuity: both sides are populated, and every kind was classified.
-        assert_eq!(operator, 3, "PondUnavailable, Storage, Internal");
+        assert_eq!(
+            operator, 4,
+            "PondUnavailable, CapabilityUnavailable, Storage, Internal"
+        );
         assert_eq!(agent, 15);
         assert_eq!(agent + operator, ErrorKind::ALL.len());
     }
 
     /// The guarantee rmcp does not give us: every envelope we can construct
-    /// matches the vendored schema. Drives ALL 18 kinds, because the schema
+    /// matches the vendored schema. Drives ALL 19 kinds, because the schema
     /// enumerates the `kind` values — a kind added to the enum without being
     /// listed there must fail here rather than ship unannounced.
     #[test]
@@ -1065,7 +1178,7 @@ mod tests {
             let errors: Vec<String> = v.iter_errors(&value).map(|e| e.to_string()).collect();
             assert!(errors.is_empty(), "{kind:?}: {errors:?}\n{value:#}");
         }
-        assert_eq!(ErrorKind::ALL.len(), 18, "every kind was driven");
+        assert_eq!(ErrorKind::ALL.len(), 19, "every kind was driven");
     }
 
     /// **Anti-vacuity for the test above.** A schema that accepts anything would
