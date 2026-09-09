@@ -485,6 +485,7 @@ impl QueryEngine for DuckEngine {
         loc: &PondLocation,
         sql: &str,
         identity: &Identity,
+        trace_id: Option<&str>,
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
         let pond = self.pond(loc)?;
@@ -504,7 +505,7 @@ impl QueryEngine for DuckEngine {
         // abortable is what keeps that bounded.
         let out = Self::run_with_abort(&guard, &abort, |i| {
             let mut datasets = plan_datasets(loc, i, sql);
-            let mut res = run_write(i, sql, identity, &loc.catalog_name)?;
+            let mut res = run_write(i, sql, identity, trace_id, &loc.catalog_name)?;
             // AFTER the statement: a `CREATE TABLE … AS`'s target has no
             // columns to describe until it exists, and a dropped table has none
             // to describe at all — which is why a failed write records none
@@ -888,7 +889,7 @@ mod tests {
         let res = within(
             Duration::from_secs(20),
             "a pre-cancelled write",
-            move || e2.write_query(&l, &format!("CREATE TABLE t AS {SLOW}"), &i2, abort),
+            move || e2.write_query(&l, &format!("CREATE TABLE t AS {SLOW}"), &i2, None, abort),
         );
         assert!(
             matches!(res, Err(EngineError::Cancelled)),
@@ -903,6 +904,7 @@ mod tests {
             &loc,
             "CREATE TABLE control AS SELECT 1 AS a",
             &id,
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -967,6 +969,7 @@ mod tests {
                 &h_loc,
                 &format!("CREATE TABLE held AS {SLOW}"),
                 &h_id,
+                None,
                 h_abort,
             )
         });
@@ -998,6 +1001,7 @@ mod tests {
                 &q_loc,
                 "CREATE TABLE queued AS SELECT 1 AS a",
                 &q_id,
+                None,
                 queued,
             )
         });
@@ -1025,6 +1029,7 @@ mod tests {
             &loc,
             "CREATE TABLE fine AS SELECT 1 AS a",
             &id,
+            None,
             AbortToken::new(),
         )
         .expect("the writer must still work after two cancelled writes");
@@ -1105,6 +1110,7 @@ mod tests {
             &loc,
             "CREATE TABLE t AS SELECT * FROM range(2500) r(i)",
             &Identity::claimed(Some("a")),
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -1160,13 +1166,20 @@ mod tests {
         let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let id = Identity::claimed(Some("writer"));
-        eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
-            .unwrap();
+        eng.write_query(
+            &loc,
+            "CREATE TABLE t(i INTEGER)",
+            &id,
+            None,
+            AbortToken::new(),
+        )
+        .unwrap();
         for n in 1..=3 {
             eng.write_query(
                 &loc,
                 &format!("INSERT INTO t VALUES ({n})"),
                 &id,
+                None,
                 AbortToken::new(),
             )
             .unwrap();
@@ -1190,12 +1203,24 @@ mod tests {
         let loc = fs.create_pond(PondId::new(), false).unwrap();
         let eng = DuckEngine::new();
         let id = Identity::claimed(Some("w"));
-        eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
-            .unwrap();
+        eng.write_query(
+            &loc,
+            "CREATE TABLE t(i INTEGER)",
+            &id,
+            None,
+            AbortToken::new(),
+        )
+        .unwrap();
         let pond = eng.pond(&loc).unwrap();
         let held = pond.checkout_read().unwrap(); // a reader is in flight
-        eng.write_query(&loc, "INSERT INTO t VALUES (1)", &id, AbortToken::new())
-            .expect("a write must proceed while a read connection is checked out");
+        eng.write_query(
+            &loc,
+            "INSERT INTO t VALUES (1)",
+            &id,
+            None,
+            AbortToken::new(),
+        )
+        .expect("a write must proceed while a read connection is checked out");
         drop(held);
     }
 
@@ -1293,6 +1318,7 @@ mod tests {
             &loc,
             "CREATE TABLE t AS SELECT i FROM range(0,50000) tbl(i)",
             &Identity::claimed(Some("w")),
+            None,
             AbortToken::new(),
         )
         .unwrap();

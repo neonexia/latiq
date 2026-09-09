@@ -33,6 +33,7 @@ fn pond_lifecycle_end_to_end() {
         &loc,
         "CREATE TABLE events(id INTEGER, sev VARCHAR)",
         &agent,
+        None,
         AbortToken::new(),
     )
     .unwrap();
@@ -41,6 +42,7 @@ fn pond_lifecycle_end_to_end() {
             &loc,
             "INSERT INTO events VALUES (1,'high'),(2,'critical')",
             &agent,
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -97,7 +99,7 @@ fn describe_schema_reports_each_table_s_columns_in_declaration_order() {
     eng.init_pond(&loc).unwrap();
     let agent = Identity::claimed(Some("agent-schema"));
     let ddl = |sql: &str| {
-        eng.write_query(&loc, sql, &agent, AbortToken::new())
+        eng.write_query(&loc, sql, &agent, None, AbortToken::new())
             .unwrap();
     };
     ddl("CREATE TABLE orders(id INTEGER, total DECIMAL(10,2), placed_at TIMESTAMP)");
@@ -164,6 +166,7 @@ fn attribution_records_the_verified_subject_not_only_the_claimed_leaf() {
         &loc,
         "CREATE TABLE events(id INTEGER)",
         &id,
+        None,
         AbortToken::new(),
     )
     .unwrap();
@@ -252,7 +255,8 @@ fn attribution_escapes_hostile_identity_values() {
     eng.init_pond(&loc).unwrap();
 
     let write = |sql: &str, id: &Identity| {
-        eng.write_query(&loc, sql, id, AbortToken::new()).unwrap();
+        eng.write_query(&loc, sql, id, None, AbortToken::new())
+            .unwrap();
     };
     let benign = Identity::claimed(Some("agent-setup"));
     write("CREATE TABLE t(id INTEGER)", &benign);
@@ -310,14 +314,90 @@ fn attribution_unverified_caller_has_empty_verified_fields() {
     eng.init_pond(&loc).unwrap();
 
     let id = Identity::claimed(Some("agent-plain"));
-    eng.write_query(&loc, "CREATE TABLE t(id INTEGER)", &id, AbortToken::new())
-        .unwrap();
+    eng.write_query(
+        &loc,
+        "CREATE TABLE t(id INTEGER)",
+        &id,
+        None,
+        AbortToken::new(),
+    )
+    .unwrap();
 
     let (author, extra) = latest_attribution(&eng, &loc);
     assert_eq!(author, "agent-plain");
     assert_eq!(extra["agent_id"], serde_json::json!("agent-plain"));
     assert_eq!(extra["verified"], serde_json::json!(false));
     assert_eq!(extra["issuer"], serde_json::json!(""));
+
+    fs.drop_pond(pond).unwrap();
+}
+
+#[test]
+fn attribution_an_untraced_write_records_no_trace_id_key_at_all() {
+    // The negative half of the trace join, and the only layer that can express
+    // it: every surface enters a trace scope, so `None` reaches the engine only
+    // from a caller that has none. An absent key says "this write was not
+    // traced"; a `""`, a `"-"` or a minted id would be joined against for ever
+    // and never match. The positive half is proven end-to-end, where the id the
+    // CALLER was given is compared with the one the pond recorded
+    // (`latiq-agent-core`'s `attribution_trace_id_joins_…`, `query_grpc.rs`).
+    let fs = TempFs::new();
+    let eng = DuckEngine::new();
+    let pond = PondId::new();
+    let loc = fs.create_pond(pond, false).unwrap();
+    eng.init_pond(&loc).unwrap();
+
+    let id = Identity::claimed(Some("agent-untraced"));
+    eng.write_query(
+        &loc,
+        "CREATE TABLE t(id INTEGER)",
+        &id,
+        None,
+        AbortToken::new(),
+    )
+    .unwrap();
+
+    let extra = latest_extra_info(&eng, &loc);
+    assert_eq!(
+        extra.get("trace_id"),
+        None,
+        "an untraced write must omit the key, not fill it: {extra}"
+    );
+    // Anti-vacuity: the record IS there and IS the one this write wrote — the
+    // assertion above would also pass against an empty object or a snapshot
+    // some other statement produced.
+    assert_eq!(extra["agent_id"], serde_json::json!("agent-untraced"));
+
+    fs.drop_pond(pond).unwrap();
+}
+
+#[test]
+fn attribution_a_traced_write_records_the_bare_trace_id() {
+    // The engine's half of the join: the id it is handed is what lands in
+    // `commit_extra_info`, under `trace_id`, verbatim and BARE — not a
+    // `traceparent`, because OpenLineage's event field is the bare id and that
+    // is what the two records join on. Recording `00-<id>-<span>-01` here would
+    // make every join a string operation.
+    let fs = TempFs::new();
+    let eng = DuckEngine::new();
+    let pond = PondId::new();
+    let loc = fs.create_pond(pond, false).unwrap();
+    eng.init_pond(&loc).unwrap();
+
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let id = Identity::claimed(Some("agent-traced"));
+    eng.write_query(
+        &loc,
+        "CREATE TABLE t(id INTEGER)",
+        &id,
+        Some(TRACE),
+        AbortToken::new(),
+    )
+    .unwrap();
+
+    let extra = latest_extra_info(&eng, &loc);
+    assert_eq!(extra["trace_id"], serde_json::json!(TRACE));
+    assert_eq!(extra["agent_id"], serde_json::json!("agent-traced"));
 
     fs.drop_pond(pond).unwrap();
 }
@@ -861,8 +941,14 @@ mod lineage {
         on.lineage = true;
 
         for loc in [&off, &on] {
-            eng.write_query(loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
-                .unwrap();
+            eng.write_query(
+                loc,
+                "CREATE TABLE t(i INTEGER)",
+                &id,
+                None,
+                AbortToken::new(),
+            )
+            .unwrap();
         }
         let quiet = eng
             .read_query(&off, "SELECT * FROM t", AbortToken::new())
@@ -917,6 +1003,7 @@ mod lineage {
             &loc,
             "CREATE TABLE orders(id INTEGER, customer VARCHAR, amount DECIMAL(10,2))",
             &id,
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -924,6 +1011,7 @@ mod lineage {
             &loc,
             "INSERT INTO orders VALUES (1,'ada',9.99)",
             &id,
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -933,9 +1021,8 @@ mod lineage {
             .write_query(
                 &loc,
                 "CREATE TABLE totals AS SELECT customer, count(*) AS n FROM orders GROUP BY customer",
-                &id,
-                AbortToken::new(),
-            )
+                &id, None,
+                AbortToken::new(),)
             .unwrap();
         assert_eq!(ctas.meta.outputs[0].name, "pond.main.totals");
         assert_eq!(
@@ -972,6 +1059,7 @@ mod lineage {
             &loc,
             &format!("COPY (SELECT 1 AS id) TO '{parquet}' (FORMAT PARQUET)"),
             &id,
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -1003,6 +1091,7 @@ mod lineage {
             &off,
             "CREATE TABLE quiet(i INTEGER)",
             &id,
+            None,
             AbortToken::new(),
         )
         .unwrap();
@@ -1028,11 +1117,23 @@ mod lineage {
         let id = Identity::claimed(Some("agent-a"));
         let mut loc = fs.create_pond(PondId::new(), true).unwrap();
         loc.lineage = true;
-        eng.write_query(&loc, "CREATE TABLE t(i INTEGER)", &id, AbortToken::new())
-            .unwrap();
+        eng.write_query(
+            &loc,
+            "CREATE TABLE t(i INTEGER)",
+            &id,
+            None,
+            AbortToken::new(),
+        )
+        .unwrap();
 
         let write = eng
-            .write_query(&loc, "INSERT INTO t VALUES (1)", &id, AbortToken::new())
+            .write_query(
+                &loc,
+                "INSERT INTO t VALUES (1)",
+                &id,
+                None,
+                AbortToken::new(),
+            )
             .unwrap();
         assert_eq!(write.meta.outputs.len(), 1, "a write reports its target");
         assert_eq!(write.meta.outputs[0].name, "pond.main.t");
@@ -1119,7 +1220,7 @@ fn error_contract_duckdb_error_classes_are_unchanged() {
     let loc = fs.create_pond(id, false).unwrap();
     eng.init_pond(&loc).unwrap();
     let agent = Identity::claimed(Some("agent-class"));
-    let write = |sql: &str| eng.write_query(&loc, sql, &agent, AbortToken::new());
+    let write = |sql: &str| eng.write_query(&loc, sql, &agent, None, AbortToken::new());
     write("CREATE TABLE t(id INTEGER NOT NULL, name VARCHAR)").unwrap();
     write("INSERT INTO t VALUES (1, 'a')").unwrap();
 
@@ -1259,7 +1360,7 @@ mod explain {
             "CREATE TABLE small(id INTEGER, w VARCHAR)",
             "INSERT INTO small SELECT i, 'w' FROM range(500) s(i)",
         ] {
-            eng.write_query(&loc, sql, &agent, AbortToken::new())
+            eng.write_query(&loc, sql, &agent, None, AbortToken::new())
                 .unwrap();
         }
         (fs, loc, eng)

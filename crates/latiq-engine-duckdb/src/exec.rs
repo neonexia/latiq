@@ -399,10 +399,14 @@ pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineErr
 /// **authoritatively** by whether the pond's snapshot id advanced, never by
 /// scanning the SQL text. Any failure rolls the transaction back (the per-pond
 /// connection is reused, so a dangling open transaction would wedge the pond).
+///
+/// `trace_id` is the request's ambient trace id (`None` outside a trace scope —
+/// see the note where it is recorded).
 pub fn run_write(
     inst: &PondInstance,
     sql: &str,
     identity: &Identity,
+    trace_id: Option<&str>,
     catalog: &str,
 ) -> Result<QueryResult, EngineError> {
     let t0 = Instant::now();
@@ -451,13 +455,28 @@ pub fn run_write(
     let author = author.replace('\'', "''");
     // Built with serde_json (never hand-concatenated) then escaped as one SQL
     // literal: every value here is caller- or token-supplied.
-    let extra = serde_json::json!({
+    let mut extra = serde_json::json!({
         "agent_id": identity.agent_id,
         "issuer": identity.issuer,
         "verified": identity.verified,
-    })
-    .to_string()
-    .replace('\'', "''");
+    });
+    // The join key between the two provenance records. The BARE trace id, not
+    // the full `traceparent`: OpenLineage's event field is `run.facets…traceId`
+    // (bare), so the bare id is the value that actually joins a snapshot to the
+    // lineage events and the `latiq::access` records for the same request. The
+    // traceparent additionally names OUR span — but a span id here would be a
+    // second spelling of one concept, and the span that wrote the snapshot is
+    // already recoverable from the trace it belongs to.
+    //
+    // OMITTED when there is no ambient trace scope: an absent key says "this
+    // write was not traced", which is true; a `"-"`, an `""` or a freshly minted
+    // id would be a value someone joins against and never matches. (The engine
+    // runs on a blocking thread, so it cannot read the task-local scope itself —
+    // the caller captures it and passes it down.)
+    if let Some(t) = trace_id {
+        extra["trace_id"] = serde_json::Value::String(t.to_string());
+    }
+    let extra = extra.to_string().replace('\'', "''");
     let call = format!(
         "CALL {cat}.set_commit_message('{author}', 'write_query', extra_info => '{extra}')"
     );
@@ -950,6 +969,7 @@ mod tests {
             &inst,
             "CREATE TABLE events(id INTEGER, sev VARCHAR)",
             &id,
+            None,
             "pond",
         )
         .unwrap();
@@ -957,6 +977,7 @@ mod tests {
             &inst,
             "INSERT INTO events VALUES (1,'high'),(2,'low')",
             &id,
+            None,
             "pond",
         )
         .unwrap();
@@ -985,7 +1006,14 @@ mod tests {
         // in a log-capture binary (each of those statically links DuckDB).
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("a"));
-        run_write(&inst, "CREATE TABLE a(id INTEGER, v VARCHAR)", &id, "pond").unwrap();
+        run_write(
+            &inst,
+            "CREATE TABLE a(id INTEGER, v VARCHAR)",
+            &id,
+            None,
+            "pond",
+        )
+        .unwrap();
 
         assert!(
             serialized_plan(&inst, "SELECT * FROM a").is_ok(),
@@ -1031,8 +1059,8 @@ mod tests {
         // rows came from, and the transaction must not outlive the call.
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("a"));
-        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
-        run_write(&inst, "INSERT INTO t VALUES (1)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, None, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1)", &id, None, "pond").unwrap();
         let latest: i64 = inst
             .conn
             .query_row("SELECT max(snapshot_id) FROM pond.snapshots()", [], |r| {
@@ -1052,7 +1080,7 @@ mod tests {
         );
         // The connection is not left mid-transaction: this write would fail
         // inside one, both because it is read-only and because COMMIT never ran.
-        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, None, "pond").unwrap();
     }
 
     #[test]
@@ -1071,6 +1099,7 @@ mod tests {
             &inst,
             "CREATE TABLE events(id INTEGER, sev VARCHAR)",
             &Identity::claimed(Some("a")),
+            None,
             "pond",
         )
         .unwrap();
@@ -1104,15 +1133,16 @@ mod tests {
     fn write_rollback_undoes_a_partial_write_and_leaves_the_pond_usable() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
-        run_write(&inst, "CREATE TABLE src(s VARCHAR)", &id, "pond").unwrap();
-        run_write(&inst, "INSERT INTO src VALUES ('nope')", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, None, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE src(s VARCHAR)", &id, None, "pond").unwrap();
+        run_write(&inst, "INSERT INTO src VALUES ('nope')", &id, None, "pond").unwrap();
         let snapshot_before = max_snapshot_id(&inst);
 
         let err = run_write(
             &inst,
             "INSERT INTO t VALUES (42); INSERT INTO t SELECT CAST(s AS INTEGER) FROM src",
             &id,
+            None,
             "pond",
         )
         .expect_err("a runtime cast failure must fail the write");
@@ -1147,7 +1177,7 @@ mod tests {
 
         // The connection is not wedged: without the ROLLBACK the transaction
         // stays open and this write's own BEGIN is refused.
-        let ok = run_write(&inst, "INSERT INTO t VALUES (7)", &id, "pond").unwrap();
+        let ok = run_write(&inst, "INSERT INTO t VALUES (7)", &id, None, "pond").unwrap();
         assert!(
             ok.meta.snapshot_id.is_some(),
             "the pond must still take writes after a rolled-back one"
@@ -1164,11 +1194,17 @@ mod tests {
     fn write_rollback_when_attribution_cannot_be_recorded() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, None, "pond").unwrap();
         let snapshot_before = max_snapshot_id(&inst);
 
-        let err = run_write(&inst, "INSERT INTO t VALUES (1)", &id, "not_this_catalog")
-            .expect_err("attribution against an unknown catalog must fail the write");
+        let err = run_write(
+            &inst,
+            "INSERT INTO t VALUES (1)",
+            &id,
+            None,
+            "not_this_catalog",
+        )
+        .expect_err("attribution against an unknown catalog must fail the write");
         // Still `Engine`, deliberately, even though DuckDB calls it a `Catalog
         // Error`: the statement that failed is OURS, not the caller's, so the
         // caller cannot fix it by looking up table names and `internal` +
@@ -1189,7 +1225,7 @@ mod tests {
             "an unattributable write must be rolled back, not kept"
         );
         assert_eq!(max_snapshot_id(&inst), snapshot_before);
-        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond")
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, None, "pond")
             .expect("the pond must still take writes");
     }
 
@@ -1206,13 +1242,13 @@ mod tests {
     fn write_commit_failure_surfaces_and_does_not_wedge_the_pond() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(i INTEGER)", &id, None, "pond").unwrap();
 
         for (sql, expect_rows) in [
             ("INSERT INTO t VALUES (1); ROLLBACK", 0),
             ("INSERT INTO t VALUES (5); COMMIT", 1),
         ] {
-            let err = match run_write(&inst, sql, &id, "pond") {
+            let err = match run_write(&inst, sql, &id, None, "pond") {
                 Ok(r) => panic!("expected `{sql}` to fail at COMMIT, got {r:?}"),
                 Err(e) => e,
             };
@@ -1244,7 +1280,7 @@ mod tests {
             "caller-committed work must land exactly once, unattributed"
         );
         // Not wedged: the next write commits normally and IS attributed.
-        let ok = run_write(&inst, "INSERT INTO t VALUES (9)", &id, "pond").unwrap();
+        let ok = run_write(&inst, "INSERT INTO t VALUES (9)", &id, None, "pond").unwrap();
         let sid = ok.meta.snapshot_id.expect("a normal write still commits");
         let author = run_read(
             &inst,
@@ -1258,12 +1294,19 @@ mod tests {
     fn write_with_trailing_comment_does_not_wedge_the_pond() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, None, "pond").unwrap();
         // A trailing line comment must NOT comment out our COMMIT/attribution or
         // leave a dangling transaction on the reused connection.
-        run_write(&inst, "INSERT INTO t VALUES (1) --trailing", &id, "pond").unwrap();
+        run_write(
+            &inst,
+            "INSERT INTO t VALUES (1) --trailing",
+            &id,
+            None,
+            "pond",
+        )
+        .unwrap();
         // The pond is still usable (would error mid-transaction if wedged).
-        run_write(&inst, "INSERT INTO t VALUES (2)", &id, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (2)", &id, None, "pond").unwrap();
         let n = run_read(&inst, "SELECT count(*) AS c FROM t").unwrap();
         assert_eq!(n.rows[0][0], serde_json::json!(2));
         // Attribution still recorded for the commented write's identity.
@@ -1279,10 +1322,10 @@ mod tests {
     fn write_query_with_a_select_creates_no_snapshot() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, None, "pond").unwrap();
         let before = snapshot_count(&inst);
         // A SELECT routed to write_query must not pollute snapshot history.
-        let res = run_write(&inst, "SELECT 1 AS x", &id, "pond").unwrap();
+        let res = run_write(&inst, "SELECT 1 AS x", &id, None, "pond").unwrap();
         assert_eq!(res.rows[0][0], serde_json::json!(1));
         assert_eq!(
             snapshot_count(&inst),
@@ -1295,8 +1338,8 @@ mod tests {
     fn from_first_shorthand_is_a_read_not_a_write() {
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
-        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, None, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, None, "pond").unwrap();
         let before = snapshot_count(&inst);
         // DuckDB's `FROM t` shorthand is `SELECT * FROM t` — must read, and routed
         // through write_query must NOT create a snapshot (the reported bug: it ran
@@ -1304,7 +1347,7 @@ mod tests {
         let r = run_read(&inst, "FROM t ORDER BY id").unwrap();
         assert_eq!(r.rows.len(), 2);
         assert_eq!(r.rows[0][0], serde_json::json!(1));
-        let w = run_write(&inst, "FROM t", &id, "pond").unwrap();
+        let w = run_write(&inst, "FROM t", &id, None, "pond").unwrap();
         assert_eq!(w.rows.len(), 2, "FROM via write path must return rows");
         assert_eq!(
             snapshot_count(&inst),
@@ -1321,10 +1364,10 @@ mod tests {
         // snapshot — no text classification involved.
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
-        run_write(&inst, "INSERT INTO t VALUES (10)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, None, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (10)", &id, None, "pond").unwrap();
         let before = snapshot_count(&inst);
-        let res = run_write(&inst, "-- fetch it\nSELECT id FROM t", &id, "pond").unwrap();
+        let res = run_write(&inst, "-- fetch it\nSELECT id FROM t", &id, None, "pond").unwrap();
         assert_eq!(res.rows.len(), 1, "commented SELECT must return its rows");
         assert_eq!(res.rows[0][0], serde_json::json!(10));
         assert_eq!(
@@ -1340,13 +1383,21 @@ mod tests {
         // detection doesn't care about the text — nothing changed, so no snapshot.
         let (_fs, inst) = pond();
         let id = Identity::claimed(Some("agent-test"));
-        run_write(&inst, "CREATE TABLE t(note VARCHAR)", &id, "pond").unwrap();
-        run_write(&inst, "INSERT INTO t VALUES (' update me ')", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(note VARCHAR)", &id, None, "pond").unwrap();
+        run_write(
+            &inst,
+            "INSERT INTO t VALUES (' update me ')",
+            &id,
+            None,
+            "pond",
+        )
+        .unwrap();
         let before = snapshot_count(&inst);
         let res = run_write(
             &inst,
             "SELECT note FROM t WHERE note = ' update me '",
             &id,
+            None,
             "pond",
         )
         .unwrap();
@@ -1369,6 +1420,7 @@ mod tests {
             &inst,
             "CREATE TABLE m(x INTEGER); INSERT INTO m VALUES (1),(2),(3)",
             &id,
+            None,
             "pond",
         )
         .unwrap();
@@ -1392,6 +1444,7 @@ mod tests {
             &inst,
             "CREATE TABLE t(id INTEGER)",
             &Identity::claimed(None),
+            None,
             "pond",
         )
         .unwrap();
@@ -1408,8 +1461,8 @@ mod tests {
         // failure this file guards against — do not weaken it.
         let (_fs, inst) = pond();
         let id = Identity::claimed(None);
-        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, "pond").unwrap();
-        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, "pond").unwrap();
+        run_write(&inst, "CREATE TABLE t(id INTEGER)", &id, None, "pond").unwrap();
+        run_write(&inst, "INSERT INTO t VALUES (1),(2)", &id, None, "pond").unwrap();
         // The KIND and the reason, not `is_err()`: a bare error check would pass
         // if the pond had vanished, or if ANALYZE had been rejected as a typo.
         match run_explain(&inst, "ANALYZE DELETE FROM t") {
