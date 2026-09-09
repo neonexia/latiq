@@ -32,7 +32,13 @@ pub struct AttachPlan {
     /// a file or an object. Two warehouses behind one endpoint are two
     /// catalogs, so the warehouse is part of it.
     pub namespace: String,
-    /// `INSTALL …; LOAD …;` for the type's extensions.
+    /// `LOAD …;` for the type's extensions — **`LOAD` only, never `INSTALL`**.
+    /// This plan is executed inside `pull_catalog`, with an agent waiting on the
+    /// call, and an `INSTALL` there is an unbounded download from an external
+    /// host at the worst possible moment (and impossible in a deployment with no
+    /// egress). The extensions come from the node's cache, put there by
+    /// `latiq warm-extensions` at image-build time or the node's startup warm.
+    /// Guarded by `attach_plan_never_installs_an_extension`.
     pub load: Vec<String>,
     /// `(secret_name, CREATE SECRET …)` — dropped on detach.
     pub secrets: Vec<(String, String)>,
@@ -70,7 +76,7 @@ pub fn plan(
         .map(|s| {
             s.required_extensions
                 .iter()
-                .map(|e| format!("INSTALL {e}; LOAD {e};"))
+                .map(|e| format!("LOAD {e};"))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -379,6 +385,73 @@ mod tests {
         );
         // …and it really is built (not two identically-absent secrets).
         assert!(s3_of(&d).1.contains("USE_SSL false"));
+    }
+
+    /// **No `INSTALL` on a request path.** The attach plan is the SQL
+    /// `pull_catalog` runs while an agent waits, and it used to carry
+    /// `INSTALL {ext}; LOAD {ext};` — so a node with a cold cache downloaded
+    /// from an external host mid-call, and a node with no egress could not pull
+    /// at all. Extensions arrive via `latiq warm-extensions`; this site only
+    /// ever loads them.
+    ///
+    /// Every catalog type is checked from `latiq_common::catalog::TYPES` rather
+    /// than by hand, so a type added later cannot reintroduce the download.
+    #[test]
+    fn attach_plan_never_installs_an_extension() {
+        // A superset of every type's params, so each type finds what it needs.
+        let all = params(&[
+            ("endpoint", "https://polaris/api/catalog"),
+            ("warehouse", "prod"),
+            ("metadata_path", "ducklake:meta.db"),
+            ("data_path", "/tmp/data"),
+        ]);
+        let mut statements = 0;
+        let mut types_checked = 0;
+        for t in latiq_common::catalog::TYPES {
+            let plan = plan(t.name, "lake", &all).unwrap_or_else(|e| {
+                panic!("catalog type '{}' has no buildable plan: {e:?}", t.name)
+            });
+            assert_eq!(
+                plan.load.len(),
+                t.required_extensions.len(),
+                "catalog type '{}' must load exactly the extensions it declares",
+                t.name
+            );
+            for stmt in &plan.load {
+                assert!(
+                    !stmt.to_uppercase().contains("INSTALL"),
+                    "catalog type '{}' would download an extension while a caller waits: {stmt}",
+                    t.name
+                );
+                assert!(
+                    stmt.starts_with("LOAD "),
+                    "catalog type '{}': expected a bare LOAD, got: {stmt}",
+                    t.name
+                );
+                statements += 1;
+            }
+            // The rest of the plan is executed on the same waiting call.
+            for stmt in std::iter::once(&plan.attach)
+                .chain(plan.secrets.iter().map(|(_, s)| s))
+                .chain(plan.teardown().iter())
+            {
+                assert!(
+                    !stmt.to_uppercase().contains("INSTALL"),
+                    "catalog type '{}' installs an extension outside `load`: {stmt}",
+                    t.name
+                );
+            }
+            types_checked += 1;
+        }
+        assert_eq!(
+            types_checked,
+            latiq_common::catalog::TYPES.len(),
+            "the loop skipped a catalog type"
+        );
+        assert!(
+            types_checked >= 2 && statements >= 4,
+            "the loop did no work: {types_checked} types, {statements} load statements"
+        );
     }
 
     #[test]
