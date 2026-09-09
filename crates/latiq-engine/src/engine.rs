@@ -175,6 +175,17 @@ pub trait QueryEngine: Send + Sync {
     /// external side is named while the catalog is still ATTACHED — after the
     /// detach nothing in the pond remembers where its rows came from, which is
     /// exactly why this edge is worth recording.
+    ///
+    /// A pull WRITES into the pond, so it carries `identity` and `trace_id` for
+    /// exactly the same reason `write_query` does, and records them the same
+    /// way: this used to run outside any attribution bracket, and data entered
+    /// the pond through a path with no author, no identity and no trace id
+    /// recorded against it.
+    // One argument past clippy's threshold, and every one of them is required:
+    // the catalog to mount, the statement to run, and — as on `write_query` —
+    // who is asking and under which trace. Bundling them into a struct would
+    // churn every call site to hide a lint, not to say anything.
+    #[allow(clippy::too_many_arguments)]
     fn pull_catalog(
         &self,
         loc: &PondLocation,
@@ -182,6 +193,8 @@ pub trait QueryEngine: Send + Sync {
         alias: &str,
         params: &std::collections::BTreeMap<String, String>,
         query: &str,
+        identity: &Identity,
+        trace_id: Option<&str>,
     ) -> Result<latiq_common::QueryMeta, EngineError>;
     /// Transiently attach a catalog and list its `(schema.table)` entries.
     fn describe_catalog(

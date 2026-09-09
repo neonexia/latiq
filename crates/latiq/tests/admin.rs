@@ -731,6 +731,20 @@ mod catalogs {
         r
     }
 
+    /// A request carrying the claimed agent id AND a caller-minted trace, so a
+    /// trace id recorded in the pond can be compared against a value this test
+    /// chose — not one it read back out of the same record it is checking.
+    fn traced_req<T>(msg: T, agent: &str, trace_id: &str) -> Request<T> {
+        let mut r = req(msg, agent);
+        r.metadata_mut().insert(
+            "traceparent",
+            format!("00-{trace_id}-00f067aa0ba902b7-01")
+                .parse()
+                .unwrap(),
+        );
+        r
+    }
+
     fn json(resp: JsonResponse) -> serde_json::Value {
         serde_json::from_str(&resp.json).unwrap()
     }
@@ -942,6 +956,189 @@ mod catalogs {
         .expect("detaching the catalog must not disturb the pond");
     }
 
+    /// A pull WRITES into the pond, so it must be attributed exactly like any
+    /// other write — this is the hole this test exists for: `pull_catalog` used
+    /// to run its `CREATE TABLE … AS SELECT` straight on the writer connection
+    /// with no transaction and no `set_commit_message`, so data entered the pond
+    /// through the one path where **nobody was recorded as having put it there**
+    /// (measured: `ducklake_snapshots('shop')` → `[[0, null, null], [1, null,
+    /// null]]`).
+    ///
+    /// Every assertion here is on a VALUE, never on "not null": a snapshot whose
+    /// author is the literal string `unknown` would satisfy a non-null check and
+    /// be exactly as useless as the null it replaced. The trace id is the one
+    /// this test minted and sent in the `traceparent` header, so it is compared
+    /// against a value produced independently of the record being checked.
+    ///
+    /// The second half is the regression guard: after driving BOTH pond-writing
+    /// paths, no snapshot in the pond may lack an author, and every commit
+    /// message must be one of the operations we actually have. A new engine path
+    /// that writes without the bracket fails this the moment it is exercised
+    /// here — see the note on coverage in `in_write_txn`.
+    #[tokio::test]
+    async fn attribution_pull_catalog_records_the_caller_the_operation_and_the_trace() {
+        const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let tmp = tempfile::tempdir().unwrap();
+        let (metadata_path, data_path) = seed_ducklake(tmp.path());
+
+        let s = start_stack().await;
+        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
+            .await
+            .unwrap();
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+
+        admin
+            .catalog_add(CatalogAddRequest {
+                catalog: Some(CatalogMsg {
+                    name: "ext".into(),
+                    r#type: "ducklake".into(),
+                    params: HashMap::from([
+                        ("metadata_path".into(), metadata_path),
+                        ("data_path".into(), data_path),
+                    ]),
+                    description: "local ducklake".into(),
+                    tags: vec!["test".into()],
+                    created_by: String::new(),
+                    created_at: String::new(),
+                }),
+            })
+            .await
+            .unwrap();
+
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        // The other pond-writing path, so the guard below compares the two
+        // rather than asserting a property only one path has ever had.
+        data.write_query(req(
+            QueryRequest {
+                pond: "shop".into(),
+                sql: "CREATE TABLE local(id INTEGER)".into(),
+                timeout_ms: 0,
+            },
+            "writer-bob",
+        ))
+        .await
+        .unwrap();
+
+        data.catalog_pull(traced_req(
+            CatalogPullRequest {
+                pond: "shop".into(),
+                catalog: "ext".into(),
+                query: "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
+                    .into(),
+                params: HashMap::new(),
+            },
+            "puller-ann",
+            TRACE,
+        ))
+        .await
+        .unwrap();
+
+        // Read the pull's own snapshot out of DuckLake's native history.
+        let r = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT author, commit_message, commit_extra_info \
+                          FROM ducklake_snapshots('shop') \
+                          ORDER BY snapshot_id DESC LIMIT 1"
+                        .into(),
+                    timeout_ms: 0,
+                },
+                "viewer",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        let row = &r["rows"][0];
+        assert_eq!(
+            row[0],
+            serde_json::json!("puller-ann"),
+            "the pull's snapshot must name the caller who asked for it: {r}"
+        );
+        assert_eq!(
+            row[1],
+            serde_json::json!("pull_catalog"),
+            "the commit message must say HOW the data arrived, so history \
+             distinguishes a pull from an ordinary write: {r}"
+        );
+        let extra: serde_json::Value = serde_json::from_str(
+            row[2]
+                .as_str()
+                .expect("commit_extra_info is the JSON we wrote"),
+        )
+        .unwrap();
+        assert_eq!(
+            extra["trace_id"],
+            serde_json::json!(TRACE),
+            "the pond's history must carry the trace the caller sent, or the \
+             snapshot cannot be joined to that request's lineage: {extra}"
+        );
+        assert_eq!(
+            extra["agent_id"],
+            serde_json::json!("puller-ann"),
+            "the claimed leaf rides alongside the author, as on every write: {extra}"
+        );
+        assert_eq!(
+            extra["verified"],
+            serde_json::json!(false),
+            "this stack configures no issuer, so the identity is claimed, and \
+             saying otherwise would make the author authority-grade: {extra}"
+        );
+
+        // The guard: nothing this pond took in is anonymous, and every commit
+        // message names an operation we have. `snapshot_id > 0` excludes
+        // DuckLake's own initial catalog snapshot, which ATTACH creates before
+        // any caller exists.
+        let all = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT snapshot_id, author, commit_message \
+                          FROM ducklake_snapshots('shop') WHERE snapshot_id > 0 \
+                          ORDER BY snapshot_id"
+                        .into(),
+                    timeout_ms: 0,
+                },
+                "viewer",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        let rows = all["rows"].as_array().unwrap();
+        // Anti-vacuity: an empty history would satisfy every check below.
+        assert_eq!(
+            rows.len(),
+            2,
+            "one snapshot per pond-writing path drove above: {all}"
+        );
+        let messages: Vec<&str> = rows.iter().map(|r| r[2].as_str().unwrap_or("")).collect();
+        assert_eq!(
+            messages,
+            vec!["write_query", "pull_catalog"],
+            "each snapshot must be labelled with the operation that produced it: {all}"
+        );
+        let authors: Vec<&str> = rows.iter().map(|r| r[1].as_str().unwrap_or("")).collect();
+        assert_eq!(
+            authors,
+            vec!["writer-bob", "puller-ann"],
+            "every path that writes into a pond records WHO wrote — an author \
+             missing here is data nobody can be held to: {all}"
+        );
+    }
+
     #[tokio::test]
     async fn catalog_add_drops_credentials_and_rejects_unknown_type() {
         let s = start_stack().await;
@@ -1121,6 +1318,32 @@ mod catalogs_iceberg {
             .into_inner(),
         );
         assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2);
+
+        // A pull is a write, so the pond's history must say who did it and how —
+        // against a REAL external catalog, not only the local fixture the
+        // in-suite `attribution_pull_catalog_*` test uses. The values, not
+        // non-null: `"unknown"` would pass a null check and tell nobody
+        // anything.
+        let attr = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT author, commit_message FROM ducklake_snapshots('shop') \
+                          ORDER BY snapshot_id DESC LIMIT 1"
+                        .into(),
+                    timeout_ms: 0,
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(
+            (attr["rows"][0][0].as_str(), attr["rows"][0][1].as_str()),
+            (Some("agent-x"), Some("pull_catalog")),
+            "an iceberg pull must be attributed like any other write: {attr}"
+        );
     }
 }
 

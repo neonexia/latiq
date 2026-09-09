@@ -388,28 +388,40 @@ pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineErr
     })
 }
 
-/// Run a statement in a transaction with native DuckLake attribution.
+/// Run `body` inside a transaction with native DuckLake attribution, and report
+/// the snapshot it published (`None` when nothing changed).
 ///
-/// We do NOT pre-classify the SQL as read-vs-write. Every statement runs inside
-/// `BEGIN … COMMIT` with `set_commit_message` issued LAST (so a user-supplied one
-/// can't override it, and a trailing comment or embedded `;` can't shift our
+/// **This is the ONE attribution bracket.** Every path that can write into a
+/// pond goes through it — `run_write` for caller SQL, `pull_catalog` for a
+/// transient external pull — because a second copy of this shape is exactly how
+/// one of them silently stops matching the other: the pull *was* that second
+/// copy (no `BEGIN`, no `set_commit_message`) and left `(snapshot, NULL, NULL)`
+/// in `ducklake_snapshots` for months. Anything new that mutates a pond belongs
+/// here too, not beside it.
+///
+/// We do NOT pre-classify the SQL as read-vs-write. `body` runs inside
+/// `BEGIN … COMMIT` with `set_commit_message` issued LAST (so a user-supplied
+/// one can't override it, and a trailing comment or embedded `;` can't shift our
 /// COMMIT/attribution). DuckLake creates a snapshot only when data actually
-/// changed, so a read run through this path is a harmless no-op — no snapshot, no
-/// attribution — and simply returns its rows. Whether a write happened is decided
+/// changed, so a read run through this path is a harmless no-op — no snapshot,
+/// no attribution (verified). Whether a write happened is decided
 /// **authoritatively** by whether the pond's snapshot id advanced, never by
 /// scanning the SQL text. Any failure rolls the transaction back (the per-pond
 /// connection is reused, so a dangling open transaction would wedge the pond).
 ///
-/// `trace_id` is the request's ambient trace id (`None` outside a trace scope —
-/// see the note where it is recorded).
-pub fn run_write(
+/// `op` is the operation recorded as DuckLake's commit message — the caller's
+/// own name for what it did (`write_query`, `pull_catalog`), so an operator
+/// reading history can tell how the data arrived. `trace_id` is the request's
+/// ambient trace id (`None` outside a trace scope — see the note where it is
+/// recorded).
+pub fn in_write_txn<T>(
     inst: &PondInstance,
-    sql: &str,
     identity: &Identity,
     trace_id: Option<&str>,
     catalog: &str,
-) -> Result<QueryResult, EngineError> {
-    let t0 = Instant::now();
+    op: &str,
+    body: impl FnOnce(&PondInstance) -> Result<T, EngineError>,
+) -> Result<(T, Option<i64>), EngineError> {
     // Attribution is a DuckLake method on THIS pond's catalog (named after the
     // pond), so qualify + quote the catalog name.
     let cat = crate::instance::quote_ident(catalog);
@@ -417,7 +429,7 @@ pub fn run_write(
     // Those are not the caller's SQL, so a failure in one is ours and stays
     // `Engine` (→ `internal`, "report to your operator"), which for a
     // mis-plumbed catalog name is exactly the right advice. The caller's
-    // statement goes through `materialize`, which classifies.
+    // statement goes through `body`, which classifies.
     let exec = |s: &str| {
         inst.conn
             .execute_batch(s)
@@ -429,8 +441,8 @@ pub fn run_write(
 
     let before = max_snapshot(inst, &cat);
     exec("BEGIN")?;
-    // Execute + materialize the user's statement (executes writes and DDL too).
-    let (columns, rows) = match materialize(inst, sql) {
+    // Execute the caller's work (writes and DDL included).
+    let out = match body(inst) {
         Ok(v) => v,
         Err(e) => {
             rollback();
@@ -477,9 +489,12 @@ pub fn run_write(
         extra["trace_id"] = serde_json::Value::String(t.to_string());
     }
     let extra = extra.to_string().replace('\'', "''");
-    let call = format!(
-        "CALL {cat}.set_commit_message('{author}', 'write_query', extra_info => '{extra}')"
-    );
+    // `op` is ours, not the caller's — a fixed literal per call site — but it is
+    // escaped like every other value so a future op name containing a quote
+    // cannot end the literal.
+    let op = op.replace('\'', "''");
+    let call =
+        format!("CALL {cat}.set_commit_message('{author}', '{op}', extra_info => '{extra}')");
     if let Err(e) = exec(&call) {
         rollback();
         return Err(e);
@@ -489,7 +504,27 @@ pub fn run_write(
         return Err(e);
     }
     let after = max_snapshot(inst, &cat);
-    let snapshot_id = if after > before { after } else { None };
+    Ok((out, if after > before { after } else { None }))
+}
+
+/// Run a caller's statement through the attribution bracket ([`in_write_txn`]),
+/// materializing whatever it returned.
+///
+/// A statement that published no snapshot was a read routed here, and gets its
+/// rows back; one that did gets the write shape (no rows + the new snapshot id).
+pub fn run_write(
+    inst: &PondInstance,
+    sql: &str,
+    identity: &Identity,
+    trace_id: Option<&str>,
+    catalog: &str,
+) -> Result<QueryResult, EngineError> {
+    let t0 = Instant::now();
+    // Execute + materialize the user's statement (executes writes and DDL too).
+    let ((columns, rows), snapshot_id) =
+        in_write_txn(inst, identity, trace_id, catalog, "write_query", |i| {
+            materialize(i, sql)
+        })?;
 
     if snapshot_id.is_some() {
         // A snapshot advanced → this was a write. Return the write shape (no rows +

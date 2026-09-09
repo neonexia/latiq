@@ -1542,3 +1542,218 @@ mod explain {
         );
     }
 }
+
+/// A pull is a WRITE into the pond, and the transaction bracket that attributes
+/// it now sits between the external `ATTACH` and its `DETACH`. This pins the
+/// composition of those two, which is where a bracket added around an existing
+/// attach/detach dance goes wrong:
+///
+/// * a pull that FAILS rolls back — no snapshot — and still tears the
+///   attachment down (that teardown predates this change and must not regress),
+/// * a pull that SUCCEEDS commits with the caller's identity, `pull_catalog` as
+///   the commit message, and the request's trace id,
+/// * a pull that writes NOTHING behaves like any other no-op write: no
+///   snapshot, and therefore nothing to attribute.
+///
+/// Assertions are on the values: `author IS NOT NULL` would be satisfied by the
+/// string `"unknown"`, which is the failure this whole change is about.
+mod pull_attribution {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A real local DuckLake catalog with one table — file metadata + local
+    /// data, so no network and no docker are involved.
+    fn seed_external(dir: &std::path::Path) -> BTreeMap<String, String> {
+        let meta = dir.join("meta.duckdb");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake;
+             ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
+             CREATE TABLE ext.widgets AS
+               SELECT * FROM (VALUES (1,'gear',9.99),(2,'bolt',0.99)) t(id,name,price);",
+            meta.display(),
+            data.display(),
+        ))
+        .unwrap();
+        BTreeMap::from([
+            ("metadata_path".to_string(), meta.display().to_string()),
+            ("data_path".to_string(), data.display().to_string()),
+        ])
+    }
+
+    /// `(author, commit_message, commit_extra_info)` of the pond's newest
+    /// snapshot, read through DuckLake's own history.
+    fn newest_snapshot(eng: &DuckEngine, loc: &latiq_storage::PondLocation) -> Vec<String> {
+        let r = eng
+            .read_query(
+                loc,
+                "SELECT author, commit_message, commit_extra_info FROM pond.snapshots() \
+                 ORDER BY snapshot_id DESC LIMIT 1",
+                AbortToken::new(),
+            )
+            .unwrap();
+        r.rows[0]
+            .iter()
+            .map(|v| v.as_str().unwrap_or("<null>").to_string())
+            .collect()
+    }
+
+    fn snapshot_count(eng: &DuckEngine, loc: &latiq_storage::PondLocation) -> i64 {
+        eng.read_query(
+            loc,
+            "SELECT count(*) AS n FROM pond.snapshots()",
+            AbortToken::new(),
+        )
+        .unwrap()
+        .rows[0][0]
+            .as_i64()
+            .unwrap()
+    }
+
+    #[test]
+    fn attribution_pull_commits_with_the_caller_and_a_failed_pull_rolls_back_and_detaches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = seed_external(tmp.path());
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        eng.init_pond(&loc).unwrap();
+        let ann = Identity::claimed(Some("ann"));
+
+        // 1. A pull that fails inside the transaction.
+        let before = snapshot_count(&eng, &loc);
+        let err = eng
+            .pull_catalog(
+                &loc,
+                "ducklake",
+                "ext",
+                &params,
+                "CREATE TABLE bad AS SELECT no_such_column FROM ext.widgets",
+                &ann,
+                Some("t0"),
+            )
+            .expect_err("a pull naming a column the source does not have must fail");
+        // The caller's own SQL, so DuckDB's class survives rather than becoming
+        // `internal` + "report to your operator".
+        assert!(
+            matches!(err, latiq_engine::EngineError::Catalog(_)),
+            "a bad column in the pull query is the caller's mistake — a name \
+             that does not resolve, not `internal`: {err:?}"
+        );
+        assert_eq!(
+            snapshot_count(&eng, &loc),
+            before,
+            "a failed pull must not publish a snapshot"
+        );
+        // The attachment is gone even though the pull failed — the teardown runs
+        // after the bracket, on both outcomes.
+        match eng.read_query(&loc, "SELECT 1 FROM ext.widgets", AbortToken::new()) {
+            Err(e) => assert!(
+                format!("{e:?}").contains("ext"),
+                "the failure must be `ext` being detached, not something else: {e:?}"
+            ),
+            Ok(r) => panic!("the external catalog outlived a failed pull: {r:?}"),
+        }
+
+        // 2. A pull that writes nothing: same no-op contract as a read routed
+        // through the write path — no snapshot, so nothing to attribute.
+        let meta = eng
+            .pull_catalog(
+                &loc,
+                "ducklake",
+                "ext",
+                &params,
+                "SELECT id FROM ext.widgets WHERE 1=0",
+                &ann,
+                Some("t1"),
+            )
+            .expect("a pull that writes nothing is not an error");
+        assert_eq!(
+            meta.snapshot_id, None,
+            "a pull that changed nothing must not claim a snapshot"
+        );
+        assert_eq!(
+            snapshot_count(&eng, &loc),
+            before,
+            "…and must not add one either"
+        );
+
+        // 3. The happy path: committed, attributed, traced.
+        let meta = eng
+            .pull_catalog(
+                &loc,
+                "ducklake",
+                "ext",
+                &params,
+                "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10",
+                &ann,
+                Some("0af7651916cd43dd8448eb211c80319c"),
+            )
+            .expect("the pull must succeed");
+        assert!(
+            meta.snapshot_id.is_some(),
+            "a pull that wrote must report the snapshot it published"
+        );
+        let row = newest_snapshot(&eng, &loc);
+        assert_eq!(row[0], "ann", "the pull's author is the caller: {row:?}");
+        assert_eq!(
+            row[1], "pull_catalog",
+            "the commit message must say how the data arrived: {row:?}"
+        );
+        let extra: serde_json::Value = serde_json::from_str(&row[2]).unwrap();
+        assert_eq!(
+            extra["trace_id"],
+            serde_json::json!("0af7651916cd43dd8448eb211c80319c"),
+            "the pull's snapshot must carry the request's trace id: {extra}"
+        );
+        assert_eq!(extra["agent_id"], serde_json::json!("ann"));
+        assert_eq!(extra["verified"], serde_json::json!(false));
+
+        // The rows really are in the pond, and the pond still writes.
+        let n = eng
+            .read_query(&loc, "SELECT count(*) AS n FROM cheap", AbortToken::new())
+            .unwrap();
+        assert_eq!(n.rows[0][0], serde_json::json!(2));
+        eng.write_query(
+            &loc,
+            "INSERT INTO cheap VALUES (9,'nut')",
+            &ann,
+            None,
+            AbortToken::new(),
+        )
+        .expect("the pond's writer must not be left mid-transaction by a pull");
+    }
+
+    /// A pull with no trace scope omits the key rather than inventing one — the
+    /// same rule `write_query` follows, and for the same reason: a `"-"` or a
+    /// minted id is a value someone joins against and never matches.
+    #[test]
+    fn attribution_pull_without_a_trace_scope_records_no_trace_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let params = seed_external(tmp.path());
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        let loc = fs.create_pond(PondId::new(), false).unwrap();
+        eng.init_pond(&loc).unwrap();
+
+        eng.pull_catalog(
+            &loc,
+            "ducklake",
+            "ext",
+            &params,
+            "CREATE TABLE cheap AS SELECT id FROM ext.widgets",
+            &Identity::claimed(Some("ann")),
+            None,
+        )
+        .unwrap();
+        let row = newest_snapshot(&eng, &loc);
+        assert_eq!(row[0], "ann", "still attributed: {row:?}");
+        let extra: serde_json::Value = serde_json::from_str(&row[2]).unwrap();
+        assert!(
+            extra.get("trace_id").is_none(),
+            "an untraced pull must omit the key, not fill it: {extra}"
+        );
+    }
+}
