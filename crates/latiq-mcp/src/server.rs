@@ -1091,6 +1091,8 @@ FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new 
 TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
 pull_catalog for an external database/lakehouse (iceberg) — you pull a subset into the pond, then work there \
 (external catalogs are never queried live). \
+WHAT A POND READS WITH NO SETUP: CSV, Parquet and JSON, from http(s):// and s3:// as well as local paths. \
+Geospatial, full-text search and IP types must be asked for at allocate_pond (`extensions: [...]`, fixed for the pond's life); Iceberg comes via pull_catalog. latiq://dialect has the full list. \
 WHO YOU ARE: your identity arrives in the transport (bearer token + the `latiq-agent-id` header), never as a tool argument — no tool takes one, so don't look for it. \
 PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be explainable later; it cannot be enabled afterwards. \
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow. \
@@ -1281,6 +1283,52 @@ mod tests {
     /// already shipped a resource teaching a tool that had been removed; this is
     /// the same class of rot one layer earlier, where it would break an agent's
     /// very first call.
+    /// **The capability claim in `instructions` has to be backed where it
+    /// points.** `instructions` is the one channel a client cannot defer, so it
+    /// is where "a pond already reads this" belongs — but it is four lines, so
+    /// it can only summarise and hand off. Same shape as
+    /// `mcp_tool_descriptions_point_at_resources_that_carry_what_they_promise`:
+    /// a link that merely resolves is how content disappears in a move.
+    ///
+    /// The three states it names are the ones an agent has to act on, and one of
+    /// them is irreversible (`extensions` is fixed at allocation), so a summary
+    /// that dropped it would cost a pond.
+    #[test]
+    fn instructions_capability_claim_is_backed_by_the_dialect_page() {
+        assert!(
+            INSTRUCTIONS.contains("latiq://dialect"),
+            "the capability summary must hand off to the page with the full list"
+        );
+        let dialect = crate::resources::read_resource("latiq://dialect")
+            .expect("latiq://dialect is served")
+            .contents
+            .into_iter()
+            .filter_map(|c| match c {
+                rmcp::model::ResourceContents::TextResourceContents { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect::<String>();
+        for promise in [
+            // Named in `instructions` as free; must be on the page as such.
+            "CSV",
+            "Parquet",
+            "always loaded",
+            // Named as requestable, and the page carries the irreversibility.
+            "extensions: [\"spatial\"]",
+            "cannot be added to a pond that already",
+            // Named as catalog-reached rather than requestable.
+            "pull_catalog",
+        ] {
+            assert!(
+                dialect.contains(promise),
+                "instructions summarise a capability the dialect page does not carry: {promise:?}"
+            );
+        }
+        // Anti-vacuity: an empty body would satisfy nothing above, but a
+        // truncated one could satisfy the short needles.
+        assert!(dialect.len() > 2000, "the served dialect body looks empty");
+    }
+
     #[test]
     fn instructions_name_only_tools_this_server_advertises() {
         let tools = advertised_tools();
