@@ -39,7 +39,13 @@ pub struct AttachPlan {
     /// egress). The extensions come from the node's cache, put there by
     /// `latiq warm-extensions` at image-build time or the node's startup warm.
     /// Guarded by `attach_plan_never_installs_an_extension`.
-    pub load: Vec<String>,
+    ///
+    /// `(extension, statement)`, not a bare statement: a LOAD that fails must
+    /// name the missing extension as a VALUE on the envelope
+    /// (`capability_unavailable`'s `facts.capability`), and recovering that name
+    /// by re-parsing our own SQL back out of the string would be a second
+    /// spelling of one fact.
+    pub load: Vec<(String, String)>,
     /// `(secret_name, CREATE SECRET …)` — dropped on detach.
     pub secrets: Vec<(String, String)>,
     /// `ATTACH … AS <alias> (…)`.
@@ -76,7 +82,7 @@ pub fn plan(
         .map(|s| {
             s.required_extensions
                 .iter()
-                .map(|e| format!("LOAD {e};"))
+                .map(|e| ((*e).to_string(), format!("LOAD {e};")))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -95,7 +101,7 @@ pub fn plan(
 fn ducklake(
     alias: &str,
     params: &BTreeMap<String, String>,
-    load: Vec<String>,
+    load: Vec<(String, String)>,
 ) -> Result<AttachPlan, EngineError> {
     let metadata = params
         .get("metadata_path")
@@ -170,7 +176,7 @@ fn s3_secret_line(alias: &str, params: &BTreeMap<String, String>) -> Option<(Str
 fn iceberg(
     alias: &str,
     params: &BTreeMap<String, String>,
-    load: Vec<String>,
+    load: Vec<(String, String)>,
 ) -> Result<AttachPlan, EngineError> {
     let endpoint = params
         .get("endpoint")
@@ -238,7 +244,7 @@ mod tests {
             ("token", "bear'er"),
         ]);
         let plan = plan("iceberg", "lake", &p).unwrap();
-        assert!(plan.load.iter().any(|s| s.contains("iceberg")));
+        assert!(plan.load.iter().any(|(ext, _)| ext == "iceberg"));
         assert_eq!(plan.secrets.len(), 1);
         assert!(plan.secrets[0].1.contains("TYPE iceberg"));
         assert!(
@@ -417,15 +423,20 @@ mod tests {
                 "catalog type '{}' must load exactly the extensions it declares",
                 t.name
             );
-            for stmt in &plan.load {
+            for (ext, stmt) in &plan.load {
                 assert!(
                     !stmt.to_uppercase().contains("INSTALL"),
                     "catalog type '{}' would download an extension while a caller waits: {stmt}",
                     t.name
                 );
-                assert!(
-                    stmt.starts_with("LOAD "),
-                    "catalog type '{}': expected a bare LOAD, got: {stmt}",
+                // The statement is exactly the LOAD of the extension the plan
+                // names — so the name published when it fails
+                // (`capability_unavailable`'s `facts.capability`) is the one
+                // this site actually tried to load.
+                assert_eq!(
+                    stmt,
+                    &format!("LOAD {ext};"),
+                    "catalog type '{}': expected a bare LOAD of '{ext}', got: {stmt}",
                     t.name
                 );
                 statements += 1;

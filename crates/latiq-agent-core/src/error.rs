@@ -313,6 +313,25 @@ impl From<EngineError> for AgentError {
                 // and no `feature` fact is published rather than a guessed one.
                 None => AgentError::of_kind(ErrorKind::UnsupportedFeature, message),
             },
+            // The call is right and the DEPLOYMENT is incomplete — the only
+            // failure where that is true. It reached agents as `internal` +
+            // "Retry; if it persists, report to your operator", which is a
+            // retry loop on a call that cannot succeed until somebody installs
+            // an extension, followed by the escalation that was the whole
+            // answer. The kind's own advice says the second half properly, so
+            // the engine's sentence is passed through unchanged.
+            //
+            // The `capability` fact is the same narrow exception
+            // `unsupported_feature`'s `feature` is: a name we did not invent,
+            // published as a value so a client (or an orchestrating agent that
+            // can install it) branches on it instead of parsing the sentence.
+            // Here it is stronger than a lift — the engine built both the
+            // sentence and the value from one argument at one site.
+            EngineError::CapabilityUnavailable {
+                message,
+                capability,
+            } => AgentError::of_kind(ErrorKind::CapabilityUnavailable, message)
+                .with_facts(facts! { "capability" => capability }),
             // The value or argument is the caller's, and the message says which
             // one. Not `Conversion`'s advice: a CAST does not fix an overflow, a
             // bad format specifier or a file that is not the format it was read
@@ -356,6 +375,11 @@ mod tests {
     /// proves the mapping itself is total and that no caller-fixable engine
     /// failure lands on `internal` — the one bucket whose advice ("retry, then
     /// wake a human") is wrong for everything the caller could fix.
+    ///
+    /// One variant is deliberately NOT the caller's — a capability this
+    /// deployment never provisioned — and it is asserted as such rather than
+    /// exempted: `internal` was wrong for it too, for the opposite reason (it
+    /// told the caller to retry something only an operator can unblock).
     #[test]
     fn error_contract_every_engine_error_maps_to_a_kind_the_caller_can_act_on() {
         let cases = [
@@ -401,6 +425,13 @@ mod tests {
                 EngineError::TransactionControl("TransactionContext Error: x".into()),
                 ErrorKind::UnsupportedFeature,
             ),
+            (
+                EngineError::CapabilityUnavailable {
+                    message: "The DuckDB extension 'spatial' … is not cached on this node".into(),
+                    capability: "spatial".into(),
+                },
+                ErrorKind::CapabilityUnavailable,
+            ),
             (EngineError::ReadOnlyViolation, ErrorKind::ReadOnlyViolation),
             (EngineError::Cancelled, ErrorKind::QueryCancelled),
             (EngineError::Timeout, ErrorKind::QueryTimeout),
@@ -409,17 +440,30 @@ mod tests {
         // deliberate `internal` one (both shapes of `Unsupported` are driven,
         // because the named-feature branch and the unnamed one build different
         // envelopes). A new variant added without a mapping decision fails here.
-        assert_eq!(cases.len(), 12, "an EngineError variant is unaccounted for");
+        assert_eq!(cases.len(), 13, "an EngineError variant is unaccounted for");
         for (engine_err, want) in cases {
             let label = format!("{engine_err:?}");
             let env = AgentError::from(engine_err).into_envelope();
             assert_eq!(env.kind, want, "{label}");
-            assert!(
-                !env.suggest.contains("report to your operator"),
-                "{label}: this is the caller's to fix, so the advice must not be \
-                 to wake an operator: {}",
-                env.suggest
-            );
+            match env.audience {
+                // Everything the caller CAN fix: the advice must be the fix,
+                // never the hand-off that `internal` gives.
+                latiq_common::Audience::Agent => assert!(
+                    !env.suggest.contains("report to your operator"),
+                    "{label}: this is the caller's to fix, so the advice must not be \
+                     to wake an operator: {}",
+                    env.suggest
+                ),
+                // The one engine failure that is genuinely nobody-here's to fix.
+                // It must not pretend otherwise — an unbounded retry (`as_is`)
+                // or a rewrite (`after_change`) are both wrong for a correct
+                // call against an under-provisioned deployment.
+                latiq_common::Audience::Operator => {
+                    assert_eq!(env.kind, ErrorKind::CapabilityUnavailable, "{label}");
+                    assert_eq!(env.retryable, latiq_common::Retryable::AfterProvisioning);
+                    assert!(env.suggest.contains("operator"), "{}", env.suggest);
+                }
+            }
             assert!(env.see.starts_with("latiq://"), "{label}: {}", env.see);
         }
         // And the catch-all still is one: a failure we have NOT classified must

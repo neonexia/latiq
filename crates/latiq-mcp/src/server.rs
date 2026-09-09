@@ -1096,7 +1096,7 @@ Geospatial, full-text search and IP types must be asked for at allocate_pond (`e
 WHO YOU ARE: your identity arrives in the transport (bearer token + the `latiq-agent-id` header), never as a tool argument — no tool takes one, so don't look for it. \
 PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be explainable later; it cannot be enabled afterwards. \
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow. \
-ERRORS ARE STRUCTURED: alongside `message`/`suggest`/`see`, every failure carries `retryable` (`as_is` / `after_change` / `never` — `never` means THIS call, and `suggest` names the different call that works), \
+ERRORS ARE STRUCTURED: alongside `message`/`suggest`/`see`, every failure carries `retryable` (`as_is` / `after_change` / `never` / `after_provisioning` — `never` means THIS call, and `suggest` names the different call that works; `after_provisioning` means your call was fine and this deployment has not installed a capability it needs, so tell whoever is orchestrating you and stop, rather than retrying), \
 `audience` (`operator` means report it and stop) and `facts` (the numbers as values, so don't parse the sentence). Branch on those, not on the prose — latiq://guidance has the contract. \
 Every tool result also carries `_meta.traceparent` IN ITS BODY — the W3C trace id of that call, the one to quote when asking an operator about it (a failure puts the same id on the envelope's own `traceparent`/`trace_id`). \
 Prompts provide SOPs for common multi-agent workflows.";
@@ -1272,7 +1272,7 @@ mod tests {
     /// explicit so a genuine tool name can never hide in it.
     // Envelope field VALUES and field NAMES, which are snake_case like a tool
     // name and are not one.
-    const NON_TOOL_WORDS: &[&str] = &["as_is", "after_change", "trace_id"];
+    const NON_TOOL_WORDS: &[&str] = &["as_is", "after_change", "after_provisioning", "trace_id"];
 
     /// **Discovery runs on the tool NAME and on this block, not on tool
     /// descriptions** — a client may defer descriptions until after the agent
