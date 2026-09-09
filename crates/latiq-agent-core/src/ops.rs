@@ -516,7 +516,7 @@ impl AgentOps {
         let mut loc = self
             .storage
             .ensure_pond(pid, info.lineage)
-            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+            .map_err(|e| AgentError::storage(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
@@ -728,7 +728,7 @@ impl AgentOps {
         let mut loc = self
             .storage
             .ensure_pond(pid, info.lineage)
-            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+            .map_err(|e| AgentError::storage(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
@@ -1163,7 +1163,7 @@ impl AgentOps {
         let mut loc = self
             .storage
             .ensure_pond(pid, info.lineage)
-            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+            .map_err(|e| AgentError::storage(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
@@ -1288,7 +1288,7 @@ impl AgentOps {
         let mut loc = self
             .storage
             .ensure_pond(pid, info.lineage)
-            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+            .map_err(|e| AgentError::storage(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
@@ -1633,7 +1633,7 @@ impl AgentOps {
         let mut loc = self
             .storage
             .ensure_pond(pid, info.lineage)
-            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+            .map_err(|e| AgentError::storage(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
@@ -1780,7 +1780,7 @@ impl AgentOps {
         let mut loc = self
             .storage
             .ensure_pond(pid, info.lineage)
-            .map_err(|e| AgentError::internal(format!("storage: {e}")))?;
+            .map_err(|e| AgentError::storage(format!("storage: {e}")))?;
         loc.catalog_name = info.name.clone();
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();

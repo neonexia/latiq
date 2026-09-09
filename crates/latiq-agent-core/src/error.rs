@@ -225,6 +225,23 @@ impl AgentError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::of_kind(ErrorKind::Internal, message)
     }
+
+    /// The pond's own files could not be read or written — a `PondStorage`
+    /// failure (a full disk, a permission, a path that vanished under us).
+    ///
+    /// Distinct from [`Self::internal`], which these sites all used to be.
+    /// `internal` means "we could not classify this, it is probably a bug of
+    /// ours"; a disk that is full is neither unclassified nor a bug, and
+    /// `storage` is the kind that says so. The two share an `audience`
+    /// (`operator`), a `retryable` (`as_is`) and their advice, so no agent
+    /// behaviour changes — what changes is that an operator reading `kind` is
+    /// told to look at the disk instead of at our stack traces, and that
+    /// `internal` goes back to meaning only what it says. Note this is the
+    /// POND's storage, never a source named in the caller's statement — that is
+    /// `source_unavailable`, and the caller fixes it.
+    pub fn storage(message: impl Into<String>) -> Self {
+        Self::of_kind(ErrorKind::Storage, message)
+    }
 }
 
 impl std::fmt::Display for AgentError {
@@ -346,6 +363,21 @@ impl From<EngineError> for AgentError {
                  correct format string, a path that really holds the format you are reading.",
                 "latiq://dialect",
             ),
+            // A catalog parameter the caller never supplied. This is Nexus
+            // finding 8's shape a second time and it survived that fix: the
+            // message is literally "ducklake catalog requires --set
+            // metadata_path=<catalog-db>" — the fix, spelled out — and it was
+            // delivered as `internal` + `audience: operator` + `retryable:
+            // as_is` + "Retry; if it persists, report to your operator". The
+            // engine had not run; there was nothing for an operator to look at.
+            // The message names the parameter, so the kind's own advice
+            // ("Provide the required argument and retry") completes it.
+            EngineError::MissingParameter(m) => AgentError::of_kind(ErrorKind::MissingArgument, m),
+            // Same site, different edit: the value is present and is not one of
+            // the choices. Its message names the legal set, which is what
+            // invariant 13(b) requires of a refusal, so the kind's "Fix the
+            // value and retry" is the whole remaining instruction.
+            EngineError::UnsupportedParameter(m) => AgentError::of_kind(ErrorKind::InvalidValue, m),
             // Transaction control is the one caller mistake that may have
             // COMMITTED something before failing, so the advice has to say so:
             // "re-send it" without that warning is advice to double-write.
@@ -432,6 +464,22 @@ mod tests {
                 },
                 ErrorKind::CapabilityUnavailable,
             ),
+            // Both were `Engine` → `internal` until the audit: a catalog
+            // parameter the caller never supplied, answered with "Retry; if it
+            // persists, report to your operator" while the message said
+            // "requires --set metadata_path=<catalog-db>".
+            (
+                EngineError::MissingParameter(
+                    "iceberg catalog requires --set endpoint=<rest-url>".into(),
+                ),
+                ErrorKind::MissingArgument,
+            ),
+            (
+                EngineError::UnsupportedParameter(
+                    "unsupported catalog type 'postgres' (supported: iceberg, ducklake)".into(),
+                ),
+                ErrorKind::InvalidValue,
+            ),
             (EngineError::ReadOnlyViolation, ErrorKind::ReadOnlyViolation),
             (EngineError::Cancelled, ErrorKind::QueryCancelled),
             (EngineError::Timeout, ErrorKind::QueryTimeout),
@@ -440,7 +488,7 @@ mod tests {
         // deliberate `internal` one (both shapes of `Unsupported` are driven,
         // because the named-feature branch and the unnamed one build different
         // envelopes). A new variant added without a mapping decision fails here.
-        assert_eq!(cases.len(), 13, "an EngineError variant is unaccounted for");
+        assert_eq!(cases.len(), 15, "an EngineError variant is unaccounted for");
         for (engine_err, want) in cases {
             let label = format!("{engine_err:?}");
             let env = AgentError::from(engine_err).into_envelope();
@@ -448,12 +496,42 @@ mod tests {
             match env.audience {
                 // Everything the caller CAN fix: the advice must be the fix,
                 // never the hand-off that `internal` gives.
-                latiq_common::Audience::Agent => assert!(
-                    !env.suggest.contains("report to your operator"),
-                    "{label}: this is the caller's to fix, so the advice must not be \
-                     to wake an operator: {}",
-                    env.suggest
-                ),
+                latiq_common::Audience::Agent => {
+                    assert!(
+                        !env.suggest.contains("report to your operator"),
+                        "{label}: this is the caller's to fix, so the advice must not be \
+                         to wake an operator: {}",
+                        env.suggest
+                    );
+                    // …and it must not invite the loop either. Where the
+                    // STATEMENT is what failed, re-sending it unchanged can only
+                    // fail again — which is exactly the Nexus-finding-8 defect:
+                    // `internal`/`as_is` sent an agent round on `CREATE TABLE
+                    // t(id INTEGER PRIMARY KEY)` for ever.
+                    //
+                    // Three kinds are `as_is` on purpose, and all three share
+                    // one reason: the call was fine and the WORLD was not, so
+                    // the same call under different conditions can succeed. The
+                    // deadline, the caller's own cancel, and a source that may
+                    // be transiently unreachable (whose advice already says one
+                    // retry is worth it and a second identical failure is not).
+                    // Listed here rather than exempted silently, so a fourth
+                    // has to be argued for.
+                    if !matches!(
+                        env.kind,
+                        ErrorKind::QueryCancelled
+                            | ErrorKind::QueryTimeout
+                            | ErrorKind::SourceUnavailable
+                    ) {
+                        assert_ne!(
+                            env.retryable,
+                            latiq_common::Retryable::AsIs,
+                            "{label}: the identical call cannot succeed, so `as_is` is the retry \
+                             loop `retryable` exists to prevent: {}",
+                            env.suggest
+                        );
+                    }
+                }
                 // The one engine failure that is genuinely nobody-here's to fix.
                 // It must not pretend otherwise — an unbounded retry (`as_is`)
                 // or a rewrite (`after_change`) are both wrong for a correct

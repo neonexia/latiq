@@ -97,6 +97,32 @@ pub enum EngineError {
     /// not a CAST.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A parameter the CALLER supplies — a catalog's `endpoint`, `metadata_path`,
+    /// `data_path` — was not provided, so the engine was never asked to do
+    /// anything. Nothing has run and nothing of ours failed.
+    ///
+    /// Its own variant because the two neighbours both lie about it. `Engine` →
+    /// `internal` → "Retry; if it persists, report to your operator" is the
+    /// Nexus-finding-8 shape exactly: the message already says *"requires --set
+    /// metadata_path=<catalog-db>"*, so the caller is told to re-send an
+    /// identical call that can never succeed and then to wake an operator who
+    /// has nothing to fix. And it is not [`Self::InvalidInput`], whose advice is
+    /// about a value the engine rejected (a CAST, a narrower type) — here there
+    /// is no value at all. The message NAMES the parameter; supplying it is the
+    /// whole fix.
+    #[error("missing parameter: {0}")]
+    MissingParameter(String),
+    /// A parameter the CALLER supplied names something this engine does not
+    /// offer — a catalog `type` that is not one of the supported set. Present,
+    /// well-formed, and not a thing: the fix is a different value, and the
+    /// message names the legal set.
+    ///
+    /// Split from [`Self::MissingParameter`] because "you left it out" and "that
+    /// is not one of the choices" are different edits, and from
+    /// [`Self::InvalidInput`] for the same reason that one is: this value never
+    /// reached DuckDB, so DuckDB's advice about casts and ranges does not apply.
+    #[error("unsupported parameter: {0}")]
+    UnsupportedParameter(String),
     /// The caller's own statement drove the transaction Latiq owns (`BEGIN` /
     /// `COMMIT` / `ROLLBACK`), or that transaction could not be closed. Its own
     /// variant because the retry advice is different from every other one here:

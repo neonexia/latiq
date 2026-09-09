@@ -668,6 +668,52 @@ impl ErrorKind {
     }
 }
 
+/// **An opaque failure may not carry specific advice.**
+///
+/// `internal` is not a severity, it is a statement about knowledge: it is the
+/// bucket for a failure we could not classify, and "Retry; if it persists,
+/// report to your operator" is not merely its default advice — it *is* the kind.
+/// So a site that has something more specific to say has, by that very fact,
+/// classified the failure, and must carry a kind that says what it learned.
+///
+/// This is checked at the one funnel every envelope passes through rather than
+/// in a test that enumerates construction sites, because enumeration is exactly
+/// what has failed here before: a guard covers the sites somebody remembered,
+/// and the defect always arrives at one they did not. Any code path in any test
+/// that builds such an envelope trips this, including paths nobody listed.
+///
+/// It caught two live envelopes when it was added — `ControlPlaneError`'s
+/// `NodeNotFound` (`internal`, `audience: operator`, `retryable: as_is`, next to
+/// a `suggest` naming a call the CALLER makes to fix it: three fields telling an
+/// agent to stop and one telling it to carry on) and `NoNodeAvailable` (whose
+/// operator-facing instruction now lives in `message`, where free prose belongs).
+/// Both also pointed `see` at `latiq://troubleshooting`, the INDEX — the same
+/// bug `default_see` was fixed for, reintroduced by an override that no guard
+/// over `ErrorKind::ALL` could see, because it never touched the kind table.
+///
+/// `debug_assert` on purpose: it compiles out of release builds, so a mistake
+/// here can never panic a serving node — it fails the build's tests instead,
+/// which is where an incoherent envelope should die.
+fn assert_opaque_kinds_keep_canonical_guidance(kind: ErrorKind, suggest: &str, see: &str) {
+    if !matches!(kind, ErrorKind::Internal) {
+        return;
+    }
+    debug_assert_eq!(
+        suggest,
+        kind.default_suggest(),
+        "an `internal` envelope must not carry bespoke `suggest` text: if this site knows a \
+         specific next step, the failure is not the unclassified one `internal` means. Give it a \
+         kind that names what went wrong (and whose `audience`/`retryable` match the advice), or \
+         move the detail into `message`, which is free prose."
+    );
+    debug_assert_eq!(
+        see, "latiq://troubleshooting/internal",
+        "an `internal` envelope must point at internal's own page, not another kind's and not \
+         the `latiq://troubleshooting` index — an index resolves, so it keeps a `see` guard green \
+         while teaching the reader nothing about their failure."
+    );
+}
+
 impl ErrorEnvelope {
     pub fn new(
         kind: ErrorKind,
@@ -675,12 +721,14 @@ impl ErrorEnvelope {
         suggest: impl Into<String>,
         see: impl Into<String>,
     ) -> Self {
+        let (suggest, see) = (suggest.into(), see.into());
+        assert_opaque_kinds_keep_canonical_guidance(kind, &suggest, &see);
         Self {
             kind,
             message: message.into(),
             location: None,
-            suggest: suggest.into(),
-            see: see.into(),
+            suggest,
+            see,
             audience: kind.audience(),
             retryable: kind.retryable(),
             facts: Facts::new(),
@@ -728,12 +776,16 @@ impl ErrorEnvelope {
         suggest: &str,
         see: impl Into<String>,
     ) -> Self {
+        // Checked on the RENDERED text, not the template: what a caller reads is
+        // what has to be coherent, and a template is only how it was spelled.
+        let (suggest, see) = (render_facts(suggest, &facts), see.into());
+        assert_opaque_kinds_keep_canonical_guidance(kind, &suggest, &see);
         Self {
             kind,
             message: render_facts(template, &facts),
             location: None,
-            suggest: render_facts(suggest, &facts),
-            see: see.into(),
+            suggest,
+            see,
             audience: kind.audience(),
             retryable: kind.retryable(),
             facts,
@@ -1120,6 +1172,67 @@ mod tests {
         assert!(ErrorEnvelope::for_kind(ErrorKind::Internal, "boom")
             .traceparent
             .is_none());
+    }
+
+    /// The funnel invariant, stated positively: the ordinary way to build an
+    /// `internal` envelope keeps the canonical guidance, and a kind that is NOT
+    /// opaque may override freely (which most of the taxonomy does).
+    #[test]
+    fn error_contract_an_internal_envelope_keeps_the_canonical_guidance() {
+        let e = ErrorEnvelope::for_kind(ErrorKind::Internal, "engine error: connection reset");
+        assert_eq!(e.suggest, "Retry; if it persists, report to your operator.");
+        assert_eq!(e.see, "latiq://troubleshooting/internal");
+        // …and a classified kind is still free to say something specific, which
+        // is the whole point of the distinction: `internal` is the bucket for a
+        // failure we could NOT classify, so having advice means you classified it.
+        let ok = ErrorEnvelope::new(
+            ErrorKind::InvalidValue,
+            "Node 'bad-id' is not registered.",
+            "Run `latiq node list`.",
+            "latiq://guidance",
+        );
+        assert_eq!(ok.suggest, "Run `latiq node list`.");
+    }
+
+    /// **Anti-vacuity for the funnel invariant.** A `debug_assert` that cannot be
+    /// made to fire guards nothing (tests/CLAUDE.md rule 7), so this constructs
+    /// the exact envelope shape the audit found in `ControlPlaneError` — an
+    /// `internal` kind carrying a bespoke, caller-actionable `suggest` — and
+    /// requires the panic.
+    ///
+    /// This is the shape that made the bug invisible: `audience: operator` +
+    /// `retryable: as_is` (stop, you cannot fix this) sitting next to advice
+    /// naming a call the caller makes. No guard over `ErrorKind::ALL` can see it,
+    /// because the kind table was never touched.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "must not carry bespoke `suggest`")]
+    fn error_contract_an_internal_envelope_may_not_carry_bespoke_advice() {
+        let _ = ErrorEnvelope::new(
+            ErrorKind::Internal,
+            "Node 'bad-id' is not registered.",
+            "Run `latiq node list` to see registered nodes.",
+            "latiq://troubleshooting/internal",
+        );
+    }
+
+    /// The other half, and its own regression: `latiq://troubleshooting` is the
+    /// INDEX. It resolves, so `error_contract_every_error_kind_sees_a_resource_that_exists`
+    /// stays green while the reader lands on a menu of other agents' problems —
+    /// exactly the bug `default_see` was fixed for, and exactly what both
+    /// `internal` envelopes in the control plane had reintroduced by overriding
+    /// `see` at the construction site, where no guard was looking.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "point at internal's own page")]
+    fn error_contract_an_internal_envelope_may_not_see_the_troubleshooting_index() {
+        let _ = ErrorEnvelope::rendered_with(
+            ErrorKind::Internal,
+            "No pond node is available: {why}.",
+            facts! { "why" => "none registered" },
+            ErrorKind::Internal.default_suggest(),
+            "latiq://troubleshooting",
+        );
     }
 
     /// `audience` must agree with `suggest`: a kind whose advice tells the
