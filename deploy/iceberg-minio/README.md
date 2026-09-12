@@ -28,11 +28,16 @@ LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
 LATIQ_S3_ENDPOINT=http://localhost:9000 \
 LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
 cargo test -p latiq --test admin -- --ignored --exact --nocapture \
-  catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond
+  catalogs_iceberg::iceberg_attach_and_join_a_second_catalog_into_a_pond
 ```
 
-It registers the catalog, `describe`s it (finds `demo.widgets`), `pull`s a subset
-into a pond, and verifies the rows landed — the same flow an agent runs over MCP.
+It **attaches** the iceberg catalog to a pond, attaches a second (local DuckLake)
+catalog alongside it, runs ONE ordinary `write_query` joining across both into a
+pond table, verifies the rows landed and that the write is attributed, then
+detaches both — the same flow an agent runs over MCP. A second, `#[ignore]`d test
+in the same module pins the error an `endpoint` that is not a REST catalog
+produces (`source_unavailable`, not `internal` + "retry"); it needs a real HTTP
+server answering wrongly, which is why it cannot live in the offline suite.
 
 In CI this is the opt-in `iceberg` job (commit message contains `[iceberg-ci]`,
 or trigger the workflow manually). The deterministic **DuckLake** catalog e2e
@@ -55,7 +60,7 @@ LATIQ_ICEBERG_WAREHOUSE=demo LATIQ_ICEBERG_TOKEN=dummy \
 LATIQ_S3_ENDPOINT=http://localhost:19000 \
 LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
 cargo test -p latiq --test admin -- --ignored --exact --nocapture \
-  catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond
+  catalogs_iceberg::iceberg_attach_and_join_a_second_catalog_into_a_pond
 ```
 
 > Verified green under Podman (`podman compose` + `apache/iceberg-rest-fixture` +

@@ -123,6 +123,24 @@ pub enum EngineError {
     /// reached DuckDB, so DuckDB's advice about casts and ranges does not apply.
     #[error("unsupported parameter: {0}")]
     UnsupportedParameter(String),
+    /// `attach_catalog` was asked for an alias this pond already has mounted.
+    ///
+    /// Its own variant, not [`Self::Catalog`], because the two have opposite
+    /// fixes and `Catalog`'s advice ("look up what the pond actually has —
+    /// describe_pond, SHOW TABLES") is about the pond's *tables* and answers
+    /// nothing here. The alias carries as a VALUE so the envelope can name it
+    /// without the message being parsed.
+    ///
+    /// Deliberately not silently idempotent: re-attaching over a live alias with
+    /// different options or a different credential would swap what every
+    /// in-flight statement in the pond resolves `lake.` against.
+    #[error("a catalog is already attached as '{name}'")]
+    CatalogAlreadyAttached { name: String },
+    /// `detach_catalog` (or a statement) named an alias that is not attached —
+    /// including after a node restart, which loses every attachment. Its own
+    /// variant so the envelope's `suggest` can name `attach_catalog`.
+    #[error("no catalog is attached as '{name}'")]
+    CatalogNotAttached { name: String },
     /// The caller's own statement drove the transaction Latiq owns (`BEGIN` /
     /// `COMMIT` / `ROLLBACK`), or that transaction could not be closed. Its own
     /// variant because the retry advice is different from every other one here:
@@ -208,45 +226,43 @@ pub trait QueryEngine: Send + Sync {
     }
     /// Summarize the pond's user tables (for describe_pond).
     fn describe_schema(&self, loc: &PondLocation) -> Result<SchemaSummary, EngineError>;
-    /// Transient pull from an external catalog: on the pond's instance, LOAD the
-    /// type's extensions + create its secrets, `ATTACH` it as `alias`, run `query`
-    /// (a `CREATE TABLE … AS SELECT … FROM <alias>.…`), then `DETACH` + drop the
-    /// secrets — regardless of success. Nothing about the catalog persists.
+    /// Mount an external catalog on the pond and **leave it mounted**: LOAD the
+    /// type's extensions, `CREATE SECRET` from `secrets`, `ATTACH … AS name`.
     ///
-    /// The meta carries the pull's `inputs`/`outputs` when the pond opted into
-    /// lineage, and is empty otherwise (same gate as every other path). The
-    /// external side is named while the catalog is still ATTACHED — after the
-    /// detach nothing in the pond remembers where its rows came from, which is
-    /// exactly why this edge is worth recording.
+    /// The attachment lives on the pond's one DuckDB instance (invariant 7) and
+    /// outlives the call, which is the whole point: two catalogs attached at
+    /// once is what lets ordinary `write_query` SQL join across them. It is
+    /// **not persisted** — a node restart loses it, and a query naming a
+    /// vanished alias gets an actionable error pointing back here.
     ///
-    /// A pull WRITES into the pond, so it carries `identity` and `trace_id` for
-    /// exactly the same reason `write_query` does, and records them the same
-    /// way: this used to run outside any attribution bracket, and data entered
-    /// the pond through a path with no author, no identity and no trace id
-    /// recorded against it.
-    // One argument past clippy's threshold, and every one of them is required:
-    // the catalog to mount, the statement to run, and — as on `write_query` —
-    // who is asking and under which trace. Bundling them into a struct would
-    // churn every call site to hide a lint, not to say anything.
-    #[allow(clippy::too_many_arguments)]
-    fn pull_catalog(
+    /// Not a write to the pond, so no `Identity` and no attribution bracket: it
+    /// mutates session/instance state, and nothing lands in the pond's DuckLake
+    /// catalog until the caller's own `write_query` runs.
+    ///
+    /// `secrets` is [`latiq_common::Secret`]-typed all the way in, so an
+    /// implementation cannot log or echo it by accident; the values may only be
+    /// exposed inside the `CREATE SECRET` statement.
+    fn attach_catalog(
         &self,
         loc: &PondLocation,
         catalog_type: &str,
-        alias: &str,
-        params: &std::collections::BTreeMap<String, String>,
-        query: &str,
-        identity: &Identity,
-        trace_id: Option<&str>,
-    ) -> Result<latiq_common::QueryMeta, EngineError>;
-    /// Transiently attach a catalog and list its `(schema.table)` entries.
-    fn describe_catalog(
+        name: &str,
+        options: &std::collections::BTreeMap<String, String>,
+        secrets: &std::collections::BTreeMap<String, latiq_common::Secret>,
+    ) -> Result<crate::result::AttachedCatalog, EngineError>;
+    /// `DETACH` a catalog and **drop the secrets that were created for it**.
+    /// Dropping the credential is half the contract, not a tidy-up: after this
+    /// returns nothing on the node holds the caller's token.
+    ///
+    /// An alias that is not attached is a [`EngineError::Catalog`] — the caller
+    /// believes something is mounted that is not, and saying so is more useful
+    /// than an idempotent success.
+    fn detach_catalog(&self, loc: &PondLocation, name: &str) -> Result<(), EngineError>;
+    /// What is attached to this pond right now, in attach order.
+    fn attached_catalogs(
         &self,
         loc: &PondLocation,
-        catalog_type: &str,
-        alias: &str,
-        params: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, EngineError>;
+    ) -> Result<Vec<crate::result::AttachedCatalog>, EngineError>;
     /// Number of pond instances currently open/cached (for the node's
     /// `open_ponds` gauge). Cheap; default 0 for engines that don't cache.
     fn open_pond_count(&self) -> usize {

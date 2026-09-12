@@ -378,6 +378,42 @@ impl From<EngineError> for AgentError {
             // invariant 13(b) requires of a refusal, so the kind's "Fix the
             // value and retry" is the whole remaining instruction.
             EngineError::UnsupportedParameter(m) => AgentError::of_kind(ErrorKind::InvalidValue, m),
+            // `name_conflict`, but NOT the pond-name sentence that kind's own
+            // suggest carries ("omit name to let Latiq generate one" — there is
+            // no generated catalog alias, the alias is the SQL namespace the
+            // caller has to type). So the suggest is bespoke and names the two
+            // calls that resolve it.
+            EngineError::CatalogAlreadyAttached { name } => AgentError::rendered_with(
+                ErrorKind::NameConflict,
+                "A catalog is already attached to this pond as '{catalog}'.",
+                facts! { "catalog" => name },
+                "Either use it as it is — list_attached_catalogs shows what '{catalog}' points at \
+                 — or, if you need different options or a different credential, detach_catalog \
+                 '{catalog}' first and attach again. Re-attaching in place is deliberately not \
+                 allowed: it would change what every statement already running in this pond \
+                 resolves '{catalog}.' against. To mount a second catalog alongside this one, \
+                 pick a different name.",
+                ErrorKind::NameConflict.default_see(),
+            ),
+            // The one an agent hits by surprise: attachments live in the pond's
+            // engine instance and do NOT survive a node restart. `catalog_error`
+            // is the honest kind (a name in the statement did not resolve), but
+            // its canonical advice is about the pond's TABLES — it would send an
+            // agent to `SHOW TABLES`, which lists nothing called `lake` and
+            // never mentions the call that fixes this.
+            EngineError::CatalogNotAttached { name } => AgentError::rendered_with(
+                ErrorKind::CatalogError,
+                "No catalog is attached to this pond as '{catalog}'.",
+                facts! { "catalog" => name },
+                "Call attach_catalog with name '{catalog}', its `type` and its `options` (and a \
+                 credential if the source needs one) before naming it in SQL. \
+                 list_attached_catalogs shows what is attached right now. An attachment lives in \
+                 the pond's engine and is NOT restored when the node restarts, so this is the \
+                 expected answer after a restart — re-attach and re-send the statement unchanged. \
+                 Data you already extracted INTO the pond is unaffected: it is a pond table and \
+                 needs no catalog.",
+                ErrorKind::CatalogError.default_see(),
+            ),
             // Transaction control is the one caller mistake that may have
             // COMMITTED something before failing, so the advice has to say so:
             // "re-send it" without that warning is advice to double-write.
@@ -470,7 +506,7 @@ mod tests {
             // "requires --set metadata_path=<catalog-db>".
             (
                 EngineError::MissingParameter(
-                    "iceberg catalog requires --set endpoint=<rest-url>".into(),
+                    "iceberg catalog requires --option endpoint=<rest-url>".into(),
                 ),
                 ErrorKind::MissingArgument,
             ),
@@ -480,6 +516,25 @@ mod tests {
                 ),
                 ErrorKind::InvalidValue,
             ),
+            // The two catalog-attachment variants. Both are the caller's, and
+            // both carry a BESPOKE suggest because their kinds' canonical advice
+            // is about something else entirely: `name_conflict`'s is "omit the
+            // name and let Latiq generate one" (there is no generated catalog
+            // alias — it is the namespace the caller has to type), and
+            // `catalog_error`'s is "look up what the pond has: SHOW TABLES",
+            // which lists nothing called `lake`.
+            (
+                EngineError::CatalogAlreadyAttached {
+                    name: "lake".into(),
+                },
+                ErrorKind::NameConflict,
+            ),
+            (
+                EngineError::CatalogNotAttached {
+                    name: "lake".into(),
+                },
+                ErrorKind::CatalogError,
+            ),
             (EngineError::ReadOnlyViolation, ErrorKind::ReadOnlyViolation),
             (EngineError::Cancelled, ErrorKind::QueryCancelled),
             (EngineError::Timeout, ErrorKind::QueryTimeout),
@@ -488,7 +543,7 @@ mod tests {
         // deliberate `internal` one (both shapes of `Unsupported` are driven,
         // because the named-feature branch and the unnamed one build different
         // envelopes). A new variant added without a mapping decision fails here.
-        assert_eq!(cases.len(), 15, "an EngineError variant is unaccounted for");
+        assert_eq!(cases.len(), 17, "an EngineError variant is unaccounted for");
         for (engine_err, want) in cases {
             let label = format!("{engine_err:?}");
             let env = AgentError::from(engine_err).into_envelope();

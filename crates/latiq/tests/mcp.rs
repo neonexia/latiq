@@ -34,16 +34,38 @@ async fn external_data_tools_discover_and_load_via_mcp() {
         "list_datasets",
         "load_dataset",
         "list_catalogs",
-        "describe_catalog",
-        "pull_catalog",
+        "attach_catalog",
+        "detach_catalog",
+        "list_attached_catalogs",
     ] {
         assert!(tools.iter().any(|t| t.name == name), "missing tool {name}");
     }
-    let pull = tools.iter().find(|t| t.name == "pull_catalog").unwrap();
+    let attach = tools.iter().find(|t| t.name == "attach_catalog").unwrap();
+    let hints = attach.annotations.as_ref();
     assert_eq!(
-        pull.annotations.as_ref().and_then(|a| a.destructive_hint),
+        hints.and_then(|a| a.read_only_hint),
+        Some(false),
+        "an attach changes what SQL in the pond resolves → not read-only"
+    );
+    assert_eq!(
+        hints.and_then(|a| a.destructive_hint),
+        Some(false),
+        "an attach writes no data and destroys none — it is undone by a detach — \
+         so calling it destructive would make a client confirm the wrong thing"
+    );
+    assert_eq!(
+        hints.and_then(|a| a.idempotent_hint),
+        Some(false),
+        "a second attach of the same alias is a name_conflict, not a no-op"
+    );
+    assert_eq!(
+        tools
+            .iter()
+            .find(|t| t.name == "list_attached_catalogs")
+            .and_then(|t| t.annotations.as_ref())
+            .and_then(|a| a.read_only_hint),
         Some(true),
-        "pull_catalog writes into the pond → destructive"
+        "listing what is attached reads nothing and changes nothing"
     );
 
     // The agent-facing recipe is discoverable.
@@ -2193,10 +2215,15 @@ mod every_tool {
     use std::collections::HashMap;
 
     /// A local DuckLake catalog with one table — file metadata + local data, no
-    /// network and no docker, so `describe_catalog`/`pull_catalog` reach a real
-    /// SUCCESS response in this suite rather than only an error one. Same seed
-    /// the Data-surface catalog test uses (`admin.rs::catalogs`).
-    pub async fn seed_catalog(s: &TestStack, dir: &std::path::Path) {
+    /// network and no docker, so the catalog tools reach a real SUCCESS response
+    /// in this suite rather than only an error one. Same seed the Data-surface
+    /// catalog test uses (`admin.rs::catalogs`).
+    ///
+    /// It is ALSO registered with the control plane, so `list_catalogs` has a
+    /// row to return — the registry is discovery only now, and the locator it
+    /// hands back is exactly what an agent passes to `attach_catalog` as
+    /// `options`. Returns that locator, so the plan below does not restate it.
+    pub async fn seed_catalog(s: &TestStack, dir: &std::path::Path) -> Map<String, Value> {
         let meta = dir.join("meta.duckdb");
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
@@ -2229,6 +2256,10 @@ mod every_tool {
             })
             .await
             .unwrap();
+        args(&[
+            ("metadata_path", meta.display().to_string().into()),
+            ("data_path", data.display().to_string().into()),
+        ])
     }
 
     fn args(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -2243,7 +2274,10 @@ mod every_tool {
     /// the drop is last because it is the one irreversible step.
     ///
     /// Requires `seed_catalog` to have run on the same stack.
-    pub fn plan(pond: &str) -> Vec<(&'static str, Map<String, Value>)> {
+    pub fn plan(
+        pond: &str,
+        catalog_options: &Map<String, Value>,
+    ) -> Vec<(&'static str, Map<String, Value>)> {
         let p: Value = pond.into();
         vec![
             (
@@ -2274,20 +2308,33 @@ mod every_tool {
             ),
             ("list_catalogs", Map::new()),
             (
-                "describe_catalog",
-                args(&[("pond", p.clone()), ("catalog", "ext".into())]),
-            ),
-            (
-                "pull_catalog",
+                "attach_catalog",
                 args(&[
                     ("pond", p.clone()),
-                    ("catalog", "ext".into()),
+                    ("name", "ext".into()),
+                    ("type", "ducklake".into()),
+                    ("options", Value::Object(catalog_options.clone())),
+                ]),
+            ),
+            ("list_attached_catalogs", args(&[("pond", p.clone())])),
+            // The extract is an ordinary write against the attached catalog —
+            // there is no catalog-aware query tool, which is the point. A second
+            // `write_query` entry is harmless: the coverage check is over the
+            // SET of tools driven.
+            (
+                "write_query",
+                args(&[
+                    ("pond", p.clone()),
                     (
-                        "query",
-                        "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
+                        "sql",
+                        "CREATE TABLE cheap AS SELECT id,name FROM ext.main.widgets WHERE price < 10"
                             .into(),
                     ),
                 ]),
+            ),
+            (
+                "detach_catalog",
+                args(&[("pond", p.clone()), ("name", "ext".into())]),
             ),
             ("get_lineage", args(&[("pond", p.clone())])),
             // Destructive, so last.
@@ -2305,8 +2352,14 @@ mod every_tool {
         plan: &[(&'static str, Map<String, Value>)],
         advertised: &[&str],
     ) {
+        // A SET, because the property is coverage: the plan drives `write_query`
+        // twice on purpose (once to make a pond table, once as the extract from
+        // an attached catalog), and a tool driven twice is not less covered than
+        // one driven once. Deduplicating here rather than forbidding the second
+        // call keeps the plan able to express a real sequence.
         let mut planned: Vec<&str> = plan.iter().map(|(n, _)| *n).collect();
         planned.sort();
+        planned.dedup();
         let mut advertised: Vec<&str> = advertised.to_vec();
         advertised.sort();
         assert_eq!(
@@ -2359,7 +2412,7 @@ mod output_schema {
     async fn output_schema_every_tool_declares_one_and_its_real_response_validates() {
         let tmp = tempfile::tempdir().unwrap();
         let s = start_stack().await;
-        every_tool::seed_catalog(&s, tmp.path()).await;
+        let catalog_options = every_tool::seed_catalog(&s, tmp.path()).await;
 
         let c = LatiqClient::connect(&s.mcp_endpoint, Some("agent-x".into()))
             .await
@@ -2378,7 +2431,7 @@ mod output_schema {
             });
             declared.insert(t.name.to_string(), Value::Object((**schema).clone()));
         }
-        let plan = every_tool::plan("sch");
+        let plan = every_tool::plan("sch", &catalog_options);
         let advertised: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         every_tool::assert_plan_covers_the_advertised_tools(&plan, &advertised);
 
@@ -2528,7 +2581,7 @@ mod trace_meta {
     async fn trace_meta_every_advertised_tool_returns_a_traceparent_on_success() {
         let tmp = tempfile::tempdir().unwrap();
         let s = start_stack().await;
-        every_tool::seed_catalog(&s, tmp.path()).await;
+        let catalog_options = every_tool::seed_catalog(&s, tmp.path()).await;
 
         let c = LatiqClient::connect_traced(
             &s.mcp_endpoint,
@@ -2540,7 +2593,7 @@ mod trace_meta {
         .unwrap();
 
         let tools = c.list_tools().await.unwrap();
-        let plan = every_tool::plan("tp");
+        let plan = every_tool::plan("tp", &catalog_options);
         let advertised: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         every_tool::assert_plan_covers_the_advertised_tools(&plan, &advertised);
 

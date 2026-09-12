@@ -112,11 +112,11 @@ pub const EXTENSIONS: &[Ext] = &[
         // installs it at node startup from there. It is listed here so the
         // advertisement can name it — `always_loaded: false` and NOT in
         // `OPTIONAL`, because a pond does not request it: `attachers.rs` LOADs
-        // it on the transient attach that `pull_catalog` performs.
+        // it on the attach that `attach_catalog` performs.
         name: "iceberg",
         bucket: Bucket::Catalog,
         always_loaded: false,
-        what: "Apache Iceberg tables via a REST catalog (pull_catalog)",
+        what: "Apache Iceberg tables via a REST catalog (attach_catalog)",
     },
     // ---- transport ---------------------------------------------------------
     Ext {
@@ -173,7 +173,7 @@ pub const EXTENSIONS: &[Ext] = &[
 /// They are in [`EXTENSIONS`] so the capability can be advertised, and excluded
 /// from [`OPTIONAL`] so `allocate_pond { extensions: ["iceberg"] }` is still
 /// refused: loading it into a pond buys nothing, because catalogs are attached
-/// transiently by `pull_catalog` and never queried live.
+/// by `attach_catalog` and never queried live.
 fn is_catalog_driven(name: &str) -> bool {
     crate::catalog::TYPES
         .iter()
@@ -196,7 +196,7 @@ pub static OPTIONAL: LazyLock<Vec<&'static str>> =
 /// ([`crate::catalog::TYPES`]), not because a pond can request them.
 ///
 /// They are warmed at node startup for the same reason [`OPTIONAL`] is:
-/// `attachers.rs` emits `LOAD <ext>;` for the transient attach a `pull_catalog`
+/// `attachers.rs` emits `LOAD <ext>;` for the attach an `attach_catalog`
 /// performs, with autoinstall **off**, so an extension that was not warmed does
 /// not download at exactly the moment an agent is waiting on the call — it
 /// fails the call, naming `latiq warm-extensions`. (That site used to emit
@@ -210,7 +210,7 @@ pub static OPTIONAL: LazyLock<Vec<&'static str>> =
 /// against the pinned DuckDB: `INSTALL iceberg` installs *only* `iceberg`, and
 /// `LOAD iceberg` then autoinstalls `avro` — over the network, at load time. So
 /// a node that warmed `iceberg` alone still downloads on its first
-/// `pull_catalog`, and (now that `autoinstall_known_extensions` is **off** on
+/// `attach_catalog`, and (now that `autoinstall_known_extensions` is **off** on
 /// every pond connection) could not load iceberg there at all. Warming the
 /// closure is what makes the offline claim true; the guard is
 /// `latiq-engine-duckdb`'s
@@ -324,7 +324,7 @@ mod tests {
     }
 
     /// `iceberg` is advertised and really installed, and is still NOT something
-    /// a pond may request: it is loaded for the transient attach `pull_catalog`
+    /// a pond may request: it is loaded for the attach `attach_catalog`
     /// makes, and loading it into a pond buys nothing. Advertising a capability
     /// must not silently widen the allowlist.
     #[test]
@@ -373,7 +373,7 @@ mod tests {
 
     /// Every extension a catalog type needs is in the one table (so it is
     /// advertised) and in [`CATALOG_DRIVEN`] (so the node installs it at
-    /// startup instead of on some agent's first `pull_catalog`).
+    /// startup instead of on some agent's first `attach_catalog`).
     #[test]
     fn every_catalog_types_extension_is_shipped_and_warmed() {
         let mut checked = 0;

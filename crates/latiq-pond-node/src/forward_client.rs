@@ -25,8 +25,10 @@ use arrow::buffer::Buffer;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamDecoder;
 use arrow::record_batch::RecordBatch;
+use latiq_agent_core::credentials::CredentialSpec;
 use latiq_agent_core::{
-    AgentError, ArrowReadStream, DescribeResult, Forwarder, LineagePage, Peer, PullResult,
+    AgentError, ArrowReadStream, AttachCatalogResult, AttachedCatalogList, DescribeResult,
+    DetachCatalogResult, Forwarder, LineagePage, Peer,
 };
 use latiq_common::{ErrorEnvelope, ErrorKind, Identity};
 use latiq_engine::{ExplainResult, QueryResult};
@@ -542,70 +544,102 @@ impl Forwarder for GrpcForwarder {
             .map_err(|e| AgentError::internal(format!("forward decode get_lineage: {e}")))
     }
 
-    async fn catalog_pull(
+    /// Attach on the owner. The credential mode is relayed **unresolved**: only
+    /// an `Explicit` map has values to carry, a `Ref` carries the URI for the
+    /// owner's own backends to dereference, and `Passthrough` carries nothing —
+    /// the owner reads the caller's bearer, which this hop replays anyway
+    /// (`latiq_agent_core::bearer`).
+    ///
+    /// This is the SECOND and last place a `Secret` is exposed (the first builds
+    /// the `CREATE SECRET`): the values have to cross the internal node-to-node
+    /// hop to reach the node that will build that statement. They go straight
+    /// into the request message and are never logged — `status_to_error` reports
+    /// the peer and the pond, never the request.
+    async fn attach_catalog(
         &self,
         peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
-        catalog: &str,
-        query: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<PullResult, AgentError> {
+        name: &str,
+        catalog_type: &str,
+        options: std::collections::BTreeMap<String, String>,
+        credentials: CredentialSpec,
+    ) -> Result<AttachCatalogResult, AgentError> {
         let mut c = self.client(peer, pond).await?;
+        let (secrets, secret_ref) = match credentials {
+            CredentialSpec::Explicit(s) => (
+                s.into_iter()
+                    .map(|(k, v)| (k, v.expose().to_string()))
+                    .collect(),
+                String::new(),
+            ),
+            CredentialSpec::Ref(uri) => (std::collections::HashMap::new(), uri),
+            CredentialSpec::Passthrough => (std::collections::HashMap::new(), String::new()),
+        };
         let req = with_identity(
-            CatalogPullRequest {
+            CatalogAttachRequest {
                 pond: pond.to_string(),
-                catalog: catalog.to_string(),
-                query: query.to_string(),
-                params: params.into_iter().collect(),
+                name: name.to_string(),
+                r#type: catalog_type.to_string(),
+                options: options.into_iter().collect(),
+                secrets,
+                secret_ref,
             },
             identity,
         );
         let resp = c
-            .catalog_pull(req)
+            .catalog_attach(req)
             .await
             .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
         serde_json::from_value(parse_json(&resp.json)?)
-            .map_err(|e| AgentError::internal(format!("forward decode catalog_pull: {e}")))
+            .map_err(|e| AgentError::internal(format!("forward decode attach_catalog: {e}")))
     }
 
-    async fn catalog_describe(
+    async fn detach_catalog(
         &self,
         peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
-        catalog: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, AgentError> {
+        name: &str,
+    ) -> Result<DetachCatalogResult, AgentError> {
         let mut c = self.client(peer, pond).await?;
         let req = with_identity(
-            CatalogDescribeRequest {
+            CatalogDetachRequest {
                 pond: pond.to_string(),
-                catalog: catalog.to_string(),
-                params: params.into_iter().collect(),
+                name: name.to_string(),
             },
             identity,
         );
         let resp = c
-            .catalog_describe(req)
+            .catalog_detach(req)
             .await
             .map_err(|s| status_to_error(peer, pond, s))?
             .into_inner();
-        // The Data service encodes describe as {catalog, tables:[{schema,table}]}.
-        // Re-hydrate the (schema, table) pairs the core returns.
-        let v = parse_json(&resp.json)?;
-        let tables = v
-            .get("tables")
-            .and_then(|t| t.as_array())
-            .ok_or_else(|| AgentError::internal("forward decode catalog_describe: no tables"))?;
-        Ok(tables
-            .iter()
-            .filter_map(|t| {
-                let schema = t.get("schema")?.as_str()?.to_string();
-                let table = t.get("table")?.as_str()?.to_string();
-                Some((schema, table))
-            })
-            .collect())
+        serde_json::from_value(parse_json(&resp.json)?)
+            .map_err(|e| AgentError::internal(format!("forward decode detach_catalog: {e}")))
+    }
+
+    async fn list_attached_catalogs(
+        &self,
+        peer: Peer<'_>,
+        identity: &Identity,
+        pond: &str,
+    ) -> Result<AttachedCatalogList, AgentError> {
+        let mut c = self.client(peer, pond).await?;
+        let req = with_identity(
+            CatalogListAttachedRequest {
+                pond: pond.to_string(),
+            },
+            identity,
+        );
+        let resp = c
+            .catalog_list_attached(req)
+            .await
+            .map_err(|s| status_to_error(peer, pond, s))?
+            .into_inner();
+        serde_json::from_value(parse_json(&resp.json)?).map_err(|e| {
+            AgentError::internal(format!("forward decode list_attached_catalogs: {e}"))
+        })
     }
 }

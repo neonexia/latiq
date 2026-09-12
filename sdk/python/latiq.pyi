@@ -103,15 +103,29 @@ class Pond:
     def load_dataset(self, dataset: str) -> Any:
         """Load a curated dataset (by name, from `db.list_datasets()`) into this pond."""
 
-    def describe_catalog(self, catalog: str, set: dict[str, str] | None = ...) -> Any:
-        """Describe an external catalog's tables. `set`: runtime config +
-        credentials (e.g. `{"token": "…"}`); never stored."""
-
-    def pull_catalog(
-        self, catalog: str, query: str, set: dict[str, str] | None = ...
+    def attach_catalog(
+        self,
+        name: str,
+        type: str,
+        options: dict[str, str] | None = ...,
+        secrets: dict[str, str] | None = ...,
+        secret_ref: str | None = ...,
     ) -> Any:
-        """Pull a subset of an external catalog into a pond table. `query` is the
-        materialization SQL. `set`: runtime config + credentials; never stored."""
+        """Mount an external catalog on this pond as `name` and LEAVE it mounted:
+        `query`/`write` can then name `<name>.<schema>.<table>`, including a JOIN
+        across two attached catalogs. `options` are locator parameters. The
+        credential is `secrets`, OR `secret_ref`, OR neither — neither means
+        passthrough, using this client's own bearer token; supplying two is
+        refused, and the returned `credential_mode` says which was applied.
+        Not persisted: a node restart loses the attachment."""
+
+    def detach_catalog(self, name: str) -> Any:
+        """Unmount a catalog and drop the credential created for it. Tables
+        already extracted into this pond are unaffected."""
+
+    def list_attached_catalogs(self) -> Any:
+        """The external catalogs attached to this pond right now. Locators only —
+        no credential is returned, in any mode."""
 
     def describe(self) -> Any:
         """The pond's structured schema (tables/columns) as JSON."""

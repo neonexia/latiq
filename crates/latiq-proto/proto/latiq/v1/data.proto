@@ -37,11 +37,17 @@ service Data {
   rpc ExplainQuery(QueryRequest) returns (JsonResponse);
   // Copy a dataset's tables into the pond (one CREATE TABLE each).
   rpc LoadDataset(LoadDatasetRequest) returns (JsonResponse);
-  // Transient pull from an external catalog: attach (with creds) → run the query
-  // (a CREATE TABLE … AS SELECT … FROM <catalog>.…) → detach. Nothing persists.
-  rpc CatalogPull(CatalogPullRequest) returns (JsonResponse);
-  // Transient attach → list the catalog's tables/columns → detach.
-  rpc CatalogDescribe(CatalogDescribeRequest) returns (JsonResponse);
+  // Mount an external catalog on the pond and LEAVE it mounted, so ordinary
+  // ReadQuery/WriteQuery SQL can name it — and JOIN across two of them. The
+  // attachment lives in the pond's engine instance on this node: it is NOT
+  // persisted, and a node restart loses it (a statement naming a vanished alias
+  // comes back as catalog_error whose suggest names this RPC).
+  rpc CatalogAttach(CatalogAttachRequest) returns (JsonResponse);
+  // Unmount a catalog and DROP the credential that was created for it.
+  rpc CatalogDetach(CatalogDetachRequest) returns (JsonResponse);
+  // What is attached to this pond right now. Locators only — no credential is
+  // returned by this or any other RPC, in any credential mode.
+  rpc CatalogListAttached(CatalogListAttachedRequest) returns (JsonResponse);
   // READ a pond's OpenLineage trail (newest first). A read, never a switch:
   // lineage stays fixed at pond creation and no RPC can turn it on or off.
   // This exists so a node that does not own the pond can forward to the one
@@ -57,15 +63,30 @@ message GetLineageRequest {
 }
 
 message LoadDatasetRequest { string pond = 1; string dataset = 2; }
-// params carry runtime --set values (incl. credentials like `token`); merged
-// over the catalog's persisted locator params (these win).
-message CatalogPullRequest {
-  string pond = 1; string catalog = 2; string query = 3;
-  map<string, string> params = 4;
+// `name` is the alias AND the SQL namespace: `FROM lake.sales.orders`.
+//
+// `options` are LOCATOR parameters, 1:1 with DuckDB's own parenthesised ATTACH
+// options (endpoint, warehouse, metadata_path, …). They are echoed back by
+// CatalogListAttached, so a CREDENTIAL key passed here is REFUSED naming
+// `secrets` rather than accepted — and an unknown key is refused rather than
+// dropped.
+//
+// The credential is exactly ONE of three modes, and supplying two is refused.
+// `secrets` non-empty means explicit values. `secret_ref` non-empty is an opaque
+// "<scheme>://<location>" URI the node dereferences (env:// is built in).
+// NEITHER means passthrough: the caller's own bearer token is the catalog
+// credential — not an omission, but the mode Iceberg REST, Unity Catalog and
+// Snowflake External OAuth actually want. The response reports which mode was
+// APPLIED (`credential_mode`), because a passthrough with no bearer to pass
+// through applies none and must not look like one that did.
+message CatalogAttachRequest {
+  string pond = 1; string name = 2; string type = 3;
+  map<string, string> options = 4;
+  map<string, string> secrets = 5;
+  string secret_ref = 6;
 }
-message CatalogDescribeRequest {
-  string pond = 1; string catalog = 2; map<string, string> params = 3;
-}
+message CatalogDetachRequest { string pond = 1; string name = 2; }
+message CatalogListAttachedRequest { string pond = 1; }
 
 // `lineage` is opt-in per pond and FIXED for the pond's lifetime — there is
 // deliberately no enable/disable RPC (turning it on later would leave a hole at

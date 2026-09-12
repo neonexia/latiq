@@ -214,12 +214,13 @@ def test_datasets_list_load_and_query(db):
 
 def test_catalogs_surface_reachable(db):
     """A fresh cluster has no external catalogs registered (that's an operator
-    action via the CLI), so list_catalogs is empty and describing an unknown one
-    errors — full pull/describe is covered by the iceberg e2e.
+    action via the CLI) and a fresh pond has none attached — attaching a real one
+    is covered by the iceberg e2e.
 
     `isinstance(cats, dict)` alone would pass forever on `{}`, so pin the actual
-    contract: an EMPTY registry (not merely a dict-shaped one), and an error that
-    names the missing catalog rather than any old transport failure."""
+    contract: an EMPTY registry (not merely a dict-shaped one), an EMPTY
+    attachment list (which is a legitimate answer, not an error), and an error
+    that names the alias rather than any old transport failure."""
     cats = db.list_catalogs()
     assert isinstance(cats, dict), f"list_catalogs returns a mapping, got {cats!r}"
     assert cats == {}, (
@@ -228,16 +229,23 @@ def test_catalogs_surface_reachable(db):
     )
 
     p = db.create_pond(name=_name("cat"))
+    attached = p.list_attached_catalogs()
+    assert attached.get("catalogs") == [], (
+        "a fresh pond has nothing attached, and that is an empty list rather "
+        f"than an error — the two mean different things: {attached!r}"
+    )
+
+    # Detaching something that is not attached is an ERROR, not a quiet success:
+    # the caller believes a catalog is mounted that is not.
     with pytest.raises(RuntimeError) as e:
-        p.describe_catalog(catalog="does-not-exist")
+        p.detach_catalog(name="does-not-exist")
     msg = str(e.value).lower()
     assert "does-not-exist" in msg, (
-        f"the error must name the unknown catalog, not just fail: {e.value}"
+        f"the error must name the alias, not just fail: {e.value}"
     )
-    # A lookup miss, not a transport failure. (The embedded control plane says
-    # "is not registered"; the gRPC one says "not found".)
-    assert "not registered" in msg or "not found" in msg, (
-        f"the error must be a catalog lookup miss, not a transport failure: {e.value}"
+    assert "attach" in msg, (
+        "the error must point at the call that fixes it, not merely report a "
+        f"miss: {e.value}"
     )
     db.drop_pond(pond=p.name, confirm=True)
 

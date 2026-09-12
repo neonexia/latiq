@@ -82,14 +82,20 @@ written. Table-level, not column-level. A statement whose plan did not resolve
 carries **no** datasets rather than guessed ones — an invented input is worse
 than a missing one.
 
-**A `catalog_pull` is one of those queries**, and the most valuable of them: the
-external catalog is detached before the call returns, so after a pull nothing in
-the pond — not the catalog, not the snapshots — remembers where its rows came
-from. Both sides are named while the catalog is still attached; the pond table
-it created is the output, and the source table is an input under the
+**An extract from an attached catalog is one of those queries**, and the most
+valuable of them: once the catalog is detached nothing in the pond — not the
+catalog, not the snapshots — remembers where its rows came from. It is an
+ordinary `write_query` (there is no special pull op), so it is filed as one: the
+pond table it created is the output, and the source table is an input under the
 **catalog's own locator** (`ducklake:<metadata>`, the iceberg endpoint +
-warehouse) rather than the pond-local alias it was mounted as, so our events
-join with the source's own lineage exactly as an `s3://` or `file` dataset does.
+warehouse) rather than the pond-local alias it was mounted as, so our events join
+with the source's own lineage exactly as an `s3://` or `file` dataset does. The
+re-filing is keyed off what is attached to the pond at the moment the statement
+runs; leaving it out would file someone else's tables under the pond's own
+namespace and claim their data as ours.
+
+**An `attach_catalog` emits nothing.** It moves no data and writes nothing to the
+pond, so an event for it would be a run with no datasets on either side.
 
 **Datasets carry their columns**, on the standard `SchemaDatasetFacet`
 (`inputs[]`/`outputs[].facets.schema.fields`) — a name and the engine's own type

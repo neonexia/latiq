@@ -1543,27 +1543,38 @@ mod explain {
     }
 }
 
-/// A pull is a WRITE into the pond, and the transaction bracket that attributes
-/// it now sits between the external `ATTACH` and its `DETACH`. This pins the
-/// composition of those two, which is where a bracket added around an existing
-/// attach/detach dance goes wrong:
+/// **The feature, driven end to end at the engine seam.**
 ///
-/// * a pull that FAILS rolls back — no snapshot — and still tears the
-///   attachment down (that teardown predates this change and must not regress),
-/// * a pull that SUCCEEDS commits with the caller's identity, `pull_catalog` as
-///   the commit message, and the request's trace id,
-/// * a pull that writes NOTHING behaves like any other no-op write: no
-///   snapshot, and therefore nothing to attribute.
+/// An external catalog is ATTACHed and left attached, so the extract is an
+/// ordinary `write_query` — which is the whole reason the attach persists: two
+/// catalogs mounted at once is what lets one statement JOIN across them, and the
+/// old transient `pull_catalog` could never have two attached at the same time.
+///
+/// What is pinned here, and why each one:
+///
+/// * **two catalogs on one pond, joined in one statement** — the use case;
+/// * **the extract is attributed like any other write** (author, commit
+///   message, trace id), because it goes through `exec::in_write_txn` by being
+///   an ordinary write and not by a second copy of the bracket;
+/// * **detach drops the SECRET as well as the attachment** — half the contract,
+///   and the half nothing else would notice;
+/// * **a statement naming a detached alias fails with the actionable variant**,
+///   which is the error an agent meets after a node restart;
+/// * **a credential never reaches an error message.**
 ///
 /// Assertions are on the values: `author IS NOT NULL` would be satisfied by the
-/// string `"unknown"`, which is the failure this whole change is about.
-mod pull_attribution {
+/// string `"unknown"`, which is the failure attribution work is always about.
+mod catalog_attach {
     use super::*;
+    use latiq_common::Secret;
     use std::collections::BTreeMap;
+
+    type Options = BTreeMap<String, String>;
+    type Secrets = BTreeMap<String, Secret>;
 
     /// A real local DuckLake catalog with one table — file metadata + local
     /// data, so no network and no docker are involved.
-    fn seed_external(dir: &std::path::Path) -> BTreeMap<String, String> {
+    fn seed_external(dir: &std::path::Path, table: &str, values: &str) -> Options {
         let meta = dir.join("meta.duckdb");
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
@@ -1571,8 +1582,7 @@ mod pull_attribution {
         conn.execute_batch(&format!(
             "INSTALL ducklake; LOAD ducklake;
              ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
-             CREATE TABLE ext.widgets AS
-               SELECT * FROM (VALUES (1,'gear',9.99),(2,'bolt',0.99)) t(id,name,price);",
+             CREATE TABLE ext.{table} AS SELECT * FROM (VALUES {values}) t(id,name);",
             meta.display(),
             data.display(),
         ))
@@ -1600,160 +1610,423 @@ mod pull_attribution {
             .collect()
     }
 
-    fn snapshot_count(eng: &DuckEngine, loc: &latiq_storage::PondLocation) -> i64 {
-        eng.read_query(
-            loc,
-            "SELECT count(*) AS n FROM pond.snapshots()",
-            AbortToken::new(),
-        )
-        .unwrap()
-        .rows[0][0]
-            .as_i64()
+    /// The names of the secrets THIS ATTACH PATH created on the pond's
+    /// instance, asked through the engine's own read path — so the test sees
+    /// exactly what a later statement on this pond would see.
+    ///
+    /// Filtered to our own `_latiq_` prefix on purpose, and it is not cosmetic:
+    /// `duckdb_secrets()` also lists DuckDB's PERSISTENT secrets, read from the
+    /// process user's `~/.duckdb`. A developer machine with any saved secret
+    /// would otherwise fail these tests for a reason that has nothing to do with
+    /// the code — and, worse, a naive `is_empty()` would PASS on a CI runner and
+    /// fail only for the person who owns a `.duckdb` directory.
+    fn live_secrets(eng: &DuckEngine, loc: &latiq_storage::PondLocation) -> Vec<String> {
+        eng.read_query(loc, "SELECT name FROM duckdb_secrets()", AbortToken::new())
             .unwrap()
+            .rows
+            .iter()
+            .map(|r| r[0].as_str().unwrap_or_default().to_string())
+            .filter(|n| n.starts_with("_latiq_"))
+            .collect()
     }
 
-    #[test]
-    fn attribution_pull_commits_with_the_caller_and_a_failed_pull_rolls_back_and_detaches() {
-        let tmp = tempfile::tempdir().unwrap();
-        let params = seed_external(tmp.path());
+    fn pond_with_engine() -> (TempFs, latiq_storage::PondLocation, DuckEngine) {
         let fs = TempFs::new();
         let eng = DuckEngine::new();
         let loc = fs.create_pond(PondId::new(), false).unwrap();
         eng.init_pond(&loc).unwrap();
+        (fs, loc, eng)
+    }
+
+    /// **The headline.** Two real external catalogs mounted on one pond at the
+    /// same time, and one ordinary `write_query` joining across both into a pond
+    /// table — then detached, with the pond table surviving.
+    ///
+    /// This is the case the previous design could not express at all: the
+    /// transient pull attached and detached inside a single call, so a second
+    /// catalog was never mounted while the first still was.
+    #[test]
+    fn catalog_attach_two_catalogs_join_into_a_pond_table_and_detach() {
+        let orders_dir = tempfile::tempdir().unwrap();
+        let customers_dir = tempfile::tempdir().unwrap();
+        let orders = seed_external(orders_dir.path(), "orders", "(1,'ann'),(2,'bob'),(3,'ann')");
+        let customers = seed_external(customers_dir.path(), "customers", "(1,'gold'),(2,'silver')");
+        let (_fs, loc, eng) = pond_with_engine();
         let ann = Identity::claimed(Some("ann"));
 
-        // 1. A pull that fails inside the transaction.
-        let before = snapshot_count(&eng, &loc);
-        let err = eng
-            .pull_catalog(
-                &loc,
-                "ducklake",
-                "ext",
-                &params,
-                "CREATE TABLE bad AS SELECT no_such_column FROM ext.widgets",
-                &ann,
-                Some("t0"),
-            )
-            .expect_err("a pull naming a column the source does not have must fail");
-        // The caller's own SQL, so DuckDB's class survives rather than becoming
-        // `internal` + "report to your operator".
+        let lake = eng
+            .attach_catalog(&loc, "ducklake", "lake", &orders, &Secrets::new())
+            .expect("the first catalog attaches");
+        let crm = eng
+            .attach_catalog(&loc, "ducklake", "crm", &customers, &Secrets::new())
+            .expect("a SECOND catalog attaches while the first is still mounted");
+        assert_eq!((lake.name.as_str(), crm.name.as_str()), ("lake", "crm"));
         assert!(
-            matches!(err, latiq_engine::EngineError::Catalog(_)),
-            "a bad column in the pull query is the caller's mistake — a name \
-             that does not resolve, not `internal`: {err:?}"
-        );
-        assert_eq!(
-            snapshot_count(&eng, &loc),
-            before,
-            "a failed pull must not publish a snapshot"
-        );
-        // The attachment is gone even though the pull failed — the teardown runs
-        // after the bracket, on both outcomes.
-        match eng.read_query(&loc, "SELECT 1 FROM ext.widgets", AbortToken::new()) {
-            Err(e) => assert!(
-                format!("{e:?}").contains("ext"),
-                "the failure must be `ext` being detached, not something else: {e:?}"
-            ),
-            Ok(r) => panic!("the external catalog outlived a failed pull: {r:?}"),
-        }
-
-        // 2. A pull that writes nothing: same no-op contract as a read routed
-        // through the write path — no snapshot, so nothing to attribute.
-        let meta = eng
-            .pull_catalog(
-                &loc,
-                "ducklake",
-                "ext",
-                &params,
-                "SELECT id FROM ext.widgets WHERE 1=0",
-                &ann,
-                Some("t1"),
-            )
-            .expect("a pull that writes nothing is not an error");
-        assert_eq!(
-            meta.snapshot_id, None,
-            "a pull that changed nothing must not claim a snapshot"
-        );
-        assert_eq!(
-            snapshot_count(&eng, &loc),
-            before,
-            "…and must not add one either"
+            lake.namespace.starts_with("ducklake:") && lake.namespace != crm.namespace,
+            "each attachment must name the source it actually points at: {lake:?} / {crm:?}"
         );
 
-        // 3. The happy path: committed, attributed, traced.
-        let meta = eng
-            .pull_catalog(
-                &loc,
-                "ducklake",
-                "ext",
-                &params,
-                "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10",
-                &ann,
-                Some("0af7651916cd43dd8448eb211c80319c"),
-            )
-            .expect("the pull must succeed");
-        assert!(
-            meta.snapshot_id.is_some(),
-            "a pull that wrote must report the snapshot it published"
+        // Both are listed, with their locators and — the point — nothing else.
+        let listed = eng.attached_catalogs(&loc).unwrap();
+        assert_eq!(
+            listed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["lake", "crm"],
+            "both attachments must be listed, in attach order: {listed:?}"
         );
+        assert_eq!(
+            listed[0].options, orders,
+            "the locator is echoed back verbatim"
+        );
+
+        // ONE ordinary write, joining the two external catalogs. Nothing about
+        // this statement is catalog-aware: it is `write_query`.
+        eng.write_query(
+            &loc,
+            "CREATE TABLE enriched AS \
+             SELECT o.id, o.name AS who, c.name AS tier \
+             FROM lake.main.orders o JOIN crm.main.customers c ON c.id = o.id",
+            &ann,
+            Some("0af7651916cd43dd8448eb211c80319c"),
+            AbortToken::new(),
+        )
+        .expect("a write joining two attached catalogs must succeed");
+
+        let n = eng
+            .read_query(
+                &loc,
+                "SELECT count(*) AS n FROM enriched",
+                AbortToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            n.rows[0][0],
+            serde_json::json!(2),
+            "the join must produce the two matching rows, not a cross product or nothing"
+        );
+
+        // Attribution: an extract is a WRITE, so it carries the author, the
+        // write's own commit message and the request's trace id — through the
+        // one bracket every pond-writing path shares, not a copy of it.
         let row = newest_snapshot(&eng, &loc);
-        assert_eq!(row[0], "ann", "the pull's author is the caller: {row:?}");
+        assert_eq!(row[0], "ann", "the extract's author is the caller: {row:?}");
         assert_eq!(
-            row[1], "pull_catalog",
-            "the commit message must say how the data arrived: {row:?}"
+            row[1], "write_query",
+            "an extract IS a write_query and history must say so — a separate \
+             commit message here would mean a second attribution bracket: {row:?}"
         );
         let extra: serde_json::Value = serde_json::from_str(&row[2]).unwrap();
         assert_eq!(
             extra["trace_id"],
             serde_json::json!("0af7651916cd43dd8448eb211c80319c"),
-            "the pull's snapshot must carry the request's trace id: {extra}"
+            "the extract's snapshot must carry the request's trace id: {extra}"
         );
-        assert_eq!(extra["agent_id"], serde_json::json!("ann"));
-        assert_eq!(extra["verified"], serde_json::json!(false));
 
-        // The rows really are in the pond, and the pond still writes.
-        let n = eng
-            .read_query(&loc, "SELECT count(*) AS n FROM cheap", AbortToken::new())
+        // Detach one: it goes, the other stays, and the pond table is untouched.
+        eng.detach_catalog(&loc, "lake").expect("detach");
+        assert_eq!(
+            eng.attached_catalogs(&loc)
+                .unwrap()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["crm".to_string()],
+            "detaching one attachment must not disturb the other"
+        );
+        let still = eng
+            .read_query(
+                &loc,
+                "SELECT count(*) AS n FROM enriched",
+                AbortToken::new(),
+            )
             .unwrap();
-        assert_eq!(n.rows[0][0], serde_json::json!(2));
-        eng.write_query(
-            &loc,
-            "INSERT INTO cheap VALUES (9,'nut')",
-            &ann,
-            None,
-            AbortToken::new(),
-        )
-        .expect("the pond's writer must not be left mid-transaction by a pull");
+        assert_eq!(
+            still.rows[0][0],
+            serde_json::json!(2),
+            "data extracted INTO the pond is a pond table and survives the detach"
+        );
+
+        // …and the detached alias no longer resolves, with the variant whose
+        // envelope names `attach_catalog` (see `latiq-agent-core`'s mapping).
+        let Err(err) = eng.read_query(&loc, "SELECT * FROM lake.main.orders", AbortToken::new())
+        else {
+            panic!("a detached catalog must stop resolving");
+        };
+        let latiq_engine::EngineError::CatalogNotAttached { name } = &err else {
+            panic!(
+                "a statement naming a catalog nobody attached must say exactly that — \
+                 a plain catalog error sends the agent to SHOW TABLES, which lists \
+                 nothing called `lake`: {err:?}"
+            );
+        };
+        assert_eq!(name, "lake", "the alias must ride as a value: {err:?}");
     }
 
-    /// A pull with no trace scope omits the key rather than inventing one — the
-    /// same rule `write_query` follows, and for the same reason: a `"-"` or a
-    /// minted id is a value someone joins against and never matches.
+    /// The same variant is what an agent meets after a NODE RESTART, which is
+    /// the condition this error really exists for — attachments are not
+    /// persisted. A fresh engine over the same pond files is exactly that.
     #[test]
-    fn attribution_pull_without_a_trace_scope_records_no_trace_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let params = seed_external(tmp.path());
-        let fs = TempFs::new();
-        let eng = DuckEngine::new();
-        let loc = fs.create_pond(PondId::new(), false).unwrap();
-        eng.init_pond(&loc).unwrap();
+    fn error_contract_a_restart_loses_attachments_and_says_which_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = seed_external(dir.path(), "orders", "(1,'ann')");
+        let (_fs, loc, eng) = pond_with_engine();
+        eng.attach_catalog(&loc, "ducklake", "lake", &options, &Secrets::new())
+            .unwrap();
+        eng.read_query(&loc, "SELECT * FROM lake.main.orders", AbortToken::new())
+            .expect("it resolves while attached");
 
-        eng.pull_catalog(
+        // A new engine over the same pond = the node came back. Nothing about
+        // the attachment was written anywhere, so it is simply gone.
+        let restarted = DuckEngine::new();
+        restarted.init_pond(&loc).unwrap();
+        assert!(
+            restarted.attached_catalogs(&loc).unwrap().is_empty(),
+            "an attachment must not survive a restart — it is engine state, and \
+             claiming otherwise is the one thing this error contract rests on"
+        );
+        let Err(latiq_engine::EngineError::CatalogNotAttached { name }) =
+            restarted.read_query(&loc, "SELECT * FROM lake.main.orders", AbortToken::new())
+        else {
+            panic!("after a restart the alias must fail with the re-attach guidance");
+        };
+        assert_eq!(name, "lake");
+    }
+
+    /// A second attach of a live alias is refused, NOT silently replaced:
+    /// re-binding `lake` under a statement already running would change what it
+    /// resolves against mid-flight. The refusal carries the alias as a value.
+    #[test]
+    fn error_contract_attaching_over_a_live_alias_is_a_name_conflict() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let first = seed_external(a.path(), "orders", "(1,'ann')");
+        let second = seed_external(b.path(), "orders", "(9,'zed')");
+        let (_fs, loc, eng) = pond_with_engine();
+        eng.attach_catalog(&loc, "ducklake", "lake", &first, &Secrets::new())
+            .unwrap();
+
+        let Err(err) = eng.attach_catalog(&loc, "ducklake", "lake", &second, &Secrets::new())
+        else {
+            panic!("a second attach of a live alias must be refused");
+        };
+        let latiq_engine::EngineError::CatalogAlreadyAttached { name } = &err else {
+            panic!("expected a conflict naming the alias, got {err:?}");
+        };
+        assert_eq!(name, "lake");
+        // …and the FIRST attachment is untouched: the refusal must not have
+        // half-applied the second one.
+        let rows = eng
+            .read_query(&loc, "SELECT id FROM lake.main.orders", AbortToken::new())
+            .unwrap();
+        assert_eq!(
+            rows.rows[0][0],
+            serde_json::json!(1),
+            "the live attachment must still point at the catalog it was mounted with"
+        );
+        // Detaching frees the alias, so the refusal is not a dead end.
+        eng.detach_catalog(&loc, "lake").unwrap();
+        eng.attach_catalog(&loc, "ducklake", "lake", &second, &Secrets::new())
+            .expect("the alias is reusable after a detach");
+    }
+
+    /// The pond's OWN catalog cannot be shadowed. Attaching over it would leave
+    /// every unqualified statement in the pond resolving against a read-only
+    /// external database.
+    #[test]
+    fn error_contract_a_catalog_cannot_be_attached_over_the_ponds_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = seed_external(dir.path(), "orders", "(1,'ann')");
+        let (_fs, mut loc, eng) = pond_with_engine();
+        loc.catalog_name = "shop".to_string();
+        let Err(latiq_engine::EngineError::CatalogAlreadyAttached { name }) =
+            eng.attach_catalog(&loc, "ducklake", "shop", &options, &Secrets::new())
+        else {
+            panic!("the pond's own catalog name must not be attachable over");
+        };
+        assert_eq!(name, "shop");
+        // DuckDB's own catalog names are refused too, by the alias validator,
+        // and with a DIFFERENT kind: that is a value the caller must change.
+        let Err(latiq_engine::EngineError::UnsupportedParameter(msg)) =
+            eng.attach_catalog(&loc, "ducklake", "memory", &options, &Secrets::new())
+        else {
+            panic!("a reserved DuckDB catalog name must be refused as a bad value");
+        };
+        assert!(msg.contains("reserved"), "{msg}");
+    }
+
+    /// **Detach drops the credential, not just the mount.** Nothing else in the
+    /// system would notice a secret left behind on the pond's reused connection,
+    /// and it would outlive the attachment it belonged to for the life of the
+    /// node.
+    #[test]
+    fn catalog_attach_detach_drops_the_secret_it_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = seed_external(dir.path(), "orders", "(1,'ann')");
+        let (_fs, loc, eng) = pond_with_engine();
+        assert!(
+            live_secrets(&eng, &loc).is_empty(),
+            "the fixture must start with none of OUR secrets, or this proves nothing"
+        );
+
+        // S3 credentials on a LOCAL ducklake: they build a real `s3` secret (the
+        // attacher does not know the data path is local) and the attach still
+        // succeeds, which is exactly the isolation this test wants — a real
+        // secret, without a network.
+        let secrets = Secrets::from([
+            ("s3_access_key".to_string(), Secret::new("AKIAEXAMPLE")),
+            ("s3_secret_key".to_string(), Secret::new("s3cr3t-value")),
+        ]);
+        eng.attach_catalog(&loc, "ducklake", "lake", &options, &secrets)
+            .expect("attach with storage credentials");
+        assert_eq!(
+            live_secrets(&eng, &loc),
+            vec!["_latiq_lake_s3".to_string()],
+            "the attach must create exactly the secret it named"
+        );
+
+        eng.detach_catalog(&loc, "lake").unwrap();
+        assert!(
+            live_secrets(&eng, &loc).is_empty(),
+            "the credential must go with the attachment it belonged to"
+        );
+    }
+
+    /// Detaching something that is not attached is an ERROR, not a quiet
+    /// success: the caller believes a catalog is mounted that is not, and every
+    /// later statement naming it will fail. Saying so here is cheaper than
+    /// letting that happen.
+    #[test]
+    fn error_contract_detaching_what_is_not_attached_says_so() {
+        let (_fs, loc, eng) = pond_with_engine();
+        let Err(latiq_engine::EngineError::CatalogNotAttached { name }) =
+            eng.detach_catalog(&loc, "lake")
+        else {
+            panic!("detaching an alias nobody attached must be refused");
+        };
+        assert_eq!(name, "lake");
+    }
+
+    /// **A credential must not reach an error message.**
+    ///
+    /// The attach fails here for a real reason — a ducklake metadata path under
+    /// a directory that does not exist — with a real credential in the plan. The
+    /// failure text is the engine's own sentence about the ADDRESS, and it is
+    /// the string that travels into `ErrorEnvelope::message`, so it is the last
+    /// place a `Secret` could leak on this seam. (The surface-level half of this
+    /// — log lines, lineage, the envelope an agent receives — is in
+    /// `crates/latiq/tests/admin.rs`.)
+    #[test]
+    fn catalog_attach_a_failed_attach_leaks_neither_the_credential_nor_the_secret() {
+        const CREDENTIAL: &str = "totally-secret-value-9f3a";
+        let (_fs, loc, eng) = pond_with_engine();
+        let options = Options::from([
+            (
+                "metadata_path".to_string(),
+                "/nonexistent_dir_xyz/meta.duckdb".to_string(),
+            ),
+            (
+                "data_path".to_string(),
+                "/nonexistent_dir_xyz/data".to_string(),
+            ),
+        ]);
+        let secrets = Secrets::from([
+            ("s3_access_key".to_string(), Secret::new("AKIAEXAMPLE")),
+            ("s3_secret_key".to_string(), Secret::new(CREDENTIAL)),
+        ]);
+
+        let Err(err) = eng.attach_catalog(&loc, "ducklake", "lake", &options, &secrets) else {
+            panic!("an attach under a non-existent directory must fail");
+        };
+        // The address is the caller's, so it is classified as a source failure
+        // rather than swallowed into `internal` (pinned in `duck_engine.rs`).
+        assert!(
+            matches!(err, latiq_engine::EngineError::SourceIo(_)),
+            "an unreachable catalog address is the caller's to fix: {err:?}"
+        );
+        let rendered = format!("{err} {err:?}");
+        assert!(
+            !rendered.contains(CREDENTIAL),
+            "the credential reached the error the caller is handed: {rendered}"
+        );
+
+        // Nothing half-applied: no attachment, and no secret left on the pond's
+        // reused connection (the secret is CREATEd before the ATTACH runs).
+        assert!(eng.attached_catalogs(&loc).unwrap().is_empty());
+        assert!(
+            live_secrets(&eng, &loc).is_empty(),
+            "a failed attach must leave no credential behind"
+        );
+        // …and the alias is free, so the caller can correct the address and
+        // retry rather than being stuck behind a phantom conflict.
+        let dir = tempfile::tempdir().unwrap();
+        eng.attach_catalog(
             &loc,
             "ducklake",
-            "ext",
-            &params,
-            "CREATE TABLE cheap AS SELECT id FROM ext.widgets",
-            &Identity::claimed(Some("ann")),
-            None,
+            "lake",
+            &seed_external(dir.path(), "orders", "(1,'ann')"),
+            &Secrets::new(),
         )
-        .unwrap();
-        let row = newest_snapshot(&eng, &loc);
-        assert_eq!(row[0], "ann", "still attributed: {row:?}");
-        let extra: serde_json::Value = serde_json::from_str(&row[2]).unwrap();
+        .expect("the alias must be reusable after a failed attach");
+    }
+
+    /// Provenance for an extract names the SOURCE, not the pond.
+    ///
+    /// The re-filing used to live on the transient pull, which was the only path
+    /// that could see an external table. Now an ordinary `write_query` is what
+    /// reads a lakehouse, so without this the pond would file someone else's
+    /// tables under its own namespace and claim their data as its own.
+    #[test]
+    fn lineage_an_extract_files_the_external_table_under_the_sources_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = seed_external(dir.path(), "orders", "(1,'ann'),(2,'bob')");
+        let fs = TempFs::new();
+        let eng = DuckEngine::new();
+        // Lineage ON: dataset extraction is gated on it, so a pond without it
+        // would report no datasets and this test would pass vacuously.
+        let mut loc = fs.create_pond(PondId::new(), true).unwrap();
+        // `create_pond` makes the directory; the FLAG is the caller's to set
+        // (`AgentOps` copies it off the registry record). Without this the
+        // engine skips extraction entirely and the assertions below would be
+        // comparing two empty lists.
+        loc.lineage = true;
+        eng.init_pond(&loc).unwrap();
+        let attached = eng
+            .attach_catalog(&loc, "ducklake", "lake", &options, &Secrets::new())
+            .unwrap();
+
+        let res = eng
+            .write_query(
+                &loc,
+                "CREATE TABLE mine AS SELECT id FROM lake.main.orders",
+                &Identity::claimed(Some("ann")),
+                None,
+                AbortToken::new(),
+            )
+            .unwrap();
+        let input = res
+            .meta
+            .inputs
+            .iter()
+            .find(|d| d.name.contains("orders"))
+            .unwrap_or_else(|| panic!("the extract read a table: {:?}", res.meta.inputs));
+        assert_eq!(
+            input.namespace.as_deref(),
+            Some(attached.namespace.as_str()),
+            "an external table must be filed under the SOURCE's namespace, not the \
+             pond's: {input:?}"
+        );
         assert!(
-            extra.get("trace_id").is_none(),
-            "an untraced pull must omit the key, not fill it: {extra}"
+            !input.name.starts_with("lake."),
+            "the pond-local alias is not a name anyone else can join on: {input:?}"
+        );
+        // The output is a POND table and must keep the pond's own filing.
+        let output = res
+            .meta
+            .outputs
+            .first()
+            .unwrap_or_else(|| panic!("the extract wrote a table: {:?}", res.meta.outputs));
+        assert!(
+            output.name.contains("mine"),
+            "the pond's own table must be left as it is: {output:?}"
         );
     }
 }

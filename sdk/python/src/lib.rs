@@ -266,35 +266,60 @@ impl PyPond {
         json_to_py(py, &v)
     }
 
-    /// Describe an external catalog's tables (attached transiently on this pond).
-    /// `set`: runtime config + credentials (e.g. `{"token": "…"}`); never stored.
-    #[pyo3(signature = (catalog, set=None))]
-    fn describe_catalog(
+    /// Mount an external catalog on this pond under `name` and leave it
+    /// mounted: `query`/`write` can then name `<name>.<schema>.<table>`,
+    /// including a JOIN across two attached catalogs.
+    ///
+    /// `options`: locator parameters (1:1 with DuckDB's own `ATTACH` options).
+    /// Credential: `secrets`, OR `secret_ref`, OR neither — neither means
+    /// passthrough, using this client's own bearer token. Supplying two is
+    /// refused; the returned `credential_mode` says which was applied. Not
+    /// persisted: a node restart loses the attachment.
+    // `r#type` in the signature, `type` in Python: pyo3 strips the raw-identifier
+    // prefix, and the bare keyword does not parse as a Rust identifier here.
+    #[pyo3(signature = (name, r#type, options=None, secrets=None, secret_ref=None))]
+    fn attach_catalog(
         &self,
         py: Python<'_>,
-        catalog: &str,
-        set: Option<HashMap<String, String>>,
+        name: &str,
+        r#type: &str,
+        options: Option<HashMap<String, String>>,
+        secrets: Option<HashMap<String, String>>,
+        secret_ref: Option<String>,
     ) -> PyResult<PyObject> {
         let (inner, pond) = (self.inner.clone(), self.info.name.clone());
         let v = py
-            .allow_threads(|| inner.describe_catalog(&pond, catalog, set.unwrap_or_default()))
+            .allow_threads(|| {
+                inner.attach_catalog(
+                    &pond,
+                    name,
+                    r#type,
+                    options.unwrap_or_default(),
+                    secrets.unwrap_or_default(),
+                    secret_ref.as_deref(),
+                )
+            })
             .map_err(err)?;
         json_to_py(py, &v)
     }
 
-    /// Pull a subset of an external catalog into a pond table. `query` is the
-    /// materialization SQL. `set`: runtime config + credentials; never stored.
-    #[pyo3(signature = (catalog, query, set=None))]
-    fn pull_catalog(
-        &self,
-        py: Python<'_>,
-        catalog: &str,
-        query: &str,
-        set: Option<HashMap<String, String>>,
-    ) -> PyResult<PyObject> {
+    /// Unmount a catalog and drop the credential created for it. Tables already
+    /// extracted into this pond are unaffected.
+    #[pyo3(signature = (name))]
+    fn detach_catalog(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
         let (inner, pond) = (self.inner.clone(), self.info.name.clone());
         let v = py
-            .allow_threads(|| inner.pull_catalog(&pond, catalog, query, set.unwrap_or_default()))
+            .allow_threads(|| inner.detach_catalog(&pond, name))
+            .map_err(err)?;
+        json_to_py(py, &v)
+    }
+
+    /// The external catalogs attached to this pond right now. Locators only —
+    /// no credential is returned, in any mode.
+    fn list_attached_catalogs(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let (inner, pond) = (self.inner.clone(), self.info.name.clone());
+        let v = py
+            .allow_threads(|| inner.list_attached_catalogs(&pond))
             .map_err(err)?;
         json_to_py(py, &v)
     }

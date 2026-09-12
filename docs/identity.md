@@ -346,7 +346,7 @@ records at completion instead.
 **Deliberately unaudited:** catalog and dataset *browsing* — `list_datasets`,
 `get_dataset`, `list_catalogs`, `get_catalog`. They are registry metadata reads
 that touch no pond and take no identity at all. Everything that touches a pond or
-moves data is audited, `load_dataset` and `catalog_pull` / `catalog_describe`
+moves data is audited, `load_dataset` and `attach_catalog` / `detach_catalog`
 included.
 
 ### Unauthenticated mode stays — and is the default
@@ -385,11 +385,16 @@ least:
   access; anything cross-subject an explicit grant. `list_ponds` filters to what
   the caller may see — today it lists everything, which is both a leak and a
   scaling problem.
-- **Catalog grants.** Today a registered catalog is reachable by anyone who can
-  reach the gateway. Credentials are not stored, which is a genuine mitigation —
-  the caller supplies the credential at pull time, so registration alone grants
-  nothing. That changes the moment Latiq can present the caller's identity to the
-  source: **the registration becomes the grant** and needs an owner.
+- **Catalog grants.** Today anyone who can reach the gateway can attach any
+  external catalog to a pond they can reach. Credentials are not stored, which is
+  a genuine mitigation — the caller supplies the credential (or its own bearer)
+  at attach time, so a registry entry alone grants nothing and an attachment is
+  reachable only by whoever can already reach that pond. **`passthrough` is the
+  sharp edge to keep in view**: the caller's own token is what authenticates to
+  the source, so the SOURCE is already doing the authorization, and Latiq is a
+  conduit rather than a holder of authority. That stops being true the moment
+  Latiq presents a credential of its own — a `secret_ref` the node resolves is
+  exactly that — and then **the reference becomes the grant** and needs an owner.
 - **Who may grant** — agent, operator, or agents-within-a-boundary.
 - **Group and role claims.** Enterprise tokens carry them; binding grants to a
   group is far more usable than binding to individual subjects, and it is the

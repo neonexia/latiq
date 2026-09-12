@@ -17,6 +17,7 @@ pub mod access;
 pub mod arrow;
 pub mod bearer;
 pub mod control;
+pub mod credentials;
 pub mod deadline;
 pub mod error;
 pub mod forward;
@@ -34,6 +35,9 @@ pub use access::record as record_access;
 pub use arrow::{ArrowReadStream, BatchStream};
 pub use bearer::{current_bearer, with_bearer};
 pub use control::ControlPlane;
+pub use credentials::{
+    CredentialMode, CredentialResolvers, CredentialSpec, EnvSecretRefResolver, SecretRefResolver,
+};
 pub use deadline::QueryControls;
 pub use error::AgentError;
 pub use forward::{Forwarder, Peer};
@@ -42,6 +46,7 @@ pub use ops::{AgentConfig, AgentOps};
 pub use registry_control::RegistryControlPlane;
 pub use trace::{current_trace, current_trace_id, current_traceparent, with_trace, TraceContext};
 pub use types::{
-    AllocateResult, CatalogInfo, DatasetInfo, DatasetTableInfo, DescribeResult, LineagePage,
-    LoadDatasetResult, PondInfo, PullResult,
+    AllocateResult, AttachCatalogResult, AttachedCatalogList, CatalogInfo, DatasetInfo,
+    DatasetTableInfo, DescribeResult, DetachCatalogResult, LineagePage, LoadDatasetResult,
+    PondInfo,
 };

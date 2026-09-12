@@ -24,8 +24,8 @@ use crate::forward::{Forwarder, Peer};
 use crate::inflight::InFlightRegistry;
 use crate::lineage::{QueryRecord, IN_PROCESS_NODE};
 use crate::types::{
-    AllocateResult, CatalogInfo, DatasetInfo, DescribeResult, LineagePage, LoadDatasetResult,
-    PondInfo, PullResult,
+    AllocateResult, AttachCatalogResult, AttachedCatalogList, CatalogInfo, DatasetInfo,
+    DescribeResult, DetachCatalogResult, LineagePage, LoadDatasetResult, PondInfo,
 };
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -113,6 +113,11 @@ pub struct AgentOps {
     engine: Arc<dyn QueryEngine>,
     inflight: InFlightRegistry,
     config: AgentConfig,
+    /// Backends this node can dereference a catalog `secret_ref` against. Empty
+    /// is legitimate — the `explicit` and `passthrough` credential modes need
+    /// none of this — and an unregistered scheme is refused with
+    /// `capability_unavailable` rather than silently attaching unauthenticated.
+    credentials: crate::credentials::CredentialResolvers,
     /// This node's own stable id — the one it registered and heartbeats with,
     /// and the one the registry assigns ponds by. `None` in
     /// single-node/in-process setups, where forwarding never applies.
@@ -171,6 +176,7 @@ impl AgentOps {
             engine,
             inflight: InFlightRegistry::new(),
             config,
+            credentials: crate::credentials::CredentialResolvers::with_defaults(),
             self_node_id: None,
             self_endpoint: None,
             forwarder: None,
@@ -178,6 +184,18 @@ impl AgentOps {
             lineage_poison_warned: Arc::new(AtomicBool::new(false)),
             lineage_sink: None,
         }
+    }
+
+    /// Replace the `secret_ref` backends this node serves. The default is
+    /// `env://` alone (see `CredentialResolvers::with_defaults`); a deployment
+    /// that has a Vault registers it here, and nothing else changes — no new
+    /// argument, no new proto field, no change on any surface.
+    pub fn with_credential_resolvers(
+        mut self,
+        resolvers: crate::credentials::CredentialResolvers,
+    ) -> Self {
+        self.credentials = resolvers;
+        self
     }
 
     /// Also publish every lineage event this node records to `sink` — the
@@ -977,145 +995,68 @@ impl AgentOps {
         })
     }
 
-    /// Transient pull from an external catalog: resolve it, merge the pull-time
-    /// `params` over its persisted locator params (pull wins), then on the pond's
-    /// engine: attach (with creds) → run `query` (a CREATE TABLE …) → detach. The
-    /// query's result table lands in the pond; nothing about the catalog persists.
-    pub async fn catalog_pull(
+    /// Mount an external catalog on a pond and leave it mounted, so ordinary
+    /// `write_query` SQL can read — and JOIN across — it.
+    ///
+    /// The whole parameter set arrives with the call: there is deliberately no
+    /// lookup of a stored catalog here. `options` is the locator, and the
+    /// credential comes from exactly one of the three modes in
+    /// [`crate::credentials`] — an explicit `secrets` map, a `secret_ref` URI,
+    /// or (supplying neither) the caller's own bearer.
+    ///
+    /// Not a write to the pond, so no lineage event and no attribution: nothing
+    /// lands in the pond's DuckLake catalog until the caller's own extract runs.
+    /// It IS a real access to a real external system, so it is audited.
+    pub async fn attach_catalog(
         &self,
         identity: &Identity,
         pond_ref: &str,
-        catalog: &str,
-        query: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<PullResult, AgentError> {
+        name: &str,
+        catalog_type: &str,
+        options: std::collections::BTreeMap<String, String>,
+        credentials: crate::credentials::CredentialSpec,
+    ) -> Result<AttachCatalogResult, AgentError> {
         let info = self
-            .pond_info_audited(identity, "catalog_pull", pond_ref)
+            .pond_info_audited(identity, "attach_catalog", pond_ref)
             .await?;
-        if let Some((fwd, owner)) = self.route(identity, "catalog_pull", &info).await? {
+        if let Some((fwd, owner)) = self.route(identity, "attach_catalog", &info).await? {
             info!(
-                op = "catalog_pull",
+                op = "attach_catalog",
                 pond = pond_ref,
                 owner = owner.node_id,
                 endpoint = owner.endpoint,
                 "forwarding to owner node"
             );
-            record_forward("catalog_pull");
+            record_forward("attach_catalog");
+            // The forward replays the caller's own bearer (see
+            // `crate::bearer`), so a `passthrough` attach resolves against the
+            // OWNER's verified view of the caller rather than this node's
+            // opinion of it — the credential is decided where the attach
+            // happens.
             return fwd
-                .catalog_pull(owner, identity, pond_ref, catalog, query, params)
+                .attach_catalog(
+                    owner,
+                    identity,
+                    pond_ref,
+                    name,
+                    catalog_type,
+                    options,
+                    credentials,
+                )
                 .await;
         }
         let started = Instant::now();
         let res = self
-            .catalog_pull_local(identity, &info, catalog, query, params)
+            .attach_catalog_local(&info, name, catalog_type, options, credentials)
             .await;
-        let duration_ms = started.elapsed().as_millis() as u64;
         self.audit(
             identity,
-            "catalog_pull",
-            Some(pond_ref),
-            Some(query.to_string()),
-            duration_ms,
-            outcome(&res),
-        )
-        .await;
-        // The one op whose INPUT is not in the pond, and the edge with the most
-        // provenance value: the catalog is detached before this returns, so
-        // nothing in the pond afterwards remembers where its rows came from.
-        // A failure carries no datasets — the plan bound against a catalog that
-        // is gone by now, and re-binding it would attach it again.
-        self.emit_lineage(QueryRecord {
-            identity,
-            info: &info,
-            op: "catalog_pull",
-            sql: query,
-            duration_ms,
-            meaning: DurationMeaning::Completion,
-            error: res.as_ref().err(),
-            meta: res.as_ref().ok().map(|(_, meta)| meta),
-            engine_version: &self.engine_version,
-        });
-        res.map(|(pull, _)| pull)
-    }
-
-    /// The local half of `catalog_pull` (see `describe_pond_local` for why it is
-    /// split out). Returns the engine's meta alongside the result: the pull's
-    /// two sides can only be named while the catalog is attached, so the
-    /// emitter cannot go looking for them afterwards.
-    async fn catalog_pull_local(
-        &self,
-        identity: &Identity,
-        info: &PondInfo,
-        catalog: &str,
-        query: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<(PullResult, QueryMeta), AgentError> {
-        let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
-        let engine = self.engine.clone();
-        let (ty, alias, q) = (cat.r#type.clone(), cat.name.clone(), query.to_string());
-        let identity = identity.clone();
-        // Captured HERE, before `spawn_blocking`, for the same reason as in
-        // `run_query`: the trace scope is a task-local and the blocking pool's
-        // thread is not in it. It is the same `current_trace_id()` that stamps
-        // `QueryMeta`, so the id in the pull's DuckLake commit and the id the
-        // caller was handed agree by construction rather than by coincidence.
-        let trace_id = crate::trace::current_trace_id();
-        let meta = tokio::task::spawn_blocking(move || {
-            engine.pull_catalog(
-                &loc,
-                &ty,
-                &alias,
-                &merged,
-                &q,
-                &identity,
-                trace_id.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| AgentError::internal(format!("join: {e}")))??;
-        Ok((
-            PullResult {
-                catalog: cat.name,
-                query: query.to_string(),
-            },
-            meta,
-        ))
-    }
-
-    /// Transiently attach a catalog on the pond and list its tables.
-    pub async fn catalog_describe(
-        &self,
-        identity: &Identity,
-        pond_ref: &str,
-        catalog: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, AgentError> {
-        let info = self
-            .pond_info_audited(identity, "catalog_describe", pond_ref)
-            .await?;
-        if let Some((fwd, owner)) = self.route(identity, "catalog_describe", &info).await? {
-            info!(
-                op = "catalog_describe",
-                pond = pond_ref,
-                owner = owner.node_id,
-                endpoint = owner.endpoint,
-                "forwarding to owner node"
-            );
-            record_forward("catalog_describe");
-            return fwd
-                .catalog_describe(owner, identity, pond_ref, catalog, params)
-                .await;
-        }
-        // This attaches an EXTERNAL catalog on the pond's engine and reads its
-        // table list — a real access to a real system, not a registry lookup, so
-        // it belongs on the trail like `catalog_pull`.
-        let started = Instant::now();
-        let res = self.catalog_describe_local(&info, catalog, params).await;
-        self.audit(
-            identity,
-            "catalog_describe",
+            "attach_catalog",
             Some(&info.pond_id),
-            Some(catalog.to_string()),
+            // The alias and the type, never the options and never the
+            // credential: the audit trail says WHAT was mounted, and a locator
+            // is already on the attach response for anyone who needs it.
+            Some(format!("{name} ({catalog_type})")),
             started.elapsed().as_millis() as u64,
             outcome(&res),
         )
@@ -1123,42 +1064,143 @@ impl AgentOps {
         res
     }
 
-    /// The local half of `catalog_describe` (see `describe_pond_local`).
-    async fn catalog_describe_local(
+    /// The local half of `attach_catalog` (see `describe_pond_local` for why it
+    /// is split out).
+    ///
+    /// `credentials` is resolved HERE rather than at the public method, because
+    /// resolution reads the ambient bearer and a forwarded call must resolve it
+    /// on the owner.
+    async fn attach_catalog_local(
         &self,
         info: &PondInfo,
-        catalog: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, AgentError> {
-        let (loc, cat, merged) = self.prepare_pull(info, catalog, params).await?;
+        name: &str,
+        catalog_type: &str,
+        options: std::collections::BTreeMap<String, String>,
+        credentials: crate::credentials::CredentialSpec,
+    ) -> Result<AttachCatalogResult, AgentError> {
+        // The option allowlist first: it is the `--option` / `--secret` boundary
+        // and a credential that arrived on the wrong side must never reach the
+        // engine, where it would be echoed back by `list_attached_catalogs`.
+        latiq_common::catalog::check_options(catalog_type, options.keys().map(|k| k.as_str()))
+            .map_err(|r| AgentError::of_kind(ErrorKind::InvalidValue, r.to_string()))?;
+        let (secrets, credential_mode) = crate::credentials::resolve_credentials(
+            catalog_type,
+            credentials,
+            &self.credentials,
+            crate::bearer::current_bearer(),
+        )
+        .await?;
+        let loc = self.catalog_location(info)?;
         let engine = self.engine.clone();
-        let (ty, alias) = (cat.r#type.clone(), cat.name.clone());
-        tokio::task::spawn_blocking(move || engine.describe_catalog(&loc, &ty, &alias, &merged))
-            .await
-            .map_err(|e| AgentError::internal(format!("join: {e}")))?
-            .map_err(Into::into)
+        let (ty, alias) = (catalog_type.to_string(), name.to_string());
+        let catalog = tokio::task::spawn_blocking(move || {
+            engine.attach_catalog(&loc, &ty, &alias, &options, &secrets)
+        })
+        .await
+        .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        Ok(AttachCatalogResult {
+            catalog,
+            credential_mode,
+        })
     }
 
-    /// Shared LOCAL setup for pull/describe (the caller has already resolved the
-    /// pond and confirmed this node owns it — remote ponds are forwarded before
-    /// reaching here): resolve the catalog and merge its locator params with the
-    /// pull-time params (pull wins).
-    async fn prepare_pull(
+    /// Detach a catalog and drop the credential that was created for it.
+    pub async fn detach_catalog(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+        name: &str,
+    ) -> Result<DetachCatalogResult, AgentError> {
+        let info = self
+            .pond_info_audited(identity, "detach_catalog", pond_ref)
+            .await?;
+        if let Some((fwd, owner)) = self.route(identity, "detach_catalog", &info).await? {
+            info!(
+                op = "detach_catalog",
+                pond = pond_ref,
+                owner = owner.node_id,
+                endpoint = owner.endpoint,
+                "forwarding to owner node"
+            );
+            record_forward("detach_catalog");
+            return fwd.detach_catalog(owner, identity, pond_ref, name).await;
+        }
+        let started = Instant::now();
+        let res = self.detach_catalog_local(&info, name).await;
+        self.audit(
+            identity,
+            "detach_catalog",
+            Some(&info.pond_id),
+            Some(name.to_string()),
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    async fn detach_catalog_local(
         &self,
         info: &PondInfo,
-        catalog: &str,
-        params: std::collections::BTreeMap<String, String>,
-    ) -> Result<
-        (
-            latiq_storage::PondLocation,
-            CatalogInfo,
-            std::collections::BTreeMap<String, String>,
-        ),
-        AgentError,
-    > {
-        let cat = self.control.get_catalog(catalog).await?;
-        let mut merged = cat.params.clone();
-        merged.extend(params);
+        name: &str,
+    ) -> Result<DetachCatalogResult, AgentError> {
+        let loc = self.catalog_location(info)?;
+        let engine = self.engine.clone();
+        let alias = name.to_string();
+        tokio::task::spawn_blocking(move || engine.detach_catalog(&loc, &alias))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        Ok(DetachCatalogResult {
+            catalog: name.to_string(),
+        })
+    }
+
+    /// What is attached to this pond right now.
+    pub async fn list_attached_catalogs(
+        &self,
+        identity: &Identity,
+        pond_ref: &str,
+    ) -> Result<AttachedCatalogList, AgentError> {
+        let info = self
+            .pond_info_audited(identity, "list_attached_catalogs", pond_ref)
+            .await?;
+        if let Some((fwd, owner)) = self
+            .route(identity, "list_attached_catalogs", &info)
+            .await?
+        {
+            record_forward("list_attached_catalogs");
+            return fwd.list_attached_catalogs(owner, identity, pond_ref).await;
+        }
+        let started = Instant::now();
+        let res = self.list_attached_catalogs_local(&info).await;
+        self.audit(
+            identity,
+            "list_attached_catalogs",
+            Some(&info.pond_id),
+            None,
+            started.elapsed().as_millis() as u64,
+            outcome(&res),
+        )
+        .await;
+        res
+    }
+
+    async fn list_attached_catalogs_local(
+        &self,
+        info: &PondInfo,
+    ) -> Result<AttachedCatalogList, AgentError> {
+        let loc = self.catalog_location(info)?;
+        let engine = self.engine.clone();
+        let catalogs = tokio::task::spawn_blocking(move || engine.attached_catalogs(&loc))
+            .await
+            .map_err(|e| AgentError::internal(format!("join: {e}")))??;
+        Ok(AttachedCatalogList { catalogs })
+    }
+
+    /// The pond's storage location, resolved for a catalog op. The caller has
+    /// already resolved the pond and confirmed this node owns it (remote ponds
+    /// are forwarded before reaching here).
+    fn catalog_location(&self, info: &PondInfo) -> Result<latiq_storage::PondLocation, AgentError> {
         let pid = Self::parse_id(&info.pond_id)?;
         let mut loc = self
             .storage
@@ -1168,7 +1210,7 @@ impl AgentOps {
         loc.limits = tier_limits(&info.tier);
         loc.extensions = info.extensions.clone();
         loc.lineage = info.lineage;
-        Ok((loc, cat, merged))
+        Ok(loc)
     }
 
     /// Stream a read as Arrow batches. Local: drive the engine's `read_arrow` on

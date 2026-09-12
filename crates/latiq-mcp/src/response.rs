@@ -75,18 +75,7 @@ pub struct ListCatalogsResponse {
     pub catalogs: Vec<CatalogInfo>,
 }
 
-/// One table an external catalog holds.
-#[derive(Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct CatalogTableRef {
-    pub schema: String,
-    pub table: String,
-}
-
-/// `describe_catalog`.
-#[derive(Debug, Serialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub struct DescribeCatalogResponse {
-    pub catalog: String,
-    pub tables: Vec<CatalogTableRef>,
-}
+// There is deliberately no `describe_catalog` response shape here any more. An
+// attached catalog is reachable by ordinary SQL, so listing its tables is
+// `read_query "SHOW TABLES FROM lake"` / a query over `information_schema` —
+// one fewer tool to teach, and one fewer shape to keep in step with DuckDB's.

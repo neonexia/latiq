@@ -12,7 +12,7 @@ GitHub issues; this table is the human-readable summary.*
 |---|---|---|---|
 | Pond primitive — allocate / query / collaborate / drop (pure DuckLake, DuckDB engine, one instance per pond) | Now | M1 | ✅ Shipped |
 | Multi-node scale-out — control-plane registry, node registration + liveness reaping, nginx gateway front door, owner-node forwarding | Now | M1 | ✅ Shipped |
-| Datasets (curated files, copied in) + catalogs (external, transiently pulled; Iceberg first; no stored creds) | Now | M1 | ✅ Shipped |
+| Datasets (curated files, copied in) + catalogs (external; attached to a pond under a caller-chosen alias and left mounted, so ordinary SQL can join across two; Iceberg + DuckLake; no stored creds) | Now | M1 | ✅ Shipped |
 | Per-pond resource tiers → engine memory / thread caps | Now | M1 | ✅ Shipped |
 | Explain / cost estimation before running a query | Now | M1 | ✅ Shipped |
 | Multi-agent collaboration — native DuckLake attribution + conflict retry | Now | M1 | ✅ Shipped |

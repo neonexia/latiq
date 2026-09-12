@@ -202,7 +202,7 @@ impl latiq_agent_core::Forwarder for NeverForwards {
     ) -> Result<(), latiq_agent_core::AgentError> {
         panic!("nothing may be forwarded; dialled {e:?}")
     }
-    async fn catalog_pull(
+    async fn attach_catalog(
         &self,
         e: Peer<'_>,
         _: &Identity,
@@ -210,17 +210,25 @@ impl latiq_agent_core::Forwarder for NeverForwards {
         _: &str,
         _: &str,
         _: std::collections::BTreeMap<String, String>,
-    ) -> Result<latiq_agent_core::PullResult, latiq_agent_core::AgentError> {
+        _: latiq_agent_core::CredentialSpec,
+    ) -> Result<latiq_agent_core::AttachCatalogResult, latiq_agent_core::AgentError> {
         panic!("nothing may be forwarded; dialled {e:?}")
     }
-    async fn catalog_describe(
+    async fn detach_catalog(
         &self,
         e: Peer<'_>,
         _: &Identity,
         _: &str,
         _: &str,
-        _: std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, latiq_agent_core::AgentError> {
+    ) -> Result<latiq_agent_core::DetachCatalogResult, latiq_agent_core::AgentError> {
+        panic!("nothing may be forwarded; dialled {e:?}")
+    }
+    async fn list_attached_catalogs(
+        &self,
+        e: Peer<'_>,
+        _: &Identity,
+        _: &str,
+    ) -> Result<latiq_agent_core::AttachedCatalogList, latiq_agent_core::AgentError> {
         panic!("nothing may be forwarded; dialled {e:?}")
     }
 }
@@ -1112,8 +1120,9 @@ mod forwarding {
     struct RecordingForwarder {
         reads: AtomicUsize,
         writes: AtomicUsize,
-        pulls: AtomicUsize,
-        describes: AtomicUsize,
+        attaches: AtomicUsize,
+        detaches: AtomicUsize,
+        lists_attached: AtomicUsize,
         lineages: AtomicUsize,
         /// Eager allocation's hop to the owner.
         materializes: AtomicUsize,
@@ -1256,20 +1265,66 @@ mod forwarding {
             }
             Ok(())
         }
-        async fn catalog_pull(
+        async fn attach_catalog(
             &self,
             e: Peer<'_>,
             _: &Identity,
             p: &str,
-            catalog: &str,
-            q: &str,
-            _params: std::collections::BTreeMap<String, String>,
-        ) -> Result<latiq_agent_core::PullResult, AgentError> {
-            self.pulls.fetch_add(1, Ordering::SeqCst);
-            self.note(e.endpoint, p, q);
-            Ok(latiq_agent_core::PullResult {
-                catalog: catalog.to_string(),
-                query: q.to_string(),
+            name: &str,
+            catalog_type: &str,
+            options: std::collections::BTreeMap<String, String>,
+            credentials: latiq_agent_core::CredentialSpec,
+        ) -> Result<latiq_agent_core::AttachCatalogResult, AgentError> {
+            self.attaches.fetch_add(1, Ordering::SeqCst);
+            // The credential MODE is recorded in the fake's free-text slot (the
+            // values never are), so a test can prove the mode crossed the hop
+            // unresolved: a greeter that resolved `passthrough` into its own
+            // view of the caller would arrive here as `Explicit` and the owner
+            // would never see the caller's real bearer.
+            let mode = match &credentials {
+                latiq_agent_core::CredentialSpec::Explicit(_) => "explicit",
+                latiq_agent_core::CredentialSpec::Ref(_) => "ref",
+                latiq_agent_core::CredentialSpec::Passthrough => "passthrough",
+            };
+            self.note(e.endpoint, p, &format!("{name}|{catalog_type}|{mode}"));
+            Ok(latiq_agent_core::AttachCatalogResult {
+                catalog: latiq_engine::AttachedCatalog {
+                    name: name.to_string(),
+                    type_: catalog_type.to_string(),
+                    namespace: "forwarded".to_string(),
+                    options,
+                },
+                credential_mode: latiq_agent_core::CredentialMode::None,
+            })
+        }
+        async fn detach_catalog(
+            &self,
+            e: Peer<'_>,
+            _: &Identity,
+            p: &str,
+            name: &str,
+        ) -> Result<latiq_agent_core::DetachCatalogResult, AgentError> {
+            self.detaches.fetch_add(1, Ordering::SeqCst);
+            self.note(e.endpoint, p, name);
+            Ok(latiq_agent_core::DetachCatalogResult {
+                catalog: name.to_string(),
+            })
+        }
+        async fn list_attached_catalogs(
+            &self,
+            e: Peer<'_>,
+            _: &Identity,
+            p: &str,
+        ) -> Result<latiq_agent_core::AttachedCatalogList, AgentError> {
+            self.lists_attached.fetch_add(1, Ordering::SeqCst);
+            self.note(e.endpoint, p, "");
+            Ok(latiq_agent_core::AttachedCatalogList {
+                catalogs: vec![latiq_engine::AttachedCatalog {
+                    name: "forwarded".to_string(),
+                    type_: "ducklake".to_string(),
+                    namespace: "ducklake:elsewhere".to_string(),
+                    options: Default::default(),
+                }],
             })
         }
         async fn get_lineage(
@@ -1297,18 +1352,6 @@ mod forwarding {
                 unreadable_files: 0,
                 limit_applied: limit,
             })
-        }
-        async fn catalog_describe(
-            &self,
-            e: Peer<'_>,
-            _: &Identity,
-            p: &str,
-            _catalog: &str,
-            _params: std::collections::BTreeMap<String, String>,
-        ) -> Result<Vec<(String, String)>, AgentError> {
-            self.describes.fetch_add(1, Ordering::SeqCst);
-            self.note(e.endpoint, p, "");
-            Ok(vec![("main".to_string(), "forwarded_table".to_string())])
         }
     }
 
@@ -1833,8 +1876,13 @@ mod forwarding {
         assert_eq!(r.rows[0][0], serde_json::json!(1));
     }
 
+    /// An attachment lives in the pond's ENGINE INSTANCE, and only the owning
+    /// node has one — so a greeter that answered locally would mount a catalog
+    /// on an empty pond of its own and report success for a pond it does not
+    /// hold. The three catalog ops are forwarded like every other pond-scoped
+    /// op.
     #[tokio::test]
-    async fn forwarding_catalog_pull_delegates_to_owner() {
+    async fn forwarding_attach_catalog_delegates_to_owner_with_the_mode_unresolved() {
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
             owned_by("owner-node", "http://owner:9092"),
@@ -1842,44 +1890,56 @@ mod forwarding {
             fwd.clone(),
         );
         let r = ops
-            .catalog_pull(
+            .attach_catalog(
                 &Identity::claimed(Some("a")),
                 "pond-x",
                 "lake",
-                "CREATE TABLE t AS SELECT 1",
-                std::collections::BTreeMap::new(),
+                "iceberg",
+                std::collections::BTreeMap::from([(
+                    "endpoint".to_string(),
+                    "https://polaris/api".to_string(),
+                )]),
+                latiq_agent_core::CredentialSpec::Passthrough,
             )
             .await
             .unwrap();
-        assert_eq!(fwd.pulls.load(Ordering::SeqCst), 1);
+        assert_eq!(fwd.attaches.load(Ordering::SeqCst), 1);
         assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
         assert_eq!(*fwd.last_pond.lock().unwrap(), "pond-x");
-        assert_eq!(r.catalog, "lake");
+        assert_eq!(r.catalog.name, "lake");
+        // The credential mode reached the owner AS THE CALLER CHOSE IT. A
+        // greeter that resolved `passthrough` here would send `explicit` with
+        // its own reading of the caller's token, and the owner — the node that
+        // re-verifies, and whose backends are the configured ones — would never
+        // see the real bearer.
+        assert_eq!(
+            *fwd.last_sql.lock().unwrap(),
+            "lake|iceberg|passthrough",
+            "the alias, type and unresolved credential mode must all cross the hop"
+        );
     }
 
     #[tokio::test]
-    async fn forwarding_catalog_describe_delegates_to_owner() {
+    async fn forwarding_detach_and_list_attached_delegate_to_owner() {
         let fwd = Arc::new(RecordingForwarder::default());
         let ops = ops_with(
             owned_by("owner-node", "http://owner:9092"),
             ("greeter-node", "http://greeter:9092"),
             fwd.clone(),
         );
-        let tables = ops
-            .catalog_describe(
-                &Identity::claimed(Some("a")),
-                "pond-x",
-                "lake",
-                std::collections::BTreeMap::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(fwd.describes.load(Ordering::SeqCst), 1);
-        assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
+        let id = Identity::claimed(Some("a"));
+        let listed = ops.list_attached_catalogs(&id, "pond-x").await.unwrap();
+        assert_eq!(fwd.lists_attached.load(Ordering::SeqCst), 1);
         assert_eq!(
-            tables,
-            vec![("main".to_string(), "forwarded_table".to_string())]
+            listed.catalogs.first().map(|c| c.name.as_str()),
+            Some("forwarded"),
+            "the OWNER's attachments are what a caller must be shown: {listed:?}"
         );
+
+        let dropped = ops.detach_catalog(&id, "pond-x", "lake").await.unwrap();
+        assert_eq!(fwd.detaches.load(Ordering::SeqCst), 1);
+        assert_eq!(*fwd.last_endpoint.lock().unwrap(), "http://owner:9092");
+        assert_eq!(dropped.catalog, "lake");
     }
 
     #[tokio::test]
@@ -1997,33 +2057,36 @@ mod forwarding {
                 ops.get_lineage(&id, "pond-x", 10, None, None)
             ),
             probe!(
-                "catalog_pull",
-                ops.catalog_pull(
+                "attach_catalog",
+                ops.attach_catalog(
                     &id,
                     "pond-x",
                     "lake",
-                    "CREATE TABLE t AS SELECT 1",
-                    no_params()
+                    "ducklake",
+                    no_params(),
+                    latiq_agent_core::CredentialSpec::Passthrough
                 )
             ),
+            probe!("detach_catalog", ops.detach_catalog(&id, "pond-x", "lake")),
             probe!(
-                "catalog_describe",
-                ops.catalog_describe(&id, "pond-x", "lake", no_params())
+                "list_attached_catalogs",
+                ops.list_attached_catalogs(&id, "pond-x")
             ),
         ];
         // Anti-vacuity: a probe deleted (or a macro that stopped expanding)
         // must fail here rather than shrink the surface being guarded.
         assert_eq!(
             probed.len(),
-            10,
+            11,
             "every pond-scoped op must be probed, not a sample: {probed:?}"
         );
 
         assert_eq!(
             fwd.reads.load(Ordering::SeqCst)
                 + fwd.writes.load(Ordering::SeqCst)
-                + fwd.pulls.load(Ordering::SeqCst)
-                + fwd.describes.load(Ordering::SeqCst)
+                + fwd.attaches.load(Ordering::SeqCst)
+                + fwd.detaches.load(Ordering::SeqCst)
+                + fwd.lists_attached.load(Ordering::SeqCst)
                 + fwd.lineages.load(Ordering::SeqCst),
             0,
             "there is no owner endpoint, so nothing may be dialled either"
@@ -2910,13 +2973,17 @@ mod lineage {
     }
 
     #[tokio::test]
-    async fn lineage_catalog_pull_names_the_external_source_and_the_pond_table() {
-        // The pull is the ONE op whose input is not in the pond, and the edge
-        // with the most provenance value: the catalog is detached before the
-        // call returns, so after this nothing in the pond — not the catalog,
-        // not the snapshots — remembers where its rows came from. If the pull
-        // emitted no event, "how did this table get here" would be answerable
-        // for every table except the imported ones.
+    async fn lineage_an_extract_from_an_attached_catalog_names_the_external_source() {
+        // The extract is the ONE op whose input is not in the pond, and the edge
+        // with the most provenance value: once the catalog is detached nothing
+        // in the pond — not the catalog, not the snapshots — remembers where its
+        // rows came from. Without this event, "how did this table get here" is
+        // answerable for every table except the imported ones.
+        //
+        // It is now an ORDINARY `write_query`, which is what makes the test
+        // worth having at this layer rather than only in the engine: the
+        // re-filing used to belong to a special-cased pull op, and the generic
+        // write path is where it has to live now.
         //
         // Both sides are asserted, because each fails on its own: an input left
         // under the pond's namespace would claim the lakehouse's table as ours
@@ -2924,52 +2991,54 @@ mod lineage {
         // missing output loses the other end of the edge entirely.
         let tmp = tempfile::tempdir().unwrap();
         let (metadata_path, data_path) = seed_ducklake(tmp.path());
-        let (ops, storage, registry) = ops_with_registry(None);
-        registry
-            .add_catalog(&latiq_control_plane::registry::CatalogRow {
-                name: "ext".into(),
-                r#type: "ducklake".into(),
-                params: std::collections::BTreeMap::from([
-                    ("metadata_path".to_string(), metadata_path.clone()),
-                    ("data_path".to_string(), data_path),
-                ]),
-                description: "local ducklake".into(),
-                tags: vec![],
-                created_by: String::new(),
-                created_at: String::new(),
-            })
-            .unwrap();
+        let (ops, storage, _registry) = ops_with_registry(None);
 
         let id = Identity::claimed(Some("agent-a"));
         let pond = ops
             .allocate_pond(&id, Some("shop".into()), "{}", "medium", &[], true)
             .await
             .unwrap();
-        ops.catalog_pull(
+        // The whole locator arrives with the attach — no registry lookup.
+        ops.attach_catalog(
             &id,
             "shop",
             "ext",
+            "ducklake",
+            std::collections::BTreeMap::from([
+                ("metadata_path".to_string(), metadata_path.clone()),
+                ("data_path".to_string(), data_path),
+            ]),
+            latiq_agent_core::CredentialSpec::Passthrough,
+        )
+        .await
+        .unwrap();
+        ops.write_query(
+            &id,
+            "shop",
             "CREATE TABLE cheap AS SELECT id, name FROM ext.main.widgets WHERE price < 10",
-            std::collections::BTreeMap::new(),
         )
         .await
         .unwrap();
         ops.flush_lineage();
 
         let events = events_in(&storage, &pond.pond_id);
-        let pull = events_for_op(&events, "shop.catalog_pull");
+        // The extract is a write, so it is filed as one. An attach of its own
+        // emits NOTHING: it moves no data and writes nothing to the pond, and an
+        // event for it would put a run in the trail with no datasets on either
+        // side.
+        let extract = events_for_op(&events, "shop.write_query");
         assert_eq!(
-            pull.len(),
+            extract.len(),
             2,
-            "one pull, one START/terminal pair: {events:#?}"
+            "one extract, one START/terminal pair: {events:#?}"
         );
-        let terminal = pull
+        let terminal = extract
             .iter()
             .find(|e| event_type(e) == "COMPLETE")
-            .expect("the pull completed");
+            .expect("the extract completed");
 
         // The external side keeps the SOURCE's own locator as its namespace —
-        // the alias `ext` is a pond-local registry name nobody else can join on.
+        // the alias `ext` is a pond-local name nobody else can join on.
         assert_eq!(
             terminal["inputs"],
             json!([{
@@ -2977,7 +3046,7 @@ mod lineage {
                 "name": "main.widgets",
                 "facets": terminal["inputs"][0]["facets"],
             }]),
-            "the pull must name the external table it read: {terminal:#}"
+            "the extract must name the external table it read: {terminal:#}"
         );
         // Free of charge from a DuckLake source: the snapshot it was read at.
         let read_at = &terminal["inputs"][0]["facets"]["version"]["datasetVersion"];
@@ -2992,10 +3061,10 @@ mod lineage {
         );
         assert_eq!(terminal["outputs"][0]["name"], json!("shop.main.cheap"));
 
-        let start = pull
+        let start = extract
             .iter()
             .find(|e| event_type(e) == "START")
-            .expect("the pull started");
+            .expect("the extract started");
         assert_eq!(
             start["inputs"][0]["name"],
             json!("main.widgets"),

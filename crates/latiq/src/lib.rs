@@ -109,7 +109,8 @@ enum Command {
     /// Datasets (simple files in the `latiq` catalog): add/list/load/remove.
     #[command(subcommand)]
     Dataset(DatasetCmd),
-    /// External catalogs (iceberg/…): add/list/describe/pull/remove.
+    /// External catalogs (iceberg/ducklake): attach one to a pond and query it
+    /// with ordinary SQL, then detach. Plus a discovery registry (add/list/remove).
     #[command(subcommand)]
     Catalog(CatalogCmd),
     /// System snapshot: nodes (state + heartbeat age), ponds, tiers.
@@ -216,49 +217,91 @@ enum DatasetCmd {
 #[derive(Subcommand)]
 #[command(after_help = SERVER_HELP)]
 enum CatalogCmd {
-    /// Register (or replace) an external catalog. Operator action. `--set` carries
-    /// locator params (credentials are dropped here — pass them at pull/describe).
+    /// Register (or replace) an external catalog in the control-plane registry.
+    /// Operator action, for DISCOVERY only: `--option` carries locator params
+    /// that `catalog list` echoes, so an agent can find a catalog and knows what
+    /// to pass to `catalog attach`. Credentials are dropped here and are never
+    /// stored — supply them at attach.
     Add {
         /// Catalog name (a bare identifier), e.g. `lake`.
         name: String,
-        /// Catalog type: iceberg.
+        /// Catalog type: iceberg, ducklake.
         #[arg(short, long)]
         r#type: String,
-        /// Config param `key=value` (repeatable), e.g. `--set endpoint=...`.
-        #[arg(short, long = "set", value_name = "KEY=VALUE")]
-        set: Vec<String>,
+        /// Locator param `key=value` (repeatable), e.g. `--option endpoint=...`.
+        /// Named `--option` because these map 1:1 onto DuckDB's own parenthesised
+        /// `ATTACH '<target>' AS <alias> (KEY 'value', …)` options.
+        #[arg(short, long = "option", value_name = "KEY=VALUE")]
+        options: Vec<String>,
         #[arg(short, long, default_value = "")]
         description: String,
         #[arg(long = "tag")]
         tags: Vec<String>,
     },
-    /// List/search catalogs. Query: `#tag`, `prefix*`, or a substring.
-    List { query: Option<String> },
-    /// List a catalog's tables (transient attach on a pond). `--set` for creds.
-    Describe {
-        name: String,
-        #[arg(short, long)]
-        pond: String,
-        #[arg(short, long = "set", value_name = "KEY=VALUE")]
-        set: Vec<String>,
-        #[arg(short, long)]
-        agent_id: Option<String>,
-    },
-    /// Pull from a catalog into a pond: transient attach → run the query → detach.
-    Pull {
-        name: String,
-        #[arg(short, long)]
-        pond: String,
-        /// SQL that materializes into the pond, e.g.
-        /// `CREATE TABLE t AS SELECT * FROM <catalog>.schema.table WHERE …`.
-        #[arg(short, long)]
-        query: String,
-        #[arg(short, long = "set", value_name = "KEY=VALUE")]
-        set: Vec<String>,
+    /// Without `--pond`: list/search REGISTERED catalogs (control plane).
+    /// With `--pond`: list what is ATTACHED to that pond right now (pond node).
+    /// Query: `#tag`, `prefix*`, or a substring — registry search only.
+    List {
+        query: Option<String>,
+        /// Show what is attached to this pond instead of the registry.
+        #[arg(short, long, conflicts_with = "query")]
+        pond: Option<String>,
         #[arg(short, long)]
         agent_id: Option<String>,
     },
-    /// Remove a catalog. Operator action.
+    /// Mount an external catalog on a pond and LEAVE it mounted, so ordinary
+    /// `latiq read`/`latiq write` SQL can name it — and join across two of them.
+    ///
+    /// The attachment lives in the pond node's engine. It is NOT persisted: a
+    /// node restart loses it, and the next statement naming the alias says so
+    /// and tells you to attach again.
+    Attach {
+        /// The alias to mount it as, AND the SQL namespace: `--name lake` makes
+        /// the source readable as `FROM lake.sales.orders`.
+        #[arg(short, long)]
+        name: String,
+        /// Catalog type: iceberg, ducklake.
+        #[arg(short, long)]
+        r#type: String,
+        #[arg(short, long)]
+        pond: String,
+        /// Locator param `key=value` (repeatable), 1:1 with DuckDB's own
+        /// parenthesised ATTACH options — e.g. `--option endpoint=http://...`.
+        /// Echoed back by `catalog list --pond`, so a credential key here is
+        /// refused: use `--secret`.
+        #[arg(short, long = "option", value_name = "KEY=VALUE")]
+        options: Vec<String>,
+        /// Credential `key=value` (repeatable), e.g. `--secret token=...`.
+        /// Never logged, never stored, never echoed by any command.
+        ///
+        /// Supply this, OR `--secret-ref`, OR NEITHER. Neither means
+        /// **passthrough**: your own bearer token (`LATIQ_TOKEN`) is used as the
+        /// catalog credential — what Iceberg REST / Unity / Snowflake External
+        /// OAuth actually want. The command prints which mode was applied.
+        #[arg(
+            long = "secret",
+            value_name = "KEY=VALUE",
+            conflicts_with = "secret_ref"
+        )]
+        secrets: Vec<String>,
+        /// An opaque credential reference the NODE dereferences, e.g.
+        /// `env://lake` — for credentials this client must not hold.
+        #[arg(long = "secret-ref", value_name = "URI")]
+        secret_ref: Option<String>,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
+    /// Unmount a catalog from a pond and drop the credential created for it.
+    /// Data already extracted INTO the pond is unaffected.
+    Detach {
+        #[arg(short, long)]
+        name: String,
+        #[arg(short, long)]
+        pond: String,
+        #[arg(short, long)]
+        agent_id: Option<String>,
+    },
+    /// Remove a catalog from the registry. Operator action.
     Remove { name: String },
 }
 
@@ -738,11 +781,11 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
         CatalogCmd::Add {
             name,
             r#type,
-            set,
+            options,
             description,
             tags,
         } => {
-            let params = parse_kv(&set, "--set")?;
+            let params = parse_kv(&options, "--option")?;
             let mut c = admin_client().await?;
             let r = c
                 .catalog_add(CatalogAddRequest {
@@ -761,15 +804,57 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
                 .into_inner();
             println!("added {}", r.name);
             if !r.dropped_params.is_empty() {
-                // Credentials never persist — they're dropped here and passed at pull.
+                // Credentials never persist in the registry — they are dropped
+                // here and supplied at `catalog attach` with `--secret`.
                 println!(
-                    "  (not stored, pass at pull: {})",
+                    "  (not stored, pass at attach with --secret: {})",
                     r.dropped_params.join(", ")
                 );
             }
             Ok(())
         }
-        CatalogCmd::List { query } => {
+        // `--pond` switches the QUESTION, and so the surface: the registry lives
+        // on the control plane and answers "what could I attach", the pond node
+        // holds the engine and answers "what is attached to this pond right
+        // now". One verb because to a user they are the same question at two
+        // scopes; two clients because they are owned by different planes
+        // (invariant 4).
+        CatalogCmd::List {
+            pond: Some(pond),
+            agent_id,
+            query: _,
+        } => {
+            let node = data_target(&pond).await?;
+            let mut c = data_client(&node).await?;
+            let resp = c
+                .catalog_list_attached(with_id(CatalogListAttachedRequest { pond }, &agent_id))
+                .await
+                .map_err(render_status)?
+                .into_inner();
+            let v: serde_json::Value = serde_json::from_str(&resp.json).unwrap_or_default();
+            let rows: Vec<[String; 3]> = v["catalogs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|c| {
+                            [
+                                c["name"].as_str().unwrap_or("").to_string(),
+                                c["type"].as_str().unwrap_or("").to_string(),
+                                c["namespace"].as_str().unwrap_or("").to_string(),
+                            ]
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            print_kv_table(
+                &["NAME", "TYPE", "SOURCE"],
+                &rows,
+                99,
+                "nothing attached (attachments are lost when the node restarts)",
+            );
+            Ok(())
+        }
+        CatalogCmd::List { query, .. } => {
             let mut c = admin_client().await?;
             let catalogs = c
                 .catalog_list(CatalogListRequest {
@@ -798,63 +883,74 @@ async fn run_catalog_cmd(cmd: CatalogCmd) -> Result<()> {
             );
             Ok(())
         }
-        CatalogCmd::Describe {
+        CatalogCmd::Attach {
             name,
+            r#type,
             pond,
-            set,
+            options,
+            secrets,
+            secret_ref,
             agent_id,
         } => {
-            let params = parse_kv(&set, "--set")?;
+            let options = parse_kv(&options, "--option")?;
+            let secrets = parse_kv(&secrets, "--secret")?;
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
-            let resp = c
-                .catalog_describe(with_id(
-                    CatalogDescribeRequest {
-                        pond,
-                        catalog: name,
-                        params,
+            match c
+                .catalog_attach(with_id(
+                    CatalogAttachRequest {
+                        pond: pond.clone(),
+                        name: name.clone(),
+                        r#type,
+                        options,
+                        secrets,
+                        secret_ref: secret_ref.unwrap_or_default(),
                     },
                     &agent_id,
                 ))
                 .await
-                .map_err(render_status)?
-                .into_inner();
-            println!("{}", resp.json);
-            Ok(())
+            {
+                Ok(resp) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&resp.into_inner().json).unwrap_or_default();
+                    // The mode is PRINTED, never assumed: `none` is the only way
+                    // a caller learns that its passthrough had no bearer to pass
+                    // through and the catalog was attached unauthenticated.
+                    println!(
+                        "attached {name} to {pond} ({}) — credential: {}",
+                        v["catalog"]["namespace"].as_str().unwrap_or("?"),
+                        v["credential_mode"].as_str().unwrap_or("?"),
+                    );
+                    println!(
+                        "  query it as `{name}.<schema>.<table>`; it is lost if the node restarts"
+                    );
+                    Ok(())
+                }
+                Err(st) => print_status(&st),
+            }
         }
-        CatalogCmd::Pull {
+        CatalogCmd::Detach {
             name,
             pond,
-            query,
-            set,
             agent_id,
         } => {
-            let params = parse_kv(&set, "--set")?;
             let node = data_target(&pond).await?;
             let mut c = data_client(&node).await?;
-            print!("pulling from {name} into {pond} … ");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
             match c
-                .catalog_pull(with_id(
-                    CatalogPullRequest {
-                        pond,
-                        catalog: name,
-                        query,
-                        params,
+                .catalog_detach(with_id(
+                    CatalogDetachRequest {
+                        pond: pond.clone(),
+                        name: name.clone(),
                     },
                     &agent_id,
                 ))
                 .await
             {
                 Ok(_) => {
-                    println!("ok");
+                    println!("detached {name} from {pond} (its credential was dropped)");
                     Ok(())
                 }
-                Err(st) => {
-                    println!("FAILED");
-                    print_status(&st)
-                }
+                Err(st) => print_status(&st),
             }
         }
         CatalogCmd::Remove { name } => {

@@ -28,5 +28,7 @@ pub use timeout::{QueryTimeouts, DEFAULT_QUERY_TIMEOUT_MS, MAX_QUERY_TIMEOUT_MS}
 pub mod tier;
 pub use tier::{PondTier, ResourceLimits};
 pub mod catalog;
+pub mod secret;
+pub use secret::Secret;
 pub mod extensions;
 pub mod pond_name;

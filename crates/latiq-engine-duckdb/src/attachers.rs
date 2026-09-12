@@ -12,14 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Per-type external-catalog attachers: map a catalog's merged params into the
-//! DuckDB `LOAD` + `CREATE SECRET` + `ATTACH` SQL. Everything is transient — the
-//! pull path runs `load → secrets → attach → <query> → detach + drop secrets`, so
-//! no credential ever persists (latiq stores none). Iceberg first; add a match
-//! arm + the type's row in `latiq_common::catalog` to support a new type.
+//! Per-type external-catalog attachers: map a catalog's `--option` locator plus
+//! its `--secret` credentials into the DuckDB `LOAD` + `CREATE SECRET` + `ATTACH`
+//! SQL.
+//!
+//! The shape mirrors DuckDB's own `ATTACH '<target>' AS <alias> (TYPE t, KEY
+//! 'v', …)` on purpose: an option here is an option there. Iceberg and DuckLake
+//! first; add a match arm + the type's row in `latiq_common::catalog` to support
+//! a new type.
+//!
+//! **This file is one of the workspace's two [`Secret::expose`] sites** (the
+//! other is the internal node-to-node hop that carries a credential here;
+//! `latiq_common::secret` pins the set). Everything upstream carries the
+//! credential as a `Secret`, which cannot be printed, logged or serialized; it
+//! becomes a `&str` exactly here, inside the string literal of one
+//! `CREATE SECRET`, and that statement is never logged (see
+//! [`AttachPlan::secrets`]).
+//!
+//! **A credential must reach DuckDB through a NAMED SECRET and nothing else.**
+//! The `ATTACH` only ever names one, because the attach is the statement whose
+//! failure gets classified, retried and talked about; a token inlined there
+//! would be one `format!` away from an error message for ever. Pinned by
+//! `a_credential_never_leaves_the_create_secret_statement`.
 use crate::instance::quote_ident;
+use latiq_common::Secret;
 use latiq_engine::EngineError;
 use std::collections::BTreeMap;
+
+/// Locator parameters, as supplied by `--option` / the `options` field. Listable,
+/// loggable, and echoed back by `list_attached_catalogs`.
+pub type Options = BTreeMap<String, String>;
+/// Credentials, as supplied by `--secret` / passthrough / a `secret_ref`. Never
+/// echoed by any surface.
+pub type Secrets = BTreeMap<String, Secret>;
 
 /// The SQL to mount an external catalog, and to tear it back down.
 pub struct AttachPlan {
@@ -33,12 +58,12 @@ pub struct AttachPlan {
     /// catalogs, so the warehouse is part of it.
     pub namespace: String,
     /// `LOAD …;` for the type's extensions — **`LOAD` only, never `INSTALL`**.
-    /// This plan is executed inside `pull_catalog`, with an agent waiting on the
-    /// call, and an `INSTALL` there is an unbounded download from an external
-    /// host at the worst possible moment (and impossible in a deployment with no
-    /// egress). The extensions come from the node's cache, put there by
-    /// `latiq warm-extensions` at image-build time or the node's startup warm.
-    /// Guarded by `attach_plan_never_installs_an_extension`.
+    /// This plan is executed inside `attach_catalog`, with an agent waiting on
+    /// the call, and an `INSTALL` there is an unbounded download from an
+    /// external host at the worst possible moment (and impossible in a
+    /// deployment with no egress). The extensions come from the node's cache,
+    /// put there by `latiq warm-extensions` at image-build time or the node's
+    /// startup warm. Guarded by `attach_plan_never_installs_an_extension`.
     ///
     /// `(extension, statement)`, not a bare statement: a LOAD that fails must
     /// name the missing extension as a VALUE on the envelope
@@ -47,8 +72,14 @@ pub struct AttachPlan {
     /// spelling of one fact.
     pub load: Vec<(String, String)>,
     /// `(secret_name, CREATE SECRET …)` — dropped on detach.
+    ///
+    /// **These statements contain exposed credential material and must never be
+    /// logged, returned, or put on an error envelope.** That is why a failure
+    /// here is reported from the CALLER's parameters (`errclass::classify` on
+    /// DuckDB's own message) and never by echoing the statement.
     pub secrets: Vec<(String, String)>,
-    /// `ATTACH … AS <alias> (…)`.
+    /// `ATTACH … AS <alias> (…)`. Credential-free by construction: a credential
+    /// reaches DuckDB through a named secret, and the attach only ever names it.
     pub attach: String,
 }
 
@@ -70,7 +101,7 @@ fn esc(v: &str) -> String {
 /// A required catalog parameter the caller did not supply.
 ///
 /// Every message passed here already NAMES the parameter and how to supply it
-/// (`--set endpoint=<rest-url>`), which is precisely why `EngineError::Engine`
+/// (`--option endpoint=<rest-url>`), which is precisely why `EngineError::Engine`
 /// was the wrong home for it: that maps to `internal`, whose advice is "Retry;
 /// if it persists, report to your operator" — an identical retry that can never
 /// succeed, then an escalation to somebody with nothing to fix, for a mistake
@@ -86,12 +117,28 @@ fn unsupported(msg: impl Into<String>) -> EngineError {
     EngineError::UnsupportedParameter(msg.into())
 }
 
+/// A locator option, treated as absent when empty: half a parameter must not
+/// build SQL that then fails obscurely inside DuckDB.
+fn opt<'a>(options: &'a Options, key: &str) -> Option<&'a str> {
+    options
+        .get(key)
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+/// A credential, treated as absent when empty (`--secret token=` supplied
+/// nothing).
+fn cred<'a>(secrets: &'a Secrets, key: &str) -> Option<&'a Secret> {
+    secrets.get(key).filter(|s| !s.is_empty())
+}
+
 /// Build the attach plan for a catalog `type_`, mounting it as `alias`, from the
-/// merged (add ⊕ pull) params.
+/// caller's locator `options` and resolved `secrets`.
 pub fn plan(
     type_: &str,
     alias: &str,
-    params: &BTreeMap<String, String>,
+    options: &Options,
+    secrets: &Secrets,
 ) -> Result<AttachPlan, EngineError> {
     let load = latiq_common::catalog::lookup(type_)
         .map(|s| {
@@ -102,10 +149,15 @@ pub fn plan(
         })
         .unwrap_or_default();
     match type_ {
-        "iceberg" => iceberg(alias, params, load),
-        "ducklake" => ducklake(alias, params, load),
+        "iceberg" => iceberg(alias, options, secrets, load),
+        "ducklake" => ducklake(alias, options, secrets, load),
         other => Err(unsupported(format!(
-            "unsupported catalog type '{other}' (supported: iceberg, ducklake)"
+            "unsupported catalog type '{other}' (supported: {})",
+            latiq_common::catalog::TYPES
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+                .join(", ")
         ))),
     }
 }
@@ -115,20 +167,18 @@ pub fn plan(
 /// secret. We only ever read from it, so the attach is read-only.
 fn ducklake(
     alias: &str,
-    params: &BTreeMap<String, String>,
+    options: &Options,
+    secrets: &Secrets,
     load: Vec<(String, String)>,
 ) -> Result<AttachPlan, EngineError> {
-    let metadata = params
-        .get("metadata_path")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| missing("ducklake catalog requires --set metadata_path=<catalog-db>"))?;
-    let data_path = params
-        .get("data_path")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| missing("ducklake catalog requires --set data_path=<data-dir-or-s3-uri>"))?;
-    let mut secrets: Vec<(String, String)> = Vec::new();
-    if let Some(line) = s3_secret_line(alias, params) {
-        secrets.push(line);
+    let metadata = opt(options, "metadata_path")
+        .ok_or_else(|| missing("ducklake catalog requires --option metadata_path=<catalog-db>"))?;
+    let data_path = opt(options, "data_path").ok_or_else(|| {
+        missing("ducklake catalog requires --option data_path=<data-dir-or-s3-uri>")
+    })?;
+    let mut plan_secrets: Vec<(String, String)> = Vec::new();
+    if let Some(line) = s3_secret_line(alias, options, secrets) {
+        plan_secrets.push(line);
     }
     let attach = format!(
         "ATTACH 'ducklake:{}' AS {} (DATA_PATH '{}', READ_ONLY)",
@@ -140,40 +190,43 @@ fn ducklake(
         alias: alias.to_string(),
         namespace: format!("ducklake:{metadata}"),
         load,
-        secrets,
+        secrets: plan_secrets,
         attach,
     })
 }
 
-/// Build an `s3` secret from `s3_access_key`/`s3_secret_key` (+ endpoint/region)
-/// for catalogs whose storage backend is MinIO/S3. SigV4 keys ride in at pull.
+/// Build an `s3` secret from the `s3_access_key`/`s3_secret_key` CREDENTIALS
+/// plus the `s3_endpoint`/`s3_region` LOCATOR options, for catalogs whose
+/// storage backend is MinIO/S3.
 ///
 /// **One implementation for every catalog type** with an S3-backed store
 /// (`ducklake`; `iceberg` behind MinIO/Polaris). It was duplicated per type,
 /// which meant a fix to the escaping — the injection-adjacent part, since both
 /// keys are caller-supplied — could land on one copy and silently miss the
 /// other.
-fn s3_secret_line(alias: &str, params: &BTreeMap<String, String>) -> Option<(String, String)> {
-    let k = params.get("s3_access_key").filter(|s| !s.is_empty())?;
-    let s = params.get("s3_secret_key").filter(|s| !s.is_empty())?;
-    let name = format!("_latiq_{alias}_s3");
+fn s3_secret_line(alias: &str, options: &Options, secrets: &Secrets) -> Option<(String, String)> {
+    let k = cred(secrets, "s3_access_key")?;
+    let s = cred(secrets, "s3_secret_key")?;
+    let name = format!("_latiq_{}_s3", sanitize(alias));
     let mut lines = vec![
         "TYPE s3".to_string(),
-        format!("KEY_ID '{}'", esc(k)),
-        format!("SECRET '{}'", esc(s)),
+        // The workspace's only `expose()` calls, both inside a single-quoted
+        // literal whose quotes are doubled just above.
+        format!("KEY_ID '{}'", esc(k.expose())),
+        format!("SECRET '{}'", esc(s.expose())),
         "URL_STYLE 'path'".to_string(),
     ];
-    if let Some(region) = params.get("s3_region").filter(|s| !s.is_empty()) {
+    if let Some(region) = opt(options, "s3_region") {
         lines.push(format!("REGION '{}'", esc(region)));
     }
-    if let Some(ep) = params.get("s3_endpoint").filter(|s| !s.is_empty()) {
+    if let Some(ep) = opt(options, "s3_endpoint") {
         // DuckDB's s3 ENDPOINT wants host:port; the scheme rides in USE_SSL.
         let (host, ssl) = if let Some(rest) = ep.strip_prefix("http://") {
             (rest, "false")
         } else if let Some(rest) = ep.strip_prefix("https://") {
             (rest, "true")
         } else {
-            (ep.as_str(), "true")
+            (ep, "true")
         };
         lines.push(format!("ENDPOINT '{}'", esc(host)));
         lines.push(format!("USE_SSL {ssl}"));
@@ -184,34 +237,41 @@ fn s3_secret_line(alias: &str, params: &BTreeMap<String, String>) -> Option<(Str
     ))
 }
 
-/// Iceberg REST catalog (Polaris / vendor-hosted). The bearer rides in via the
-/// `token` param at pull time → an `iceberg` secret. Optional S3 storage backend
-/// creds (SigV4) build an `s3` secret. See swarm's `IcebergHandler` + DuckDB's
-/// iceberg REST-catalog docs.
+/// A DuckDB secret name is a bare identifier, and the alias it is derived from
+/// is caller-supplied. The alias is validated upstream
+/// (`latiq_common::pond_name`-shaped: letters, digits, `_`, `-`), so this only
+/// has to map the one legal character DuckDB will not take — and it keeps the
+/// derivation honest if that validation is ever loosened.
+fn sanitize(alias: &str) -> String {
+    alias
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Iceberg REST catalog (Polaris / Unity / vendor-hosted). The bearer rides in
+/// as the `token` credential — explicitly, or as the caller's own token under
+/// `passthrough` — and becomes an `iceberg` secret. Optional S3 storage-backend
+/// creds (SigV4) build an `s3` secret. See DuckDB's iceberg REST-catalog docs.
 fn iceberg(
     alias: &str,
-    params: &BTreeMap<String, String>,
+    options: &Options,
+    secrets: &Secrets,
     load: Vec<(String, String)>,
 ) -> Result<AttachPlan, EngineError> {
-    let endpoint = params
-        .get("endpoint")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| missing("iceberg catalog requires --set endpoint=<rest-url>"))?;
-    let warehouse = params
-        .get("warehouse")
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("warehouse");
-    let mut secrets: Vec<(String, String)> = Vec::new();
+    let endpoint = opt(options, "endpoint")
+        .ok_or_else(|| missing("iceberg catalog requires --option endpoint=<rest-url>"))?;
+    let warehouse = opt(options, "warehouse").unwrap_or("warehouse");
+    let mut plan_secrets: Vec<(String, String)> = Vec::new();
 
-    // Catalog auth: the caller's bearer (or an explicit --set token=…).
-    let secret_clause = if let Some(tok) = params.get("token").filter(|s| !s.is_empty()) {
-        let name = format!("_latiq_{alias}_iceberg");
-        secrets.push((
+    // Catalog auth: the resolved credential, whichever mode produced it.
+    let secret_clause = if let Some(tok) = cred(secrets, "token") {
+        let name = format!("_latiq_{}_iceberg", sanitize(alias));
+        plan_secrets.push((
             name.clone(),
             format!(
                 "CREATE OR REPLACE SECRET {name} (TYPE iceberg, TOKEN '{}')",
-                esc(tok)
+                esc(tok.expose())
             ),
         ));
         format!(", SECRET {name}")
@@ -221,8 +281,8 @@ fn iceberg(
 
     // Optional S3 storage backend (e.g. MinIO behind Polaris). SigV4 keys —
     // same builder as every other S3-backed catalog type, see `s3_secret_line`.
-    if let Some(line) = s3_secret_line(alias, params) {
-        secrets.push(line);
+    if let Some(line) = s3_secret_line(alias, options, secrets) {
+        plan_secrets.push(line);
     }
 
     let attach = format!(
@@ -236,7 +296,7 @@ fn iceberg(
         alias: alias.to_string(),
         namespace: format!("{}/{warehouse}", endpoint.trim_end_matches('/')),
         load,
-        secrets,
+        secrets: plan_secrets,
         attach,
     })
 }
@@ -245,20 +305,30 @@ fn iceberg(
 mod tests {
     use super::*;
 
-    fn params(kv: &[(&str, &str)]) -> BTreeMap<String, String> {
+    fn options(kv: &[(&str, &str)]) -> Options {
         kv.iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
     }
 
+    fn creds(kv: &[(&str, &str)]) -> Secrets {
+        kv.iter()
+            .map(|(k, v)| (k.to_string(), Secret::new(*v)))
+            .collect()
+    }
+
     #[test]
     fn iceberg_with_token_builds_secret_and_attach() {
-        let p = params(&[
-            ("endpoint", "https://polaris/api/catalog"),
-            ("warehouse", "prod"),
-            ("token", "bear'er"),
-        ]);
-        let plan = plan("iceberg", "lake", &p).unwrap();
+        let plan = plan(
+            "iceberg",
+            "lake",
+            &options(&[
+                ("endpoint", "https://polaris/api/catalog"),
+                ("warehouse", "prod"),
+            ]),
+            &creds(&[("token", "bear'er")]),
+        )
+        .unwrap();
         assert!(plan.load.iter().any(|(ext, _)| ext == "iceberg"));
         assert_eq!(plan.secrets.len(), 1);
         assert!(plan.secrets[0].1.contains("TYPE iceberg"));
@@ -272,22 +342,35 @@ mod tests {
             .contains("ENDPOINT 'https://polaris/api/catalog'"));
         assert!(plan.attach.contains("SECRET _latiq_lake_iceberg"));
         assert_eq!(plan.teardown()[0], "DETACH \"lake\"");
+        // The credential is in the SECRET statement and NOWHERE else — in
+        // particular not in the ATTACH, which is the statement a failure is
+        // reported against.
+        assert!(
+            !plan.attach.contains("bear"),
+            "the attach must name the secret, never carry it: {}",
+            plan.attach
+        );
     }
 
     #[test]
     fn iceberg_without_token_uses_authorization_none() {
-        let p = params(&[("endpoint", "https://x/api"), ("warehouse", "w")]);
-        let plan = plan("iceberg", "lake", &p).unwrap();
+        let plan = plan(
+            "iceberg",
+            "lake",
+            &options(&[("endpoint", "https://x/api"), ("warehouse", "w")]),
+            &Secrets::new(),
+        )
+        .unwrap();
         assert!(plan.secrets.is_empty());
         assert!(plan.attach.contains("AUTHORIZATION_TYPE none"));
     }
 
     /// S3 params common to the secret-line tests. The "secrets" here are
     /// obviously synthetic; nothing real is ever put in a test fixture.
-    fn s3_params(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
-        let mut p = params(&[("s3_access_key", "AK"), ("s3_secret_key", "SK")]);
-        p.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        p
+    fn s3_creds(extra: &[(&str, &str)]) -> Secrets {
+        let mut c = creds(&[("s3_access_key", "AK"), ("s3_secret_key", "SK")]);
+        c.extend(extra.iter().map(|(k, v)| (k.to_string(), Secret::new(*v))));
+        c
     }
 
     /// The key and the secret are caller-supplied and land inside SQL string
@@ -298,8 +381,8 @@ mod tests {
     /// corrupt a key that legitimately contains one.
     #[test]
     fn s3_secret_escapes_quotes_only_and_cannot_inject_clauses() {
-        let p = s3_params(&[("s3_access_key", "a'b\\c"), ("s3_secret_key", "x'; DROP")]);
-        let (name, sql) = s3_secret_line("lake", &p).expect("both keys present");
+        let c = s3_creds(&[("s3_access_key", "a'b\\c"), ("s3_secret_key", "x'; DROP")]);
+        let (name, sql) = s3_secret_line("lake", &Options::new(), &c).expect("both keys present");
         assert_eq!(name, "_latiq_lake_s3");
         assert!(
             sql.contains("KEY_ID 'a''b\\c'"),
@@ -333,8 +416,8 @@ mod tests {
             ("https://s3.example.com", "s3.example.com", "true"),
             ("s3.example.com", "s3.example.com", "true"),
         ] {
-            let p = s3_params(&[("s3_endpoint", endpoint)]);
-            let (_, sql) = s3_secret_line("lake", &p).unwrap();
+            let o = options(&[("s3_endpoint", endpoint)]);
+            let (_, sql) = s3_secret_line("lake", &o, &s3_creds(&[])).unwrap();
             assert!(
                 sql.contains(&format!("ENDPOINT '{host}'")),
                 "{endpoint}: the scheme must be stripped from ENDPOINT"
@@ -346,20 +429,26 @@ mod tests {
         }
         // No endpoint at all: neither clause is emitted, so DuckDB's own AWS
         // default endpoint stands rather than being pinned to an empty host.
-        let bare = s3_secret_line("lake", &s3_params(&[])).unwrap().1;
+        let bare = s3_secret_line("lake", &Options::new(), &s3_creds(&[]))
+            .unwrap()
+            .1;
         assert!(!bare.contains("ENDPOINT"), "no endpoint param, no ENDPOINT");
         assert!(!bare.contains("USE_SSL"));
     }
 
     #[test]
     fn s3_secret_region_is_optional_and_escaped() {
-        let with = s3_secret_line("lake", &s3_params(&[("s3_region", "eu-west-1")]))
-            .unwrap()
-            .1;
+        let with = s3_secret_line(
+            "lake",
+            &options(&[("s3_region", "eu-west-1")]),
+            &s3_creds(&[]),
+        )
+        .unwrap()
+        .1;
         assert!(with.contains("REGION 'eu-west-1'"));
         // Empty is treated as absent, not as `REGION ''` (which DuckDB would
         // take as a real, wrong region).
-        let empty = s3_secret_line("lake", &s3_params(&[("s3_region", "")]))
+        let empty = s3_secret_line("lake", &options(&[("s3_region", "")]), &s3_creds(&[]))
             .unwrap()
             .1;
         assert!(!empty.contains("REGION"), "an empty region must be omitted");
@@ -367,14 +456,16 @@ mod tests {
 
     #[test]
     fn s3_secret_needs_both_keys() {
-        assert!(s3_secret_line("lake", &params(&[])).is_none());
-        assert!(s3_secret_line("lake", &params(&[("s3_access_key", "AK")])).is_none());
-        assert!(s3_secret_line("lake", &params(&[("s3_secret_key", "SK")])).is_none());
+        let o = Options::new();
+        assert!(s3_secret_line("lake", &o, &Secrets::new()).is_none());
+        assert!(s3_secret_line("lake", &o, &creds(&[("s3_access_key", "AK")])).is_none());
+        assert!(s3_secret_line("lake", &o, &creds(&[("s3_secret_key", "SK")])).is_none());
         // Present-but-empty is not "supplied": half a credential must not build
         // a secret that then fails obscurely inside DuckDB.
         assert!(s3_secret_line(
             "lake",
-            &params(&[("s3_access_key", "AK"), ("s3_secret_key", "")])
+            &o,
+            &creds(&[("s3_access_key", "AK"), ("s3_secret_key", "")])
         )
         .is_none());
     }
@@ -384,14 +475,15 @@ mod tests {
     /// a fix landing on one copy only.
     #[test]
     fn s3_secret_is_identical_across_catalog_types() {
-        let mut ducklake_params = s3_params(&[("s3_endpoint", "http://minio:9000")]);
-        ducklake_params.insert("metadata_path".into(), "ducklake:m.db".into());
-        ducklake_params.insert("data_path".into(), "s3://b/d".into());
-        let mut iceberg_params = s3_params(&[("s3_endpoint", "http://minio:9000")]);
-        iceberg_params.insert("endpoint".into(), "https://polaris/api".into());
+        let shared = s3_creds(&[]);
+        let mut ducklake_options = options(&[("s3_endpoint", "http://minio:9000")]);
+        ducklake_options.insert("metadata_path".into(), "ducklake:m.db".into());
+        ducklake_options.insert("data_path".into(), "s3://b/d".into());
+        let mut iceberg_options = options(&[("s3_endpoint", "http://minio:9000")]);
+        iceberg_options.insert("endpoint".into(), "https://polaris/api".into());
 
-        let d = plan("ducklake", "lake", &ducklake_params).unwrap();
-        let i = plan("iceberg", "lake", &iceberg_params).unwrap();
+        let d = plan("ducklake", "lake", &ducklake_options, &shared).unwrap();
+        let i = plan("iceberg", "lake", &iceberg_options, &shared).unwrap();
         let s3_of = |p: &AttachPlan| {
             p.secrets
                 .iter()
@@ -408,19 +500,115 @@ mod tests {
         assert!(s3_of(&d).1.contains("USE_SSL false"));
     }
 
+    /// Two catalogs attached to ONE pond at once is the whole feature, so their
+    /// secret names must not collide: the second `CREATE OR REPLACE SECRET`
+    /// would otherwise overwrite the first and the first catalog would start
+    /// authenticating with the second's credentials.
+    #[test]
+    fn two_catalogs_on_one_pond_get_distinct_secret_names() {
+        let c = s3_creds(&[]);
+        let o = options(&[("metadata_path", "m.db"), ("data_path", "/d")]);
+        let a = plan("ducklake", "lake", &o, &c).unwrap();
+        let b = plan("ducklake", "other", &o, &c).unwrap();
+        let names = |p: &AttachPlan| p.secrets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&a), vec!["_latiq_lake_s3"]);
+        assert_eq!(names(&b), vec!["_latiq_other_s3"]);
+        assert_ne!(names(&a), names(&b), "the alias must scope the secret name");
+        // And each plan tears down only its own.
+        assert!(a
+            .teardown()
+            .contains(&"DROP SECRET IF EXISTS _latiq_lake_s3".to_string()));
+        assert!(!a
+            .teardown()
+            .contains(&"DROP SECRET IF EXISTS _latiq_other_s3".to_string()));
+    }
+
+    /// **A credential reaches DuckDB through a named secret and nothing else.**
+    ///
+    /// The `ATTACH` and the `LOAD`s are the statements a failure is classified
+    /// from, retried against and quoted in logs; the `CREATE SECRET` lines are
+    /// the ones nothing may ever print. So the split has to hold per statement,
+    /// not per plan — and it is asserted over EVERY catalog type from
+    /// `latiq_common::catalog::TYPES`, with every credential that type declares,
+    /// so a type added later cannot inline one.
+    ///
+    /// This is the guard that catches the leak the surface tests cannot: a token
+    /// in the `ATTACH` does not show up in DuckDB's error text today (measured —
+    /// its messages do not echo the statement), so a containment test that only
+    /// reads error envelopes passes while the credential sits in a statement one
+    /// `format!` away from a log line.
+    #[test]
+    fn a_credential_never_leaves_the_create_secret_statement() {
+        const SENTINEL: &str = "SENTINEL-CREDENTIAL-VALUE";
+        let all = options(&[
+            ("endpoint", "https://polaris/api/catalog"),
+            ("warehouse", "prod"),
+            ("metadata_path", "ducklake:meta.db"),
+            ("data_path", "/tmp/data"),
+            ("s3_endpoint", "http://minio:9000"),
+            ("s3_region", "eu-west-1"),
+        ]);
+        let mut checked = 0;
+        for t in latiq_common::catalog::TYPES {
+            // Every credential this type declares, all set to the sentinel, so
+            // one pass covers the token AND the S3 keys.
+            let secrets: Secrets = t
+                .secret_params
+                .iter()
+                .map(|k| ((*k).to_string(), Secret::new(SENTINEL)))
+                .collect();
+            assert!(
+                !secrets.is_empty(),
+                "catalog type '{}' declares no credentials, so this proves nothing for it",
+                t.name
+            );
+            let plan = plan(t.name, "lake", &all, &secrets)
+                .unwrap_or_else(|e| panic!("catalog type '{}': {e:?}", t.name));
+
+            // It IS in the secret statements — otherwise the assertions below
+            // are satisfied by a plan that simply dropped the credential.
+            assert!(
+                plan.secrets.iter().any(|(_, sql)| sql.contains(SENTINEL)),
+                "catalog type '{}' built no secret from {:?} — the check below \
+                 would then pass vacuously",
+                t.name,
+                t.secret_params
+            );
+            // …and it is NOWHERE else.
+            for stmt in std::iter::once(plan.attach.clone())
+                .chain(plan.load.iter().map(|(_, s)| s.clone()))
+                .chain(plan.teardown())
+                .chain(std::iter::once(plan.namespace.clone()))
+                .chain(std::iter::once(plan.alias.clone()))
+            {
+                assert!(
+                    !stmt.contains(SENTINEL),
+                    "catalog type '{}' put a credential in a statement that is not \
+                     a CREATE SECRET: {stmt}",
+                    t.name
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 8,
+            "the loop examined only {checked} statements, so it is guarding nothing"
+        );
+    }
+
     /// **No `INSTALL` on a request path.** The attach plan is the SQL
-    /// `pull_catalog` runs while an agent waits, and it used to carry
+    /// `attach_catalog` runs while an agent waits, and it used to carry
     /// `INSTALL {ext}; LOAD {ext};` — so a node with a cold cache downloaded
-    /// from an external host mid-call, and a node with no egress could not pull
-    /// at all. Extensions arrive via `latiq warm-extensions`; this site only
-    /// ever loads them.
+    /// from an external host mid-call, and a node with no egress could not
+    /// attach at all. Extensions arrive via `latiq warm-extensions`; this site
+    /// only ever loads them.
     ///
     /// Every catalog type is checked from `latiq_common::catalog::TYPES` rather
     /// than by hand, so a type added later cannot reintroduce the download.
     #[test]
     fn attach_plan_never_installs_an_extension() {
-        // A superset of every type's params, so each type finds what it needs.
-        let all = params(&[
+        // A superset of every type's options, so each type finds what it needs.
+        let all = options(&[
             ("endpoint", "https://polaris/api/catalog"),
             ("warehouse", "prod"),
             ("metadata_path", "ducklake:meta.db"),
@@ -429,7 +617,7 @@ mod tests {
         let mut statements = 0;
         let mut types_checked = 0;
         for t in latiq_common::catalog::TYPES {
-            let plan = plan(t.name, "lake", &all).unwrap_or_else(|e| {
+            let plan = plan(t.name, "lake", &all, &Secrets::new()).unwrap_or_else(|e| {
                 panic!("catalog type '{}' has no buildable plan: {e:?}", t.name)
             });
             assert_eq!(
@@ -486,17 +674,17 @@ mod tests {
     /// Every one of these came back as `EngineError::Engine` → `internal` →
     /// `audience: operator`, `retryable: as_is`, "Retry; if it persists, report
     /// to your operator" — while the message it carried said, verbatim,
-    /// *"requires --set endpoint=<rest-url>"*. The caller was handed the fix and
-    /// told to re-send the identical call instead, then to wake an operator who
-    /// had nothing to look at: no SQL had run, no node was unwell, the plan was
-    /// never built.
+    /// *"requires --option endpoint=<rest-url>"*. The caller was handed the fix
+    /// and told to re-send the identical call instead, then to wake an operator
+    /// who had nothing to look at: no SQL had run, no node was unwell, the plan
+    /// was never built.
     ///
     /// This replaces a pair of bare `is_err()` assertions (tests/CLAUDE.md rule
     /// 2) which passed throughout — they proved only that *something* failed,
     /// which was never in doubt, and said nothing about what the caller was told.
     #[test]
     fn error_contract_a_missing_catalog_parameter_is_the_callers_to_supply() {
-        /// (catalog type, the params supplied, why this case is here).
+        /// (catalog type, the options supplied, why this case is here).
         type Case = (
             &'static str,
             &'static [(&'static str, &'static str)],
@@ -519,8 +707,8 @@ mod tests {
                 "no data_path",
             ),
         ];
-        for (type_, p, why) in cases {
-            let Err(err) = plan(type_, "x", &params(p)) else {
+        for (type_, o, why) in cases {
+            let Err(err) = plan(type_, "x", &options(o), &Secrets::new()) else {
                 panic!("{type_} must refuse: {why}");
             };
             let EngineError::MissingParameter(msg) = &err else {
@@ -529,7 +717,7 @@ mod tests {
             // The message has to NAME what to supply, since the kind's own
             // advice is only "Provide the required argument and retry."
             assert!(
-                msg.contains("--set"),
+                msg.contains("--option"),
                 "{type_} ({why}): the message is the whole instruction here: {msg}"
             );
         }
@@ -541,7 +729,12 @@ mod tests {
     /// 13(b), the refusal names the legal set rather than silently defaulting.
     #[test]
     fn error_contract_an_unknown_catalog_type_names_the_supported_set() {
-        let Err(err) = plan("snowflake", "x", &params(&[("endpoint", "y")])) else {
+        let Err(err) = plan(
+            "snowflake",
+            "x",
+            &options(&[("endpoint", "y")]),
+            &Secrets::new(),
+        ) else {
             panic!("an unsupported catalog type must be refused");
         };
         let EngineError::UnsupportedParameter(msg) = &err else {

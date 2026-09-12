@@ -64,7 +64,7 @@ static DIALECT_BODY: LazyLock<String> =
 ///
 /// Three states, and an agent has to be able to tell them apart, because the
 /// action is different for each: always there, ask for it at `allocate_pond`
-/// (and you cannot add it later), or reached through `pull_catalog`.
+/// (and you cannot add it later), or reached through `attach_catalog`.
 fn capabilities() -> String {
     use latiq_common::extensions::{in_bucket, Bucket, CATALOG_DRIVEN, OPTIONAL};
     let mut out = String::from(
@@ -74,7 +74,7 @@ fn capabilities() -> String {
          below is an extension we ship. Three states, and the difference is what YOU have to do: \
          *always loaded* is simply there; *ask at allocation* has to be requested in \
          `allocate_pond { extensions: [...] }` and **cannot be added to a pond that already \
-         exists**, so decide before you allocate; *via `pull_catalog`* is reached through the \
+         exists**, so decide before you allocate; *via `attach_catalog`* is reached through the \
          catalog tools, not by requesting an extension.\n\n",
     );
     for bucket in Bucket::ALL {
@@ -83,7 +83,7 @@ fn capabilities() -> String {
             let how = if OPTIONAL.contains(&e.name) {
                 format!(" *(ask at allocation: `extensions: [\"{}\"]`)*", e.name)
             } else if CATALOG_DRIVEN.contains(&e.name) {
-                " *(via list_catalogs → describe_catalog → pull_catalog)*".to_string()
+                " *(via attach_catalog)*".to_string()
             } else {
                 " *(always loaded)*".to_string()
             };
@@ -94,7 +94,7 @@ fn capabilities() -> String {
     out.push_str(
         "Read a remote file straight from SQL — `SELECT * FROM \
          read_csv('https://…/x.csv')`, `… FROM 's3://bucket/x.parquet'` — or bring it in with \
-         load_dataset / pull_catalog. See latiq://recipes/data-ingestion-m1 and \
+         load_dataset / attach_catalog. See latiq://recipes/data-ingestion-m1 and \
          latiq://recipes/external-data.\n\n",
     );
     out
@@ -112,7 +112,7 @@ const RESOURCES: &[Res] = &[
 - **Attribution:** your writes are tagged with your agent identity. To see who wrote what: `SELECT author, commit_message, commit_extra_info FROM ducklake_snapshots('<pond>')`. `author` is the identity; `commit_extra_info` carries the evidence for it (issuer/subject when the caller was verified) — read BOTH, because an unverified caller can claim any author.\n\
 - **Latiq owns the transaction:** send plain statements — multi-statement SQL is fine, but never `BEGIN`/`COMMIT`/`ROLLBACK`/`START TRANSACTION`. Latiq commits your write itself and records the author just before committing; your own `COMMIT` ends that transaction first, so the change lands in history with NO author.\n\
 - **Discover:** describe_pond is one call for the WHOLE pond — its metadata plus every table with its columns, a row estimate, the stored comment and the pond's `lineage` flag — where `SHOW TABLES` + `DESCRIBE` is one call per table. In SQL: `SHOW TABLES` lists tables, `DESCRIBE <table>` its columns and types, and `SELECT column_name, comment FROM duckdb_columns() WHERE table_name='<table>'` the column comments. list_ponds + describe_pond find existing work to join.\n\
-- **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or list_catalogs → describe_catalog → pull_catalog (external databases/lakehouses like iceberg — you pull a subset into the pond, then work there). See latiq://recipes/external-data.\n\
+- **External data:** to bring outside data in, use list_datasets + load_dataset (curated public files), or attach_catalog (external databases/lakehouses like iceberg or ducklake — it mounts under a name you choose and then it is ordinary SQL, including a JOIN across two attached catalogs; extract the subset you need into the pond, then detach_catalog). See latiq://recipes/external-data.\n\
 - **Identity:** who you are arrives in the TRANSPORT, never in a tool argument — no tool takes an agent id, so don't try to set one. The `Authorization: Bearer` token is the verified principal (`subject` + `issuer`); the `latiq-agent-id` header is a CLAIM and carries no authority. On a deployment with no issuer configured nothing is verified: you get `verified: false` and a null `subject` wherever identity is reported. Read that as \"nobody proved it\", not \"nobody did it\".\n\
 - **Provenance:** a pond allocated with `lineage: true` records an OpenLineage event pair for every query; read it with get_lineage (newest first), and check the `lineage` flag in describe_pond to know whether a pond has it. It is chosen at allocation and CANNOT be turned on later, so ask for it when you allocate. It is a working record, not tamper-proof evidence — the events are files in the pond, and dropping the pond destroys them. See latiq://recipes/lineage.\n\
 - **Large results:** results are capped (~10k rows). Narrow with WHERE/LIMIT, aggregate server-side, or materialize with CREATE TABLE AS SELECT. See latiq://recipes/large-results.\n\
@@ -186,9 +186,9 @@ Send it as one write_query — several plain statements in one call are fine, an
         desc: "Loading data into a pond with SQL",
         static_body: "# Recipe — ingest data with SQL\n\n\
 **Files by URL:** read CSV/Parquet/JSON straight into a table from write_query:\n```sql\nCREATE TABLE raw AS SELECT * FROM read_csv('https://example.com/data.csv');\nINSERT INTO raw SELECT * FROM 's3://public-bucket/more.parquet';\n```\n\
-**No credentials are attached to these reads.** A source that needs authentication will fail as `source_unavailable` — for those use pull_catalog, whose `set:{…}` credentials are used once and never stored (latiq://recipes/external-data). \
+**No credentials are attached to these reads.** A source that needs authentication will fail as `source_unavailable` — for those use attach_catalog, whose credentials are never stored and never returned (latiq://recipes/external-data). \
 **And the address is not restricted.** Latiq does not inspect or allow-list the path in your SQL, so the node will read whatever it can reach — including its own local files. That is a known gap (issue #79), not a sandbox: name only sources you were asked to use, and never read that a path worked as permission to read it.\n\
-For curated/registered sources (incl. external lakehouses like iceberg) use list_datasets/load_dataset and list_catalogs -> describe_catalog -> pull_catalog — see latiq://recipes/external-data.\n\
+For curated/registered sources (incl. external lakehouses like iceberg) use list_datasets/load_dataset and attach_catalog — see latiq://recipes/external-data.\n\
 **Own data:** `INSERT INTO t VALUES (...)` or `CREATE TABLE t AS SELECT ...`.",
     },
     Res {
@@ -197,16 +197,25 @@ For curated/registered sources (incl. external lakehouses like iceberg) use list
         name: "Recipe: external data (datasets & catalogs)",
         desc: "Bring outside data into a pond — curated files or external catalogs",
         static_body: "# Recipe — bring external data into a pond\n\n\
-Latiq has two paths. Everything ends up as tables IN your pond — external catalogs are never queried live.\n\n\
+Latiq has two paths. Everything you keep ends up as tables IN your pond — external catalogs are never queried live, and an attached catalog is for the extract, not for the work.\n\n\
 ## Datasets — curated public files (copy in)\n\
 A dataset loads into a SCHEMA named after it — query its tables as `<dataset>.<table>`.\n\
 ```\nlist_datasets {query?}            # discover; e.g. query='#sample' or 'tpch'\nload_dataset {pond, dataset:'tpch'}   # -> schema 'tpch'; returns schema-qualified tables\nread_query {pond, sql:'SELECT count(*) FROM tpch.orders'}\n```\n\n\
-## Catalogs — external databases/lakehouses (pull a subset in)\n\
-An operator registers a catalog (iceberg today). You discover its tables, then pull what you need:\n\
-```\nlist_catalogs {query?}                                  # find a catalog, e.g. 'lake'\ndescribe_catalog {pond, catalog, set:{token:'<bearer>'}} # list its tables (transient attach)\npull_catalog {pond, catalog, query:'CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region=''us''', set:{token:'<bearer>'}}\nread_query {pond, sql:'SELECT * FROM us LIMIT 10'}\n```\n\
-**Credentials** ride in via `set` (e.g. `{token: '<bearer>'}`) on describe/pull only — used once, never stored. \
-Write the pull `query` as a CREATE TABLE that names the catalog; DuckDB downloads only the columns/rows you SELECT. \
-**Don't** try to query `lake.…` outside a pull — attach is transient. **Do** describe_catalog first so you SELECT real table names.",
+## Catalogs — external databases/lakehouses (attach, extract, detach)\n\
+attach_catalog mounts a catalog on your pond under a name YOU choose, and leaves it mounted. From then on it is ordinary SQL: the name is the SQL namespace.\n\
+```\nattach_catalog {pond, name:'lake', type:'iceberg', options:{endpoint:'https://…/catalog', warehouse:'demo'}}\nread_query  {pond, sql:'SHOW TABLES FROM lake'}            # orient: real table names, no special tool\nwrite_query {pond, sql:'CREATE TABLE us AS SELECT id,total FROM lake.sales.orders WHERE region=''us'''}\ndetach_catalog {pond, name:'lake'}\nread_query  {pond, sql:'SELECT * FROM us LIMIT 10'}         # the pond table survives the detach\n```\n\
+**Two at once, joined in one statement.** This is why the attach persists — attach both, then extract across them:\n\
+```\nattach_catalog {pond, name:'lake',  type:'iceberg',  options:{endpoint:'https://…/catalog', warehouse:'demo'}}\nattach_catalog {pond, name:'crm',   type:'ducklake', options:{metadata_path:'/srv/crm.duckdb', data_path:'/srv/crm'}}\nwrite_query {pond, sql:'CREATE TABLE enriched AS SELECT o.id, o.total, c.segment FROM lake.sales.orders o JOIN crm.main.customers c ON c.id = o.customer_id'}\n```\n\n\
+### Credentials — pick exactly one mode\n\
+- **passthrough (send neither field)** — YOUR OWN bearer token is used as the catalog credential. This is what Iceberg REST, Unity Catalog and Snowflake External OAuth want, and it stores nothing anywhere. Prefer it.\n\
+- `secrets:{token:'…'}` — explicit values, when you legitimately hold them. Never logged, never stored, **never returned** by list_attached_catalogs or any other call.\n\
+- `secret_ref:'env://lake'` — an opaque reference the NODE dereferences, for credentials you must not hold. A scheme this deployment has no backend for comes back `capability_unavailable`/`after_provisioning`: report it and stop, or send `secrets` instead if you hold the values.\n\
+Supplying two of these is refused. The response's `credential_mode` says which was APPLIED — `none` means no credential was used at all (correct for a local ducklake; a surprise for an iceberg REST catalog, and the sign your passthrough had no bearer to pass through).\n\
+**options vs secrets:** an `options` value is a LOCATOR and is echoed back by list_attached_catalogs; a credential key passed there is refused naming `secrets`, and an unknown key is refused rather than dropped.\n\n\
+### When `lake.…` stops resolving\n\
+An attachment lives in the pond node's engine. It is **not persisted**, so a node restart loses it and the next statement naming it fails with `catalog_error` whose `suggest` names attach_catalog. Call list_attached_catalogs to see what is mounted now, attach again with the same arguments, and re-send the statement unchanged. Tables you already extracted into the pond are unaffected — they are pond tables and need no catalog.\n\n\
+### Registered catalogs (discovery)\n\
+An operator can register a catalog's locator so you do not have to be told it: list_catalogs returns each one's `type` and `params`. Pass those `params` as your `options` to attach_catalog. Registration stores locators only — it never stores a credential.",
     },
     Res {
         generated: None,
@@ -271,7 +280,7 @@ A **dataset** is a curated file this deployment already knows how to fetch — y
 **`dataset_not_found` means the reference is not registered in THIS deployment.** The catalogue differs per deployment and is an operator's to extend, so:\n\
 - Call **list_datasets** and use a name from the answer — do not guess, and do not retry the same reference.\n\
 - If what you need is a URL rather than a registered dataset, read it directly instead: `write_query {sql:\"CREATE TABLE raw AS SELECT * FROM read_csv('https://…')\"}` (latiq://recipes/data-ingestion-m1).\n\
-- For an external database or lakehouse, that is a **catalog**, not a dataset: list_catalogs → describe_catalog → pull_catalog (latiq://recipes/external-data).",
+- For an external database or lakehouse, that is a **catalog**, not a dataset: attach_catalog, then ordinary SQL against the name you mounted it as (latiq://recipes/external-data).",
     },
     Res {
         generated: None,
@@ -304,7 +313,7 @@ Your statement is valid SQL. A **name** in it does not match this pond: a table,
 `Catalog Error: Table with name nope does not exist!`, `Binder Error: Referenced column \"qty\" not found`.\n\
 1. **Look, don't guess:** `read_query {sql:'SHOW TABLES'}`, `read_query {sql:'DESCRIBE orders'}`, or **describe_pond** for the whole schema in one call.\n\
 2. Ponds are separate — a table in another pond is not visible here. `list_ponds` if you may be in the wrong one.\n\
-3. If it genuinely isn't there, create it with **write_query** (`CREATE TABLE …`, or `CREATE TABLE … AS SELECT …`), or bring the data in with load_dataset / pull_catalog (latiq://recipes/external-data).\n\n\
+3. If it genuinely isn't there, create it with **write_query** (`CREATE TABLE …`, or `CREATE TABLE … AS SELECT …`), or bring the data in with load_dataset / attach_catalog (latiq://recipes/external-data).\n\n\
 ## The name already exists\n\
 `Catalog Error: Table with name t already exists!` — from `CREATE TABLE t …`.\n\
 - **Do not retry the same statement.** It will fail identically forever; this is not a transient error.\n\
@@ -324,7 +333,7 @@ The statement named a data source outside the pond — a URL, an object-store pa
 **Nothing in Latiq is broken, and this is not the pond's storage.** The address is yours, in your SQL, so the fix is too:\n\
 1. **Check the address** — spelling, scheme, host, bucket, the file actually being there. `read_csv('http://127.0.0.1:9/none.csv')` fails for the obvious reason.\n\
 2. **Check it is reachable from the NODE**, not from you — the node's network decides, and it is not yours. Your laptop's localhost and your VPN's private hosts are not the node's. There is no URI allowlist: a source is refused because it could not be read, never because it was disallowed.\n\
-3. **Credentials:** Latiq attaches none to a URL in your SQL, so anything requiring authentication fails here. For those use **pull_catalog** with `set:{…}` (used once, never stored) — see latiq://recipes/external-data.\n\
+3. **Credentials:** Latiq attaches none to a URL in your SQL, so anything requiring authentication fails here. For those use **attach_catalog**, whose credential is never stored and never returned — see latiq://recipes/external-data.\n\
 4. **Retry once, not repeatedly.** A transient network fault is worth one retry; a second identical failure is the source, and repeating it will not change that.\n\n\
 Once the data is in the pond it can't fail this way again: `CREATE TABLE raw AS SELECT * FROM read_csv('<url>')` copies it in, and later queries read the pond.",
     },
@@ -742,12 +751,12 @@ mod tests {
                 e.name
             );
             // The state is the ACTION: always there / ask at allocation / go
-            // through pull_catalog. A name with no state tells an agent nothing
+            // through attach_catalog. A name with no state tells an agent nothing
             // it can do.
             let state = if OPTIONAL.contains(&e.name) {
                 format!("extensions: [\"{}\"]", e.name)
             } else if CATALOG_DRIVEN.contains(&e.name) {
-                "pull_catalog".to_string()
+                "attach_catalog".to_string()
             } else {
                 "always loaded".to_string()
             };

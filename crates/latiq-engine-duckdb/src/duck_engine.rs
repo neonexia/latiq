@@ -32,14 +32,14 @@
 //! (`Pond::lock_writer`), because an interrupt has nothing to act on there.
 use crate::abort::AbortWatcher;
 use crate::exec::{
-    annotate_schemas, in_read_txn, in_write_txn, referenced_tables, run_explain, run_read,
-    run_read_arrow, run_write,
+    annotate_schemas, in_read_txn, referenced_tables, run_explain, run_read, run_read_arrow,
+    run_write,
 };
 use crate::instance::PondInstance;
 use latiq_common::{DatasetRef, Identity, QueryMeta};
 use latiq_engine::{
-    AbortToken, ArrowSink, EngineError, ExplainResult, QueryEngine, QueryResult, SchemaSummary,
-    TableInfo,
+    AbortToken, ArrowSink, AttachedCatalog, EngineError, ExplainResult, QueryEngine, QueryResult,
+    SchemaSummary, TableInfo,
 };
 use latiq_storage::PondLocation;
 use std::collections::HashMap;
@@ -91,29 +91,93 @@ fn annotate(loc: &PondLocation, inst: &PondInstance, datasets: &mut PlanDatasets
     }
 }
 
-/// Attach what the plan found to the statement's meta. A no-op for a pond
-/// without lineage, so `tables_touched` stays empty exactly where nothing asked
-/// for it.
-fn apply_datasets(meta: &mut QueryMeta, datasets: PlanDatasets) {
+/// Attach what the plan found to the statement's meta, re-filing anything that
+/// came from an attached external catalog under that catalog's own namespace. A
+/// no-op for a pond without lineage, so `tables_touched` stays empty exactly
+/// where nothing asked for it.
+///
+/// The re-filing used to live on `pull_catalog`, which was the only path that
+/// could see an external table. Now that a catalog stays attached, an ORDINARY
+/// `write_query` is what joins across two lakehouses — so without this the
+/// extract's inputs would be recorded as tables of the pond, and the pond would
+/// claim someone else's data as its own.
+fn apply_datasets(meta: &mut QueryMeta, datasets: PlanDatasets, external: &ExternalAliases) {
     if let Some((inputs, outputs)) = datasets {
-        meta.set_datasets(inputs, outputs);
+        let refile = |ds: Vec<DatasetRef>| -> Vec<DatasetRef> {
+            ds.into_iter()
+                .map(|d| {
+                    external
+                        .iter()
+                        .fold(d, |d, (alias, ns)| externalize(d, alias, ns))
+                })
+                .collect()
+        };
+        meta.set_datasets(refile(inputs), refile(outputs));
     }
 }
 
-/// Re-file a dataset that a transient `ATTACH` put under the catalog's local
-/// `alias` in the SOURCE's own namespace.
+/// Re-file a dataset that an `ATTACH` put under the catalog's local `alias` in
+/// the SOURCE's own namespace.
 ///
-/// The alias is a pond-local name — the operator's registry entry, mounted for
-/// the duration of one pull — so `ext.main.widgets` says nothing another tool's
-/// lineage can join on, and leaving `namespace` empty would hand the table the
-/// *pond's* namespace and claim the lakehouse's data as ours. Anything not
-/// under the alias (the pond table the pull creates) is left exactly as it is.
+/// The alias is a pond-local name — whatever this caller chose to mount the
+/// catalog as — so `lake.sales.orders` says nothing another tool's lineage can
+/// join on, and leaving `namespace` empty would hand the table the *pond's*
+/// namespace and claim the lakehouse's data as ours. Anything not under an
+/// attached alias (the pond table the extract creates) is left exactly as it is.
 fn externalize(mut ds: DatasetRef, alias: &str, namespace: &str) -> DatasetRef {
     if let Some(rest) = ds.name.strip_prefix(&format!("{alias}.")) {
         ds.name = rest.to_string();
         ds.namespace = Some(namespace.to_string());
     }
     ds
+}
+
+/// `(alias, source namespace)` for every catalog attached to this pond — what
+/// [`externalize`] needs to tell a lakehouse table apart from a pond one.
+///
+/// Empty (not an error) when the pond is not open: nothing is attached to a pond
+/// nobody has touched, so there is nothing to re-file, and a provenance lookup
+/// must never be the thing that fails a query.
+type ExternalAliases = Vec<(String, String)>;
+
+/// Re-classify a failure whose only problem is that a catalog nobody attached
+/// was named in the statement.
+///
+/// This is the error that defines the feature's edges: an attachment is held in
+/// the pond's DuckDB instance and is lost when the node restarts, so
+/// `FROM lake.sales.orders` **will** one day come back "Catalog \"lake\" does
+/// not exist". Left as a plain `catalog_error`, the advice an agent receives is
+/// *"look up what the pond actually has — describe_pond, SHOW TABLES"* — which
+/// is about the pond's TABLES, lists nothing called `lake`, and never once
+/// mentions the call that fixes it.
+///
+/// The claim is only made when it is certainly true: DuckDB's own unambiguous
+/// *catalog*-level sentence (a qualified `catalog.schema.table`), AND the named
+/// alias is neither attached to this pond nor the pond's own catalog. A
+/// two-part `lake.orders` is deliberately left alone — DuckDB reports it as a
+/// missing *schema*, which a schema typo produces too, and guessing between
+/// them would put "call attach_catalog" in front of an agent that mistyped
+/// `main`.
+fn name_missing_catalog(e: EngineError, external: &ExternalAliases, own: &str) -> EngineError {
+    let EngineError::Catalog(ref msg) = e else {
+        return e;
+    };
+    let Some(name) = msg
+        .split_once("Catalog \"")
+        .and_then(|(_, rest)| rest.split_once("\" does not exist"))
+        .map(|(name, _)| name)
+    else {
+        return e;
+    };
+    if name.eq_ignore_ascii_case(own) || external.iter().any(|(alias, _)| alias == name) {
+        // It IS attached (or is the pond itself) and DuckDB still could not
+        // resolve it — something else is wrong and this is not our sentence to
+        // write.
+        return e;
+    }
+    EngineError::CatalogNotAttached {
+        name: name.to_string(),
+    }
 }
 
 /// One pond's engine resources. Still **one DuckDB database per pond**
@@ -134,6 +198,21 @@ struct Pond {
     /// opened — so if the resolved limits no longer match, the instance is stale
     /// and must be re-opened for the new caps to take effect.
     limits: Option<latiq_common::ResourceLimits>,
+    /// External catalogs currently ATTACHed to this pond, in attach order.
+    ///
+    /// It lives on the `Pond` and not beside it because the attachment IS the
+    /// instance's state: DuckDB's `ATTACH` is database-level, so a catalog
+    /// mounted on the writer is visible to every pooled read connection, and the
+    /// two must therefore live and die together. Everything that drops the
+    /// instance — `forget_pond`, a re-tier — drops this with it, which is
+    /// exactly right: the attachments are gone from DuckDB at that moment too.
+    ///
+    /// The plans are kept, not just the descriptions, because teardown needs the
+    /// **secret names** this attachment created. Rebuilding them at detach time
+    /// would mean holding the credential for the life of the attachment; the
+    /// plan holds only the `CREATE SECRET` text it already built, and detach
+    /// needs nothing but `DROP SECRET <name>`.
+    attached: Mutex<Vec<Attachment>>,
     writer: Mutex<PondInstance>,
     /// Clone source for growing the read pool. Never runs queries, so growing the
     /// pool never has to wait behind a long-running write.
@@ -228,6 +307,7 @@ impl Pond {
             });
         Ok(Self {
             limits: loc.limits,
+            attached: Mutex::new(Vec::new()),
             writer: Mutex::new(writer),
             source: Mutex::new(source),
             reads: ReadPool {
@@ -322,6 +402,21 @@ impl DuckEngine {
         let p = Arc::new(Pond::open(loc)?);
         map.insert(loc.catalog_uri.clone(), p.clone());
         Ok(p)
+    }
+
+    /// `(alias, namespace)` for every catalog attached to this pond — see
+    /// [`ExternalAliases`]. Read once per statement, before the engine work, so
+    /// a statement's provenance describes the attachments it actually ran
+    /// against rather than whatever is mounted when it finishes.
+    fn external_aliases(&self, loc: &PondLocation) -> ExternalAliases {
+        self.pond(loc)
+            .map(|p| {
+                lock_recover(&p.attached)
+                    .iter()
+                    .map(|a| (a.info.name.clone(), a.info.namespace.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Run a read on a pooled connection. The connection is dropped rather than
@@ -419,6 +514,7 @@ impl QueryEngine for DuckEngine {
         if latiq_engine::classify(sql) == latiq_engine::SqlShape::Write {
             return Err(EngineError::ReadOnlyViolation);
         }
+        let external = self.external_aliases(loc);
         self.with_read(loc, |i| {
             // Both under ONE abort watcher: the extra bind is real work (a
             // remote glob can dominate the query) and must be interruptible.
@@ -437,11 +533,12 @@ impl QueryEngine for DuckEngine {
                     // ones the rows came from.
                     annotate(loc, i, &mut datasets);
                     let mut res = run_read(i, sql)?;
-                    apply_datasets(&mut res.meta, datasets);
+                    apply_datasets(&mut res.meta, datasets, &external);
                     Ok(res)
                 })
             })
         })
+        .map_err(|e| name_missing_catalog(e, &external, &loc.catalog_name))
     }
 
     fn read_arrow(
@@ -455,6 +552,7 @@ impl QueryEngine for DuckEngine {
         if latiq_engine::classify(sql) == latiq_engine::SqlShape::Write {
             return Err(EngineError::ReadOnlyViolation);
         }
+        let external = self.external_aliases(loc);
         self.with_read(loc, |i| {
             // One abort watcher over both, as in `read_query`. The transaction
             // stays open across the whole batch stream — a correctness gain, in
@@ -473,11 +571,12 @@ impl QueryEngine for DuckEngine {
                     let mut datasets = plan_datasets(loc, i, sql);
                     annotate(loc, i, &mut datasets);
                     let mut meta = run_read_arrow(i, sql, &abort, sink)?;
-                    apply_datasets(&mut meta, datasets);
+                    apply_datasets(&mut meta, datasets, &external);
                     Ok(meta)
                 })
             })
         })
+        .map_err(|e| name_missing_catalog(e, &external, &loc.catalog_name))
     }
 
     fn write_query(
@@ -489,6 +588,7 @@ impl QueryEngine for DuckEngine {
         abort: AbortToken,
     ) -> Result<QueryResult, EngineError> {
         let pond = self.pond(loc)?;
+        let external = self.external_aliases(loc);
         // Abortably: the wait for this mutex is as long as the write ahead of us,
         // and it used to be a stretch of the query's life that NO timeout
         // covered — the deadline fired against a connection running nothing, the
@@ -512,7 +612,7 @@ impl QueryEngine for DuckEngine {
             // either: the `QueryEngine::plan_datasets` recovery path below
             // recovers the datasets and deliberately not their columns.
             annotate(loc, i, &mut datasets);
-            apply_datasets(&mut res.meta, datasets);
+            apply_datasets(&mut res.meta, datasets, &external);
             Ok(res)
         });
         if out.is_err() {
@@ -530,11 +630,15 @@ impl QueryEngine for DuckEngine {
             // race is exactly what this removes. Defence, deliberately unpinned.
             let _ = guard.conn.execute_batch("ROLLBACK");
         }
-        out
+        out.map_err(|e| name_missing_catalog(e, &external, &loc.catalog_name))
     }
 
     fn explain_query(&self, loc: &PondLocation, sql: &str) -> Result<ExplainResult, EngineError> {
+        // Same re-classification as the executing paths: planning a statement
+        // against a catalog that is not attached fails for one reason, and the
+        // fix is the same call whether or not the statement would have run.
         self.with_read(loc, |i| run_explain(i, sql))
+            .map_err(|e| name_missing_catalog(e, &self.external_aliases(loc), &loc.catalog_name))
     }
 
     fn plan_datasets(&self, loc: &PondLocation, sql: &str) -> Option<QueryMeta> {
@@ -630,120 +734,99 @@ impl QueryEngine for DuckEngine {
         Ok(SchemaSummary { tables })
     }
 
-    fn pull_catalog(
+    fn attach_catalog(
         &self,
         loc: &PondLocation,
         catalog_type: &str,
-        alias: &str,
-        params: &std::collections::BTreeMap<String, String>,
-        query: &str,
-        identity: &Identity,
-        trace_id: Option<&str>,
-    ) -> Result<QueryMeta, EngineError> {
-        // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
-        // write into the pond — must run on the writer connection, not a pooled
-        // read one whose session state other readers would then observe.
+        name: &str,
+        options: &std::collections::BTreeMap<String, String>,
+        secrets: &std::collections::BTreeMap<String, latiq_common::Secret>,
+    ) -> Result<AttachedCatalog, EngineError> {
+        // The alias becomes a SQL catalog identifier, so it is validated before
+        // anything else — the refusal names the legal set, which no message from
+        // inside DuckDB would.
+        latiq_common::catalog::validate_alias(name).map_err(EngineError::UnsupportedParameter)?;
+        // …and it must not collide with the pond's OWN catalog. Attaching over
+        // it would leave every unqualified statement in the pond resolving
+        // against a read-only external database.
+        if name.eq_ignore_ascii_case(&loc.catalog_name) {
+            return Err(EngineError::CatalogAlreadyAttached {
+                name: name.to_string(),
+            });
+        }
+        // Built before any lock is taken: a plan that cannot be built is the
+        // caller's parameters, and nothing should queue behind the pond's writer
+        // to be told so.
+        let plan = crate::attachers::plan(catalog_type, name, options, secrets)?;
         let pond = self.pond(loc)?;
+        // `attached` is taken FIRST and held across the DuckDB statements, so two
+        // concurrent attaches of one alias cannot both pass the conflict check
+        // and race into `CREATE OR REPLACE SECRET` — where the second would
+        // silently rebind the first's credential.
+        let mut attached = lock_recover(&pond.attached);
+        if attached.iter().any(|a| a.info.name == name) {
+            return Err(EngineError::CatalogAlreadyAttached {
+                name: name.to_string(),
+            });
+        }
+        // ATTACH and CREATE SECRET are instance-level state, so they run on the
+        // writer connection — never a pooled read one, whose own session other
+        // readers would then inherit.
         let guard = lock_recover(&pond.writer);
-        let plan = crate::attachers::plan(catalog_type, alias, params)?;
-        attach_catalog(&guard.conn, &plan)?;
-        // Extracted while the catalog is still ATTACHED and before the pull
-        // runs — the only window where both sides bind: afterwards the external
-        // tables are detached and the pull's own target already exists. Gated
-        // on the pond's lineage flag like every other path, so a pond that did
-        // not opt in pays nothing for the second bind.
-        let mut datasets = plan_datasets(loc, &guard, query);
-        // Run the pull query (a CREATE TABLE … in the pond's default catalog)
-        // through the SAME attribution bracket as `write_query` — a pull is a
-        // write into the pond, and without this its snapshot landed with a null
-        // author and a null commit message. The ATTACH sits outside the
-        // transaction (it is session state, not catalog state) and the DETACH
-        // below runs after the bracket has closed, so the transaction never
-        // ends with the external catalog still in it.
-        let ran = in_write_txn(
-            &guard,
-            identity,
-            trace_id,
-            &loc.catalog_name,
-            "pull_catalog",
-            |i| {
-                i.conn
-                    .execute_batch(query)
-                    // The pull query is the CALLER's SQL, so it is classified
-                    // like any other caller SQL. Wrapping it as `Engine` put a
-                    // mistyped table name in a pull behind "Retry; if it
-                    // persists, report to your operator", and dropped DuckDB's
-                    // class prefix on the way.
-                    .map_err(|e| crate::errclass::classify(&e))
-            },
-        );
-        // Regardless of the outcome — including a rolled-back pull, which must
-        // still leave no attachment and no secret behind.
-        teardown_catalog(&guard.conn, &plan);
-        let ((), snapshot_id) = ran?;
-        // The pull's own target is a pond table, and it exists now. The source
-        // side is external and is skipped, exactly as an `s3://` input is.
-        annotate(loc, &guard, &mut datasets);
-        let mut meta = QueryMeta {
-            // The snapshot this pull published, or `None` for a pull that wrote
-            // nothing — the same authoritative "did anything change?" answer
-            // `write_query` reports, read from DuckLake rather than guessed.
-            snapshot_id,
-            ..QueryMeta::default()
+        run_attach_plan(&guard.conn, &plan)?;
+        drop(guard);
+        let info = AttachedCatalog {
+            name: name.to_string(),
+            type_: catalog_type.to_string(),
+            namespace: plan.namespace.clone(),
+            options: options.clone(),
         };
-        apply_datasets(
-            &mut meta,
-            datasets.map(|(inputs, outputs)| {
-                let f = |ds: Vec<DatasetRef>| {
-                    ds.into_iter()
-                        .map(|d| externalize(d, &plan.alias, &plan.namespace))
-                        .collect()
-                };
-                (f(inputs), f(outputs))
-            }),
-        );
-        Ok(meta)
+        attached.push(Attachment {
+            plan,
+            info: info.clone(),
+        });
+        Ok(info)
     }
 
-    fn describe_catalog(
-        &self,
-        loc: &PondLocation,
-        catalog_type: &str,
-        alias: &str,
-        params: &std::collections::BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, EngineError> {
-        // Session-scoped ATTACH/DETACH (+ a transient secret) and, for a pull, a
-        // write into the pond — must run on the writer connection, not a pooled
-        // read one whose session state other readers would then observe.
+    fn detach_catalog(&self, loc: &PondLocation, name: &str) -> Result<(), EngineError> {
         let pond = self.pond(loc)?;
+        let mut attached = lock_recover(&pond.attached);
+        let Some(idx) = attached.iter().position(|a| a.info.name == name) else {
+            return Err(EngineError::CatalogNotAttached {
+                name: name.to_string(),
+            });
+        };
+        // Removed from the map BEFORE the statements run, and unconditionally:
+        // `teardown_catalog` is best-effort by design, and an entry left behind
+        // by a failed DETACH would make the alias permanently un-reattachable
+        // (`CatalogAlreadyAttached`) for a catalog DuckDB may well have dropped.
+        let entry = attached.remove(idx);
         let guard = lock_recover(&pond.writer);
-        let plan = crate::attachers::plan(catalog_type, alias, params)?;
-        attach_catalog(&guard.conn, &plan)?;
-        let cat = alias.replace('\'', "''");
-        let listed = run_read(
-            &guard,
-            &format!(
-                "SELECT table_schema, table_name FROM information_schema.tables \
-                 WHERE table_catalog = '{cat}' ORDER BY table_schema, table_name"
-            ),
-        );
-        teardown_catalog(&guard.conn, &plan);
-        let res = listed?;
-        Ok(res
-            .rows
+        teardown_catalog(&guard.conn, &entry.plan);
+        Ok(())
+    }
+
+    fn attached_catalogs(&self, loc: &PondLocation) -> Result<Vec<AttachedCatalog>, EngineError> {
+        // Reported from OUR record rather than from `duckdb_databases()`: the
+        // pond's own catalog and DuckDB's built-ins are in that view too, and
+        // it carries neither the catalog type nor the options the caller
+        // supplied.
+        Ok(lock_recover(&self.pond(loc)?.attached)
             .iter()
-            .map(|r| {
-                (
-                    r.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    r.get(1).and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                )
-            })
+            .map(|a| a.info.clone())
             .collect())
     }
 }
 
+/// One live attachment: the description a surface may see, and the plan whose
+/// `teardown()` detaches it and drops its secrets.
+struct Attachment {
+    plan: crate::attachers::AttachPlan,
+    info: AttachedCatalog,
+}
+
 /// LOAD the type's extensions, create its secrets, and ATTACH it.
-fn attach_catalog(
+fn run_attach_plan(
     conn: &duckdb::Connection,
     plan: &crate::attachers::AttachPlan,
 ) -> Result<(), EngineError> {
@@ -751,7 +834,7 @@ fn attach_catalog(
     // endpoint), the credential would otherwise linger on the reused per-pond
     // connection. Tear down on error so no secret survives a failed attach —
     // Latiq stores zero credentials (invariant 6).
-    match attach_catalog_inner(conn, plan) {
+    match run_attach_plan_inner(conn, plan) {
         Ok(()) => Ok(()),
         Err(e) => {
             teardown_catalog(conn, plan);
@@ -760,11 +843,11 @@ fn attach_catalog(
     }
 }
 
-fn attach_catalog_inner(
+fn run_attach_plan_inner(
     conn: &duckdb::Connection,
     plan: &crate::attachers::AttachPlan,
 ) -> Result<(), EngineError> {
-    // This runs while a caller waits on `pull_catalog`, so it must not download:
+    // This runs while a caller waits on `attach_catalog`, so it must not download:
     // the plan is LOAD-only (`attachers::AttachPlan::load`) and autoinstall is
     // off. `PondInstance::open` already turns it off globally on this
     // connection; re-asserting it here keeps the property with the site that
@@ -775,7 +858,7 @@ fn attach_catalog_inner(
         conn.execute_batch(s).map_err(|e| {
             crate::instance::extension_not_cached(
                 ext,
-                "required by this catalog type, for the transient attach behind pull_catalog",
+                "required by this catalog type, to attach it to a pond",
                 &e,
             )
         })?;
@@ -846,7 +929,7 @@ mod tests {
                 .into(),
         };
         assert!(
-            attach_catalog(&inst.conn, &plan).is_err(),
+            run_attach_plan(&inst.conn, &plan).is_err(),
             "attach should fail on a bad path"
         );
         let n: i64 = inst
@@ -889,7 +972,7 @@ mod tests {
                      (DATA_PATH '/nonexistent_dir_xyz/data')"
                 .into(),
         };
-        let Err(err) = attach_catalog(&inst.conn, &plan) else {
+        let Err(err) = run_attach_plan(&inst.conn, &plan) else {
             panic!("an attach under a non-existent directory must fail");
         };
         // The address is the caller's, so the failure is the caller's to act on.

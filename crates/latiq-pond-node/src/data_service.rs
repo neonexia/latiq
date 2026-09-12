@@ -445,23 +445,76 @@ impl Data for DataService {
         .await
     }
 
-    async fn catalog_pull(
+    /// Mount an external catalog on the pond and leave it mounted.
+    ///
+    /// This is where proto3's inability to express absence is mapped, and
+    /// nowhere else (invariant 13c): an empty `secrets` map plus an empty
+    /// `secret_ref` is the caller CHOOSING passthrough, not a field it forgot.
+    /// `CredentialSpec::from_request` then refuses the one genuinely ambiguous
+    /// combination — both supplied — rather than preferring either.
+    async fn catalog_attach(
         &self,
-        req: Request<CatalogPullRequest>,
+        req: Request<CatalogAttachRequest>,
     ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req, "catalog_pull").await?;
+        let (id, tok) = self.identity(&req, "attach_catalog").await?;
         let tid = trace_of(&req);
         let r = req.into_inner();
         let ops = self.ops.clone();
-        traced("catalog_pull", tid, tok, async move {
+        traced("attach_catalog", tid, tok, async move {
+            // Into `Secret` at the edge of the process, so the raw strings never
+            // travel further than this statement.
+            let secrets = r
+                .secrets
+                .into_iter()
+                .map(|(k, v)| (k, latiq_common::Secret::new(v)))
+                .collect();
+            let spec = latiq_agent_core::CredentialSpec::from_request(secrets, Some(r.secret_ref))
+                .map_err(to_status)?;
             let res = ops
-                .catalog_pull(
+                .attach_catalog(
                     &id,
                     &r.pond,
-                    &r.catalog,
-                    &r.query,
-                    r.params.into_iter().collect(),
+                    &r.name,
+                    &r.r#type,
+                    r.options.into_iter().collect(),
+                    spec,
                 )
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(res).unwrap_or_default()))
+        })
+        .await
+    }
+
+    async fn catalog_detach(
+        &self,
+        req: Request<CatalogDetachRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let (id, tok) = self.identity(&req, "detach_catalog").await?;
+        let tid = trace_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("detach_catalog", tid, tok, async move {
+            let res = ops
+                .detach_catalog(&id, &r.pond, &r.name)
+                .await
+                .map_err(to_status)?;
+            Ok(json_resp(serde_json::to_value(res).unwrap_or_default()))
+        })
+        .await
+    }
+
+    async fn catalog_list_attached(
+        &self,
+        req: Request<CatalogListAttachedRequest>,
+    ) -> Result<Response<JsonResponse>, Status> {
+        let (id, tok) = self.identity(&req, "list_attached_catalogs").await?;
+        let tid = trace_of(&req);
+        let r = req.into_inner();
+        let ops = self.ops.clone();
+        traced("list_attached_catalogs", tid, tok, async move {
+            let res = ops
+                .list_attached_catalogs(&id, &r.pond)
                 .await
                 .map_err(to_status)?;
             Ok(json_resp(serde_json::to_value(res).unwrap_or_default()))
@@ -492,30 +545,6 @@ impl Data for DataService {
                 .await
                 .map_err(to_status)?;
             Ok(json_resp(serde_json::to_value(page).unwrap_or_default()))
-        })
-        .await
-    }
-
-    async fn catalog_describe(
-        &self,
-        req: Request<CatalogDescribeRequest>,
-    ) -> Result<Response<JsonResponse>, Status> {
-        let (id, tok) = self.identity(&req, "catalog_describe").await?;
-        let tid = trace_of(&req);
-        let r = req.into_inner();
-        let ops = self.ops.clone();
-        traced("catalog_describe", tid, tok, async move {
-            let tables = ops
-                .catalog_describe(&id, &r.pond, &r.catalog, r.params.into_iter().collect())
-                .await
-                .map_err(to_status)?;
-            let rows: Vec<_> = tables
-                .into_iter()
-                .map(|(schema, table)| serde_json::json!({"schema": schema, "table": table}))
-                .collect();
-            Ok(json_resp(
-                serde_json::json!({"catalog": r.catalog, "tables": rows}),
-            ))
         })
         .await
     }

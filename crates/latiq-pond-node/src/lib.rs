@@ -100,7 +100,7 @@ pub struct PondNodeConfig {
 /// **Strict, on purpose.** It used to install the required set fatally and the
 /// rest best-effort, so `deploy/Dockerfile` could build an image "successfully"
 /// while missing extensions the image's own comment claimed it had — the gap
-/// then surfaced as a failed pond or a failed `pull_catalog` in production, far
+/// then surfaced as a failed pond or a failed `attach_catalog` in production, far
 /// from the build that caused it. Any extension that cannot be installed, or
 /// that will not load offline afterwards, fails the command (and so the build).
 pub fn warm_extensions() -> Result<(), Box<dyn std::error::Error>> {
@@ -314,7 +314,7 @@ pub async fn run_pond_node_until(
     // here (a node whose cache is merely incomplete still serves every pond that
     // needs nothing from the gap) and it must not block serving or the create
     // path — but it must not be SILENT either: every LOAD site now refuses to
-    // download, so a gap left here is a pond or a `pull_catalog` that fails
+    // download, so a gap left here is a pond or an `attach_catalog` that fails
     // later, with nothing at startup to connect it to. Name what is missing, at
     // the moment we find out.
     tokio::task::spawn_blocking(|| {

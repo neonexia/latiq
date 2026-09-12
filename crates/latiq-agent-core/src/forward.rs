@@ -20,8 +20,11 @@
 //! `ControlPlane` trait: the core abstracts "a remote node" the same way it
 //! already abstracts "the registry".
 use crate::arrow::ArrowReadStream;
+use crate::credentials::CredentialSpec;
 use crate::error::AgentError;
-use crate::types::{DescribeResult, LineagePage, PullResult};
+use crate::types::{
+    AttachCatalogResult, AttachedCatalogList, DescribeResult, DetachCatalogResult, LineagePage,
+};
 use latiq_common::Identity;
 use latiq_engine::{ExplainResult, QueryResult};
 use std::collections::BTreeMap;
@@ -137,26 +140,45 @@ pub trait Forwarder: Send + Sync {
         pond: &str,
     ) -> Result<(), AgentError>;
 
-    /// Transient pull from an external catalog on the owning node. The runtime
-    /// `params` (incl. any credentials) ride the gRPC hop and are dropped after
-    /// the attach/detach on the owner — nothing about the catalog persists.
-    async fn catalog_pull(
+    /// Attach an external catalog on the OWNING node — the only node that has
+    /// the pond's engine instance, and therefore the only one the attachment
+    /// could live on.
+    ///
+    /// The credential travels as the caller asked for it, un-resolved: an
+    /// explicit map rides the internal hop, a `secret_ref` is dereferenced by
+    /// the owner (whose configured backends are the ones that matter), and a
+    /// `passthrough` carries nothing at all — the owner reads the caller's own
+    /// bearer, which this hop already replays (`crate::bearer`). Resolving here
+    /// would impose this node's view of the caller on the node doing the work,
+    /// the same discipline `served_by` and the timeout ask follow.
+    // One argument past clippy's threshold, and each is load-bearing: where to
+    // dial, who is asking, which pond, and the four halves of the attach.
+    #[allow(clippy::too_many_arguments)]
+    async fn attach_catalog(
         &self,
         peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
-        catalog: &str,
-        query: &str,
-        params: BTreeMap<String, String>,
-    ) -> Result<PullResult, AgentError>;
+        name: &str,
+        catalog_type: &str,
+        options: BTreeMap<String, String>,
+        credentials: CredentialSpec,
+    ) -> Result<AttachCatalogResult, AgentError>;
 
-    /// List an external catalog's tables on the owning node (transient attach).
-    async fn catalog_describe(
+    /// Detach a catalog on the owning node (and drop its credential there).
+    async fn detach_catalog(
         &self,
         peer: Peer<'_>,
         identity: &Identity,
         pond: &str,
-        catalog: &str,
-        params: BTreeMap<String, String>,
-    ) -> Result<Vec<(String, String)>, AgentError>;
+        name: &str,
+    ) -> Result<DetachCatalogResult, AgentError>;
+
+    /// What is attached on the owning node.
+    async fn list_attached_catalogs(
+        &self,
+        peer: Peer<'_>,
+        identity: &Identity,
+        pond: &str,
+    ) -> Result<AttachedCatalogList, AgentError>;
 }
