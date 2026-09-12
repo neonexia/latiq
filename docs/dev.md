@@ -273,8 +273,8 @@ latiq query --pond demo "SELECT count(*) FROM 's3://some-public-bucket/file.parq
 ### Datasets & catalogs
 
 Latiq has two ways to get external data into a pond: **datasets** (simple files
-you copy in) and **catalogs** (external databases you pull from once). Full guide:
-[`docs/dataset.md`](dataset.md).
+you copy in) and **catalogs** (external databases you attach to the pond, extract
+from with ordinary SQL, and detach). Full guide: [`docs/dataset.md`](dataset.md).
 
 ```bash
 # datasets — simple files in the built-in `latiq` catalog
@@ -282,17 +282,26 @@ latiq dataset list                                 # samples are seeded (tpch, �
 latiq dataset add sales --table sales=https://example.com/sales.parquet --tag finance
 latiq dataset load tpch -p demo                     # copy all 8 TPC-H tables into `demo`
 
-# catalogs — external (iceberg/…); credentials ride in at pull, never stored
-latiq catalog add lake --type iceberg \
-  --set endpoint=https://polaris.acme/api/catalog --set warehouse=prod --tag prod
-latiq catalog describe lake -p demo --set token="$BEARER"
-latiq catalog pull lake -p demo --set token="$BEARER" \
-  --query "CREATE TABLE us AS SELECT * FROM lake.sales.orders WHERE region='us'"
+# catalogs — external (iceberg/ducklake). Attach once; then it is just SQL.
+latiq catalog attach --name lake --type iceberg --pond demo \
+  --option endpoint=https://polaris.acme/api/catalog --option warehouse=prod \
+  --secret token="$BEARER"
+latiq query "SHOW TABLES FROM lake" -p demo
+latiq query "CREATE TABLE us AS SELECT * FROM lake.sales.orders WHERE region='us'" -p demo
+latiq catalog list   --pond demo                    # what is attached right now
+latiq catalog detach --name lake --pond demo
 ```
 
-`dataset add`/`catalog add` are operator actions; loading/pulling are available to
-anyone. A `--set token=…` at `add` is **dropped** (credentials never persist) — pass
-it at pull/describe. Credentialed identity integration: issue #26.
+Two catalogs can be attached at once and **joined in one statement** — that is
+what the persistent attach is for. The attachment lives in the pond node's
+engine and is lost on a restart; the next statement naming it says so and names
+`attach_catalog`.
+
+Omit `--secret` entirely and your own bearer (`LATIQ_TOKEN`) becomes the catalog
+credential — the `passthrough` mode, and the one an Iceberg REST catalog wants.
+`dataset add`/`catalog add` are operator actions (the latter registers a locator
+for **discovery** only); attaching and loading are available to anyone. A
+credential passed to `catalog add` is **dropped** — credentials never persist.
 
 ### Targeting a non-default control plane
 

@@ -51,6 +51,7 @@ pub const IO: &str = "IO Error";
 pub const HTTP: &str = "HTTP Error";
 pub const NOT_IMPLEMENTED: &str = "Not implemented Error";
 pub const INVALID_INPUT: &str = "Invalid Input Error";
+pub const INVALID_CONFIGURATION: &str = "Invalid Configuration Error";
 pub const OUT_OF_RANGE: &str = "Out of Range Error";
 pub const TRANSACTION: &str = "TransactionContext Error";
 
@@ -95,8 +96,30 @@ pub fn classify_message(msg: &str) -> EngineError {
         Some(CONVERSION) => EngineError::Conversion(owned()),
         Some(CONSTRAINT) => EngineError::Constraint(owned()),
         // The source is not ours: a URL, a bucket, a file. `HTTP Error` is
-        // httpfs's own class for the same situation.
-        Some(IO) | Some(HTTP) => EngineError::SourceIo(owned()),
+        // httpfs's own class for the same situation, and so — measured, not
+        // assumed — is `Invalid Configuration Error`: it is what the iceberg
+        // extension raises when the REST `/v1/config` request to the CALLER's
+        // `endpoint` comes back non-200, which is the same mistake as a refused
+        // connection to that endpoint and must get the same advice. It had no
+        // mapping at all, so a wrong `attach_catalog` endpoint fell into
+        // `Engine` → `internal` → "Retry; if it persists, report to your
+        // operator" — an agent re-sending a typo for ever, then waking an
+        // operator with nothing to fix. Nexus finding 8's shape, a third time.
+        //
+        // Classifying it by WHAT WENT WRONG rather than by the class's name is
+        // the whole point: `source_unavailable`'s advice ("check the path or
+        // URL — spelling, host, bucket … it must be reachable from the node") is
+        // exactly right here, and putting it under `invalid_value` instead would
+        // mean the SAME wrong endpoint got different advice depending on whether
+        // the far side refused the connection (`IO Error`) or answered wrongly.
+        //
+        // It cannot be driven offline — no `SET` in this DuckDB raises it
+        // (measured: `memory_limit`/`default_null_order` are `Parser Error`,
+        // an unknown parameter is `Catalog Error`, a bad `threads` is `Invalid
+        // Input Error`) — so it is pinned by the ignored iceberg e2e,
+        // `admin.rs::error_contract_an_iceberg_endpoint_that_is_not_a_catalog_is_not_our_failure`,
+        // and not by `engine_e2e.rs`'s offline class table.
+        Some(IO) | Some(HTTP) | Some(INVALID_CONFIGURATION) => EngineError::SourceIo(owned()),
         // The statement is fine; the engine does not implement what it asks
         // for. Everything DuckLake rejects this way is a clause the caller
         // wrote and can delete — measured against the real engine, not assumed:
@@ -153,6 +176,7 @@ fn class_of(msg: &str) -> Option<&'static str> {
         HTTP,
         NOT_IMPLEMENTED,
         INVALID_INPUT,
+        INVALID_CONFIGURATION,
         OUT_OF_RANGE,
         TRANSACTION,
     ]
@@ -224,6 +248,15 @@ mod tests {
             // site (`instance::extension_not_cached`), which knows which
             // extension it asked for — DuckDB's message class does not.
             EngineError::CapabilityUnavailable { .. } => "CapabilityUnavailable",
+            // Never produced by `class_of` either. The first is raised by the
+            // attach path from its OWN record of what is mounted; the second is
+            // a Catalog/Binder failure RE-classified afterwards
+            // (`duck_engine::name_missing_catalog`), once the engine has checked
+            // the named alias against that record — which is the only way to
+            // know the difference between "you did not attach it" and "it is
+            // attached and something else is wrong".
+            EngineError::CatalogAlreadyAttached { .. } => "CatalogAlreadyAttached",
+            EngineError::CatalogNotAttached { .. } => "CatalogNotAttached",
             EngineError::ReadOnlyViolation => "ReadOnlyViolation",
             EngineError::Cancelled => "Cancelled",
             EngineError::Timeout => "Timeout",

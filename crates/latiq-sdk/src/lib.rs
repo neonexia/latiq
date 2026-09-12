@@ -114,25 +114,35 @@ impl Pond<'_> {
     pub fn load_dataset(&self, dataset: &str) -> Result<serde_json::Value> {
         self.latiq.load_dataset(&self.info.name, dataset)
     }
-    /// Describe an external catalog's tables (attached transiently on this pond).
-    /// `set`: runtime config + credentials (e.g. `{"token": "…"}`); never stored.
-    pub fn describe_catalog(
+    /// Mount an external catalog on this pond under `name` and leave it
+    /// mounted: `query`/`write` can then name `<name>.<schema>.<table>`,
+    /// including a JOIN across two attached catalogs. See
+    /// [`Latiq::attach_catalog`] for the credential modes.
+    pub fn attach_catalog(
         &self,
-        catalog: &str,
-        set: HashMap<String, String>,
+        name: &str,
+        catalog_type: &str,
+        options: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+        secret_ref: Option<&str>,
     ) -> Result<serde_json::Value> {
-        self.latiq.describe_catalog(&self.info.name, catalog, set)
+        self.latiq.attach_catalog(
+            &self.info.name,
+            name,
+            catalog_type,
+            options,
+            secrets,
+            secret_ref,
+        )
     }
-    /// Pull a subset of an external catalog into a pond table. `query` is the
-    /// materialization SQL (e.g. `CREATE TABLE us AS SELECT … FROM lake.s.orders`).
-    pub fn pull_catalog(
-        &self,
-        catalog: &str,
-        query: &str,
-        set: HashMap<String, String>,
-    ) -> Result<serde_json::Value> {
-        self.latiq
-            .pull_catalog(&self.info.name, catalog, query, set)
+    /// Unmount a catalog and drop the credential created for it. Tables already
+    /// extracted into this pond are unaffected.
+    pub fn detach_catalog(&self, name: &str) -> Result<serde_json::Value> {
+        self.latiq.detach_catalog(&self.info.name, name)
+    }
+    /// The external catalogs attached to this pond right now.
+    pub fn list_attached_catalogs(&self) -> Result<serde_json::Value> {
+        self.latiq.list_attached_catalogs(&self.info.name)
     }
     pub fn name(&self) -> &str {
         &self.info.name
@@ -563,49 +573,73 @@ impl Latiq {
         })
     }
 
-    /// Describe an external catalog's tables (attached transiently on `pond`).
-    /// `set` carries runtime config + credentials; never stored.
-    pub fn describe_catalog(
+    /// Mount an external catalog on `pond` under `name`, and leave it mounted:
+    /// afterwards `read_query`/`write_query` can name `<name>.<schema>.<table>`,
+    /// including a JOIN across two attached catalogs.
+    ///
+    /// `options` are LOCATOR parameters (1:1 with DuckDB's own `ATTACH`
+    /// options). The credential is exactly one of: `secrets` (explicit values),
+    /// `secret_ref` (an opaque URI the node dereferences), or NEITHER — which
+    /// means passthrough, where this client's own bearer token is used as the
+    /// catalog credential. Supplying two is refused; the returned
+    /// `credential_mode` says which was applied.
+    ///
+    /// The attachment is **not persisted**: a node restart loses it.
+    pub fn attach_catalog(
         &self,
         pond: &str,
-        catalog: &str,
-        set: HashMap<String, String>,
+        name: &str,
+        catalog_type: &str,
+        options: HashMap<String, String>,
+        secrets: HashMap<String, String>,
+        secret_ref: Option<&str>,
     ) -> Result<serde_json::Value> {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .catalog_describe(CatalogDescribeRequest {
+                .catalog_attach(CatalogAttachRequest {
                     pond: pond.to_string(),
-                    catalog: catalog.to_string(),
-                    params: set,
+                    name: name.to_string(),
+                    r#type: catalog_type.to_string(),
+                    options,
+                    secrets,
+                    secret_ref: secret_ref.unwrap_or_default().to_string(),
                 })
                 .await
-                .map_err(|s| anyhow!("describe_catalog: {}", s.message()))?
+                .map_err(|s| anyhow!("attach_catalog: {}", s.message()))?
                 .into_inner();
             parse_json(&resp.json)
         })
     }
 
-    /// Pull a subset of an external catalog into a pond table. `query` is the
-    /// materialization SQL. `set` carries runtime config + credentials; never stored.
-    pub fn pull_catalog(
-        &self,
-        pond: &str,
-        catalog: &str,
-        query: &str,
-        set: HashMap<String, String>,
-    ) -> Result<serde_json::Value> {
+    /// Unmount a catalog from `pond` and drop the credential created for it.
+    /// Tables already extracted into the pond are unaffected.
+    pub fn detach_catalog(&self, pond: &str, name: &str) -> Result<serde_json::Value> {
         self.rt.block_on(async {
             let mut d = self.data().await?;
             let resp = d
-                .catalog_pull(CatalogPullRequest {
+                .catalog_detach(CatalogDetachRequest {
                     pond: pond.to_string(),
-                    catalog: catalog.to_string(),
-                    query: query.to_string(),
-                    params: set,
+                    name: name.to_string(),
                 })
                 .await
-                .map_err(|s| anyhow!("pull_catalog: {}", s.message()))?
+                .map_err(|s| anyhow!("detach_catalog: {}", s.message()))?
+                .into_inner();
+            parse_json(&resp.json)
+        })
+    }
+
+    /// The external catalogs attached to `pond` right now. Locators only — no
+    /// credential is returned, in any mode.
+    pub fn list_attached_catalogs(&self, pond: &str) -> Result<serde_json::Value> {
+        self.rt.block_on(async {
+            let mut d = self.data().await?;
+            let resp = d
+                .catalog_list_attached(CatalogListAttachedRequest {
+                    pond: pond.to_string(),
+                })
+                .await
+                .map_err(|s| anyhow!("list_attached_catalogs: {}", s.message()))?
                 .into_inner();
             parse_json(&resp.json)
         })

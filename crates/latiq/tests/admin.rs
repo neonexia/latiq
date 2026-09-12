@@ -749,9 +749,26 @@ mod catalogs {
         serde_json::from_str(&resp.json).unwrap()
     }
 
-    /// Create a local DuckLake catalog with one table, returning (metadata_path,
-    /// data_path). Uses a throwaway in-memory DuckDB — same engine the pond uses.
-    fn seed_ducklake(dir: &std::path::Path) -> (String, String) {
+    /// The `ErrorEnvelope` a Data-gRPC failure carries in its `details`.
+    ///
+    /// Asserted on rather than on `Status::message`, because the envelope is
+    /// what an agent actually branches on — `kind`, `audience`, `retryable` and
+    /// `facts` — and a test that reads only the prose cannot tell a correct
+    /// kind from a plausible sentence.
+    fn envelope(status: &tonic::Status) -> serde_json::Value {
+        assert!(
+            !status.details().is_empty(),
+            "no ErrorEnvelope rode on this status, so there is nothing for an \
+             agent to act on: {status:?}"
+        );
+        serde_json::from_slice(status.details()).expect("the details are an ErrorEnvelope")
+    }
+
+    /// Create a local DuckLake catalog with a `widgets` table, returning the
+    /// ATTACH OPTIONS for it (`metadata_path` + `data_path`) — the shape
+    /// `catalog attach` takes, so no caller has to rebuild the map. A throwaway
+    /// in-memory DuckDB seeds it: the same engine the pond uses, no network.
+    fn seed_ducklake(dir: &std::path::Path) -> HashMap<String, String> {
         let meta = dir.join("meta.duckdb");
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
@@ -766,7 +783,34 @@ mod catalogs {
             data.display(),
         ))
         .unwrap();
-        (meta.display().to_string(), data.display().to_string())
+        HashMap::from([
+            ("metadata_path".to_string(), meta.display().to_string()),
+            ("data_path".to_string(), data.display().to_string()),
+        ])
+    }
+
+    /// A SECOND, independent DuckLake catalog — `customers`, joinable to
+    /// `widgets` on `id`. Two separate sources is the whole point of the
+    /// headline test: one catalog would prove nothing the old transient pull
+    /// could not already do.
+    fn seed_customers(dir: &std::path::Path) -> HashMap<String, String> {
+        let meta = dir.join("meta.duckdb");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake;
+             ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
+             CREATE TABLE ext.customers AS
+               SELECT * FROM (VALUES (1,'gold'),(2,'silver')) t(id,segment);",
+            meta.display(),
+            data.display(),
+        ))
+        .unwrap();
+        HashMap::from([
+            ("metadata_path".to_string(), meta.display().to_string()),
+            ("data_path".to_string(), data.display().to_string()),
+        ])
     }
 
     #[tokio::test]
@@ -823,38 +867,23 @@ mod catalogs {
         );
     }
 
+    /// **The headline, over the real Data gRPC surface.** Two external catalogs
+    /// attached to ONE pond, a single `write_query` joining across both into a
+    /// pond table, then detach.
+    ///
+    /// The old transient `catalog_pull` could not express this at all — it
+    /// attached and detached inside one call, so two sources were never mounted
+    /// at the same time. Everything the extract needs is ordinary SQL; nothing
+    /// in this test calls a catalog-aware query verb, because there is not one.
     #[tokio::test]
-    async fn catalog_pull_from_local_ducklake_lands_in_pond() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (metadata_path, data_path) = seed_ducklake(tmp.path());
+    async fn catalog_attach_two_catalogs_join_in_one_write_and_detach() {
+        let orders_dir = tempfile::tempdir().unwrap();
+        let crm_dir = tempfile::tempdir().unwrap();
+        let orders = seed_ducklake(orders_dir.path());
+        let customers = seed_customers(crm_dir.path());
 
         let s = start_stack().await;
-        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
-            .await
-            .unwrap();
         let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
-
-        // Register the external catalog (operator).
-        let added = admin
-            .catalog_add(CatalogAddRequest {
-                catalog: Some(CatalogMsg {
-                    name: "ext".into(),
-                    r#type: "ducklake".into(),
-                    params: HashMap::from([
-                        ("metadata_path".into(), metadata_path),
-                        ("data_path".into(), data_path),
-                    ]),
-                    description: "local ducklake".into(),
-                    tags: vec!["test".into()],
-                    created_by: String::new(),
-                    created_at: String::new(),
-                }),
-            })
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(added.name, "ext");
-
         data.allocate_pond(req(
             AllocatePondRequest {
                 name: "shop".into(),
@@ -867,13 +896,18 @@ mod catalogs {
         .await
         .unwrap();
 
-        // Describe: discover the catalog's tables (transient attach → detach).
-        let described = json(
-            data.catalog_describe(req(
-                CatalogDescribeRequest {
+        // Attach both. The whole locator arrives with the call — no registry
+        // lookup, and no credential at all for a local DuckLake source, which
+        // the response says in as many words rather than leaving to inference.
+        let first = json(
+            data.catalog_attach(req(
+                CatalogAttachRequest {
                     pond: "shop".into(),
-                    catalog: "ext".into(),
-                    params: HashMap::new(),
+                    name: "lake".into(),
+                    r#type: "ducklake".into(),
+                    options: orders.clone(),
+                    secrets: HashMap::new(),
+                    secret_ref: String::new(),
                 },
                 "agent-x",
             ))
@@ -881,233 +915,96 @@ mod catalogs {
             .unwrap()
             .into_inner(),
         );
-        let tables: Vec<&str> = described["tables"]
+        assert_eq!(first["catalog"]["name"], "lake");
+        assert_eq!(
+            first["credential_mode"], "none",
+            "a local ducklake authenticates to nothing, and the response must SAY \
+             no credential was applied rather than let the caller assume one was: {first}"
+        );
+        data.catalog_attach(req(
+            CatalogAttachRequest {
+                pond: "shop".into(),
+                name: "crm".into(),
+                r#type: "ducklake".into(),
+                options: customers,
+                secrets: HashMap::new(),
+                secret_ref: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("a SECOND catalog attaches while the first is still mounted");
+
+        // Both are listed, with their locators — and nothing else. The
+        // credential containment test below is what proves "nothing else".
+        let attached = json(
+            data.catalog_list_attached(req(
+                CatalogListAttachedRequest {
+                    pond: "shop".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        let names: Vec<&str> = attached["catalogs"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|t| t["table"].as_str())
+            .filter_map(|c| c["name"].as_str())
             .collect();
-        assert!(
-            tables.contains(&"widgets"),
-            "describe found tables: {tables:?}"
-        );
+        assert_eq!(names, vec!["lake", "crm"], "attached: {attached}");
 
-        // Pull a subset into the pond, then detach.
-        data.catalog_pull(req(
-            CatalogPullRequest {
-                pond: "shop".into(),
-                catalog: "ext".into(),
-                query: "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
-                    .into(),
-                params: HashMap::new(),
-            },
-            "agent-x",
-        ))
-        .await
-        .unwrap();
-
-        // The data is now a pond table; the external catalog is detached.
-        let r = json(
-            data.read_query(req(
-                QueryRequest {
-                    pond: "shop".into(),
-                    sql: "SELECT count(*) AS n FROM cheap".into(),
-                    timeout_ms: 0,
-                },
-                "agent-x",
-            ))
-            .await
-            .unwrap()
-            .into_inner(),
-        );
-        assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2, "pulled rows: {r}");
-
-        // After detach, the external catalog is no longer queryable from the pond.
-        // After detach, the external catalog is no longer queryable from the pond.
-        // Asserted on the REASON: `is_err()` alone is satisfied by a dropped pond, a
-        // dead node, or a syntax error -- i.e. by everything except the detach.
-        let err = data
-            .read_query(req(
-                QueryRequest {
-                    pond: "shop".into(),
-                    sql: "SELECT count(*) FROM ext.widgets".into(),
-                    timeout_ms: 0,
-                },
-                "agent-x",
-            ))
-            .await
-            .expect_err("external catalog must be detached after pull");
-        let msg = err.message().to_lowercase();
-        assert!(
-            msg.contains("ext") && msg.contains("does not exist"),
-            "the failure must be `ext` being gone, not some other error: {msg}"
-        );
-        // ...and the pond itself is fine, which is what rules out "the whole pond
-        // went away" as the reason above.
-        data.read_query(req(
-            QueryRequest {
-                pond: "shop".into(),
-                sql: "SELECT count(*) FROM cheap".into(),
-                timeout_ms: 0,
-            },
-            "agent-x",
-        ))
-        .await
-        .expect("detaching the catalog must not disturb the pond");
-    }
-
-    /// A pull WRITES into the pond, so it must be attributed exactly like any
-    /// other write — this is the hole this test exists for: `pull_catalog` used
-    /// to run its `CREATE TABLE … AS SELECT` straight on the writer connection
-    /// with no transaction and no `set_commit_message`, so data entered the pond
-    /// through the one path where **nobody was recorded as having put it there**
-    /// (measured: `ducklake_snapshots('shop')` → `[[0, null, null], [1, null,
-    /// null]]`).
-    ///
-    /// Every assertion here is on a VALUE, never on "not null": a snapshot whose
-    /// author is the literal string `unknown` would satisfy a non-null check and
-    /// be exactly as useless as the null it replaced. The trace id is the one
-    /// this test minted and sent in the `traceparent` header, so it is compared
-    /// against a value produced independently of the record being checked.
-    ///
-    /// The second half is the regression guard: after driving BOTH pond-writing
-    /// paths, no snapshot in the pond may lack an author, and every commit
-    /// message must be one of the operations we actually have. A new engine path
-    /// that writes without the bracket fails this the moment it is exercised
-    /// here — see the note on coverage in `in_write_txn`.
-    #[tokio::test]
-    async fn attribution_pull_catalog_records_the_caller_the_operation_and_the_trace() {
+        // THE extract: one ordinary write, joining two external catalogs.
         const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-        let tmp = tempfile::tempdir().unwrap();
-        let (metadata_path, data_path) = seed_ducklake(tmp.path());
-
-        let s = start_stack().await;
-        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
-            .await
-            .unwrap();
-        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
-
-        admin
-            .catalog_add(CatalogAddRequest {
-                catalog: Some(CatalogMsg {
-                    name: "ext".into(),
-                    r#type: "ducklake".into(),
-                    params: HashMap::from([
-                        ("metadata_path".into(), metadata_path),
-                        ("data_path".into(), data_path),
-                    ]),
-                    description: "local ducklake".into(),
-                    tags: vec!["test".into()],
-                    created_by: String::new(),
-                    created_at: String::new(),
-                }),
-            })
-            .await
-            .unwrap();
-
-        data.allocate_pond(req(
-            AllocatePondRequest {
-                name: "shop".into(),
-                policy_json: String::new(),
-                tier: String::new(),
-                lineage: false,
-            },
-            "agent-x",
-        ))
-        .await
-        .unwrap();
-
-        // The other pond-writing path, so the guard below compares the two
-        // rather than asserting a property only one path has ever had.
-        data.write_query(req(
+        data.write_query(traced_req(
             QueryRequest {
                 pond: "shop".into(),
-                sql: "CREATE TABLE local(id INTEGER)".into(),
-                timeout_ms: 0,
-            },
-            "writer-bob",
-        ))
-        .await
-        .unwrap();
-
-        data.catalog_pull(traced_req(
-            CatalogPullRequest {
-                pond: "shop".into(),
-                catalog: "ext".into(),
-                query: "CREATE TABLE cheap AS SELECT id,name FROM ext.widgets WHERE price < 10"
+                sql: "CREATE TABLE enriched AS \
+                      SELECT o.id, o.name AS item, c.segment \
+                      FROM lake.main.widgets o JOIN crm.main.customers c ON c.id = o.id"
                     .into(),
-                params: HashMap::new(),
+                timeout_ms: 0,
             },
             "puller-ann",
             TRACE,
         ))
         .await
-        .unwrap();
+        .expect("a write joining two attached catalogs must succeed");
 
-        // Read the pull's own snapshot out of DuckLake's native history.
         let r = json(
             data.read_query(req(
                 QueryRequest {
                     pond: "shop".into(),
-                    sql: "SELECT author, commit_message, commit_extra_info \
-                          FROM ducklake_snapshots('shop') \
-                          ORDER BY snapshot_id DESC LIMIT 1"
-                        .into(),
+                    sql: "SELECT count(*) AS n FROM enriched".into(),
                     timeout_ms: 0,
                 },
-                "viewer",
+                "agent-x",
             ))
             .await
             .unwrap()
             .into_inner(),
         );
-        let row = &r["rows"][0];
         assert_eq!(
-            row[0],
-            serde_json::json!("puller-ann"),
-            "the pull's snapshot must name the caller who asked for it: {r}"
-        );
-        assert_eq!(
-            row[1],
-            serde_json::json!("pull_catalog"),
-            "the commit message must say HOW the data arrived, so history \
-             distinguishes a pull from an ordinary write: {r}"
-        );
-        let extra: serde_json::Value = serde_json::from_str(
-            row[2]
-                .as_str()
-                .expect("commit_extra_info is the JSON we wrote"),
-        )
-        .unwrap();
-        assert_eq!(
-            extra["trace_id"],
-            serde_json::json!(TRACE),
-            "the pond's history must carry the trace the caller sent, or the \
-             snapshot cannot be joined to that request's lineage: {extra}"
-        );
-        assert_eq!(
-            extra["agent_id"],
-            serde_json::json!("puller-ann"),
-            "the claimed leaf rides alongside the author, as on every write: {extra}"
-        );
-        assert_eq!(
-            extra["verified"],
-            serde_json::json!(false),
-            "this stack configures no issuer, so the identity is claimed, and \
-             saying otherwise would make the author authority-grade: {extra}"
+            r["rows"][0][0].as_i64().unwrap(),
+            2,
+            "the join must produce the two matching rows: {r}"
         );
 
-        // The guard: nothing this pond took in is anonymous, and every commit
-        // message names an operation we have. `snapshot_id > 0` excludes
-        // DuckLake's own initial catalog snapshot, which ATTACH creates before
-        // any caller exists.
-        let all = json(
+        // **Attribution.** The extract is a write, so the pond's own history
+        // must name who did it, what the operation was, and under which trace —
+        // through the one bracket every pond-writing path shares. Values, never
+        // "not null": the string `unknown` would satisfy a null check and tell
+        // nobody anything. The trace id is the one this test minted and sent in
+        // the `traceparent` header, so it is compared against a value produced
+        // independently of the record being checked.
+        let attr = json(
             data.read_query(req(
                 QueryRequest {
                     pond: "shop".into(),
-                    sql: "SELECT snapshot_id, author, commit_message \
-                          FROM ducklake_snapshots('shop') WHERE snapshot_id > 0 \
-                          ORDER BY snapshot_id"
+                    sql: "SELECT author, commit_message, commit_extra_info \
+                          FROM ducklake_snapshots('shop') ORDER BY snapshot_id DESC LIMIT 1"
                         .into(),
                     timeout_ms: 0,
                 },
@@ -1117,25 +1014,631 @@ mod catalogs {
             .unwrap()
             .into_inner(),
         );
-        let rows = all["rows"].as_array().unwrap();
-        // Anti-vacuity: an empty history would satisfy every check below.
+        let row = &attr["rows"][0];
         assert_eq!(
-            rows.len(),
-            2,
-            "one snapshot per pond-writing path drove above: {all}"
+            (row[0].as_str(), row[1].as_str()),
+            (Some("puller-ann"), Some("write_query")),
+            "an extract across two lakehouses is attributed like any other write: {attr}"
         );
-        let messages: Vec<&str> = rows.iter().map(|r| r[2].as_str().unwrap_or("")).collect();
+        let extra: serde_json::Value =
+            serde_json::from_str(row[2].as_str().expect("commit_extra_info")).unwrap();
         assert_eq!(
-            messages,
-            vec!["write_query", "pull_catalog"],
-            "each snapshot must be labelled with the operation that produced it: {all}"
+            extra["trace_id"],
+            serde_json::json!(TRACE),
+            "the snapshot must carry the trace the caller sent, or it cannot be \
+             joined to that request's lineage: {extra}"
         );
-        let authors: Vec<&str> = rows.iter().map(|r| r[1].as_str().unwrap_or("")).collect();
+        assert_eq!(extra["agent_id"], serde_json::json!("puller-ann"));
+        assert_eq!(extra["verified"], serde_json::json!(false));
+
+        // Detach both, and the pond table survives.
+        for name in ["lake", "crm"] {
+            data.catalog_detach(req(
+                CatalogDetachRequest {
+                    pond: "shop".into(),
+                    name: name.into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("detach {name}: {e}"));
+        }
+        let after = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT count(*) AS n FROM enriched".into(),
+                    timeout_ms: 0,
+                },
+                "agent-x",
+            ))
+            .await
+            .expect("detaching must not disturb the pond")
+            .into_inner(),
+        );
+        assert_eq!(after["rows"][0][0].as_i64().unwrap(), 2);
+    }
+
+    /// A statement naming a catalog nobody attached must hand an agent an
+    /// envelope it can ACT on: the kind, the alias as a value, and a `suggest`
+    /// naming `attach_catalog` — not `catalog_error`'s canonical "run SHOW
+    /// TABLES", which lists nothing called `lake`.
+    ///
+    /// Driven by a REAL detach, not by a fabricated error: the condition this
+    /// error exists for is an attachment that is genuinely gone (a node restart
+    /// produces the same thing), and a kind nobody can reach is not a feature.
+    #[tokio::test]
+    async fn error_contract_a_statement_naming_a_detached_catalog_says_to_attach_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orders = seed_ducklake(tmp.path());
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+        data.catalog_attach(req(
+            CatalogAttachRequest {
+                pond: "shop".into(),
+                name: "lake".into(),
+                r#type: "ducklake".into(),
+                options: orders,
+                secrets: HashMap::new(),
+                secret_ref: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+        // It resolves while attached — so the failure below can only be the
+        // detach, and not a table name that was never right.
+        data.read_query(req(
+            QueryRequest {
+                pond: "shop".into(),
+                sql: "SELECT count(*) FROM lake.main.widgets".into(),
+                timeout_ms: 0,
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("the attached catalog resolves");
+
+        data.catalog_detach(req(
+            CatalogDetachRequest {
+                pond: "shop".into(),
+                name: "lake".into(),
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        let err = data
+            .read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT count(*) FROM lake.main.widgets".into(),
+                    timeout_ms: 0,
+                },
+                "agent-x",
+            ))
+            .await
+            .expect_err("a detached catalog must stop resolving");
+        let env = envelope(&err);
+        assert_eq!(env["kind"], "catalog_error", "envelope: {env}");
+        assert_eq!(env["audience"], "agent", "the caller can fix this: {env}");
         assert_eq!(
-            authors,
-            vec!["writer-bob", "puller-ann"],
-            "every path that writes into a pond records WHO wrote — an author \
-             missing here is data nobody can be held to: {all}"
+            env["retryable"], "after_change",
+            "re-sending the identical statement cannot work until the catalog is \
+             back, so `as_is` would be the retry loop `retryable` prevents: {env}"
+        );
+        assert_eq!(
+            env["facts"]["catalog"], "lake",
+            "the alias must ride as a VALUE, not only inside the sentence: {env}"
+        );
+        assert!(
+            env["suggest"]
+                .as_str()
+                .is_some_and(|s| s.contains("attach_catalog")),
+            "the suggest must name the call that fixes it: {env}"
+        );
+        assert!(
+            env["suggest"]
+                .as_str()
+                .is_some_and(|s| s.contains("list_attached_catalogs")),
+            "…and the call that answers 'what IS attached': {env}"
+        );
+
+        // Re-attaching is the fix the suggest names, and it works.
+        let re = seed_ducklake(tempfile::tempdir().unwrap().keep().as_path());
+        data.catalog_attach(req(
+            CatalogAttachRequest {
+                pond: "shop".into(),
+                name: "lake".into(),
+                r#type: "ducklake".into(),
+                options: re,
+                secrets: HashMap::new(),
+                secret_ref: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("the advice must be advice that works");
+        data.read_query(req(
+            QueryRequest {
+                pond: "shop".into(),
+                sql: "SELECT count(*) FROM lake.main.widgets".into(),
+                timeout_ms: 0,
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("and the original statement then runs unchanged");
+    }
+
+    /// Attaching twice over one alias is a `name_conflict` whose advice is the
+    /// two calls that resolve it — NOT `name_conflict`'s canonical "omit the
+    /// name and let Latiq generate one", which is about pond names and is
+    /// impossible here: the alias is the SQL namespace the caller has to type.
+    #[tokio::test]
+    async fn error_contract_attaching_over_a_live_alias_names_detach_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orders = seed_ducklake(tmp.path());
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+        let attach = |options: HashMap<String, String>| CatalogAttachRequest {
+            pond: "shop".into(),
+            name: "lake".into(),
+            r#type: "ducklake".into(),
+            options,
+            secrets: HashMap::new(),
+            secret_ref: String::new(),
+        };
+        data.catalog_attach(req(attach(orders.clone()), "agent-x"))
+            .await
+            .unwrap();
+        let err = data
+            .catalog_attach(req(attach(orders), "agent-x"))
+            .await
+            .expect_err("a second attach of a live alias must be refused");
+        let env = envelope(&err);
+        assert_eq!(env["kind"], "name_conflict", "envelope: {env}");
+        assert_eq!(env["facts"]["catalog"], "lake");
+        let suggest = env["suggest"].as_str().unwrap_or_default();
+        assert!(
+            suggest.contains("detach_catalog"),
+            "the suggest must name the call that frees the alias: {env}"
+        );
+        assert!(
+            !suggest.contains("omit"),
+            "there is no generated catalog alias — the caller has to type it in \
+             every statement — so the pond-name advice must not leak in: {env}"
+        );
+    }
+
+    /// **Credential containment, over the whole stack.**
+    ///
+    /// A wrong credential fails the attach for a real reason, and the value must
+    /// then appear in NO log line, NO error envelope, and be returned by NO
+    /// surface. Every one of those is a separate escape route: `tracing` renders
+    /// `Debug`, the envelope serializes, and `list_attached_catalogs`
+    /// round-trips the attachment.
+    ///
+    /// (The engine-seam half — that the DuckDB statement text and the engine's
+    /// own error do not carry it — is in `latiq-engine-duckdb`'s
+    /// `catalog_attach_a_failed_attach_leaks_neither_the_credential_nor_the_secret`.)
+    #[tokio::test]
+    async fn catalog_attach_a_rejected_credential_appears_on_no_surface() {
+        const CREDENTIAL: &str = "totally-secret-value-9f3a";
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: true,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        // A real failure with a real credential in the plan: the metadata path
+        // is under a directory that does not exist, so the ATTACH fails AFTER
+        // the `CREATE SECRET` has run.
+        let err = data
+            .catalog_attach(req(
+                CatalogAttachRequest {
+                    pond: "shop".into(),
+                    name: "lake".into(),
+                    r#type: "ducklake".into(),
+                    options: HashMap::from([
+                        (
+                            "metadata_path".into(),
+                            "/nonexistent_dir_xyz/meta.duckdb".into(),
+                        ),
+                        ("data_path".into(), "/nonexistent_dir_xyz/data".into()),
+                    ]),
+                    secrets: HashMap::from([
+                        ("s3_access_key".into(), "AKIAEXAMPLE".into()),
+                        ("s3_secret_key".into(), CREDENTIAL.into()),
+                    ]),
+                    secret_ref: String::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .expect_err("an attach under a non-existent directory must fail");
+
+        // 1. Not in the envelope — message, suggest, facts, anywhere.
+        let env = envelope(&err);
+        assert_eq!(
+            env["kind"], "source_unavailable",
+            "the address is the caller's, so this is not our failure: {env}"
+        );
+        let rendered = env.to_string();
+        assert!(
+            !rendered.contains(CREDENTIAL),
+            "the credential reached the error envelope: {rendered}"
+        );
+        // 2. …nor in the raw Status, which is what a non-envelope-aware client
+        // prints.
+        assert!(
+            !format!("{err:?}").contains(CREDENTIAL),
+            "the credential reached the gRPC status: {err:?}"
+        );
+
+        // 3. Not returned by any surface. Nothing attached, so there is nothing
+        // to list — which is itself the assertion that the failed attach did not
+        // half-register.
+        let attached = json(
+            data.catalog_list_attached(req(
+                CatalogListAttachedRequest {
+                    pond: "shop".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(
+            attached["catalogs"].as_array().map(|a| a.len()),
+            Some(0),
+            "a failed attach must leave nothing mounted: {attached}"
+        );
+
+        // 4. Now a SUCCESSFUL attach carrying the same credential, so the
+        // containment is proved on the path where the value is actually held
+        // for the life of the attachment — the list must still not carry it.
+        let tmp = tempfile::tempdir().unwrap();
+        data.catalog_attach(req(
+            CatalogAttachRequest {
+                pond: "shop".into(),
+                name: "lake".into(),
+                r#type: "ducklake".into(),
+                options: seed_ducklake(tmp.path()),
+                secrets: HashMap::from([
+                    ("s3_access_key".into(), "AKIAEXAMPLE".into()),
+                    ("s3_secret_key".into(), CREDENTIAL.into()),
+                ]),
+                secret_ref: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("a local ducklake attaches even with storage credentials supplied");
+        let attached = json(
+            data.catalog_list_attached(req(
+                CatalogListAttachedRequest {
+                    pond: "shop".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(attached["catalogs"][0]["name"], "lake");
+        assert_eq!(
+            attached["credential_mode"],
+            serde_json::Value::Null,
+            "the list must not even have a credential-shaped field: {attached}"
+        );
+        assert!(
+            !attached.to_string().contains(CREDENTIAL),
+            "the credential is readable through list_attached_catalogs: {attached}"
+        );
+
+        // 5. …and the lineage the pond recorded for this work carries none of
+        // it either. (This pond opted in, so there is a trail to check; a pond
+        // without one would make this assertion vacuous.)
+        let page = json(
+            data.get_lineage(req(
+                GetLineageRequest {
+                    pond: "shop".into(),
+                    limit: 50,
+                    since: String::new(),
+                    before: String::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert!(
+            !page.to_string().contains(CREDENTIAL),
+            "the credential reached the pond's lineage trail: {page}"
+        );
+    }
+
+    /// The `--option` / `--secret` split is the security boundary of this
+    /// surface, and it is enforced BEFORE anything reaches the engine: an option
+    /// is echoed back by `list_attached_catalogs`, so a credential that arrived
+    /// there would be readable through a surface.
+    #[tokio::test]
+    async fn error_contract_a_credential_passed_as_an_option_is_refused_naming_secrets() {
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        let err = data
+            .catalog_attach(req(
+                CatalogAttachRequest {
+                    pond: "shop".into(),
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    options: HashMap::from([
+                        ("endpoint".into(), "https://polaris/api".into()),
+                        ("token".into(), "SECRET".into()),
+                    ]),
+                    secrets: HashMap::new(),
+                    secret_ref: String::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .expect_err("a credential passed as an option must be refused");
+        let env = envelope(&err);
+        assert_eq!(env["kind"], "invalid_value", "envelope: {env}");
+        let message = env["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("token") && message.contains("secret"),
+            "the refusal must name the key AND the field it belongs on: {env}"
+        );
+
+        // Its sibling: an option this type does not know is refused, not
+        // dropped. A dropped typo is a locator the caller believes it set.
+        let err = data
+            .catalog_attach(req(
+                CatalogAttachRequest {
+                    pond: "shop".into(),
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    options: HashMap::from([("endpont".into(), "https://polaris/api".into())]),
+                    secrets: HashMap::new(),
+                    secret_ref: String::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .expect_err("a typo'd option must be refused, never dropped");
+        let env = envelope(&err);
+        assert_eq!(env["kind"], "invalid_value");
+        let message = env["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("endpont") && message.contains("endpoint"),
+            "the refusal must name the typo and the legal set: {env}"
+        );
+    }
+
+    /// The three credential modes are mutually exclusive, and a `secret_ref`
+    /// scheme this deployment cannot serve is `capability_unavailable` /
+    /// `after_provisioning` — the kind that tells an agent its call was RIGHT
+    /// and to escalate rather than loop.
+    #[tokio::test]
+    async fn error_contract_a_secret_ref_this_node_cannot_serve_escalates() {
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+        let attach = |secrets: HashMap<String, String>, secret_ref: &str| CatalogAttachRequest {
+            pond: "shop".into(),
+            name: "lake".into(),
+            r#type: "iceberg".into(),
+            options: HashMap::from([("endpoint".into(), "https://polaris/api".into())]),
+            secrets,
+            secret_ref: secret_ref.into(),
+        };
+
+        // Two modes at once: refused, naming the legal shapes.
+        let err = data
+            .catalog_attach(req(
+                attach(HashMap::from([("token".into(), "t".into())]), "env://lake"),
+                "agent-x",
+            ))
+            .await
+            .expect_err("two credential modes at once must be refused");
+        let env = envelope(&err);
+        assert_eq!(env["kind"], "invalid_value", "envelope: {env}");
+        for shape in ["secrets", "secret_ref", "passthrough"] {
+            assert!(
+                env["message"].as_str().is_some_and(|m| m.contains(shape)),
+                "the refusal must name every legal shape, and '{shape}' is missing: {env}"
+            );
+        }
+
+        // A scheme with no backend: the call was correct, the deployment is
+        // missing a piece, and an agent must escalate rather than retry.
+        let err = data
+            .catalog_attach(req(attach(HashMap::new(), "vault://team/lake"), "agent-x"))
+            .await
+            .expect_err("no vault backend is configured on this node");
+        let env = envelope(&err);
+        assert_eq!(env["kind"], "capability_unavailable", "envelope: {env}");
+        assert_eq!(env["audience"], "operator");
+        assert_eq!(env["retryable"], "after_provisioning");
+        assert_eq!(
+            env["facts"]["capability"], "vault://",
+            "the missing capability must be a value a client can branch on: {env}"
+        );
+    }
+
+    /// **`passthrough`: the caller's OWN bearer becomes the catalog credential.**
+    ///
+    /// The mode that stores nothing anywhere, and the one Iceberg REST, Unity
+    /// Catalog and Snowflake External OAuth actually want — so it is the one worth
+    /// proving end to end rather than at a seam.
+    ///
+    /// The bearer here is a REAL one: minted by a real IdP, verified by the node on
+    /// the way in, and never written down by this test in any other form. What is
+    /// asserted is the byte sequence a real HTTP server on the other side of DuckDB
+    /// received — so nothing in between (the adapter's mapping of "no secrets
+    /// supplied", the resolver's choice of key, the attacher's `CREATE SECRET`, and
+    /// DuckDB's own REST client) can be right in isolation and wrong together.
+    ///
+    /// The stand-in catalog answers 404, so the attach fails — deliberately. A
+    /// server that answered correctly would need to be an Iceberg REST catalog; the
+    /// question here is what was SENT, and that is settled before the status code.
+    /// The failure is also asserted, because a request that never happened would
+    /// leave `seen` empty and every other check vacuous.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_attach_passthrough_sends_the_callers_own_bearer_to_the_catalog() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        // A stand-in REST catalog that records what it was asked, on a real socket.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let catalog_addr = listener.local_addr().unwrap();
+        let recorder = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+
+        let idp = latiq_auth::test_support::TestIdp::start().await;
+        let token = idp.mint("svc-extractor", "latiq", &idp.issuer, 300);
+        let s = crate::common::start_stack_with_auth(idp.auth_config()).await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+
+        /// Every call on an authenticated stack carries the bearer — including the
+        /// allocate, which is what makes this the caller's real, verified token
+        /// rather than a header this test happened to set on one request.
+        fn authed<T>(msg: T, token: &str) -> Request<T> {
+            let mut r = Request::new(msg);
+            r.metadata_mut()
+                .insert("latiq-agent-id", "svc-extractor".parse().unwrap());
+            r.metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            r
+        }
+
+        data.allocate_pond(authed(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            &token,
+        ))
+        .await
+        .unwrap();
+
+        // NEITHER `secrets` NOR `secret_ref`: that is the caller selecting
+        // passthrough, not an omission.
+        let err = data
+            .catalog_attach(authed(
+                CatalogAttachRequest {
+                    pond: "shop".into(),
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    options: HashMap::from([
+                        ("endpoint".into(), format!("http://{catalog_addr}")),
+                        ("warehouse".into(), "demo".into()),
+                    ]),
+                    secrets: HashMap::new(),
+                    secret_ref: String::new(),
+                },
+                &token,
+            ))
+            .await
+            .expect_err("the stand-in catalog answers 404, so the attach fails");
+        let env = envelope(&err);
+        assert_eq!(
+            env["kind"], "source_unavailable",
+            "a catalog that answers wrongly is the caller's address to fix: {env}"
+        );
+
+        // THE assertion: the request DuckDB made to the external catalog carried the
+        // caller's own token as its credential.
+        let requests = seen.lock().unwrap().clone();
+        let config_request = requests
+            .iter()
+            .find(|r| r.contains("/v1/config"))
+            .unwrap_or_else(|| {
+                panic!("the catalog was never contacted, so nothing below is proved: {requests:?}")
+            });
+        assert!(
+            config_request.contains(&format!("Authorization: Bearer {token}")),
+            "the caller's own bearer must be what authenticates to the catalog — this \
+             is the whole of `passthrough`, and it stores nothing anywhere. The \
+             catalog received:\n{config_request}"
+        );
+        // …and nothing else did. A node that substituted a token of its own (a
+        // service account, a cached one) would still send SOMETHING here.
+        assert_eq!(
+            config_request.matches("Authorization:").count(),
+            1,
+            "exactly one credential may be presented: {config_request}"
         );
     }
 
@@ -1192,8 +1695,8 @@ mod catalogs {
     }
 }
 
-/// Iceberg + MinIO end-to-end for the catalog pull path. `#[ignore]`d because it
-/// needs a live Iceberg REST catalog + S3 (MinIO) — bring them up with
+/// Iceberg + MinIO end-to-end for the catalog attach path. `#[ignore]`d because
+/// it needs a live Iceberg REST catalog + S3 (MinIO) — bring them up with
 /// `deploy/iceberg-minio/up.sh`, then run with `--ignored`. Config comes from env
 /// (set by the harness / CI):
 ///
@@ -1201,7 +1704,6 @@ mod catalogs {
 ///   LATIQ_S3_ENDPOINT  LATIQ_S3_ACCESS_KEY  LATIQ_S3_SECRET_KEY
 mod catalogs_iceberg {
     use crate::common::start_stack;
-    use latiq_proto::v1::admin_client::AdminClient;
     use latiq_proto::v1::data_client::DataClient;
     use latiq_proto::v1::*;
     use std::collections::HashMap;
@@ -1220,43 +1722,59 @@ mod catalogs_iceberg {
         serde_json::from_str(&resp.json).unwrap()
     }
 
+    /// A local DuckLake catalog to JOIN the iceberg one against — the cheapest
+    /// possible SECOND source, seeded with rows that match the fixture's
+    /// `demo.widgets` on `id`.
+    fn seed_local(dir: &std::path::Path) -> HashMap<String, String> {
+        let meta = dir.join("meta.duckdb");
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "INSTALL ducklake; LOAD ducklake;
+             ATTACH 'ducklake:{}' AS ext (DATA_PATH '{}');
+             CREATE TABLE ext.tiers AS
+               SELECT * FROM (VALUES (1,'gold'),(2,'silver'),(3,'bronze')) t(id,tier);",
+            meta.display(),
+            data.display(),
+        ))
+        .unwrap();
+        HashMap::from([
+            ("metadata_path".to_string(), meta.display().to_string()),
+            ("data_path".to_string(), data.display().to_string()),
+        ])
+    }
+
+    /// **The headline use case against a REAL lakehouse.**
+    ///
+    /// An Iceberg REST catalog behind MinIO and a local DuckLake catalog are
+    /// attached to one pond at the same time, and a single ordinary
+    /// `write_query` joins across both into a pond table. Then both are
+    /// detached and the pond table is still there.
+    ///
+    /// The in-suite `mod catalogs` proves the same shape over two local
+    /// DuckLake sources, which is cheap and runs everywhere; this one proves it
+    /// against a real REST catalog with real S3 credentials — the attach path
+    /// that has an `iceberg` secret, an S3 secret and a network in it.
     #[tokio::test]
     #[ignore = "needs a live Iceberg REST + MinIO; see deploy/iceberg-minio/up.sh"]
-    async fn iceberg_pull_seeded_widgets_into_pond() {
-        // Storage creds + the REST bearer ride in at pull/describe — never persisted.
-        let runtime = HashMap::from([
-            ("token".to_string(), env("LATIQ_ICEBERG_TOKEN")),
+    async fn iceberg_attach_and_join_a_second_catalog_into_a_pond() {
+        // Locators (echoed back by list_attached_catalogs) and CREDENTIALS
+        // (never echoed by anything) are separate fields, not one bag.
+        let options = HashMap::from([
+            ("endpoint".to_string(), env("LATIQ_ICEBERG_ENDPOINT")),
+            ("warehouse".to_string(), env("LATIQ_ICEBERG_WAREHOUSE")),
             ("s3_endpoint".to_string(), env("LATIQ_S3_ENDPOINT")),
+            ("s3_region".to_string(), "us-east-1".to_string()),
+        ]);
+        let secrets = HashMap::from([
+            ("token".to_string(), env("LATIQ_ICEBERG_TOKEN")),
             ("s3_access_key".to_string(), env("LATIQ_S3_ACCESS_KEY")),
             ("s3_secret_key".to_string(), env("LATIQ_S3_SECRET_KEY")),
-            ("s3_region".to_string(), "us-east-1".to_string()),
         ]);
 
         let s = start_stack().await;
-        let mut admin = AdminClient::connect(s.admin_endpoint.clone())
-            .await
-            .unwrap();
         let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
-
-        admin
-            .catalog_add(CatalogAddRequest {
-                catalog: Some(CatalogMsg {
-                    name: "lake".into(),
-                    r#type: "iceberg".into(),
-                    params: HashMap::from([
-                        ("endpoint".into(), env("LATIQ_ICEBERG_ENDPOINT")),
-                        ("warehouse".into(), env("LATIQ_ICEBERG_WAREHOUSE")),
-                        ("s3_endpoint".into(), env("LATIQ_S3_ENDPOINT")),
-                    ]),
-                    description: "local iceberg".into(),
-                    tags: vec!["test".into()],
-                    created_by: String::new(),
-                    created_at: String::new(),
-                }),
-            })
-            .await
-            .unwrap();
-
         data.allocate_pond(req(
             AllocatePondRequest {
                 name: "shop".into(),
@@ -1269,12 +1787,59 @@ mod catalogs_iceberg {
         .await
         .unwrap();
 
-        let described = json(
-            data.catalog_describe(req(
-                CatalogDescribeRequest {
+        let attached = json(
+            data.catalog_attach(req(
+                CatalogAttachRequest {
                     pond: "shop".into(),
-                    catalog: "lake".into(),
-                    params: runtime.clone(),
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    options,
+                    secrets: secrets.clone(),
+                    secret_ref: String::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .expect("the iceberg catalog must attach")
+            .into_inner(),
+        );
+        assert_eq!(
+            attached["credential_mode"], "explicit",
+            "the explicit token was supplied, and the response must say it was \
+             the one applied — `none` here would mean an unauthenticated attach \
+             that happened to work: {attached}"
+        );
+        assert!(
+            !attached.to_string().contains(&secrets["s3_secret_key"]),
+            "the attach response must not echo a credential: {attached}"
+        );
+
+        // The second source, mounted at the same time. This is what the
+        // transient pull could never do.
+        let tmp = tempfile::tempdir().unwrap();
+        data.catalog_attach(req(
+            CatalogAttachRequest {
+                pond: "shop".into(),
+                name: "local".into(),
+                r#type: "ducklake".into(),
+                options: seed_local(tmp.path()),
+                secrets: HashMap::new(),
+                secret_ref: String::new(),
+            },
+            "agent-x",
+        ))
+        .await
+        .expect("a local ducklake attaches alongside the iceberg one");
+
+        // Orientation is ordinary SQL now — no describe_catalog tool.
+        let tables = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT table_name FROM information_schema.tables \
+                          WHERE table_catalog = 'lake'"
+                        .into(),
+                    timeout_ms: 0,
                 },
                 "agent-x",
             ))
@@ -1282,27 +1847,29 @@ mod catalogs_iceberg {
             .unwrap()
             .into_inner(),
         );
-        let tables: Vec<&str> = described["tables"]
+        let names: Vec<&str> = tables["rows"]
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|t| t["table"].as_str())
+            .filter_map(|r| r[0].as_str())
             .collect();
-        assert!(tables.contains(&"widgets"), "tables: {tables:?}");
+        assert!(names.contains(&"widgets"), "iceberg tables: {names:?}");
 
-        data.catalog_pull(req(
-            CatalogPullRequest {
+        // ONE write, joining the lakehouse to the local catalog.
+        data.write_query(req(
+            QueryRequest {
                 pond: "shop".into(),
-                catalog: "lake".into(),
-                query:
-                    "CREATE TABLE cheap AS SELECT id,name FROM lake.demo.widgets WHERE price < 10"
-                        .into(),
-                params: runtime,
+                sql: "CREATE TABLE cheap AS \
+                      SELECT w.id, w.name, t.tier \
+                      FROM lake.demo.widgets w JOIN local.main.tiers t ON t.id = w.id \
+                      WHERE w.price < 10"
+                    .into(),
+                timeout_ms: 0,
             },
             "agent-x",
         ))
         .await
-        .unwrap();
+        .expect("a write joining iceberg and ducklake must succeed");
 
         let r = json(
             data.read_query(req(
@@ -1317,13 +1884,12 @@ mod catalogs_iceberg {
             .unwrap()
             .into_inner(),
         );
-        assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2);
+        assert_eq!(r["rows"][0][0].as_i64().unwrap(), 2, "joined rows: {r}");
 
-        // A pull is a write, so the pond's history must say who did it and how —
-        // against a REAL external catalog, not only the local fixture the
-        // in-suite `attribution_pull_catalog_*` test uses. The values, not
-        // non-null: `"unknown"` would pass a null check and tell nobody
-        // anything.
+        // The extract is a write, so the pond's history must say who did it and
+        // how — against a REAL external catalog, not only the local fixture the
+        // in-suite test uses. The values, not non-null: `"unknown"` would pass a
+        // null check and tell nobody anything.
         let attr = json(
             data.read_query(req(
                 QueryRequest {
@@ -1341,9 +1907,162 @@ mod catalogs_iceberg {
         );
         assert_eq!(
             (attr["rows"][0][0].as_str(), attr["rows"][0][1].as_str()),
-            (Some("agent-x"), Some("pull_catalog")),
-            "an iceberg pull must be attributed like any other write: {attr}"
+            (Some("agent-x"), Some("write_query")),
+            "an iceberg extract is attributed like any other write: {attr}"
         );
+
+        // Detach both; the pond table survives and the aliases stop resolving.
+        for name in ["lake", "local"] {
+            data.catalog_detach(req(
+                CatalogDetachRequest {
+                    pond: "shop".into(),
+                    name: name.into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("detach {name}: {e}"));
+        }
+        let after = json(
+            data.read_query(req(
+                QueryRequest {
+                    pond: "shop".into(),
+                    sql: "SELECT count(*) AS n FROM cheap".into(),
+                    timeout_ms: 0,
+                },
+                "agent-x",
+            ))
+            .await
+            .expect("the extracted pond table survives the detach")
+            .into_inner(),
+        );
+        assert_eq!(after["rows"][0][0].as_i64().unwrap(), 2);
+    }
+
+    /// **An iceberg `endpoint` that is not a REST catalog is the caller's to
+    /// fix, and must never come back as `internal` + "retry".**
+    ///
+    /// Regression pin, and the only place `Invalid Configuration Error` is
+    /// driven anywhere in the suite. A wrong catalog URL is the single most
+    /// likely mistake in an `attach_catalog` call, and DuckDB's iceberg
+    /// extension reports it as `Invalid Configuration Error: Request to
+    /// 'http://…/v1/config?warehouse=…' returned a non-200 status code` — a
+    /// class `errclass` did not key on, so it fell into `EngineError::Engine` →
+    /// `internal` → `audience: operator`, `retryable: as_is`, "Retry; if it
+    /// persists, report to your operator". An agent re-sending a typo for ever
+    /// and then waking an operator who has nothing to fix: Nexus finding 8's
+    /// shape, at a third site.
+    ///
+    /// It has to be driven against a real HTTP server, and that is why it lives
+    /// here rather than in `engine_e2e.rs`'s offline class table: nothing
+    /// offline raises this class (measured — a bad `SET` gives `Parser Error`,
+    /// `Catalog Error` or `Invalid Input Error`). A fabricated `EngineError`
+    /// would assert our mapping and stay green while the production path
+    /// produced something else, which is exactly how this one survived.
+    ///
+    /// Note what is deliberately NOT tested here: a WRONG WAREHOUSE. Measured
+    /// against this fixture, `warehouse: "no-such-warehouse"` attaches happily
+    /// and its queries return the real `demo.widgets` rows — the REST catalog
+    /// serves one warehouse and ignores the parameter — so a test asserting a
+    /// failure there would be asserting a condition that does not exist.
+    #[tokio::test]
+    #[ignore = "needs a live Iceberg REST + MinIO; see deploy/iceberg-minio/up.sh"]
+    async fn error_contract_an_iceberg_endpoint_that_is_not_a_catalog_is_not_our_failure() {
+        const WRONG: &str = "wrong-key-8c21";
+        let s = start_stack().await;
+        let mut data = DataClient::connect(s.data_endpoint.clone()).await.unwrap();
+        data.allocate_pond(req(
+            AllocatePondRequest {
+                name: "shop".into(),
+                policy_json: String::new(),
+                tier: String::new(),
+                lineage: false,
+            },
+            "agent-x",
+        ))
+        .await
+        .unwrap();
+
+        let err = data
+            .catalog_attach(req(
+                CatalogAttachRequest {
+                    pond: "shop".into(),
+                    name: "lake".into(),
+                    r#type: "iceberg".into(),
+                    options: HashMap::from([
+                        // The STORAGE endpoint, not the catalog endpoint — a
+                        // real HTTP server that answers, and answers the REST
+                        // `/v1/config` request the iceberg extension makes at
+                        // ATTACH with a non-200. Chosen over a dead port on
+                        // purpose: a refused connection is an `IO Error`
+                        // (already mapped), and the class this pins is the one
+                        // an HTTP server reaching back with the WRONG answer
+                        // produces. It is also a mistake people really make.
+                        ("endpoint".to_string(), env("LATIQ_S3_ENDPOINT")),
+                        ("warehouse".to_string(), env("LATIQ_ICEBERG_WAREHOUSE")),
+                        ("s3_endpoint".to_string(), env("LATIQ_S3_ENDPOINT")),
+                    ]),
+                    secrets: HashMap::from([
+                        ("token".to_string(), env("LATIQ_ICEBERG_TOKEN")),
+                        ("s3_access_key".to_string(), "AKIAEXAMPLE".to_string()),
+                        ("s3_secret_key".to_string(), WRONG.to_string()),
+                    ]),
+                    secret_ref: String::new(),
+                },
+                "agent-x",
+            ))
+            .await
+            .expect_err("an endpoint that is not a REST catalog must fail the attach");
+
+        assert!(
+            !err.details().is_empty(),
+            "no ErrorEnvelope rode on this status: {err:?}"
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(err.details()).unwrap();
+        assert_eq!(
+            envelope["kind"], "source_unavailable",
+            "the endpoint is the CALLER's, so an attach that cannot reach a REST \
+             catalog there is `source_unavailable` + 'check the path or URL' — \
+             NOT `internal` + 'retry, then report to your operator': {envelope}"
+        );
+        assert_eq!(
+            envelope["audience"], "agent",
+            "there is nothing for an operator to do about a wrong URL: {envelope}"
+        );
+        // The SAME wrong endpoint refused at the TCP level is an `IO Error` and
+        // already mapped here; this pins that answering-wrongly lands in the
+        // same place, so the advice does not depend on how the far side failed.
+        assert!(
+            envelope["suggest"]
+                .as_str()
+                .is_some_and(|s| s.contains("path or URL")),
+            "the advice must be about the address the caller supplied: {envelope}"
+        );
+        assert!(
+            envelope["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("/v1/config")),
+            "DuckDB's own sentence names the request it made and what came back, \
+             and that is the most useful part for whoever fixes it: {envelope}"
+        );
+        assert!(
+            !envelope.to_string().contains(WRONG) && !format!("{err:?}").contains(WRONG),
+            "the credential reached the caller: {envelope} / {err:?}"
+        );
+
+        // Nothing half-attached.
+        let attached = json(
+            data.catalog_list_attached(req(
+                CatalogListAttachedRequest {
+                    pond: "shop".into(),
+                },
+                "agent-x",
+            ))
+            .await
+            .unwrap()
+            .into_inner(),
+        );
+        assert_eq!(attached["catalogs"].as_array().map(|a| a.len()), Some(0));
     }
 }
 
@@ -1426,8 +2145,8 @@ mod cli_auth {
 
         // Every CLI command that reaches the ADMIN surface — the one `--auth-issuer`
         // protects. Data ops (`query`, `pond drop|describe`, `dataset load`,
-        // `catalog describe|pull`) need a pond node and are covered by the
-        // Data-surface tests; `pond create` is the one command on the internal
+        // `catalog attach|detach|list --pond`) need a pond node and are covered by
+        // the Data-surface tests; `pond create` is the one command on the internal
         // Control surface, which carries no verifier by design, so its credential is
         // covered structurally by the constructor guard below instead.
         let commands: Vec<Vec<&str>> = vec![

@@ -43,9 +43,9 @@ Plus one internal surface: **Control gRPC** (pond-node → control-plane; routin
 ## Crates (`crates/`)
 
 - `latiq` — the single binary: server roles (`control-plane`, `pond-node`) + the CLI (gRPC client; **not** an MCP client).
-- `latiq-common` — kernel: `Identity`, `ErrorEnvelope`/`ErrorKind`, `QueryMeta`, `PondId`.
+- `latiq-common` — kernel: `Identity`, `ErrorEnvelope`/`ErrorKind`, `QueryMeta`, `PondId`, and `Secret` (a credential that masks its own `Debug`/`Display`/`Serialize`; the two places it may be exposed are pinned by a guard in that module).
 - `latiq-proto` — gRPC contracts: Control, Admin, and **Data/Query** services (tonic codegen).
-- `latiq-agent-core` — **protocol-neutral** `AgentOps` + `ControlPlane` trait + in-flight/abort registry. No transport types (invariant 5).
+- `latiq-agent-core` — **protocol-neutral** `AgentOps` + `ControlPlane` trait + in-flight/abort registry + the catalog-credential resolver (explicit / passthrough-the-caller's-bearer / opaque `secret_ref` URI). No transport types (invariant 5).
 - `latiq-auth` — **protocol-neutral** OAuth 2.1 token verification: multi-issuer JWKS cache + claim validation + RFC 9728 metadata. Takes a token string, returns an `Identity`; adapters extract the carrier.
 - `latiq-mcp` — **inbound adapter**: MCP-over-HTTP (rmcp) → `AgentOps`. Agent-only.
 - the Data/Query gRPC **inbound adapter** → `AgentOps` (shipped — `latiq-pond-node/src/data_service.rs` + `stream_service.rs`).
@@ -114,4 +114,4 @@ So:
 
 ## Scope / deferrals
 
-The deferral list (identity/auth, rate limiting, OTLP, k8s, Flight SQL streaming, DataFusion, …) lives in product.md *What's next*. **Don't build any of it without an explicit decision.** Coding notes: M1 Data gRPC is unary, bounded by the inline cap (Flight SQL streaming deferred); external catalogs **shipped** (pull-only/transient, no stored creds — see `docs/dataset.md`).
+The deferral list (identity/auth, rate limiting, OTLP, k8s, Flight SQL streaming, DataFusion, …) lives in product.md *What's next*. **Don't build any of it without an explicit decision.** Coding notes: M1 Data gRPC is unary, bounded by the inline cap (Flight SQL streaming deferred); external catalogs **shipped** (`attach_catalog` mounts one on a pond under a caller-chosen alias and LEAVES it mounted, so ordinary `write_query` SQL can join across two of them; the attachment is engine state and is lost on a node restart, and no credential is stored anywhere — see `docs/dataset.md`).

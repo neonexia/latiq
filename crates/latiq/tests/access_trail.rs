@@ -353,11 +353,14 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
     .unwrap_err();
 
     // The two paths that reached the engine with no record at all until now.
-    data.catalog_describe(bearer_req(
-        CatalogDescribeRequest {
+    data.catalog_attach(bearer_req(
+        CatalogAttachRequest {
             pond: "never-existed".into(),
-            catalog: "nope".into(),
-            params: Default::default(),
+            name: "nope".into(),
+            r#type: "ducklake".into(),
+            options: Default::default(),
+            secrets: Default::default(),
+            secret_ref: String::new(),
         },
         "agent-7",
         &token,
@@ -521,10 +524,13 @@ async fn auth_data_surface_records_failures_and_rejections_like_admin_does() {
         "the failed read still records what was attempted: {capped}"
     );
 
-    let described = access("op=\"catalog_describe\"");
+    // Mounting an external catalog is a real access to a real external system
+    // — the one op that reaches OUTSIDE the deployment — so it belongs on the
+    // trail whether it succeeded or not.
+    let attached = access("op=\"attach_catalog\"");
     assert!(
-        described.contains("outcome=\"error\"") && described.contains("pond=\"never-existed\""),
-        "an external-catalog describe must be on the trail: {described}"
+        attached.contains("outcome=\"error\"") && attached.contains("pond=\"never-existed\""),
+        "an external-catalog attach must be on the trail: {attached}"
     );
     let loaded = access("op=\"load_dataset\"");
     assert!(

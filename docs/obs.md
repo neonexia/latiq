@@ -36,7 +36,7 @@ Loki/ELK). Nothing Latiq-specific to configure.
 
 There is **no audit table** — every access is a structured `tracing` event on the
 **`latiq::access`** target (one per operation: allocate/describe/list/drop pond,
-read/write/explain, dataset load, catalog pull/describe, and the Admin surface's
+read/write/explain, dataset load, catalog attach/detach/list, and the Admin surface's
 operator actions — pure registry browsing, `list_datasets`/`list_catalogs` and
 their `get_*`, is deliberately not audited: no pond, no identity). Each carries
 `agent` (the caller's **claim**), `subject`/`issuer` (verified, empty when not),

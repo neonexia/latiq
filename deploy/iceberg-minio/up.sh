@@ -25,7 +25,11 @@
 #   LATIQ_S3_ENDPOINT=http://localhost:9000 \
 #   LATIQ_S3_ACCESS_KEY=admin LATIQ_S3_SECRET_KEY=password \
 #   cargo test -p latiq --test admin -- --ignored --exact --nocapture \
-  catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond
+#     catalogs_iceberg::iceberg_attach_and_join_a_second_catalog_into_a_pond
+#
+# The `#` on the line above is load-bearing: a `#` comment does NOT continue
+# across a trailing backslash, so without it that line was a real command this
+# script ran (and silently failed) before `set -e` was in force.
 set -euo pipefail
 cd "$(dirname "$0")"
 

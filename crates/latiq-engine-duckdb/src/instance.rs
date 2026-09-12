@@ -17,7 +17,7 @@
 //!
 //! **No `INSTALL` on a request path.** Downloading an extension is an unbounded
 //! wait on an external host, and every path that reaches DuckDB from a caller —
-//! opening a pond, the transient attach behind `pull_catalog` — is a path where
+//! opening a pond, an external catalog's `attach_catalog` — is a path where
 //! an agent is sitting on the call. So there are exactly two places an `INSTALL`
 //! may run, and both are before the node serves anything:
 //!
@@ -85,7 +85,7 @@ pub fn ensure_standard_extensions() -> Result<(), EngineError> {
 ///   **off**, so a cache miss fails the pond rather than downloading.
 /// - `CATALOG_DRIVEN` — what a *catalog type* needs (`iceberg`, plus the `avro`
 ///   DuckDB pulls in when iceberg loads); `attachers.rs` `LOAD`s it for the
-///   transient attach behind `pull_catalog`.
+///   attach of an external catalog (`attach_catalog`).
 ///
 /// `parquet`/`json` are statically linked into the binary and need no cache.
 pub fn warmable_extensions() -> Vec<&'static str> {
@@ -105,7 +105,7 @@ pub fn warmable_extensions() -> Vec<&'static str> {
 ///
 /// The warm used to be `let _ = INSTALL …` — right for a node that is merely
 /// topping up its cache, but it made a gap invisible until some pond or
-/// `pull_catalog` failed much later, far from the cause. The report is what lets
+/// `attach_catalog` failed much later, far from the cause. The report is what lets
 /// the node **warn** with the names and the build-time command **fail**.
 #[derive(Debug, Default, Clone)]
 pub struct WarmReport {
@@ -455,7 +455,7 @@ mod tests {
     /// `latiq warm-extensions` "so nodes start without network", and every LOAD
     /// site — `PondInstance::open`'s standard set, a pond's requested
     /// extensions, `attachers.rs` for the transient attach behind
-    /// `pull_catalog` — now runs with autoinstall **off**. So the whole
+    /// `attach_catalog` — now runs with autoinstall **off**. So the whole
     /// deployment claim reduces to: after a warm, does every warmable extension
     /// load with no network?
     ///

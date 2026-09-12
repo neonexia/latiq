@@ -87,10 +87,11 @@ jobs:
           set -o pipefail
           cargo test -p latiq --test admin -- \
             --ignored --exact --nocapture \
-            catalogs_iceberg::iceberg_pull_seeded_widgets_into_pond \
+            catalogs_iceberg::iceberg_attach_and_join_a_second_catalog_into_a_pond \
+            catalogs_iceberg::error_contract_an_iceberg_endpoint_that_is_not_a_catalog_is_not_our_failure \
             | tee iceberg.log
-          grep -q '^test result: ok\. 1 passed' iceberg.log \
-            || { echo "::error::iceberg e2e matched no test — did it move or get renamed?"; exit 1; }
+          grep -q '^test result: ok\. 2 passed' iceberg.log \
+            || { echo "::error::the iceberg e2e matched the wrong number of tests — did one move or get renamed?"; exit 1; }
 
   cluster-scale-out:
     name: dockerized cluster + scale-out e2e

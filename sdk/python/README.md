@@ -51,8 +51,11 @@ in-process), so the wheel is large; that's the cost of zero-dependency local mod
 
 `connect(server, root, query_gateway)` · `Database.{server, create_pond, get_pond,
 list_ponds, list_datasets, list_catalogs, drop_pond}` · `Pond.{name, id, tier,
-description, lineage, query, explain, snapshots, load_dataset, describe_catalog,
-pull_catalog, describe, drop}`. Reads return a `pyarrow.Table` over the streaming
+description, lineage, query, explain, snapshots, load_dataset, attach_catalog,
+detach_catalog, list_attached_catalogs, describe, drop}`. An attached catalog is
+mounted under a name you choose and stays mounted, so ordinary `query`/`write`
+SQL can name it — including a JOIN across two of them — until you
+`detach_catalog`. Reads return a `pyarrow.Table` over the streaming
 `ReadArrow` RPC (`query(sql, stream=True)` → a `RecordBatchReader`); writes are
 visible via `snapshots()`. The data path uses the front door + greeter forwarding
 (k8s-safe). Ships PEP 561 type stubs. Operator surfaces (nodes/policy/stats) stay

@@ -111,11 +111,38 @@ pub struct LoadDatasetResult {
     pub tables: Vec<String>,
 }
 
-/// Result of a transient pull from an external catalog (the query ran in-pond).
+/// Result of `attach_catalog`: what is now mounted, and **which credential mode
+/// was actually applied**.
+///
+/// The mode is reported rather than assumed because the modes are not equally
+/// visible from the call site: supplying no secret selects `passthrough`, and a
+/// passthrough with no bearer to pass through applies NO credential at all. Both
+/// look like "I sent no secret" from outside; only one of them means the
+/// caller's token is in force, so the response says which happened (invariant
+/// 13b — clamp visibly, substitute never).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PullResult {
+pub struct AttachCatalogResult {
+    pub catalog: latiq_engine::AttachedCatalog,
+    /// `explicit` | `passthrough` | `ref` | `none`.
+    pub credential_mode: crate::credentials::CredentialMode,
+}
+
+/// Result of `detach_catalog`. The alias is echoed so a caller batching several
+/// detaches can tell the responses apart.
+///
+/// There is deliberately no `credential_dropped` flag: dropping the secret is
+/// part of detaching, not a separate outcome, and a field that is always `true`
+/// is a claim nobody measured.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DetachCatalogResult {
     pub catalog: String,
-    pub query: String,
+}
+
+/// What `list_attached_catalogs` returns. Locators only — a credential appears
+/// on no surface, in no mode (see `latiq_common::Secret`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedCatalogList {
+    pub catalogs: Vec<latiq_engine::AttachedCatalog>,
 }
 
 /// A page of a pond's OpenLineage trail, newest first — what `get_lineage`

@@ -543,7 +543,7 @@ impl ErrorKind {
                  node, whose network is not yours. One retry is worth it if the \
                  failure could be a transient network fault; a second identical failure means the \
                  source, not the query. To work offline of it, load the data into the pond first \
-                 (load_dataset / pull_catalog)."
+                 (load_dataset / attach_catalog)."
             }
             ErrorKind::Storage | ErrorKind::Internal => {
                 "Retry; if it persists, report to your operator."

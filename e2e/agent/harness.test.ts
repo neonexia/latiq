@@ -65,7 +65,8 @@ function transport() {
 const EXPECTED_TOOLS = [
   "allocate_pond", "describe_pond", "list_ponds", "drop_pond",
   "read_query", "write_query", "explain_query",
-  "list_datasets", "load_dataset", "list_catalogs", "describe_catalog", "pull_catalog",
+  "list_datasets", "load_dataset", "list_catalogs",
+  "attach_catalog", "detach_catalog", "list_attached_catalogs",
 ];
 
 let ai: Awaited<ReturnType<typeof experimental_createMCPClient>>;
@@ -161,10 +162,11 @@ test("dataset catalog surface: list + load + query a curated dataset", async () 
 });
 
 test("catalog surface is reachable (list_catalogs)", async () => {
-  // describe/pull_catalog need a registered external catalog (the dedicated
-  // iceberg e2e covers that); here we prove the agent can ENUMERATE them — and
-  // asserting only `isError === false` could not fail on any regression in what
-  // enumeration returns, so assert the payload the model actually reads.
+  // Attaching needs a reachable external source (the dedicated iceberg e2e
+  // covers that); here we prove the agent can ENUMERATE registered catalogs and
+  // ask a pond what it currently has attached — and asserting only
+  // `isError === false` could not fail on any regression in what enumeration
+  // returns, so assert the payload the model actually reads.
   const r: any = ok(await tools.list_catalogs.execute({}, opts()));
   assert.ok(Array.isArray(r?.catalogs),
     `list_catalogs returns {catalogs: [...]}: ${JSON.stringify(r)}`);
@@ -178,14 +180,21 @@ test("catalog surface is reachable (list_catalogs)", async () => {
     assert.ok(c?.type, `catalog ${c?.name} must advertise its type: ${JSON.stringify(c)}`);
   }
 
-  // The negative half: an unknown catalog is a structured tool error, not a
-  // silent empty success the model would read as "nothing there".
+  // A fresh pond has nothing attached, and that is an EMPTY LIST rather than an
+  // error — the two answers mean different things and a model must be able to
+  // tell them apart.
   const pond = name("cat");
   ok(await tools.allocate_pond.execute({ name: pond }, opts()));
-  const err = failed(await tools.describe_catalog.execute(
-    { pond, catalog: "does-not-exist" }, opts()));
+  const attached: any = ok(await tools.list_attached_catalogs.execute({ pond }, opts()));
+  assert.deepEqual(attached?.catalogs, [],
+    `a fresh pond has nothing attached: ${JSON.stringify(attached)}`);
+
+  // The negative half: detaching something that is not attached is a structured
+  // tool error, not a silent success the model would read as "done".
+  const err = failed(await tools.detach_catalog.execute(
+    { pond, name: "does-not-exist" }, opts()));
   assert.match(JSON.stringify(err ?? ""), /does-not-exist/,
-    `the error names the unknown catalog: ${JSON.stringify(err)}`);
+    `the error names the alias that is not attached: ${JSON.stringify(err)}`);
   ok(await tools.drop_pond.execute({ pond, confirm: true }, opts()));
 });
 

@@ -31,8 +31,7 @@
 use crate::encode::{err_envelope, ok, ok_explain, ok_query};
 use crate::resources;
 use crate::response::{
-    CatalogTableRef, DescribeCatalogResponse, DropPondResponse, ListCatalogsResponse,
-    ListDatasetsResponse, ListPondsResponse, QueryResponse,
+    DropPondResponse, ListCatalogsResponse, ListDatasetsResponse, ListPondsResponse, QueryResponse,
 };
 use crate::schema::output_schema;
 use latiq_agent_core::{with_bearer, AgentError, AgentOps, QueryControls};
@@ -165,33 +164,45 @@ pub struct LoadDatasetArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
-pub struct CatalogDescribeArgs {
-    #[schemars(description = "Pond id or name (the catalog is attached on it transiently)")]
+pub struct CatalogAttachArgs {
+    #[schemars(description = "Pond id or name to attach the catalog to")]
     pub pond: String,
-    #[schemars(description = "Catalog name (from list_catalogs), e.g. `lake`")]
-    pub catalog: String,
     #[schemars(
-        description = "Runtime config + credentials as key→value, e.g. {\"token\":\"<bearer>\"}. Merged over the catalog's stored locator params (these win). NOT stored."
+        description = "The alias to mount it as, AND the SQL namespace you will then write: `name: \"lake\"` makes the source readable as `FROM lake.sales.orders`. 1-64 characters of letters, digits, `_` or `-`."
     )]
-    pub set: Option<std::collections::HashMap<String, String>>,
+    pub name: String,
+    #[schemars(description = "Catalog type: `iceberg` or `ducklake`.")]
+    pub r#type: String,
+    #[schemars(
+        description = "LOCATOR parameters, 1:1 with DuckDB's own ATTACH options — iceberg: endpoint, warehouse, s3_endpoint, s3_region; ducklake: metadata_path, data_path, s3_endpoint, s3_region. These are echoed back by list_attached_catalogs, so a CREDENTIAL key here is refused: put it in `secrets`. An unknown key is refused too, never dropped."
+    )]
+    pub options: Option<std::collections::HashMap<String, String>>,
+    #[schemars(
+        description = "CREDENTIALS as key→value — iceberg: token, s3_access_key, s3_secret_key; ducklake: s3_access_key, s3_secret_key. Never logged, never returned by any tool. Supply this OR `secret_ref` OR NEITHER; supplying two is refused. Omitting both selects passthrough: YOUR OWN bearer token becomes the catalog credential, which is what Iceberg REST / Unity / Snowflake External OAuth want — so if you are authenticated and the catalog trusts your issuer, send neither field. The response's `credential_mode` says which mode was applied."
+    )]
+    pub secrets: Option<std::collections::HashMap<String, String>>,
+    #[schemars(
+        description = "An opaque credential reference the NODE dereferences, as `<scheme>://<location>` (e.g. `env://lake`). For credentials you must not hold yourself. A scheme this deployment has no backend for returns capability_unavailable — report it, do not retry."
+    )]
+    pub secret_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(crate = "rmcp::schemars")]
-pub struct CatalogPullArgs {
-    #[schemars(description = "Pond id or name to pull into")]
+pub struct CatalogDetachArgs {
+    #[schemars(description = "Pond id or name the catalog is attached to")]
     pub pond: String,
-    #[schemars(description = "Catalog name (from list_catalogs), e.g. `lake`")]
-    pub catalog: String,
-    #[schemars(
-        description = "The SQL to materialize, naming the catalog + a target table, e.g. `CREATE TABLE us_orders AS SELECT id,total FROM lake.sales.orders WHERE region='us'`."
-    )]
-    pub query: String,
-    #[schemars(
-        description = "Runtime config + credentials as key→value, e.g. {\"token\":\"<bearer>\"}. NOT stored."
-    )]
-    pub set: Option<std::collections::HashMap<String, String>>,
+    #[schemars(description = "The alias it was attached as (from list_attached_catalogs)")]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct PondArgs {
+    #[schemars(description = "Pond id or name")]
+    pub pond: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -255,6 +266,31 @@ fn reject_zero(field: &str, value: Option<u64>) -> Option<CallToolResult> {
                 "`{field}` must be at least 1.",
                 latiq_common::facts! { "field" => field },
                 "Omit `{field}` to use the node's default; `0` is not 'unlimited'.",
+                "latiq://guidance",
+            )
+            .envelope(),
+        )
+    })
+}
+
+/// [`reject_zero`]'s sibling for containers and strings: an explicitly-supplied
+/// EMPTY `{}` / `[]` / `""` is a value the caller chose, not "unset".
+///
+/// `empty` is `Some(true)` only when the field was present AND empty — so a
+/// caller that omitted it is untouched. It matters most on `attach_catalog`,
+/// where omitting `secrets` is not a gap to be filled in but a MODE selection
+/// (passthrough, the caller's own bearer): reading `secrets: {}` as "absent"
+/// there would quietly authenticate an external catalog with a token the caller
+/// never offered it.
+fn reject_empty(field: &str, empty: Option<bool>) -> Option<CallToolResult> {
+    (empty == Some(true)).then(|| {
+        err_envelope(
+            AgentError::rendered_with(
+                latiq_common::ErrorKind::InvalidValue,
+                "`{field}` was supplied empty, which is not a value.",
+                latiq_common::facts! { "field" => field },
+                "Either give `{field}` at least one entry, or OMIT it entirely — omitting is a \
+                 real choice with a defined meaning, and an empty one is not the same request.",
                 "latiq://guidance",
             )
             .envelope(),
@@ -923,8 +959,7 @@ A write. See latiq://recipes/external-data.",
     /// Discover registered external catalogs (iceberg/…) you can pull data from.
     #[tool(
         output_schema = output_schema::<ListCatalogsResponse>(),
-        description = "Browse registered external CATALOGS (iceberg today), then describe_catalog its tables and pull_catalog a subset into a pond. \
-See latiq://recipes/external-data.",
+        description = "Browse external CATALOGS an operator registered: each one's type and locator `params`, to pass as `options` to attach_catalog. See latiq://recipes/external-data.",
         annotations(
             title = "List catalogs",
             read_only_hint = true,
@@ -954,71 +989,116 @@ See latiq://recipes/external-data.",
             .await)
     }
 
-    /// List an external catalog's tables (transient attach on a pond). Pass creds via `set`.
+    /// Mount an external catalog on a pond and leave it mounted, so ordinary SQL
+    /// can read it — and join across two of them.
     #[tool(
-        output_schema = output_schema::<DescribeCatalogResponse>(),
-        description = "List an external catalog's tables — attached on `pond` transiently, then detached. \
-Credentials in `set`, used once. See latiq://recipes/external-data.",
+        output_schema = output_schema::<latiq_agent_core::AttachCatalogResult>(),
+        description = "Mount an external catalog (iceberg/ducklake) on `pond` as `name` and LEAVE it mounted: SQL can then name `<name>.<schema>.<table>`, and two attached catalogs can be JOINed. \
+Credential: `secrets`, `secret_ref`, or neither (your own bearer). See latiq://recipes/external-data.",
         annotations(
-            title = "Describe catalog",
-            read_only_hint = true,
+            title = "Attach catalog",
+            read_only_hint = false,
+            // It changes what SQL in this pond can resolve, but it writes no
+            // data and destroys none: an attach is undone by a detach.
             destructive_hint = false,
-            idempotent_hint = true
+            // A second attach of the same alias is a name_conflict, not a no-op.
+            idempotent_hint = false
         )
     )]
-    async fn describe_catalog(
+    async fn attach_catalog(
         &self,
-        Parameters(a): Parameters<CatalogDescribeArgs>,
+        Parameters(a): Parameters<CatalogAttachArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        let set = a.set.unwrap_or_default().into_iter().collect();
+        // On THIS surface an explicitly-supplied empty value is a value the
+        // caller chose, so it is refused rather than re-read as "unset"
+        // (invariant 13c — the same rule `reject_zero` enforces for numbers).
+        // The distinction is load-bearing here: "absent" selects PASSTHROUGH,
+        // where the caller's own bearer becomes the catalog credential, so
+        // silently treating `secrets: {}` as absent would authenticate a catalog
+        // with a token the caller never offered for it.
+        if let Some(r) = reject_empty("secrets", a.secrets.as_ref().map(|s| s.is_empty())) {
+            return Ok(r);
+        }
+        if let Some(r) = reject_empty("secret_ref", a.secret_ref.as_ref().map(|s| s.is_empty())) {
+            return Ok(r);
+        }
+        if let Some(r) = reject_empty("options", a.options.as_ref().map(|o| o.is_empty())) {
+            return Ok(r);
+        }
+        let options = a.options.unwrap_or_default().into_iter().collect();
+        let secrets = a
+            .secrets
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k, latiq_common::Secret::new(v)))
+            .collect();
+        let spec = match latiq_agent_core::CredentialSpec::from_request(secrets, a.secret_ref) {
+            Ok(s) => s,
+            Err(e) => return Ok(err_envelope(e.envelope())),
+        };
         Ok(self
-            .traced("describe_catalog", &ctx, tok, async {
+            .traced("attach_catalog", &ctx, tok, async {
                 match self
                     .ops
-                    .catalog_describe(&id, &a.pond, &a.catalog, set)
+                    .attach_catalog(&id, &a.pond, &a.name, &a.r#type, options, spec)
                     .await
                 {
-                    Ok(tables) => ok(&DescribeCatalogResponse {
-                        catalog: a.catalog.clone(),
-                        tables: tables
-                            .into_iter()
-                            .map(|(schema, table)| CatalogTableRef { schema, table })
-                            .collect(),
-                    }),
+                    Ok(r) => ok(&r),
                     Err(e) => err_envelope(e.envelope()),
                 }
             })
             .await)
     }
 
-    /// Pull a subset of an external catalog into a pond: transient attach → your query → detach.
+    /// Unmount a catalog and drop the credential that was created for it.
     #[tool(
-        output_schema = output_schema::<latiq_agent_core::PullResult>(),
-        description = "Copy a subset of an external catalog INTO a pond: attach → your `query` (a CREATE TABLE naming the catalog) → detach. \
-Credentials in `set`, used once. A write. See latiq://recipes/external-data.",
+        output_schema = output_schema::<latiq_agent_core::DetachCatalogResult>(),
+        description = "Unmount an external catalog from a pond and drop its credential. Tables already extracted into the pond are unaffected. See latiq://recipes/external-data.",
         annotations(
-            title = "Pull from catalog",
+            title = "Detach catalog",
             read_only_hint = false,
-            destructive_hint = true,
+            destructive_hint = false,
             idempotent_hint = false
         )
     )]
-    async fn pull_catalog(
+    async fn detach_catalog(
         &self,
-        Parameters(a): Parameters<CatalogPullArgs>,
+        Parameters(a): Parameters<CatalogDetachArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let (id, tok) = self.identity(&ctx)?;
-        let set = a.set.unwrap_or_default().into_iter().collect();
         Ok(self
-            .traced("pull_catalog", &ctx, tok, async {
-                match self
-                    .ops
-                    .catalog_pull(&id, &a.pond, &a.catalog, &a.query, set)
-                    .await
-                {
+            .traced("detach_catalog", &ctx, tok, async {
+                match self.ops.detach_catalog(&id, &a.pond, &a.name).await {
+                    Ok(r) => ok(&r),
+                    Err(e) => err_envelope(e.envelope()),
+                }
+            })
+            .await)
+    }
+
+    /// What is attached to this pond right now.
+    #[tool(
+        output_schema = output_schema::<latiq_agent_core::AttachedCatalogList>(),
+        description = "The external catalogs attached to a pond right now, and the locator each points at. Credentials are never returned. See latiq://recipes/external-data.",
+        annotations(
+            title = "List attached catalogs",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn list_attached_catalogs(
+        &self,
+        Parameters(a): Parameters<PondArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (id, tok) = self.identity(&ctx)?;
+        Ok(self
+            .traced("list_attached_catalogs", &ctx, tok, async {
+                match self.ops.list_attached_catalogs(&id, &a.pond).await {
                     Ok(r) => ok(&r),
                     Err(e) => err_envelope(e.envelope()),
                 }
@@ -1088,11 +1168,13 @@ const DEFAULT_LINEAGE_LIMIT: u32 = 50;
 const INSTRUCTIONS: &str = "Latiq — the agent-native data pond. Allocate a pond (a private DuckLake workspace), \
 write/read SQL with native attribution. Latiq owns the transaction around every write — send plain statements, never BEGIN/COMMIT/ROLLBACK. \
 FIRST MOVES: list_ponds to find or join a workspace, or allocate_pond for a new one; then write_query/read_query. \
-TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or list_catalogs → describe_catalog → \
-pull_catalog for an external database/lakehouse (iceberg) — you pull a subset into the pond, then work there \
-(external catalogs are never queried live). \
+TO BRING IN EXTERNAL DATA: list_datasets + load_dataset for curated public files; or attach_catalog for an external \
+database/lakehouse (iceberg, ducklake) — it mounts under a name you choose, and from then on it is ordinary SQL: \
+write_query \"CREATE TABLE t AS SELECT … FROM lake.sales.orders JOIN other.customers USING (id)\" can join across TWO \
+attached catalogs. Extract the subset you need into the pond, work there, then detach_catalog \
+(external catalogs are never queried live). list_attached_catalogs says what is mounted now — attachments are lost on a node restart. \
 WHAT A POND READS WITH NO SETUP: CSV, Parquet and JSON, from http(s):// and s3:// as well as local paths. \
-Geospatial, full-text search and IP types must be asked for at allocate_pond (`extensions: [...]`, fixed for the pond's life); Iceberg comes via pull_catalog. latiq://dialect has the full list. \
+Geospatial, full-text search and IP types must be asked for at allocate_pond (`extensions: [...]`, fixed for the pond's life); Iceberg comes via attach_catalog. latiq://dialect has the full list. \
 WHO YOU ARE: your identity arrives in the transport (bearer token + the `latiq-agent-id` header), never as a tool argument — no tool takes one, so don't look for it. \
 PROVENANCE: pass `lineage: true` at allocate_pond if this pond's work must be explainable later; it cannot be enabled afterwards. \
 Read latiq://guidance to start and latiq://recipes/external-data for the data-loading flow. \
@@ -1317,7 +1399,7 @@ mod tests {
             "extensions: [\"spatial\"]",
             "cannot be added to a pond that already",
             // Named as catalog-reached rather than requestable.
-            "pull_catalog",
+            "attach_catalog",
         ] {
             assert!(
                 dialect.contains(promise),
@@ -1476,7 +1558,17 @@ mod tests {
     /// it is asserted rather than hoped for.
     #[test]
     fn mcp_tool_descriptions_stay_within_the_context_budget() {
-        const TOTAL: usize = 2_500;
+        // The budget is a DENSITY, not a fixed total, and that is the one thing
+        // that changed when the belt grew: the original 2,500 was thirteen tools
+        // at ~192 bytes each, and a fourteenth tool that genuinely exists costs
+        // its share. Expressing it per tool keeps exactly the discipline the
+        // number was chosen for (a client re-fetches ALL of them, so the sum is
+        // what it pays) while refusing the one thing that made the flat total
+        // wrong: a real new capability failing a budget for a belt it is not in.
+        // `PER_TOOL` is unchanged and is what stops any single description
+        // becoming a tutorial again; the `>= 60` floor below stops the average
+        // being bought with empty ones.
+        const PER_TOOL_AVERAGE: usize = 200;
         const PER_TOOL: usize = 400;
         let tools = tool_descriptions();
         assert!(
@@ -1502,10 +1594,13 @@ mod tests {
             );
             total += d.len();
         }
+        let budget = tools.len() * PER_TOOL_AVERAGE;
         assert!(
-            total <= TOTAL,
-            "the 13 tool descriptions total {total} chars (~{} tokens), over the {TOTAL} \
-             budget: every client that defers and re-fetches them pays this repeatedly",
+            total <= budget,
+            "the {} tool descriptions total {total} chars (~{} tokens), over the {budget} \
+             budget ({PER_TOOL_AVERAGE} per tool): every client that defers and re-fetches \
+             them pays this repeatedly",
+            tools.len(),
             total / 4
         );
     }
@@ -1570,15 +1665,37 @@ mod tests {
                 "<dataset>.<table>",
             ),
             ("list_catalogs", "latiq://recipes/external-data", "Catalogs"),
+            // the attach/extract/detach shape, the two-catalog join, the three
+            // credential modes, and what a lost attachment looks like.
             (
-                "describe_catalog",
-                "latiq://recipes/external-data",
-                "never stored",
-            ),
-            (
-                "pull_catalog",
+                "attach_catalog",
                 "latiq://recipes/external-data",
                 "never queried live",
+            ),
+            (
+                "attach_catalog",
+                "latiq://recipes/external-data",
+                "JOIN crm.main.customers",
+            ),
+            (
+                "attach_catalog",
+                "latiq://recipes/external-data",
+                "passthrough (send neither field)",
+            ),
+            (
+                "detach_catalog",
+                "latiq://recipes/external-data",
+                "the pond table survives the detach",
+            ),
+            (
+                "list_attached_catalogs",
+                "latiq://recipes/external-data",
+                "not persisted",
+            ),
+            (
+                "list_attached_catalogs",
+                "latiq://recipes/external-data",
+                "never returned",
             ),
             // paging, the page bounds, the facets, and read_json_auto.
             ("get_lineage", "latiq://recipes/lineage", "limit_applied"),

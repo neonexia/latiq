@@ -21,5 +21,5 @@ pub mod sql;
 pub use abort::AbortToken;
 pub use arrow_stream::ArrowSink;
 pub use engine::{EngineError, QueryEngine};
-pub use result::{ExplainResult, QueryResult, ScanOp, SchemaSummary, TableInfo};
+pub use result::{AttachedCatalog, ExplainResult, QueryResult, ScanOp, SchemaSummary, TableInfo};
 pub use sql::{classify, is_read_only, SqlShape};

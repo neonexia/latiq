@@ -15,7 +15,7 @@
 # then proves it LOADs with autoinstall off, and FAILS this build if any does
 # not. It has to, because nothing downloads at runtime any more — every LOAD
 # site on a request path (opening a pond, the transient attach behind
-# pull_catalog) refuses to reach the network, so an extension missing from this
+# attach_catalog) refuses to reach the network, so an extension missing from this
 # layer is a failed query later, not a slow one.
 
 # ---- builder ---------------------------------------------------------------

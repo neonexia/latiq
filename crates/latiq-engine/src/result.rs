@@ -81,6 +81,32 @@ pub struct SchemaSummary {
     pub tables: Vec<TableInfo>,
 }
 
+/// An external catalog currently ATTACHED to a pond — what
+/// `list_attached_catalogs` reports and what the engine holds while it is
+/// mounted.
+///
+/// **There is no credential on this type, in any form.** It is returned by a
+/// surface, so a field for one could only ever be a leak; the credential lives
+/// in the engine's `CREATE SECRET` and in nothing else. `options` is the locator
+/// the caller supplied, which is safe by construction: the `--option` /
+/// `--secret` split in `latiq_common::catalog` refuses a credential key on the
+/// option side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AttachedCatalog {
+    /// The alias, which is also the SQL namespace: `FROM lake.sales.orders`.
+    pub name: String,
+    /// The catalog type (`iceberg`, `ducklake`).
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// How the SOURCE identifies itself — the REST endpoint + warehouse, or
+    /// `ducklake:<metadata>`. The same value lineage files its datasets under,
+    /// so an agent can tell two attachments of the same type apart by what they
+    /// actually point at rather than by the local alias.
+    pub namespace: String,
+    /// The locator options this attachment was made with, verbatim.
+    pub options: std::collections::BTreeMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

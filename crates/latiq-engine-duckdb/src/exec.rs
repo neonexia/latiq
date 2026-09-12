@@ -231,7 +231,7 @@ impl Drop for ReadTxn<'_> {
 /// take one for every pond, not only a lineage pond's.
 ///
 /// Scope: the two `QueryEngine` read paths. `describe_schema`,
-/// `describe_catalog` and `explain_query` deliberately stay unbracketed —
+/// `attach_catalog` and `explain_query` deliberately stay unbracketed —
 /// single-statement introspection with no version to record and nothing to keep
 /// consistent across statements.
 ///
@@ -392,12 +392,15 @@ pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineErr
 /// the snapshot it published (`None` when nothing changed).
 ///
 /// **This is the ONE attribution bracket.** Every path that can write into a
-/// pond goes through it — `run_write` for caller SQL, `pull_catalog` for a
-/// transient external pull — because a second copy of this shape is exactly how
-/// one of them silently stops matching the other: the pull *was* that second
-/// copy (no `BEGIN`, no `set_commit_message`) and left `(snapshot, NULL, NULL)`
-/// in `ducklake_snapshots` for months. Anything new that mutates a pond belongs
-/// here too, not beside it.
+/// pond goes through it — today that is `run_write` alone, for caller SQL, and
+/// an extract from an external catalog reaches it by being an ordinary
+/// `write_query` rather than by having a bracket of its own.
+///
+/// That is the lesson, not a coincidence: a second copy of this shape is exactly
+/// how one of them silently stops matching the other. The old special-cased
+/// `pull_catalog` *was* that second copy (no `BEGIN`, no `set_commit_message`)
+/// and left `(snapshot, NULL, NULL)` in `ducklake_snapshots` for months.
+/// Anything new that mutates a pond belongs here too, not beside it.
 ///
 /// We do NOT pre-classify the SQL as read-vs-write. `body` runs inside
 /// `BEGIN … COMMIT` with `set_commit_message` issued LAST (so a user-supplied
@@ -410,7 +413,7 @@ pub fn run_read(inst: &PondInstance, sql: &str) -> Result<QueryResult, EngineErr
 /// connection is reused, so a dangling open transaction would wedge the pond).
 ///
 /// `op` is the operation recorded as DuckLake's commit message — the caller's
-/// own name for what it did (`write_query`, `pull_catalog`), so an operator
+/// own name for what it did (`write_query`), so an operator
 /// reading history can tell how the data arrived. `trace_id` is the request's
 /// ambient trace id (`None` outside a trace scope — see the note where it is
 /// recorded).
